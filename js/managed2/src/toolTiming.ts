@@ -70,7 +70,7 @@ export class ToolTiming {
   externalTurn(context: ToolContext): string | undefined {
     this.ensureSchema();
     const rows = this.sql.exec<{ external_turn_id: string }>(
-      "SELECT external_turn_id FROM managed2_tool_timing WHERE call_id = ? AND status IS NULL",
+      "SELECT DISTINCT external_turn_id FROM managed2_tool_timing WHERE call_id = ? AND status IS NULL",
       context.callId).toArray();
     return rows.length === 1 ? rows[0]!.external_turn_id : undefined;
   }

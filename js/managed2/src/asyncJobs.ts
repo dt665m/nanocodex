@@ -30,6 +30,14 @@ const bound = (value: string) => value.length > MAX_STATUS_RESULT ? `${value.sli
 type Job = { id: string; invocation: string; original_turn: string; execution_turn: string | null; call_id: string | null;
   tool: string; args: string; state: string; result: string | null; attempts: number; started_at: number | null; created_at: number;
   terminal_state: string | null; delivered_at: number | null; continuation_started: number | null; wake_generation: number; lease_id: string | null; context_json: string | null; replay_safe: number; };
+type StatusRow = Pick<Job, "id" | "state" | "tool" | "result" | "continuation_started">;
+// SQLite substr counts code points, while JS bound() counts UTF-16 code units.
+// Fetch one *extra code point*: it is always enough for bound() to retain the
+// exact existing status semantics, even when the prefix contains astral text.
+const STATUS_PROJECTION = "id, state, tool, substr(result, 1, ?) AS result, continuation_started";
+const statusRow = (job: StatusRow) => ({ job_id: job.id, state: job.state, tool: job.tool,
+  ...(job.result === null ? {} : { result: bound(job.result) }),
+  ...(job.continuation_started === null ? {} : { continuation_started: job.continuation_started === 1 }) });
 /** Durable intent, NOT a provider output. ToolContext.turnId identifies a JS
  * execution; it must not be assumed to identify a Rust Agent turn. */
 export type FinalToolResultIntent = Readonly<{ originalTurn: string; executionTurn: string; callId: string;
@@ -125,8 +133,15 @@ export class AsyncJobs {
     // An old tool invocation must never become a new mutable side effect.
     storage.sql.exec(`CREATE TABLE IF NOT EXISTS async_job_tombstones (
       id TEXT PRIMARY KEY, invocation TEXT NOT NULL UNIQUE, tool TEXT NOT NULL,
-      archived_at INTEGER NOT NULL
+      archived_at INTEGER NOT NULL, original_turn TEXT, call_id TEXT
     )`);
+    const tombstoneColumns = new Set(storage.sql.exec<{ name: string }>(
+      "PRAGMA table_info(async_job_tombstones)").toArray().map(row => row.name));
+    if (!tombstoneColumns.has("original_turn")) storage.sql.exec(
+      "ALTER TABLE async_job_tombstones ADD COLUMN original_turn TEXT");
+    if (!tombstoneColumns.has("call_id")) storage.sql.exec(
+      "ALTER TABLE async_job_tombstones ADD COLUMN call_id TEXT");
+    storage.sql.exec("CREATE INDEX IF NOT EXISTS async_job_tombstones_original_call ON async_job_tombstones(original_turn, call_id)");
     // Deployment alone does not wake an idle DO. On its next construction,
     // recheck one old checkpoint or an output parked against an older kernel.
     // If the capability is still absent, park again without a polling alarm.
@@ -159,8 +174,8 @@ export class AsyncJobs {
     this.recordHighWater();
     const cutoff = Date.now() - RETENTION_MS;
     this.storage.transactionSync(() => {
-      this.storage.sql.exec(`INSERT INTO async_job_tombstones (id, invocation, tool, archived_at)
-        SELECT id, invocation, tool, ? FROM async_jobs
+      this.storage.sql.exec(`INSERT INTO async_job_tombstones (id, invocation, tool, archived_at, original_turn, call_id)
+        SELECT id, invocation, tool, ?, original_turn, call_id FROM async_jobs
         WHERE state = 'delivered' AND delivered_at IS NOT NULL AND delivered_at < ?`, Date.now(), cutoff);
       this.storage.sql.exec("DELETE FROM async_jobs WHERE state = 'delivered' AND delivered_at IS NOT NULL AND delivered_at < ?", cutoff);
     });
@@ -170,20 +185,20 @@ export class AsyncJobs {
     return this.storage.sql.exec<Job>("SELECT * FROM async_jobs WHERE id = ?", id).toArray()[0];
   }
   public status(id: string): { job_id: string; state: string; tool: string; result?: string; continuation_started?: boolean } | undefined {
-    const job = this.get(id);
-    if (!job) {
-      const archived = this.storage.sql.exec<{ tool: string }>(
-        "SELECT tool FROM async_job_tombstones WHERE id = ?", id).toArray()[0];
-      return archived ? { job_id: id, state: "archived", tool: archived.tool,
-        continuation_started: true } : undefined;
-    }
-    return { job_id: job.id, state: job.state, tool: job.tool,
-      ...(job.result === null ? {} : { result: bound(job.result) }),
-      ...(job.continuation_started === null ? {} : { continuation_started: job.continuation_started === 1 }) };
+    const job = this.storage.sql.exec<StatusRow>(
+      `SELECT ${STATUS_PROJECTION} FROM async_jobs WHERE id = ?`, MAX_STATUS_RESULT + 1, id).toArray()[0];
+    if (job) return statusRow(job);
+    const archived = this.storage.sql.exec<{ tool: string }>(
+      "SELECT tool FROM async_job_tombstones WHERE id = ?", id).toArray()[0];
+    return archived ? { job_id: id, state: "archived", tool: archived.tool,
+      continuation_started: true } : undefined;
   }
   public list(): ReturnType<AsyncJobs["status"]>[] {
-    return this.storage.sql.exec<{ id: string }>("SELECT id FROM async_jobs ORDER BY created_at DESC LIMIT 50")
-      .toArray().map(row => this.status(row.id));
+    // One bounded projection rather than 50 SELECT * round trips that hydrate
+    // up to 50 MiB of terminal payload just to return 8 KiB previews.
+    return this.storage.sql.exec<StatusRow>(
+      `SELECT ${STATUS_PROJECTION} FROM async_jobs ORDER BY created_at DESC LIMIT 50`,
+      MAX_STATUS_RESULT + 1).toArray().map(statusRow);
   }
   public tool(tool: NamedTool): NamedTool {
     if (!Object.hasOwn(this.registeredTools, tool.name)) throw new Error("async tool is not registered for this session");
@@ -192,22 +207,30 @@ export class AsyncJobs {
       if (!originalTurn || !context.turnId || !context.callId) throw new Error("async tool call lacks durable turn correlation");
       const input = JSON.stringify(args);
       if (!input || input.length > MAX_INPUT) throw new Error("async tool arguments exceed limit");
-      const invocation = `${context.turnId}:${context.callId}`;
+      // The Rust execution turn index may reset on a cold driver. The public
+      // source turn and provider call ID are the stable replay identity.
+      const invocation = `v2:${JSON.stringify([originalTurn, context.callId])}`;
       // Only serializable, non-authority-bearing correlation is persisted. The
       // owner-scoped registered handler remains the sole source of permissions.
       const contextJson = JSON.stringify({ parentCallId: context.parentCallId,
         sessionId: context.sessionId, model: context.model, subagent: context.subagent });
       if (contextJson.length > MAX_INPUT) throw new Error("async context exceeds limit");
       const replaySafe = this.replaySafeTools.has(tool.name) ? 1 : 0;
-      let job = this.storage.sql.exec<Job>("SELECT * FROM async_jobs WHERE invocation = ?", invocation).toArray()[0];
+      const candidates = this.storage.sql.exec<Job>(
+        "SELECT * FROM async_jobs WHERE original_turn = ? AND call_id = ? LIMIT 2",
+        originalTurn, context.callId).toArray();
+      if (candidates.length > 1) throw new Error("async invocation ambiguous; unsafe to replay");
+      let job = candidates[0];
       if (job && (job.tool !== tool.name || job.args !== input || job.original_turn !== originalTurn
-        || job.execution_turn !== context.turnId || job.call_id !== context.callId
-        || job.context_json !== contextJson || job.replay_safe !== replaySafe))
+        || job.call_id !== context.callId || job.context_json !== contextJson || job.replay_safe !== replaySafe))
         throw new Error("async invocation conflict");
       if (!job) {
         this.archiveDelivered();
-        if (this.storage.sql.exec<{ n: number }>(
-          "SELECT COUNT(*) AS n FROM async_job_tombstones WHERE invocation = ?", invocation,
+        if (this.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM async_job_tombstones
+          WHERE (original_turn = ? AND call_id = ?)
+            OR (original_turn IS NULL AND (invocation = ?
+              OR substr(invocation, -length(?) - 1) = ':' || ?))`,
+          originalTurn, context.callId, invocation, context.callId, context.callId,
         ).toArray()[0]!.n > 0) throw new Error("async invocation archived; unsafe to replay");
         // Check only *new* invocations after existing-ID and tombstone lookup.
         // A sampled high-water survives restarts and later database shrinkage;
@@ -313,7 +336,11 @@ export class AsyncJobs {
         model: correlation.model ?? "async-job", ...(correlation.subagent ? { subagent: correlation.subagent } : {}),
         signal: new AbortController().signal };
       const output = JSON.stringify(await tool.handler(JSON.parse(job.args), context)) ?? "null";
-      if (output.length > MAX_DURABLE_RESULT) throw new Error("tool output exceeds durable limit");
+      // Persisted SQLite and native journal bytes, not JS UTF-16 code units,
+      // consume the session storage reserve. Astral text can take four bytes
+      // per code point and must not evade the per-result limit.
+      if (new TextEncoder().encode(output).byteLength > MAX_DURABLE_RESULT)
+        throw new Error("tool output exceeds durable limit");
       this.storage.sql.exec("UPDATE async_jobs SET state = 'completed', terminal_state = 'completed', result = ? WHERE id = ? AND state = 'running' AND attempts = ? AND lease_id = ?",
         output, id, attempt, leaseId);
     } catch {

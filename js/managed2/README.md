@@ -201,11 +201,16 @@ occurs in the selected region or that provider response time will improve.
 agents still use synchronous tools. The old pilot's synthetic *user turn* has
 been removed; old rows are quarantined, never replayed as typed tool output.
 
-The dormant `AsyncJobs` ledger persists a stable turn, original provider call
-ID, job ID, arguments, correlation, and bounded result before dispatch. It
+The dormant `AsyncJobs` ledger persists the stable **external source turn +
+original provider call ID** replay identity (not the Rust execution-turn index,
+which can change on cold restart), job ID, arguments, correlation, and bounded
+result before dispatch. Legacy tombstones with no source-turn column fence any
+matching original call ID conservatively. It
 registers `current_time`, `web__run`, and the local Just Bash `exec_command`,
-with eight active jobs and seven-day payload retention measured from
-**confirmed model-step delivery**, not tool creation. An expired confirmed delivery becomes a compact permanent invocation tombstone:
+with eight active jobs, a 1 MiB UTF-8 byte limit per persisted tool result,
+and seven-day payload retention measured from **confirmed model-step delivery**,
+not tool creation. `/jobs` uses bounded 8,192-unit result previews and one
+projection query for list responses, avoiding full-payload hydration. An expired confirmed delivery becomes a compact permanent invocation tombstone:
 its status is `archived`, the original payload is no longer available from
 `/jobs`, and a replay of the same invocation fails closed rather than
 executing a mutable tool a second time. New jobs also fail closed when the

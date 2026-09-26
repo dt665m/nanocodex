@@ -38,6 +38,9 @@ it("keys background jobs by stable turn+call, caps active jobs, and rejects tool
     timing.observe("internal-a", "external-a", "tool.call", { call_id: "same", tool: "web__run" }, Date.now());
     timing.observe("internal-b", "external-b", "tool.call", { call_id: "same", tool: "web__run" }, Date.now());
     expect(timing.externalTurn(context("same"))).toBeUndefined(); // refuse ambiguous cross-turn attribution
+    timing.observe("internal-c", "external-c", "tool.call", { call_id: "resumed", tool: "web__run" }, Date.now());
+    timing.observe("internal-d", "external-c", "tool.call", { call_id: "resumed", tool: "web__run" }, Date.now());
+    expect(timing.externalTurn(context("resumed"))).toBe("external-c"); // cold replay, same stable source
   });
 });
 
@@ -945,6 +948,16 @@ it("meters append-only native receipts across cold construction, replay and new 
     expect(count()).toBe(oldBytes + nextBytes);
     insert(); // an exact replay must not charge twice
     expect(count()).toBe(oldBytes + nextBytes);
+    // The trigger and native record must roll back together on an aborted
+    // durability transaction; a failed attempt cannot exhaust future quota.
+    expect(() => state.storage.transactionSync(() => {
+      state.storage.sql.exec(
+        "INSERT INTO nanocodex_durable_records (state_id, key, value) VALUES ('agent', 'rolled-back', 'payload')");
+      throw new Error("simulate transaction abort");
+    })).toThrow("simulate transaction abort");
+    expect(count()).toBe(oldBytes + nextBytes);
+    expect(state.storage.sql.exec<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM nanocodex_durable_records WHERE key = 'rolled-back'").toArray()[0]!.n).toBe(0);
     const limited = new AsyncJobs(state.storage, { exec_command: shell }, () => "source", deliver,
       waitUntil, undefined, undefined, undefined, undefined, undefined, undefined,
       oldBytes + nextBytes);
@@ -963,5 +976,101 @@ it("meters append-only native receipts across cold construction, replay and new 
     expect(() => reopened.tool(shell).handler({ cmd: "another" }, context("receipt-another")))
       .toThrow("async immutable receipt budget reached");
     expect(count()).toBe(oldBytes + nextBytes);
+  });
+});
+
+it("lists bounded status previews in one query without changing Unicode truncation or archived lookup", async () => {
+  await runInDurableObject(stub(), (_session, state) => {
+    const read: NamedTool = { name: "current_time", description: "read", handler: () => "now" };
+    const jobs = new AsyncJobs(state.storage, { current_time: read }, () => "source", async () => {}, () => {});
+    const insert = (id: string, value: string, created: number, continuation: number | null) =>
+      state.storage.sql.exec(`INSERT INTO async_jobs
+        (id, invocation, original_turn, execution_turn, call_id, tool, args,
+         state, result, terminal_state, created_at, continuation_started)
+        VALUES (?, ?, 'source', 'turn-1', ?, 'current_time', '{}', 'completed', ?, 'completed', ?, ?)`,
+      id, `turn-1:${id}`, id, value, created, continuation);
+    const short = '{"value":"α"}';
+    const long = `{"value":"${"🎵".repeat(5_000)}${"z".repeat(100_000)}"}`;
+    insert("short", short, 1, null);
+    insert("long", long, 2, 0);
+    const expectedLong = `${long.slice(0, 8_192)}\n[truncated in status; original output retained]`;
+    expect(jobs.status("short")).toEqual({ job_id: "short", state: "completed", tool: "current_time", result: short });
+    expect(jobs.status("long")).toEqual({ job_id: "long", state: "completed", tool: "current_time",
+      result: expectedLong, continuation_started: false });
+    expect(jobs.list()).toEqual([jobs.status("long"), jobs.status("short")]);
+    state.storage.sql.exec("INSERT INTO async_job_tombstones (id, invocation, tool, archived_at) VALUES ('archived', 'turn-1:archived', 'current_time', 0)");
+    expect(jobs.status("archived")).toEqual({ job_id: "archived", state: "archived",
+      tool: "current_time", continuation_started: true });
+    expect(jobs.list()).toHaveLength(2);
+  });
+});
+
+it("bounds multibyte results by stored bytes and fences a mutable side effect", async () => {
+  await runInDurableObject(stub(), async (_session, state) => {
+    const tasks: Promise<unknown>[] = [];
+    let effects = 0;
+    const shell: NamedTool = { name: "exec_command", description: "mutable", handler: () => {
+      effects++;
+      return "🎵".repeat(300_000); // 600K UTF-16 units, >1 MiB UTF-8 bytes
+    } };
+    const jobs = new AsyncJobs(state.storage, { exec_command: shell }, () => "source",
+      async intent => accepted(intent), work => { tasks.push(work); });
+    expect(jobs.tool(shell).handler({ cmd: "large-output" }, context("multibyte")))
+      .toEqual({ output: UNREAL_RUNNING_OUTPUT });
+    const id = jobId(state, "multibyte");
+    await Promise.all(tasks.splice(0));
+    expect(jobs.status(id)).toMatchObject({ state: "uncertain",
+      result: "Execution outcome unknown; side effect may have occurred" });
+    expect(effects).toBe(1);
+    expect(jobs.tool(shell).handler({ cmd: "large-output" }, context("multibyte")))
+      .toEqual({ output: UNREAL_RUNNING_OUTPUT });
+    await Promise.all(tasks.splice(0));
+    expect(effects).toBe(1);
+  });
+});
+
+it("reuses a mutable job across cold execution-turn renumbering without a second side effect", async () => {
+  await runInDurableObject(stub(), async (_session, state) => {
+    const tasks: Promise<unknown>[] = [];
+    let effects = 0;
+    const shell: NamedTool = { name: "exec_command", description: "mutable", handler: () => {
+      effects++;
+      return { output: "effect committed" };
+    } };
+    const create = () => new AsyncJobs(state.storage, { exec_command: shell }, () => "external-turn-2",
+      async intent => accepted(intent), work => { tasks.push(work); });
+    const first = create();
+    const before = { ...context("same-call"), turnId: "thread:2" };
+    expect(first.tool(shell).handler({ cmd: "once" }, before)).toEqual({ output: UNREAL_RUNNING_OUTPUT });
+    const id = jobId(state, "same-call");
+    await Promise.all(tasks.splice(0));
+    expect(effects).toBe(1);
+    // A new Rust driver starts its logical index at one. The durable external
+    // turn, original provider call ID and handler arguments remain identical.
+    const resumed = create();
+    const after = { ...before, turnId: "thread:1" };
+    expect(resumed.tool(shell).handler({ cmd: "once" }, after)).toEqual({ output: UNREAL_RUNNING_OUTPUT });
+    await Promise.all(tasks.splice(0));
+    expect(effects).toBe(1);
+    expect(state.storage.sql.exec<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM async_jobs WHERE original_turn = 'external-turn-2' AND call_id = 'same-call'").toArray()[0]!.n).toBe(1);
+    expect(resumed.status(id)).toMatchObject({ state: "completed" });
+    expect(() => resumed.tool(shell).handler({ cmd: "different" }, after)).toThrow("async invocation conflict");
+  });
+});
+
+it("migrates legacy tombstones and conservatively fences a renumbered call ID", async () => {
+  await runInDurableObject(stub(), (_session, state) => {
+    state.storage.sql.exec(`CREATE TABLE async_job_tombstones (
+      id TEXT PRIMARY KEY, invocation TEXT NOT NULL UNIQUE, tool TEXT NOT NULL, archived_at INTEGER NOT NULL)`);
+    state.storage.sql.exec("INSERT INTO async_job_tombstones VALUES ('legacy', 'thread:2:same-call', 'exec_command', 0)");
+    const shell: NamedTool = { name: "exec_command", description: "mutable", handler: () => {
+      throw new Error("must not execute");
+    } };
+    const jobs = new AsyncJobs(state.storage, { exec_command: shell }, () => "external-turn-2",
+      async intent => accepted(intent), () => {});
+    expect(() => jobs.tool(shell).handler({ cmd: "once" }, { ...context("same-call"), turnId: "thread:1" }))
+      .toThrow("async invocation archived; unsafe to replay");
+    expect(jobs.status("legacy")).toMatchObject({ state: "archived", tool: "exec_command" });
   });
 });
