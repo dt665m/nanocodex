@@ -1,4 +1,5 @@
 import type { NamedTool, ToolContext } from "nanocodex";
+import { createCloudflareDurabilityStore } from "nanocodex/durability/cloudflare";
 import { stageFunctionCallOutput } from "../../nanocodex/host/internal-Agent.mjs";
 
 /** Durable background jobs for explicitly registered owner-scoped tools. */
@@ -16,6 +17,7 @@ const MAX_ACTIVE = 8;
 // This is a protective admission throttle, not a hard size bound: native
 // writes can grow between samples and the reserve is not an enforced maximum.
 const MAX_ASYNC_DATABASE_BYTES = 256 * 1024 * 1024;
+const MAX_ASYNC_IMMUTABLE_BYTES = 192 * 1024 * 1024;
 const ASYNC_ADMISSION_HEADROOM_BYTES = 64 * 1024 * 1024;
 const RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 // Once the originating turn settles, replay the identical stable operation
@@ -66,7 +68,8 @@ export class AsyncJobs {
     private readonly activeOutputStatus?: OutputStatus,
     private readonly idleOutputStatus?: OutputStatus,
     private readonly deliverIdleBatch?: DeliverFinalToolResults,
-    private readonly maxDatabaseBytes = MAX_ASYNC_DATABASE_BYTES) {
+    private readonly maxDatabaseBytes = MAX_ASYNC_DATABASE_BYTES,
+    private readonly maxImmutableBytes = MAX_ASYNC_IMMUTABLE_BYTES) {
     storage.sql.exec(`CREATE TABLE IF NOT EXISTS async_jobs (
       id TEXT PRIMARY KEY, invocation TEXT NOT NULL UNIQUE, original_turn TEXT NOT NULL,
       execution_turn TEXT, call_id TEXT, tool TEXT NOT NULL, args TEXT NOT NULL,
@@ -90,9 +93,34 @@ export class AsyncJobs {
     )`);
     storage.sql.exec("INSERT OR IGNORE INTO async_jobs_reconcile_cursor VALUES (1, -1, '')");
     storage.sql.exec(`CREATE TABLE IF NOT EXISTS async_jobs_storage_budget (
-      singleton INTEGER PRIMARY KEY CHECK (singleton = 1), peak_bytes INTEGER NOT NULL
+      singleton INTEGER PRIMARY KEY CHECK (singleton = 1), peak_bytes INTEGER NOT NULL,
+      immutable_bytes INTEGER NOT NULL DEFAULT 0
     )`);
-    storage.sql.exec("INSERT OR IGNORE INTO async_jobs_storage_budget VALUES (1, 0)");
+    const budgetColumns = new Set(storage.sql.exec<{ name: string }>(
+      "PRAGMA table_info(async_jobs_storage_budget)").toArray().map(row => row.name));
+    if (!budgetColumns.has("immutable_bytes")) storage.sql.exec(
+      "ALTER TABLE async_jobs_storage_budget ADD COLUMN immutable_bytes INTEGER NOT NULL DEFAULT 0");
+    storage.sql.exec("INSERT OR IGNORE INTO async_jobs_storage_budget VALUES (1, 0, 0)");
+    // Use the same published schema as the Rust/WASM Cloudflare durability
+    // adapter. The append-only record table is shared with the Agent; do not
+    // infer its growth from sampled databaseSize after it has shrunk.
+    createCloudflareDurabilityStore(storage);
+    storage.transactionSync(() => {
+      const exists = storage.sql.exec<{ n: number }>(
+        "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'trigger' AND name = 'async_jobs_meter_durable_records'").toArray()[0]!.n > 0;
+      if (!exists) {
+        const baseline = storage.sql.exec<{ bytes: number }>(
+          `SELECT COALESCE(SUM(length(CAST(state_id AS BLOB)) + length(CAST(key AS BLOB))
+            + length(CAST(value AS BLOB))), 0) AS bytes FROM nanocodex_durable_records`).toArray()[0]!.bytes;
+        storage.sql.exec("UPDATE async_jobs_storage_budget SET immutable_bytes = MAX(immutable_bytes, ?) WHERE singleton = 1", baseline);
+        storage.sql.exec(`CREATE TRIGGER async_jobs_meter_durable_records
+          AFTER INSERT ON nanocodex_durable_records BEGIN
+          UPDATE async_jobs_storage_budget SET immutable_bytes = immutable_bytes
+            + length(CAST(NEW.state_id AS BLOB)) + length(CAST(NEW.key AS BLOB))
+            + length(CAST(NEW.value AS BLOB)) WHERE singleton = 1;
+          END`);
+      }
+    });
     // Keep an immutable, compact replay fence after delivered payloads expire.
     // An old tool invocation must never become a new mutable side effect.
     storage.sql.exec(`CREATE TABLE IF NOT EXISTS async_job_tombstones (
@@ -188,6 +216,10 @@ export class AsyncJobs {
         const peak = this.recordHighWater();
         if (peak + ASYNC_ADMISSION_HEADROOM_BYTES >= this.maxDatabaseBytes)
           throw new Error("async session storage budget reached; existing results remain recoverable");
+        const immutableBytes = this.storage.sql.exec<{ immutable_bytes: number }>(
+          "SELECT immutable_bytes FROM async_jobs_storage_budget WHERE singleton = 1").toArray()[0]!.immutable_bytes;
+        if (immutableBytes >= this.maxImmutableBytes)
+          throw new Error("async immutable receipt budget reached; existing results remain recoverable");
         if (this.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM async_jobs")
           .toArray()[0]!.n >= MAX_JOBS || this.storage.sql.exec<{ n: number }>(
           "SELECT COUNT(*) AS n FROM async_jobs WHERE state IN ('queued', 'running')"

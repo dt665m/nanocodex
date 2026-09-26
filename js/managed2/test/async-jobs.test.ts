@@ -906,3 +906,62 @@ it("caps lifetime SQLite growth after archived invocations without blocking old-
     expect(restarted.status(first)).toMatchObject({ state: "archived" });
   });
 });
+
+it("meters append-only native receipts across cold construction, replay and new immutable writes", async () => {
+  await runInDurableObject(stub(), async (_session, state) => {
+    const { createCloudflareDurabilityStore } = await import("nanocodex/durability/cloudflare");
+    createCloudflareDurabilityStore(state.storage);
+    // An already deployed sampled-high-water row has no immutable column.
+    state.storage.sql.exec(`CREATE TABLE async_jobs_storage_budget (
+      singleton INTEGER PRIMARY KEY CHECK (singleton = 1), peak_bytes INTEGER NOT NULL)`);
+    state.storage.sql.exec("INSERT INTO async_jobs_storage_budget VALUES (1, 1234)");
+    const oldValue = "old-α";
+    state.storage.sql.exec(
+      "INSERT INTO nanocodex_durable_records (state_id, key, value) VALUES ('agent', 'late-output:old', ?)", oldValue);
+    const tasks: Promise<unknown>[] = [];
+    let effects = 0;
+    const shell: NamedTool = { name: "exec_command", description: "mutable", handler: () => {
+      effects++;
+      return { output: "done" };
+    } };
+    const deliver = async (intent: FinalToolResultIntent) => accepted(intent);
+    const waitUntil = (task: Promise<unknown>) => { tasks.push(task); };
+    const jobs = new AsyncJobs(state.storage, { exec_command: shell }, () => "source", deliver, waitUntil);
+    const count = () => state.storage.sql.exec<{ immutable_bytes: number }>(
+      "SELECT immutable_bytes FROM async_jobs_storage_budget").toArray()[0]!.immutable_bytes;
+    const encoded = (value: string) => new TextEncoder().encode(value).byteLength;
+    const oldBytes = encoded("agent") + encoded("late-output:old") + encoded(oldValue);
+    expect(count()).toBe(oldBytes); // migrated baseline from before trigger installation
+    expect(state.storage.sql.exec<{ peak_bytes: number }>(
+      "SELECT peak_bytes FROM async_jobs_storage_budget").toArray()[0]!.peak_bytes).toBe(1234);
+    expect(jobs.tool(shell).handler({ cmd: "existing" }, context("receipt-existing")))
+      .toEqual({ output: UNREAL_RUNNING_OUTPUT });
+    const existing = jobId(state, "receipt-existing");
+    const nextValue = "new-β".repeat(2048);
+    const insert = () => state.storage.sql.exec(
+      "INSERT INTO nanocodex_durable_records (state_id, key, value) VALUES ('agent', 'late-output:new', ?) ON CONFLICT (state_id, key) DO NOTHING", nextValue);
+    insert();
+    const nextBytes = encoded("agent") + encoded("late-output:new") + encoded(nextValue);
+    expect(count()).toBe(oldBytes + nextBytes);
+    insert(); // an exact replay must not charge twice
+    expect(count()).toBe(oldBytes + nextBytes);
+    const limited = new AsyncJobs(state.storage, { exec_command: shell }, () => "source", deliver,
+      waitUntil, undefined, undefined, undefined, undefined, undefined, undefined,
+      oldBytes + nextBytes);
+    expect(count()).toBe(oldBytes + nextBytes); // constructor doesn't rebaseline an existing trigger
+    expect(() => limited.tool(shell).handler({ cmd: "new" }, context("receipt-new")))
+      .toThrow("async immutable receipt budget reached");
+    expect(limited.tool(shell).handler({ cmd: "existing" }, context("receipt-existing")))
+      .toEqual({ output: UNREAL_RUNNING_OUTPUT });
+    await Promise.all(tasks.splice(0));
+    await limited.reconcile(); // pre-admitted work remains recoverable over budget
+    expect(limited.status(existing)).toMatchObject({ state: "checkpointed" });
+    expect(effects).toBe(1);
+    const reopened = new AsyncJobs(state.storage, { exec_command: shell }, () => "source", deliver,
+      waitUntil, undefined, undefined, undefined, undefined, undefined, undefined,
+      oldBytes + nextBytes);
+    expect(() => reopened.tool(shell).handler({ cmd: "another" }, context("receipt-another")))
+      .toThrow("async immutable receipt budget reached");
+    expect(count()).toBe(oldBytes + nextBytes);
+  });
+});

@@ -213,11 +213,15 @@ sampled session SQL database-size high-water reaches 192 MiB (256 MiB
 budget minus 64 MiB admission headroom). The sampler observes native Rust
 journals and permanent tombstones before delivered-job archival, after
 reconciliation, and at new admission; its recorded peak survives restarts.
-Existing-ID status, recovery, and terminal delivery bypass the throttle.
-This is **not** a hard database or lifetime cap: native writes can grow between
-samples, other turns can grow the same database after the gate, and 64 MiB is
-not a proven maximum for in-flight checkpoints. Precise cumulative metering
-and long-term immutable-receipt archival remain production release gates.
+A separate 192 MiB **cumulative** logical-byte meter for the append-only
+native durability records uses an insert trigger and baselines existing records
+on migration. Neither record deletion nor a shrinking live SQLite size resets
+that meter. Both limits gate only *new* async invocations; existing-ID status,
+recovery, and terminal delivery bypass them. They are **not** a hard database
+size cap: already-admitted jobs and unrelated turns can still grow the database,
+and 64 MiB is not a proven maximum for in-flight checkpoints. Permanent host
+tombstones, long-term immutable-receipt archival, and a production storage
+budget review remain release gates.
 Results checkpointed without a model wake remain durable and visible but may
 consume capacity. The read-only
 operations may be retried after a stale lease (at most three attempts),

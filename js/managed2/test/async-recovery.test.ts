@@ -50,8 +50,14 @@ it("reconciles a lost SQL job completion after DO eviction under its original ca
     row: state.storage.sql.exec<{ call_id: string; attempts: number; original_turn: string }>(
       "SELECT call_id, attempts, original_turn FROM async_jobs WHERE id = ?", jobId).toArray()[0],
     turns: state.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM turns").toArray()[0]!.n,
+    nativeRecordBytes: state.storage.sql.exec<{ immutable_bytes: number }>(
+      "SELECT immutable_bytes FROM async_jobs_storage_budget WHERE singleton = 1").toArray()[0]!.immutable_bytes,
+    nativeRecords: state.storage.sql.exec<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM nanocodex_durable_records").toArray()[0]!.n,
   }));
   expect(final.row).toMatchObject({ call_id: "call-web", original_turn: turnId });
+  expect(final.nativeRecords).toBeGreaterThan(0);
+  expect(final.nativeRecordBytes).toBeGreaterThan(0);
   expect(final.row.attempts).toBeGreaterThanOrEqual(2);
   expect(final.turns).toBe(1);
 }, 40_000);
