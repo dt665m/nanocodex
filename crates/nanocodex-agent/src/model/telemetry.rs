@@ -122,6 +122,9 @@ pub(super) struct ToolResultEvent<'a> {
     pub(super) started_after_ns: Option<u64>,
     pub(super) result: &'a ToolOutputBody,
     pub(super) structured_result: &'a Value,
+    // Host-set capability bit, not provider output or tool-authored metadata.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) trusted_unreal_pending: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) metadata: Option<&'a RawValue>,
 }

@@ -1,6 +1,6 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import { expect, it } from "vitest";
-import { AsyncJobs, TypedIngestionUnavailable, UNREAL_RUNNING_OUTPUT, type FinalToolResultIntent, type FinalToolResultReceipt } from "../src/asyncJobs";
+import { AsyncJobs, PendingToolBarrier, TypedIngestionUnavailable, UNREAL_RUNNING_OUTPUT, type FinalToolResultIntent, type FinalToolResultReceipt } from "../src/asyncJobs";
 import { ToolTiming } from "../src/toolTiming";
 import type { NamedTool, ToolContext } from "nanocodex";
 
@@ -13,6 +13,50 @@ const accepted = (intent: FinalToolResultIntent, continuation_started = false): 
 });
 const stub = () => (env as unknown as { SESSIONS: DurableObjectNamespace })
   .SESSIONS.getByName(`jobs-test:${crypto.randomUUID()}`);
+// Direct AsyncJobs tests emulate the native next-model-request boundary after
+// a pending output has been staged. The handler itself must not dispatch work.
+const stagePending = (jobs: AsyncJobs, state: DurableObjectState) => {
+  const pending = state.storage.sql.exec<{ original_turn: string; call_id: string }>(
+    "SELECT original_turn, call_id FROM async_jobs WHERE state = 'queued' AND ready_at IS NULL").toArray();
+  for (const { original_turn: source, call_id: callId } of pending)
+    jobs.activateAfterPendingStage(source, [callId]);
+};
+
+it("does not release an un-staged or differently staged call at the replay's initial model boundary", async () => {
+  const barrier = new PendingToolBarrier();
+  // An old tool event in a still-live owner is not sufficient after an
+  // input.accepted replay. The replay's initial model.call.started is not a
+  // witness that the old tool call has been staged this time.
+  barrier.observe("internal-reused", { call_id: "old", trusted_unreal_pending: true });
+  barrier.reset("internal-reused");
+  expect(barrier.take("internal-reused")).toEqual([]);
+  barrier.observe("internal-reused", { call_id: "old", metadata: { trusted_unreal_pending: true } });
+  expect(barrier.take("internal-reused")).toEqual([]);
+  barrier.observe("internal-reused", { call_id: "exact", trusted_unreal_pending: true });
+  expect(barrier.take("internal-reused")).toEqual(["exact"]);
+  expect(barrier.take("internal-reused")).toEqual([]);
+  await runInDurableObject(stub(), async (_session, state) => {
+    let effects = 0;
+    const tool: NamedTool = { name: "exec_command", description: "mutable", handler: () => {
+      effects++; return "done";
+    } };
+    const tasks: Promise<unknown>[] = [];
+    const jobs = new AsyncJobs(state.storage, { exec_command: tool }, () => "same-source",
+      async intent => accepted(intent), task => { tasks.push(task); });
+    jobs.tool(tool).handler({ cmd: "first" }, context("exact"));
+    jobs.tool(tool).handler({ cmd: "second" }, context("unstaged"));
+    jobs.activateAfterPendingStage("same-source", []); // initial model request
+    await Promise.all(tasks.splice(0));
+    expect(effects).toBe(0);
+    jobs.activateAfterPendingStage("same-source", ["exact"]); // only exact pending staged
+    await Promise.all(tasks.splice(0));
+    expect(effects).toBe(1);
+    expect(jobs.status(jobId(state, "unstaged"))).toMatchObject({ state: "queued" });
+    jobs.activateAfterPendingStage("same-source", ["unstaged"]);
+    await Promise.all(tasks.splice(0));
+    expect(effects).toBe(2);
+  });
+});
 
 it("keys background jobs by stable turn+call, caps active jobs, and rejects tools absent from the registered catalog", async () => {
   await runInDurableObject(stub(), (_session, state) => {
@@ -62,15 +106,19 @@ it("persists same-call identity before egress and emits a stable terminal intent
     const first = { job_id: jobId(state, "call-1") };
     expect(first.job_id).toMatch(/^[0-9a-f-]{36}$/);
     expect(calls).toBe(0); // work must not execute inline before provisional output
+    stagePending(jobs, state);
     await jobs.reconcile(); // alarm resumes work after the model tool handler returns
+    stagePending(jobs, state);
     await Promise.all(tasks);
     expect(calls).toBe(1);
     expect(jobs.status(first.job_id)).toMatchObject({ state: "completed" });
+    stagePending(jobs, state);
     await jobs.reconcile(); // Fast result arrived before the next model request.
     expect(injected).toEqual([{ originalTurn: "original-turn", executionTurn: "turn-1",
       callId: "call-1", tool: "web__run", jobId: first.job_id, terminalState: "completed",
       output: '{"citation":"https://example.org/source"}' }]);
     expect(jobs.status(first.job_id)).toMatchObject({ state: "checkpointed" });
+    stagePending(jobs, state);
     await jobs.reconcile();
     expect(injected).toHaveLength(1);
   });
@@ -90,9 +138,12 @@ it("reconciles an active acceptance once after source turn settles, including af
       deliver, work => { tasks.push(work); });
     expect(jobs.tool(read).handler({}, context("call-cancelled"))).toEqual({ output: UNREAL_RUNNING_OUTPUT });
     const id = jobId(state, "call-cancelled");
+    stagePending(jobs, state);
     await Promise.all(tasks);
+    stagePending(jobs, state);
     await jobs.reconcile();
     expect(jobs.status(id)).toMatchObject({ state: "checkpointed", continuation_started: false });
+    stagePending(jobs, state);
     await jobs.reconcile();
     expect(intents).toHaveLength(1); // never resubmit during the active turn
     state.storage.sql.exec("UPDATE turns SET state = 'failed' WHERE id = 'original-turn'");
@@ -122,6 +173,7 @@ it("keeps a terminal-racing active receipt eligible for idle retry", async () =>
         return accepted(intent);
       }, work => { tasks.push(work); });
     jobs.tool(read).handler({}, context("call-race"));
+    stagePending(jobs, state);
     await Promise.all(tasks);
     const first = jobs.reconcile();
     // Wait until the first delivery has started and captured the active state.
@@ -130,6 +182,7 @@ it("keeps a terminal-racing active receipt eligible for idle retry", async () =>
     state.storage.sql.exec("UPDATE turns SET state = 'failed' WHERE id = 'original-turn'");
     release();
     await first;
+    stagePending(jobs, state);
     await jobs.reconcile();
     expect(intents).toHaveLength(2);
     expect(intents[1]).toEqual(intents[0]);
@@ -151,13 +204,17 @@ it("only a matching durable completed model-step status marks an active output d
         return { state: "pruned_or_unknown" }; });
     jobs.tool(read).handler({}, context("call-confirmed"));
     const id = jobId(state, "call-confirmed");
+    stagePending(jobs, state);
     await Promise.all(tasks);
+    stagePending(jobs, state);
     await jobs.reconcile();
     expect(jobs.status(id)).toMatchObject({ state: "checkpointed", continuation_started: false });
+    stagePending(jobs, state);
     await jobs.reconcile();
     expect(intents).toHaveLength(1);
     state.storage.sql.exec("UPDATE turns SET state = 'completed' WHERE id = 'original-turn'");
     status = "confirmed";
+    stagePending(jobs, state);
     await jobs.reconcile();
     expect(jobs.status(id)).toMatchObject({ state: "delivered", continuation_started: true });
     expect(intents).toHaveLength(1); // never resubmit a confirmed active output
@@ -180,12 +237,16 @@ it("idle wake uptake requires the exact durable model step, not the submission h
         : { state: idleState });
     jobs.tool(read).handler({}, context("call-idle"));
     const id = jobId(state, "call-idle");
+    stagePending(jobs, state);
     await Promise.all(tasks);
+    stagePending(jobs, state);
     await jobs.reconcile();
     expect(jobs.status(id)).toMatchObject({ state: "checkpointed", continuation_started: false });
+    stagePending(jobs, state);
     await jobs.reconcile();
     expect(receipts).toBe(1);
     idleState = "bound_unconfirmed";
+    stagePending(jobs, state);
     await jobs.reconcile();
     expect(jobs.status(id)).toMatchObject({ state: "checkpointed" });
     // A crash after staging but before an alarm write still re-arms from the
@@ -199,6 +260,7 @@ it("idle wake uptake requires the exact durable model step, not the submission h
     await Promise.all(rearmed);
     expect(await state.storage.getAlarm()).not.toBeNull();
     idleState = "confirmed";
+    stagePending(jobs, state);
     await jobs.reconcile();
     expect(jobs.status(id)).toMatchObject({ state: "delivered", continuation_started: true });
     expect(receipts).toBe(1);
@@ -222,18 +284,23 @@ it("only an authoritative discarded status retries the original job at idle", as
       new Set(["current_time"]), undefined, async () => ({ state: status }));
     jobs.tool(read).handler({}, context("call-discarded"));
     const id = jobId(state, "call-discarded");
+    stagePending(jobs, state);
     await Promise.all(tasks);
+    stagePending(jobs, state);
     await jobs.reconcile();
     state.storage.sql.exec("UPDATE turns SET state = 'failed' WHERE id = 'original-turn'");
+    stagePending(jobs, state);
     await jobs.reconcile(); // bound is not consumed, and must not be replayed
     expect(intents).toHaveLength(1);
     // Simulate a later status discovery after a cold restart/version bump.
     state.storage.sql.exec("UPDATE async_jobs SET wake_generation = 0 WHERE id = ?", id);
     status = "discarded";
+    stagePending(jobs, state);
     await jobs.reconcile();
     expect(intents).toHaveLength(2);
     expect(intents[1]).toEqual(intents[0]);
     expect(jobs.status(id)).toMatchObject({ state: "checkpointed", continuation_started: false });
+    stagePending(jobs, state);
     await jobs.reconcile();
     expect(intents).toHaveLength(2);
   });
@@ -253,10 +320,14 @@ it("retries the identical terminal intent after uncertain delivery", async () =>
       }, work => { tasks.push(work); });
     expect(jobs.tool(read).handler({}, context("call-time"))).toEqual({ output: UNREAL_RUNNING_OUTPUT });
     const first = { job_id: jobId(state, "call-time") };
+    stagePending(jobs, state);
     await jobs.reconcile();
+    stagePending(jobs, state);
     await Promise.all(tasks);
+    stagePending(jobs, state);
     await jobs.reconcile();
     expect(jobs.status(first.job_id)).toMatchObject({ state: "completed" });
+    stagePending(jobs, state);
     await jobs.reconcile();
     expect(jobs.status(first.job_id)).toMatchObject({ state: "checkpointed" });
     expect(injected).toHaveLength(2);
@@ -273,8 +344,11 @@ it("holds a terminal intent without a typed ingestion adapter or a synthetic con
       async (): Promise<FinalToolResultReceipt> => { throw new TypedIngestionUnavailable(); }, work => { tasks.push(work); });
     expect(jobs.tool(read).handler({}, context("call-time"))).toEqual({ output: UNREAL_RUNNING_OUTPUT });
     const first = { job_id: jobId(state, "call-time") };
+    stagePending(jobs, state);
     await jobs.reconcile();
+    stagePending(jobs, state);
     await Promise.all(tasks);
+    stagePending(jobs, state);
     await jobs.reconcile();
     expect(jobs.status(first.job_id)).toMatchObject({ state: "awaiting_integration", result: '{"utc":"now"}' });
     expect(state.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM async_jobs WHERE state = 'checkpointed'")
@@ -309,6 +383,7 @@ it("quarantines old tagged-continuation rows instead of forging a typed result",
     let injected = false;
     const jobs = new AsyncJobs(state.storage, {}, () => "old-turn",
       async () => { injected = true; }, () => {});
+    stagePending(jobs, state);
     await jobs.reconcile();
     expect(jobs.status("old")).toMatchObject({ state: "legacy_uninjectable" });
     expect(injected).toBe(false);
@@ -361,11 +436,13 @@ it("fences stale results from a crashed lease and delivers the winning retry onc
     expect(jobs.tool(read).handler({}, context("call-restarted"))).toEqual({ output: UNREAL_RUNNING_OUTPUT });
     const id = jobId(state, "call-restarted");
     expect(attempts).toBe(0);
+    stagePending(jobs, state);
     await jobs.reconcile();
     expect(attempts).toBe(1);
     // A hung handler in this very same object must not suppress expired-lease
     // recovery; a later cold instance sees the same durable winning attempt.
     state.storage.sql.exec("UPDATE async_jobs SET started_at = ? WHERE id = ?", Date.now() - 31_000, id);
+    stagePending(jobs, state);
     await jobs.reconcile();
     expect(attempts).toBe(2);
     const restored = new AsyncJobs(state.storage, { current_time: read }, () => "original-turn", deliver,
@@ -373,6 +450,7 @@ it("fences stale results from a crashed lease and delivers the winning retry onc
     await Promise.resolve();
     expect(restored.status(id)).toMatchObject({ state: "completed", result: '{"fresh":true}' });
     resolveFirst({ stale: true });
+    stagePending(jobs, state);
     await Promise.all(tasks);
     expect(restored.status(id)).toMatchObject({ state: "completed", result: '{"fresh":true}' });
     await restored.reconcile();
@@ -401,9 +479,11 @@ it("never replays a mutable tool after its lease becomes uncertain", async () =>
     expect(jobs.tool(mutate).handler({ cmd: "touch /brain/sentinel" }, context("call-mutable")))
       .toEqual({ output: UNREAL_RUNNING_OUTPUT });
     const id = jobId(state, "call-mutable");
+    stagePending(jobs, state);
     await jobs.reconcile();
     expect(executions).toBe(1);
     state.storage.sql.exec("UPDATE async_jobs SET started_at = ? WHERE id = ?", Date.now() - 31_000, id);
+    stagePending(jobs, state);
     await jobs.reconcile(); // still the same object with a hung handler
     expect(executions).toBe(1);
     expect(jobs.status(id)).toMatchObject({ state: "uncertain" });
@@ -412,6 +492,7 @@ it("never replays a mutable tool after its lease becomes uncertain", async () =>
     expect(delivered).toHaveLength(1);
     expect(delivered[0]).toMatchObject({ callId: "call-mutable", terminalState: "uncertain" });
     resolveFirst("late success");
+    stagePending(jobs, state);
     await Promise.all(tasks);
     expect(restored.status(id)).toMatchObject({ state: "checkpointed" });
   });
@@ -428,6 +509,9 @@ it("cancels a queued mutable operation without dispatching it", async () => {
     jobs.tool(mutate).handler({ cmd: "touch /brain/sentinel" }, context("queued-mutable"));
     const id = jobId(state, "queued-mutable");
     await jobs.cancel(id);
+    await jobs.reconcile(); // no original pending output exists yet
+    expect(delivered).toHaveLength(0);
+    jobs.activateAfterPendingStage("turn", ["queued-mutable"]);
     await jobs.reconcile();
     expect(executions).toBe(0);
     expect(delivered).toHaveLength(1);
@@ -451,11 +535,15 @@ it("does not acknowledge a mismatched core receipt, then reconciles the stable o
       task => { tasks.push(task); }, new Set(["current_time"]));
     jobs.tool(read).handler({}, context("call-1"));
     const id = jobId(state, "call-1");
+    stagePending(jobs, state);
     await jobs.reconcile();
+    stagePending(jobs, state);
     await Promise.all(tasks);
+    stagePending(jobs, state);
     await jobs.reconcile();
     expect(jobs.status(id)).toMatchObject({ state: "completed" });
     wrong = false;
+    stagePending(jobs, state);
     await jobs.reconcile();
     expect(jobs.status(id)).toMatchObject({ state: "checkpointed", continuation_started: false });
     expect(intents).toHaveLength(2);
@@ -475,7 +563,9 @@ it("fences concurrent reconciliation of one terminal call while a core acknowled
       task => { tasks.push(task); }, new Set(["current_time"]));
     jobs.tool(read).handler({}, context("call-1"));
     const id = jobId(state, "call-1");
+    stagePending(jobs, state);
     await jobs.reconcile();
+    stagePending(jobs, state);
     await Promise.all(tasks);
     const first = jobs.reconcile();
     const second = jobs.reconcile();
@@ -505,8 +595,11 @@ it("retains a checkpoint without a model continuation and reconciles the same op
     const jobs = make();
     jobs.tool(read).handler({}, context("call-1"));
     const id = jobId(state, "call-1");
+    stagePending(jobs, state);
     await jobs.reconcile();
+    stagePending(jobs, state);
     await Promise.all(tasks);
+    stagePending(jobs, state);
     await jobs.reconcile();
     expect(jobs.status(id)).toMatchObject({ state: "checkpointed", continuation_started: false });
     expect(intents).toHaveLength(1);
@@ -546,16 +639,21 @@ it("retains a compact invocation fence after an old delivered mutable payload is
     expect(jobs.tool(shell).handler({ cmd: "write-once" }, context("mutable-once")))
       .toEqual({ output: UNREAL_RUNNING_OUTPUT });
     const id = jobId(state, "mutable-once");
+    stagePending(jobs, state);
     await Promise.all(tasks);
+    stagePending(jobs, state);
     await jobs.reconcile(); // original typed result checkpoint
+    stagePending(jobs, state);
     await jobs.reconcile(); // completed model-step receipt
     expect(jobs.status(id)).toMatchObject({ state: "delivered", continuation_started: true });
     state.storage.sql.exec("UPDATE async_jobs SET created_at = ? WHERE id = ?",
       Date.now() - 8 * 24 * 60 * 60 * 1000, id);
+    stagePending(jobs, state);
     await jobs.reconcile(); // old creation alone must not expire a recent confirmation
     expect(jobs.status(id)).toMatchObject({ state: "delivered", continuation_started: true });
     state.storage.sql.exec("UPDATE async_jobs SET delivered_at = ? WHERE id = ?",
       Date.now() - 8 * 24 * 60 * 60 * 1000, id);
+    stagePending(jobs, state);
     await jobs.reconcile(); // archive payload and preserve durable invocation identity
     expect(jobs.status(id)).toMatchObject({ job_id: id, state: "archived", continuation_started: true });
     expect(state.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM async_jobs WHERE id = ?", id)
@@ -588,13 +686,16 @@ it("wraps exec_command as a mutable background tool and checkpoints its single r
       .toEqual({ output: UNREAL_RUNNING_OUTPUT });
     const id = jobId(state, "shell-call");
     expect(jobs.status(id)).toMatchObject({ state: "queued" });
+    stagePending(jobs, state);
     await Promise.all(tasks);
+    stagePending(jobs, state);
     await jobs.reconcile();
     expect(jobs.status(id)).toMatchObject({ state: "checkpointed", continuation_started: false,
       result: '{"exit_code":0,"output":"printf safe"}' });
     expect(intents).toEqual([{ originalTurn: "original-turn", executionTurn: "turn-1", callId: "shell-call",
       tool: "exec_command", jobId: id, terminalState: "completed",
       output: '{"exit_code":0,"output":"printf safe"}' }]);
+    stagePending(jobs, state);
     await jobs.reconcile();
     expect(executions).toBe(1);
     expect(intents).toHaveLength(1);
@@ -630,6 +731,7 @@ it("spills a ninth terminal across the bounded wake without losing or falsely de
         return intents.map(intent => accepted(intent, true));
       });
     let jobs = makeJobs();
+    stagePending(jobs, state);
     await jobs.reconcile();
     expect(batches.map(batch => batch.length)).toEqual([8]);
     expect(batches[0]!.map(intent => intent.jobId)).toEqual(ids.slice(0, 8));
@@ -638,17 +740,20 @@ it("spills a ninth terminal across the bounded wake without losing or falsely de
     // Rehydrate the host's reconciliation object while the native wake is
     // still active; the ninth durable row must not race or vanish on restart.
     jobs = makeJobs();
+    stagePending(jobs, state);
     await jobs.reconcile();
     expect(batches.map(batch => batch.length)).toEqual([8]);
     expect(jobs.status(ids[8]!)).toMatchObject({ state: "completed" });
     firstUptaken = true;
     wakeActive = false;
+    stagePending(jobs, state);
     await jobs.reconcile();
     expect(batches.map(batch => batch.length)).toEqual([8, 1]);
     expect(batches.at(-1)![0]!.callId).toBe("call-8");
     for (const id of ids.slice(0, 8)) expect(jobs.status(id)).toMatchObject({ state: "delivered", continuation_started: true });
     expect(jobs.status(ids[8]!)).toMatchObject({ state: "checkpointed", continuation_started: false });
     secondUptaken = true;
+    stagePending(jobs, state);
     await jobs.reconcile();
     expect(jobs.status(ids[8]!)).toMatchObject({ state: "delivered", continuation_started: true });
   });
@@ -685,11 +790,13 @@ it("prioritizes a same-source wake receipt ahead of a full page of completed job
         batches.push(intents.map(intent => intent.callId));
         return intents.map(intent => accepted(intent, true));
       });
+    stagePending(jobs, state);
     await jobs.reconcile();
     expect(statusReads).toBe(0); // first page saw ready rows, but the SQL fence held them
     expect(batches).toHaveLength(0);
     expect(jobs.status(ready[0]!)).toMatchObject({ state: "completed" });
     confirmed = true;
+    stagePending(jobs, state);
     await jobs.reconcile();
     expect(statusReads).toBe(1); // durable keyset rotated to the hidden receipt
     expect(jobs.status(inFlight)).toMatchObject({ state: "delivered", continuation_started: true });
@@ -719,7 +826,9 @@ it("runs queued work despite a full page of unconfirmed checkpointed receipts", 
       async intent => accepted(intent), work => { tasks.push(work); },
       new Set(["current_time"]), undefined, async () => ({ state: "pruned_or_unknown" }),
       async () => ({ state: "accepted_unbound" }));
+    stagePending(jobs, state);
     await jobs.reconcile();
+    stagePending(jobs, state);
     await Promise.all(tasks);
     expect(executions).toBe(1);
     expect(jobs.status(queued)).toMatchObject({ state: "completed" });
@@ -741,10 +850,13 @@ it("probes every parked integration receipt once per construction across pages a
     const makeJobs = () => new AsyncJobs(state.storage, { current_time: read }, () => "source",
       async () => { attempts++; throw new TypedIngestionUnavailable(); }, () => {});
     const jobs = makeJobs();
+    stagePending(jobs, state);
     await jobs.reconcile();
     expect(attempts).toBe(25);
+    stagePending(jobs, state);
     await jobs.reconcile();
     expect(attempts).toBe(30);
+    stagePending(jobs, state);
     await jobs.reconcile();
     expect(attempts).toBe(30); // no perpetual poll on the old capability
     const parked = state.storage.sql.exec<{ n: number }>(
@@ -789,7 +901,8 @@ it("rotates nearly full terminal capacity across rehydration without false uptak
     let jobs = makeJobs();
     for (let tick = 0; tick < 6; tick++) {
       if (tick === 2) jobs = makeJobs(); // durable cursor survives DO/host rehydration
-      await jobs.reconcile();
+      stagePending(jobs, state);
+    await jobs.reconcile();
     }
     expect(inspected.size).toBe(checkpointed.length);
     expect(readyAttempts).toBeGreaterThan(0);
@@ -820,13 +933,16 @@ it("does not stage a batch while another turn is active and fails a mismatched r
         return intents.map((intent, i) => ({ ...accepted(intent),
           operation_id: wrong && i === 1 ? "forged" : intent.jobId }));
       });
+    stagePending(jobs, state);
     await jobs.reconcile();
     expect(batches).toHaveLength(0);
     state.storage.sql.exec("UPDATE turns SET state = 'completed' WHERE id = 'other'");
+    stagePending(jobs, state);
     await jobs.reconcile();
     expect(batches).toHaveLength(1);
     ids.forEach(id => expect(jobs.status(id)).toMatchObject({ state: "completed" }));
     wrong = false;
+    stagePending(jobs, state);
     await jobs.reconcile();
     expect(batches).toHaveLength(2);
     expect(batches[1]).toEqual(batches[0]);
@@ -858,12 +974,16 @@ it("caps lifetime SQLite growth after archived invocations without blocking old-
     expect(jobs.tool(shell).handler({ cmd: "once" }, context("call-first")))
       .toEqual({ output: UNREAL_RUNNING_OUTPUT });
     const first = jobId(state, "call-first");
+    stagePending(jobs, state);
     await Promise.all(tasks.splice(0));
+    stagePending(jobs, state);
     await jobs.reconcile(); // submit exact terminal receipt
+    stagePending(jobs, state);
     await jobs.reconcile(); // provider-step confirmation
     expect(jobs.status(first)).toMatchObject({ state: "delivered" });
     state.storage.sql.exec("UPDATE async_jobs SET delivered_at = ? WHERE id = ?",
       Date.now() - 8 * 24 * 60 * 60 * 1000, first);
+    stagePending(jobs, state);
     await jobs.reconcile();
     expect(jobs.status(first)).toMatchObject({ state: "archived" });
 
@@ -879,6 +999,7 @@ it("caps lifetime SQLite growth after archived invocations without blocking old-
        result, terminal_state, created_at, delivered_at)
       VALUES (?, ?, 'source', 'turn-1', ?, 'exec_command', '{}', 'delivered', ?, 'completed', ?, ?)`,
     crypto.randomUUID(), `turn-1:historical-${n}`, `historical-${n}`, "X".repeat(8192), old, old);
+    stagePending(jobs, state);
     await jobs.reconcile(); // archive old payloads into permanent fences
     expect(state.storage.sql.exec<{ n: number }>(
       "SELECT COUNT(*) AS n FROM async_job_tombstones").toArray()[0]!.n).toBe(102);
@@ -897,6 +1018,7 @@ it("caps lifetime SQLite growth after archived invocations without blocking old-
       .toThrow("async invocation archived; unsafe to replay");
     expect(restored.tool(shell).handler({ cmd: "existing" }, context("call-existing")))
       .toEqual({ output: UNREAL_RUNNING_OUTPUT });
+    stagePending(jobs, state);
     await Promise.all(tasks.splice(0));
     await restored.reconcile();
     await restored.reconcile();
@@ -966,6 +1088,7 @@ it("meters append-only native receipts across cold construction, replay and new 
       .toThrow("async immutable receipt budget reached");
     expect(limited.tool(shell).handler({ cmd: "existing" }, context("receipt-existing")))
       .toEqual({ output: UNREAL_RUNNING_OUTPUT });
+    stagePending(jobs, state);
     await Promise.all(tasks.splice(0));
     await limited.reconcile(); // pre-admitted work remains recoverable over budget
     expect(limited.status(existing)).toMatchObject({ state: "checkpointed" });
@@ -1018,12 +1141,14 @@ it("bounds multibyte results by stored bytes and fences a mutable side effect", 
     expect(jobs.tool(shell).handler({ cmd: "large-output" }, context("multibyte")))
       .toEqual({ output: UNREAL_RUNNING_OUTPUT });
     const id = jobId(state, "multibyte");
+    stagePending(jobs, state);
     await Promise.all(tasks.splice(0));
     expect(jobs.status(id)).toMatchObject({ state: "uncertain",
       result: "Execution outcome unknown; side effect may have occurred" });
     expect(effects).toBe(1);
     expect(jobs.tool(shell).handler({ cmd: "large-output" }, context("multibyte")))
       .toEqual({ output: UNREAL_RUNNING_OUTPUT });
+    stagePending(jobs, state);
     await Promise.all(tasks.splice(0));
     expect(effects).toBe(1);
   });
@@ -1043,6 +1168,7 @@ it("reuses a mutable job across cold execution-turn renumbering without a second
     const before = { ...context("same-call"), turnId: "thread:2" };
     expect(first.tool(shell).handler({ cmd: "once" }, before)).toEqual({ output: UNREAL_RUNNING_OUTPUT });
     const id = jobId(state, "same-call");
+    stagePending(first, state);
     await Promise.all(tasks.splice(0));
     expect(effects).toBe(1);
     // A new Rust driver starts its logical index at one. The durable external
@@ -1050,6 +1176,7 @@ it("reuses a mutable job across cold execution-turn renumbering without a second
     const resumed = create();
     const after = { ...before, turnId: "thread:1" };
     expect(resumed.tool(shell).handler({ cmd: "once" }, after)).toEqual({ output: UNREAL_RUNNING_OUTPUT });
+    stagePending(resumed, state);
     await Promise.all(tasks.splice(0));
     expect(effects).toBe(1);
     expect(state.storage.sql.exec<{ n: number }>(
@@ -1072,5 +1199,62 @@ it("migrates legacy tombstones and conservatively fences a renumbered call ID", 
     expect(() => jobs.tool(shell).handler({ cmd: "once" }, { ...context("same-call"), turnId: "thread:1" }))
       .toThrow("async invocation archived; unsafe to replay");
     expect(jobs.status("legacy")).toMatchObject({ state: "archived", tool: "exec_command" });
+  });
+});
+
+it("does not dispatch before native pending staging even across alarm and cold construction", async () => {
+  await runInDurableObject(stub(), async (_session, state) => {
+    const tasks: Promise<unknown>[] = [];
+    let effects = 0;
+    const mutable: NamedTool = { name: "exec_command", description: "mutable", handler: () => {
+      effects++;
+      return { output: "done" };
+    } };
+    const create = () => new AsyncJobs(state.storage, { exec_command: mutable }, () => "source",
+      async intent => accepted(intent), work => { tasks.push(work); });
+    let jobs = create();
+    expect(jobs.tool(mutable).handler({ cmd: "once" }, context("pending-gap")))
+      .toEqual({ output: UNREAL_RUNNING_OUTPUT });
+    const id = jobId(state, "pending-gap");
+    await Promise.resolve();
+    await jobs.reconcile(); // alarm cannot dispatch a queued job without native readiness
+    await Promise.all(tasks.splice(0));
+    expect(jobs.status(id)).toMatchObject({ state: "queued" });
+    expect(effects).toBe(0);
+    jobs = create(); // simulate a cold constructor before the original turn resumes
+    await jobs.reconcile();
+    await Promise.all(tasks.splice(0));
+    expect(effects).toBe(0);
+    jobs.activateAfterPendingStage("source", ["pending-gap"]); // original call's pending output was staged
+    await Promise.all(tasks.splice(0));
+    expect(jobs.status(id)).toMatchObject({ state: "completed" });
+    expect(effects).toBe(1);
+    jobs.activateAfterPendingStage("source", ["pending-gap"]); // replay of the same event is idempotent
+    await Promise.all(tasks.splice(0));
+    expect(effects).toBe(1);
+  });
+});
+
+it("reconstructs an admitted staged job without replaying a mutation", async () => {
+  await runInDurableObject(stub(), async (_session, state) => {
+    const firstTasks: Promise<unknown>[] = [];
+    const resumedTasks: Promise<unknown>[] = [];
+    let effects = 0;
+    const tool: NamedTool = { name: "exec_command", description: "mutable", handler: () => {
+      effects++;
+      return "done";
+    } };
+    const first = new AsyncJobs(state.storage, { exec_command: tool }, () => "source",
+      async intent => accepted(intent), task => { firstTasks.push(task); });
+    expect(first.tool(tool).handler({ cmd: "write" }, context("staged-cold")))
+      .toEqual({ output: UNREAL_RUNNING_OUTPUT });
+    const id = jobId(state, "staged-cold");
+    first.activateAfterPendingStage("source", ["staged-cold"]); // a second owner may race its queued microtask
+    const resumed = new AsyncJobs(state.storage, { exec_command: tool }, () => "source",
+      async intent => accepted(intent), task => { resumedTasks.push(task); });
+    await resumed.reconcile();
+    await Promise.all([...resumedTasks.splice(0), ...firstTasks.splice(0)]);
+    expect(effects).toBe(1);
+    expect(resumed.status(id)).toMatchObject({ state: "completed" });
   });
 });

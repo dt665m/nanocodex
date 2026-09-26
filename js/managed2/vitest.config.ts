@@ -204,6 +204,28 @@ export default defineConfig({
                     arguments: JSON.stringify({ search_query: [{ q: "a synthetic active question" }] }) }],
                   usage: { input_tokens: 10, output_tokens: 4, total_tokens: 14 } } }];
               }
+              // A direct Just Bash function tool is conservatively classified
+              // mutable by AsyncJobs. Exercise its native pending-stage gate
+              // through the actual Worker/DO/WASM/tool path, not just a mock.
+              const bashOutputs = input.filter(item => item.type === "function_call_output" && item.call_id === "call-bash");
+              const bashPending = bashOutputs.find(item => String(item.output).includes("Tool call is still running."));
+              const bashTerminal = bashOutputs.findLast(item => !String(item.output).includes("Tool call is still running."));
+              if (bashPending || bashTerminal) {
+                const text = bashTerminal ? "Async Bash finished: " + bashTerminal.output : "Waiting for async Bash";
+                return [{ type: "response.completed", response: { id: bashTerminal ? "fixture-bash-terminal" : "fixture-bash-pending",
+                  status: "completed", end_turn: true,
+                  output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text }] }],
+                  usage: { input_tokens: 10, output_tokens: 4, total_tokens: 14 } } }];
+              }
+              if (JSON.stringify(input).includes("Use async exec_command fixture")) {
+                if (input.some(item => item.type === "function_call" && item.call_id === "call-bash"))
+                  throw new Error("async Bash continuation lacked original-call-ID output");
+                if (!input.find(item => item.type === "additional_tools")?.tools?.some(tool => tool.name === "exec_command"))
+                  throw new Error("exec_command was not offered");
+                return [{ type: "response.completed", response: { id: "fixture-bash-call", status: "completed", end_turn: false,
+                  output: [{ type: "function_call", call_id: "call-bash", name: "exec_command", arguments: JSON.stringify({ cmd: "pwd" }) }],
+                  usage: { input_tokens: 10, output_tokens: 4, total_tokens: 14 } } }];
+              }
               const continuation = input.find(item => item.type === "function_call_output" && item.call_id === "call-time");
               const timeTool = input.find(item => item.type === "additional_tools")?.tools?.find(tool => tool.name === "current_time");
               const webTool = input.find(item => item.type === "additional_tools")?.tools?.find(tool => tool.name === "web__run");

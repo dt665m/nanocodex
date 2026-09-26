@@ -205,8 +205,17 @@ The dormant `AsyncJobs` ledger persists the stable **external source turn +
 original provider call ID** replay identity (not the Rust execution-turn index,
 which can change on cold restart), job ID, arguments, correlation, and bounded
 result before dispatch. Legacy tombstones with no source-turn column fence any
-matching original call ID conservatively. It
-registers `current_time`, `web__run`, and the local Just Bash `exec_command`,
+matching original call ID conservatively. The job remains queued until the
+Rust driver's next `model.call.started` event **after a current-execution
+native `tool.result` carrying the host-only trusted pending bit for that exact
+call ID**, following staging of that original-call-ID pending output; an
+initial model event on cold replay or an unrelated call cannot release it.
+Alarm reconciliation and cold construction cannot execute an unstaged queued
+job. This closes the handler-return microtask window for mutable effects. A
+turn interrupted before that
+next model event can leave an unstarted job requiring native pending-status
+reconciliation; a fault-injection proof of that recovery remains a release gate.
+It registers `current_time`, `web__run`, and the local Just Bash `exec_command`,
 with eight active jobs, a 1 MiB UTF-8 byte limit per persisted tool result,
 and seven-day payload retention measured from **confirmed model-step delivery**,
 not tool creation. `/jobs` uses bounded 8,192-unit result previews and one

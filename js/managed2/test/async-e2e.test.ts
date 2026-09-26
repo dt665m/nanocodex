@@ -64,13 +64,19 @@ it("returns same-ID pending without waiting for a slow tool, then wakes for same
   const rows = await runInDurableObject(stub, (_session, state) => ({
     source: state.storage.sql.exec<{ state: string; message: string }>(
       "SELECT state, message FROM turns WHERE id = ?", turnId).toArray()[0],
-    asyncJob: state.storage.sql.exec<{ state: string; call_id: string; original_turn: string; execution_turn: string }>(
-      "SELECT state, call_id, original_turn, execution_turn FROM async_jobs WHERE id = ?", jobId).toArray()[0],
+    asyncJob: state.storage.sql.exec<{ state: string; call_id: string; original_turn: string;
+      execution_turn: string; ready_at: number; started_at: number }>(
+      "SELECT state, call_id, original_turn, execution_turn, ready_at, started_at FROM async_jobs WHERE id = ?", jobId).toArray()[0],
+    modelBoundary: state.storage.sql.exec<{ first_tool_result_ms: number; post_tool_model_call_ms: number }>(
+      "SELECT first_tool_result_ms, post_tool_model_call_ms FROM turn_timing WHERE id = ?", turnId).toArray()[0],
     // A background wake must not be a fabricated prompt-bearing user turn.
     userTurns: state.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM turns").toArray()[0]!.n,
   }));
   expect(rows.source).toMatchObject({ state: "completed", message: "Waiting for background search" });
   expect(rows.asyncJob).toMatchObject({ state: "delivered", call_id: "call-web", original_turn: turnId });
+  expect(rows.modelBoundary.post_tool_model_call_ms).toBeGreaterThanOrEqual(rows.modelBoundary.first_tool_result_ms);
+  expect(rows.asyncJob.ready_at).toBeGreaterThan(0);
+  expect(rows.asyncJob.started_at).toBeGreaterThanOrEqual(rows.asyncJob.ready_at);
   expect(rows.userTurns).toBe(1);
   expect(originalTurnMs).toBeLessThan(2500);
 }, 40_000);

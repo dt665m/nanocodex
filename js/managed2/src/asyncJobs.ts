@@ -2,6 +2,26 @@ import type { NamedTool, ToolContext } from "nanocodex";
 import { createCloudflareDurabilityStore } from "nanocodex/durability/cloudflare";
 import { stageFunctionCallOutput } from "../../nanocodex/host/internal-Agent.mjs";
 
+/** A volatile per-execution witness: prior tool events or SQL timestamps may
+ * survive a crash while the original pending output has not been staged.
+ * Only a *current* trusted native result followed by a model boundary can
+ * release its exact original call. No event == fail closed, not a timer. */
+export class PendingToolBarrier {
+  private readonly emitted = new Map<string, Set<string>>();
+  public reset(internalTurn: string): void { this.emitted.delete(internalTurn); }
+  public observe(internalTurn: string, payload: Record<string, unknown>): void {
+    if (payload.trusted_unreal_pending !== true || typeof payload.call_id !== "string") return;
+    let calls = this.emitted.get(internalTurn);
+    if (!calls) this.emitted.set(internalTurn, calls = new Set());
+    calls.add(payload.call_id);
+  }
+  public take(internalTurn: string): string[] {
+    const calls = [...(this.emitted.get(internalTurn) ?? [])];
+    this.emitted.delete(internalTurn);
+    return calls;
+  }
+}
+
 /** Durable background jobs for explicitly registered owner-scoped tools. */
 // Unreal Agent's MIT-licensed context-builder pending output; source:
 // https://github.com/unreallabsai/unreal-agent/blob/1b9f778453f411c029b39b85102aaefb95e7e48d/harness/contextbuilder/builder.go
@@ -29,7 +49,7 @@ const bound = (value: string) => value.length > MAX_STATUS_RESULT ? `${value.sli
 
 type Job = { id: string; invocation: string; original_turn: string; execution_turn: string | null; call_id: string | null;
   tool: string; args: string; state: string; result: string | null; attempts: number; started_at: number | null; created_at: number;
-  terminal_state: string | null; delivered_at: number | null; continuation_started: number | null; wake_generation: number; lease_id: string | null; context_json: string | null; replay_safe: number; };
+  terminal_state: string | null; delivered_at: number | null; continuation_started: number | null; wake_generation: number; lease_id: string | null; context_json: string | null; replay_safe: number; ready_at: number | null; };
 type StatusRow = Pick<Job, "id" | "state" | "tool" | "result" | "continuation_started">;
 // SQLite substr counts code points, while JS bound() counts UTF-16 code units.
 // Fetch one *extra code point*: it is always enough for bound() to retain the
@@ -83,7 +103,7 @@ export class AsyncJobs {
       execution_turn TEXT, call_id TEXT, tool TEXT NOT NULL, args TEXT NOT NULL,
       state TEXT NOT NULL, result TEXT, terminal_state TEXT, attempts INTEGER NOT NULL DEFAULT 0,
       started_at INTEGER, created_at INTEGER NOT NULL, delivered_at INTEGER, continuation_started INTEGER, wake_generation INTEGER NOT NULL DEFAULT -1, lease_id TEXT, context_json TEXT, replay_safe INTEGER NOT NULL DEFAULT 0,
-      integration_probe_epoch TEXT
+      integration_probe_epoch TEXT, ready_at INTEGER
     )`);
     // Pilot rows used synthetic user turns, not typed tool results. Preserve
     // their status but never replay them into the new same-call-ID path.
@@ -91,7 +111,7 @@ export class AsyncJobs {
       .toArray().map(column => column.name));
     this.legacyContinuationColumn = columns.has("continuation_turn");
     for (const [name, kind] of [["execution_turn", "TEXT"], ["call_id", "TEXT"], ["delivered_at", "INTEGER"], ["continuation_started", "INTEGER"], ["wake_generation", "INTEGER NOT NULL DEFAULT -1"], ["lease_id", "TEXT"], ["context_json", "TEXT"], ["replay_safe", "INTEGER NOT NULL DEFAULT 0"],
-      ["integration_probe_epoch", "TEXT"]] as const) {
+      ["integration_probe_epoch", "TEXT"], ["ready_at", "INTEGER"]] as const) {
       if (!columns.has(name)) storage.sql.exec(`ALTER TABLE async_jobs ADD COLUMN ${name} ${kind}`);
     }
     storage.sql.exec("UPDATE async_jobs SET state = 'legacy_uninjectable' WHERE execution_turn IS NULL");
@@ -147,7 +167,8 @@ export class AsyncJobs {
     // If the capability is still absent, park again without a polling alarm.
     if (storage.sql.exec<{ n: number }>(
       `SELECT COUNT(*) AS n FROM async_jobs WHERE
-        state IN ('queued', 'running', 'completed', 'failed', 'uncertain', 'cancelled')
+        state IN ('running', 'completed', 'failed', 'uncertain')
+        OR (state IN ('queued', 'cancelled') AND ready_at IS NOT NULL)
         OR (state = 'awaiting_integration' AND (integration_probe_epoch IS NULL OR integration_probe_epoch != ?))
         OR (state = 'checkpointed' AND wake_generation < ? AND ${terminalOrigin})`,
       this.probeEpoch, this.wakeGeneration).toArray()[0]!.n > 0) {
@@ -262,13 +283,38 @@ export class AsyncJobs {
         id, invocation, originalTurn, context.turnId, context.callId, tool.name, input, contextJson, replaySafe, Date.now());
         job = this.get(id)!;
       }
-      // Dispatch after the provisional output returns to the model, but do not
-      // impose a one-second alarm delay. The durable queued row and alarm fence
-      // isolate loss; only explicitly read-only jobs may be retried.
-      if (job.state === "queued") this.waitUntil(Promise.resolve().then(() => this.run(job!.id)));
-      this.waitUntil(this.storage.setAlarm(Date.now() + 1_000));
+      // Dispatch after the provisional output is staged by the native model
+      // boundary, without imposing a one-second alarm delay. Only explicitly
+      // read-only jobs may be retried after an uncertain execution.
+      // Native emits the next model.call.started only after all original
+      // function-call pending outputs were staged. Before that barrier,
+      // cancellation may append an ordinary terminal instead. Never execute
+      // a job while its original pending output is not yet attachable.
+      if (job.state === "queued" && job.ready_at !== null)
+        this.waitUntil(Promise.resolve().then(() => this.run(job!.id)));
+      if (job.ready_at !== null) this.waitUntil(this.storage.setAlarm(Date.now() + 1_000));
       return stageFunctionCallOutput(UNREAL_RUNNING_OUTPUT);
     } };
+  }
+
+  /** The next native model-request event follows staging of every pending
+   * output in that tool batch. Its durable SQL marker fences early execution
+   * across DO eviction; a cold replay must reach this event before dispatch. */
+  public activateAfterPendingStage(originalTurn: string, callIds: readonly string[]): void {
+    // Never release a different (or replayed but not yet staged) call merely
+    // because its source turn shares this model-request boundary.
+    for (const callId of new Set(callIds)) {
+      this.storage.sql.exec(`UPDATE async_jobs SET ready_at = ? WHERE original_turn = ? AND call_id = ?
+        AND ready_at IS NULL AND state IN ('queued', 'cancelled')`, Date.now(), originalTurn, callId);
+      const ready = this.storage.sql.exec<{ id: string; state: string }>(
+        "SELECT id, state FROM async_jobs WHERE original_turn = ? AND call_id = ? AND state IN ('queued', 'cancelled') AND ready_at IS NOT NULL",
+        originalTurn, callId).toArray();
+      for (const { id, state } of ready) if (state === "queued")
+        this.waitUntil(Promise.resolve().then(() => this.run(id)));
+      // A cancellation requested before staging has no runnable handler but
+      // still needs its same-ID terminal delivered once pending exists.
+      if (ready.length > 0) this.waitUntil(this.storage.setAlarm(Date.now() + 1_000));
+    }
   }
 
   public readonly statusTool: NamedTool = {
@@ -303,7 +349,8 @@ export class AsyncJobs {
     // mutable outcome, or let a read-only attempt supersede that lease. The
     // old handler's conditional write cannot overwrite the winning result.
     if (this.active.has(id) && !expired) return;
-    if (!job || (job.state !== "queued" && !expired)) return;
+    if (!job || (job.state !== "queued" && !expired)
+      || (job.state === "queued" && job.ready_at === null)) return;
     // A stale running mutable lease could already have executed. Even an
     // apparently idempotent shell command is never replayed without proof.
     if (job.state === "running" && !job.replay_safe) {
@@ -363,13 +410,14 @@ export class AsyncJobs {
     // through a durable keyset, so neither a page of unconfirmed checkpoints
     // nor a page of ready results can starve the other after DO eviction.
     const activeRows = this.storage.sql.exec<Job>(
-      "SELECT * FROM async_jobs WHERE state IN ('queued', 'running') ORDER BY created_at, id LIMIT ?",
+      "SELECT * FROM async_jobs WHERE (state = 'running' OR (state = 'queued' AND ready_at IS NOT NULL)) ORDER BY created_at, id LIMIT ?",
       MAX_ACTIVE).toArray();
     const cursor = this.storage.sql.exec<{ created_at: number; id: string }>(
       "SELECT created_at, id FROM async_jobs_reconcile_cursor WHERE singleton = 1",
     ).toArray()[0]!;
     const eligible = `state NOT IN ('queued', 'running', 'delivered', 'legacy_uninjectable')
       AND (state != 'checkpointed' OR (wake_generation < ? AND ${terminalOrigin}))
+      AND (state != 'cancelled' OR ready_at IS NOT NULL)
       AND (state != 'awaiting_integration' OR integration_probe_epoch IS NULL OR integration_probe_epoch != ?)`;
     const capacity = 25 - activeRows.length;
     const terminalRows = this.storage.sql.exec<Job>(
@@ -588,7 +636,8 @@ export class AsyncJobs {
     // its false receipt still cannot prove model uptake.
     if (retry || this.storage.sql.exec<{ n: number }>(
       `SELECT COUNT(*) AS n FROM async_jobs WHERE state IN
-        ('queued', 'running', 'completed', 'failed', 'uncertain', 'cancelled')
+        ('running', 'completed', 'failed', 'uncertain')
+        OR (state IN ('queued', 'cancelled') AND ready_at IS NOT NULL)
         OR (state = 'checkpointed' AND wake_generation < ? AND ${terminalOrigin})
         OR (state = 'awaiting_integration' AND (integration_probe_epoch IS NULL OR integration_probe_epoch != ?))`,
       this.wakeGeneration, this.probeEpoch,

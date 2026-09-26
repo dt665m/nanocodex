@@ -6,7 +6,7 @@ import { authenticate } from "./auth";
 import { ToolTiming } from "./toolTiming";
 import { managedWeb } from "./web";
 import { createJustBashTool } from "./just-bash";
-import { AsyncJobs, TypedIngestionUnavailable } from "./asyncJobs";
+import { AsyncJobs, PendingToolBarrier, TypedIngestionUnavailable } from "./asyncJobs";
 // Host-only capability: absent from model-visible Actions and public Agent exports.
 import { batchFunctionCallOutputCapability, functionCallOutputCapability } from "../../nanocodex/host/internal-Agent.mjs";
 
@@ -177,6 +177,7 @@ export class Session extends DurableObject<Env> {
   #admissions = new Map<string, { input: string; outcome: Promise<{ status: number; body: string; headers: [string, string][] }> }>();
   #activeTraces = new Map<string, string>();
   #eventTurns = new Map<string, string>();
+  #pendingToolResults = new PendingToolBarrier();
   #constructorMs: number;
   #toolTiming: ToolTiming;
 
@@ -436,6 +437,7 @@ export class Session extends DurableObject<Env> {
       const internal = event.payload.turn_id;
       if (typeof external === "string" && typeof internal === "string" && this.#activeTraces.has(external)) {
         this.#eventTurns.set(internal, external);
+        this.#pendingToolResults.reset(internal);
       }
       return;
     }
@@ -457,6 +459,12 @@ export class Session extends DurableObject<Env> {
       this.ctx.storage.sql.exec(
         `UPDATE turn_timing SET ${column} = COALESCE(${column}, ?) WHERE id = ?`, elapsed, external,
       );
+      // This event is emitted by Rust after execute_model_tools has appended
+      // the trusted pending outputs. Never dispatch background work from the
+      // JS handler-return microtask, which can beat that native staging step.
+      const pending = this.#pendingToolResults.take(internal as string);
+      if (pending.length && this.#asyncJobs)
+        this.#asyncJobs.activateAfterPendingStage(external, pending);
       console.info({ event: "managed2.model_call_started", trace_id: timing.trace_id,
         phase: timing.first_tool_result_ms !== null ? "after_tool" : "initial", elapsed_ms: elapsed });
       return;
@@ -479,6 +487,10 @@ export class Session extends DurableObject<Env> {
       return;
     }
     if (event.type === "tool.result") {
+      // Native sets this bit only for a host-capability pending function output;
+      // tool metadata and text cannot forge it. A replay's initial model call
+      // must not release a job from an earlier, interrupted execution.
+      this.#pendingToolResults.observe(internal as string, event.payload);
       this.#toolTiming.observe(internal as string, external, "tool.result", event.payload, timing.started_at);
       const durationMs = typeof event.payload.duration_ns === "number" ? event.payload.duration_ns / 1e6 : 0;
       this.ctx.storage.sql.exec(
@@ -516,7 +528,10 @@ export class Session extends DurableObject<Env> {
       );
       console.info({ event: "managed2.turn_first_answer_delta", trace_id: timing.trace_id,
         first_answer_delta_ms: elapsed });
-      if (typeof internal === "string") this.#eventTurns.delete(internal);
+      if (typeof internal === "string") {
+        this.#eventTurns.delete(internal);
+        this.#pendingToolResults.reset(internal);
+      }
     }
   }
 
@@ -765,7 +780,10 @@ export class Session extends DurableObject<Env> {
               this.#running.delete(id);
               this.#activeTraces.delete(id);
               for (const [internal, external] of this.#eventTurns) {
-                if (external === id) this.#eventTurns.delete(internal);
+                if (external === id) {
+                  this.#eventTurns.delete(internal);
+                  this.#pendingToolResults.reset(internal);
+                }
               }
             }
           }
@@ -794,7 +812,10 @@ export class Session extends DurableObject<Env> {
         this.#running.delete(id);
         this.#activeTraces.delete(id);
         for (const [internal, external] of this.#eventTurns) {
-          if (external === id) this.#eventTurns.delete(internal);
+          if (external === id) {
+                  this.#eventTurns.delete(internal);
+                  this.#pendingToolResults.reset(internal);
+                }
         }
       }
       throw error;
