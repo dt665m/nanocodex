@@ -2,6 +2,33 @@ import XCTest
 import UIKit
 
 final class InboxUITests: XCTestCase {
+    func testNativeCommandReviewAndDeniedAuthentication() throws {
+        let app = XCUIApplication()
+        app.launchArguments = ["--native-secure-input-ui-fixture"]
+        app.launch()
+        XCTAssertTrue(app.staticTexts["Machine: fixture-machine"].waitForExistence(timeout: 5))
+        let executable = app.descendants(matching: .any)["native-secure-command-executable"].firstMatch
+        XCTAssertTrue(executable.waitForExistence(timeout: 5))
+        XCTAssertTrue(executable.label.contains("\"/usr/bin/id\""), executable.label)
+        let cwd = app.descendants(matching: .any)["native-secure-command-cwd"].firstMatch
+        XCTAssertTrue(cwd.exists)
+        XCTAssertTrue(cwd.label.contains("\"/\""), cwd.label)
+        XCTAssertTrue(app.staticTexts["Local user ID: 501"].exists)
+        let arguments = app.descendants(matching: .any)["native-secure-command-arguments"].firstMatch
+        XCTAssertTrue(arguments.exists)
+        XCTAssertTrue(arguments.label.contains("\\u202e"))
+        XCTAssertFalse(arguments.label.contains("\u{202e}"))
+        let field = app.secureTextFields["secure-input-password"]
+        field.tap(); field.typeText("synthetic-native-secret")
+        app.buttons["secure-input-submit"].tap()
+        XCTAssertTrue(app.staticTexts["Authentication denied"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["Submission attempts: 0"].exists)
+        XCTAssertFalse(app.staticTexts["synthetic-native-secret"].exists)
+        let attachment = XCTAttachment(screenshot: app.screenshot())
+        attachment.name = "native-command-auth-denied"; attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
     func testPrivatePasswordFieldAndSafeReceipt() throws {
         let app = XCUIApplication()
         app.launchArguments = ["--secure-input-ui-fixture"]

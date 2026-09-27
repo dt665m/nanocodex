@@ -1,4 +1,8 @@
 import SwiftUI
+import LocalAuthentication
+#if DEBUG && targetEnvironment(simulator)
+import CryptoKit
+#endif
 import QuickLook
 import PhotosUI
 import UniformTypeIdentifiers
@@ -3848,10 +3852,10 @@ private struct SecureInputCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             Label("Enter password privately", systemImage: "lock.shield").font(.headline)
-            Text(intake.origin).font(.subheadline)
+            Text(intake.machineID ?? intake.origin).font(.subheadline)
             if let status { Text(status) }
             else {
-                Text("Use your password manager or enter a password. It goes directly to this browser and is not saved to Vault.").font(.subheadline)
+                Text(intake.isNative ? "Review the machine and exact command, then authenticate to send a password privately. Not saved to Vault." : "Use your password manager or enter a password. It goes directly to this browser and is not saved to Vault.").font(.subheadline)
                 Button("Open secure form") { showing = true }
                     .disabled(attempted || !intake.isCurrent(agentID: model.focused?.id ?? ""))
                     .accessibilityIdentifier("secure-input-open")
@@ -3876,10 +3880,13 @@ private struct SecureInputSheet: View {
     @State private var submission: Task<Void, Never>?
     @State private var resolved = false
     @State private var cancellationStarted = false
+    @State private var nativeDescription: NativeSecureInputDescription?
+    @State private var authentication: LAContext?
     private func cancelRequest() {
         password = ""
         guard !resolved, !cancellationStarted else { return }
         cancellationStarted = true; attempted = true
+        authentication?.invalidate(); authentication = nil
         submission?.cancel()
         Task { @MainActor in
             do {
@@ -3893,9 +3900,14 @@ private struct SecureInputSheet: View {
         NavigationStack {
             Form {
                 Section {
-                    Text(intake.origin)
-                    SecurePasswordField(password: $password).disabled(attempted)
-                } footer: { Text("Sent directly to the bound browser input, outside chat. Not saved to Vault.") }
+                    if intake.isNative {
+                        Text("Machine: " + (intake.machineID ?? ""))
+                        if let nativeDescription {
+                            NativeSecureInputReview(description: nativeDescription)
+                        } else { Text("Verifying the protected command…") }
+                    } else { Text(intake.origin) }
+                    SecurePasswordField(password: $password).disabled(attempted || (intake.isNative && nativeDescription == nil))
+                } footer: { Text(intake.isNative ? "Use your password manager or enter the machine password. Encrypted for the enrolled helper, outside chat. Approve only root commands and files you trust. Not saved to Vault. Switching apps cancels this request." : "Sent directly to the bound browser input, outside chat. Not saved to Vault.") }
                 if let failure { Text(failure) }
                 Button(busy ? "Sending…" : "Send password") {
                     attempted = true; busy = true
@@ -3903,11 +3915,26 @@ private struct SecureInputSheet: View {
                     submission = Task { @MainActor in
                         defer { busy = false }
                         do {
-                            let receipt = try await model.submitSecureInput(intake, value: value, account: account)
+                            let receipt: SecureInputReceipt
+                            if intake.isNative {
+                                guard let nativeDescription else { throw APIError.invalidResponse }
+                                let context = LAContext()
+                                authentication = context
+                                defer { context.invalidate(); authentication = nil }
+                                receipt = try await NativeSecureInputAuthorization.perform(
+                                    authenticate: { try await context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: "Approve the displayed command on " + nativeDescription.machineID) },
+                                    isActive: { scenePhase == .active },
+                                    isCancelled: { cancellationStarted || !model.connected || model.vaultIntakeAccount != account || !intake.isCurrent(agentID: model.focused?.id ?? "") }
+                                ) {
+                                    try await model.submitNativeSecureInput(intake, description: nativeDescription, value: value, account: account)
+                                }
+                            } else {
+                                receipt = try await model.submitSecureInput(intake, value: value, account: account)
+                            }
                             guard !Task.isCancelled, model.vaultIntakeAccount == account else { return }
                             model.publishSecureInputReceipt(receipt, intake: intake, account: account)
                             resolved = true
-                            completed(receipt.message)
+                            completed(intake.isNative && receipt.status == "outcome_unknown" ? "Submission outcome unknown. Check the machine before any further attempt." : receipt.message)
                             dismiss()
                         } catch {
                             guard !cancellationStarted, model.vaultIntakeAccount == account else { return }
@@ -3915,7 +3942,7 @@ private struct SecureInputSheet: View {
                             completed("Submission could not be confirmed. Check the destination directly before any further attempt.")
                         }
                     }
-                }.disabled(attempted || password.isEmpty || password.utf16.count > 4096 || password.unicodeScalars.contains(where: { $0.value < 32 || $0.value == 127 }) || !intake.isCurrent(agentID: model.focused?.id ?? ""))
+                }.disabled(attempted || (intake.isNative && nativeDescription == nil) || password.isEmpty || (intake.isNative ? password.utf8.count : password.utf16.count) > 4096 || password.unicodeScalars.contains(where: { $0.value < 32 || $0.value == 127 }) || !intake.isCurrent(agentID: model.focused?.id ?? ""))
                     .accessibilityIdentifier("secure-input-submit")
             }
             .navigationTitle("Private password")
@@ -3925,6 +3952,10 @@ private struct SecureInputSheet: View {
         .interactiveDismissDisabled(busy)
         .task(id: intake.requestID) {
             account = model.vaultIntakeAccount
+            if intake.isNative {
+                do { nativeDescription = try await model.describeNativeSecureInput(intake, account: account) }
+                catch { failure = "Couldn’t verify the protected command. Cancel and request it again."; return }
+            }
             while !Task.isCancelled {
                 let remaining = intake.expiresAt / 1000 - Date().timeIntervalSince1970
                 if remaining <= 0 {
@@ -3937,9 +3968,29 @@ private struct SecureInputSheet: View {
             }
         }
         .onDisappear { password = ""; if !resolved { cancelRequest() } }
-        .onChange(of: scenePhase) { _, phase in if phase != .active { password = "" } }
+        .onChange(of: scenePhase) { _, phase in
+            if phase != .active { password = "" }
+            if phase == .background { cancelRequest(); dismiss() }
+        }
         .onChange(of: model.vaultIntakeAccount) { _, _ in submission?.cancel(); password = ""; dismiss() }
         .onChange(of: model.connected) { _, connected in if !connected { submission?.cancel(); password = ""; dismiss() } }
+    }
+}
+
+private struct NativeSecureInputReview: View {
+    let description: NativeSecureInputDescription
+    var body: some View {
+        LabeledContent("Executable") { Text(NativeSecureInputDescription.displayLiteral(description.executable)).font(.system(.body, design: .monospaced)) }
+            .accessibilityElement(children: .combine)
+            .accessibilityIdentifier("native-secure-command-executable")
+        LabeledContent("Working directory") { Text(NativeSecureInputDescription.displayLiteral(description.cwd)).font(.system(.body, design: .monospaced)) }
+            .accessibilityElement(children: .combine)
+            .accessibilityIdentifier("native-secure-command-cwd")
+        Text("Local user ID: \(description.uid)")
+        Text("Arguments (ordered)").font(.headline)
+        Text("[" + description.arguments.map(NativeSecureInputDescription.displayLiteral).joined(separator: ",\n") + "]")
+            .font(.system(.body, design: .monospaced)).textSelection(.enabled)
+            .accessibilityIdentifier("native-secure-command-arguments")
     }
 }
 
@@ -3953,6 +4004,46 @@ struct SecurePasswordField: View {
     }
 }
 #if DEBUG && targetEnvironment(simulator)
+struct NativeSecureInputUIFixture: View {
+    private let description: NativeSecureInputDescription
+    @State private var password = ""
+    @State private var status = ""
+    @State private var attempts = 0
+    init() {
+        let requestID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        let expiry = Date().addingTimeInterval(300).timeIntervalSince1970 * 1000
+        let args = ["-u", "visible\u{202e}hidden"]
+        let binding = try! JSONSerialization.data(withJSONObject: ["arguments": args, "cwd": "/", "executable": "/usr/bin/id", "uid": 501], options: [.sortedKeys, .withoutEscapingSlashes])
+        let hint: JSON = .object(["type": .string("secure_input"), "status": .string("input_required"), "kind": .string("native_sudo"), "request_id": .string(requestID), "agent_id": .string("fixture"), "machine_id": .string("fixture-machine"), "expires_at": .number(expiry)])
+        let request = SecureInputRequest.parse(hint)!
+        let recipient = P256.KeyAgreement.PrivateKey()
+        description = try! NativeSecureInputDescription.parse(.object(["request_id": .string(requestID), "machine_id": .string("fixture-machine"), "uid": .number(501), "executable": .string("/usr/bin/id"), "arguments": .array(args.map(JSON.string)), "cwd": .string("/"), "command_digest": .string(Data(SHA256.hash(data: binding)).base64EncodedString()), "public_key": .string(recipient.publicKey.x963Representation.base64EncodedString()), "expires_at": .number(expiry)]), intake: request)
+    }
+    var body: some View {
+        NavigationStack {
+            Form {
+                Text("Machine: " + description.machineID)
+                NativeSecureInputReview(description: description)
+                SecurePasswordField(password: $password)
+                Button("Send password") {
+                    password = ""
+                    Task { @MainActor in
+                        do {
+                            let _: Bool = try await NativeSecureInputAuthorization.perform(authenticate: { false }, isActive: { true }, isCancelled: { false }) {
+                                attempts += 1
+                                return true
+                            }
+                            status = "Unexpected submission"
+                        } catch { status = "Authentication denied" }
+                    }
+                }.accessibilityIdentifier("secure-input-submit")
+                Text(status)
+                Text("Submission attempts: \(attempts)")
+            }
+        }
+    }
+}
+
 /// Synthetic UI journey; HTTP protocol coverage lives in InboxCore tests.
 struct SecureInputUIFixture: View {
     @State private var password = ""
