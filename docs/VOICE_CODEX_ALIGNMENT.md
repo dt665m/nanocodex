@@ -55,18 +55,7 @@ Automated protocol and adapter tests do not establish live microphone/speaker
 quality, echo cancellation, or production deployment. A live call must verify
 those separately.
 
-## Validation
-
-- `cargo test --locked -p nanocodex-voice-protocol -p nanocodex-voice --lib`: 51 protocol and 26 native voice tests passed.
-- `cargo test -p nanocodex-oai-api --features realtime realtime:: --lib`: 43 transport tests passed.
-- Rebuilt WASM with `bash js/nanocodex-vite/scripts/build-js-package.sh`; browser voice, managed voice, and optional synthesis isolation suites: 64 tests passed.
-- Managed realtime transport, credential ownership, transcript validation, and durable stop/replay suites: 53 tests passed.
-- Managed TypeScript typecheck and both native CLI package checks passed.
-- Worker dry-run bundle validated with container rollout disabled (no container code changed).
-
-No authenticated live call or production deployment was performed for this change.
-
-## App-server lifecycle pass
+## App-server lifecycle
 
 | Boundary | Upstream reference | Alignment |
 | --- | --- | --- |
