@@ -6,6 +6,8 @@ public struct SecureInputRequest: Codable, Equatable, Sendable {
     public let agentID: String
     public let origin: String
     public private(set) var machineID: String? = nil
+    private var browserKind: String? = nil
+    public var isForm: Bool { browserKind == "browser_form" }
     public var isNative: Bool { machineID != nil }
     public let expiresAt: Double
     public func isCurrent(agentID: String, now: Date = Date()) -> Bool {
@@ -30,13 +32,15 @@ public struct SecureInputRequest: Codable, Equatable, Sendable {
         if value["type"].string == "secure_input" {
             guard case .object(let fields) = value,
                   Set(fields.keys) == Set(["type", "status", "request_id", "agent_id", "origin", "expires_at", "kind"]),
-                  value["status"].string == "input_required", value["kind"].string == "browser_password",
+                  value["status"].string == "input_required", ["browser_password", "browser_form"].contains(value["kind"].string),
                   UUID(uuidString: value["request_id"].string) != nil,
                   (try? ManagedClient.agentPath(value["agent_id"].string)) != nil,
                   case .number(let expiry) = value["expires_at"], expiry.isFinite, expiry > 0,
                   let validated = VaultIntake.parse(.object(["type": .string("vault_intake"), "status": .string("input_required"), "kind": .string("login"), "origin": value["origin"]])),
                   let origin = validated.origin else { return nil }
-            return .init(requestID: value["request_id"].string, agentID: value["agent_id"].string, origin: origin, expiresAt: expiry)
+            var request = Self(requestID: value["request_id"].string, agentID: value["agent_id"].string, origin: origin, expiresAt: expiry)
+            request.browserKind = value["kind"].string
+            return request
         }
         switch value {
         case .array(let values): return values.lazy.compactMap { parse($0, depth: depth + 1) }.first
@@ -56,9 +60,9 @@ public struct SecureInputReceipt: Sendable {
         switch status {
         case "completed": return "Protected command completed successfully."
         case "failed": return "Protected command failed. Check the machine before continuing."
-        case "filled": return "Password filled in browser."
-        case "submitted": return "Password submitted. Sign-in is not yet verified."
-        case "action_required": return "Password filled. A separate private browser sign-in action is required."
+        case "filled": return "Sensitive fields filled in browser."
+        case "submitted": return "Sensitive fields submitted. Completion is not yet verified."
+        case "action_required": return "Sensitive fields filled. A separate private browser action is required."
         case "cancelled": return "Secure input cancelled."
         default: return "Submission outcome unknown. Check the private browser before any further attempt."
         }

@@ -1,4 +1,4 @@
-# One-time private password input
+# One-time private secure input
 
 `request_secure_input({target_id, expected_origin, password_selector, submit})`
 creates a five-minute request for a visible password field on a same-origin HTTPS
@@ -51,6 +51,52 @@ cookies, raw DOM, provider URLs, or screenshots.
 The browser API does not support terminal stdin, native CUA input, arbitrary
 application fields, or CAPTCHA. Native sudo uses the separate enrolled helper
 boundary below; ordinary Hand RPC must never receive a plaintext password.
+
+## Typed browser forms
+
+The same conversation bottom sheet supports multiple private fields:
+
+```js
+request_secure_input({
+  target_id, expected_origin, submit: false,
+  fields: [
+    {id: "card", kind: "card_number", selector: "#card-number"},
+    {id: "expiry", kind: "card_expiry", selector: "#expiry"},
+    {id: "cvc", kind: "card_cvc", selector: "#security-code"}
+  ]
+})
+```
+
+Supported kinds are `password`, `card_number`, `card_expiry`, `card_cvc`, and
+`sensitive_text`. One to eight fields must be unique visible native inputs in
+one same-origin top-frame HTTPS POST form. Password fields require password
+inputs; other kinds accept text, tel, or password inputs. Iframes, custom controls,
+readonly/disabled fields, duplicate selectors and cross-origin form actions fail
+closed. This is not universal form or native-app support.
+
+The tool returns metadata only with `kind: "browser_form"`. The authenticated
+client posts `{request_id, action: "describe"}` to the private endpoint and gets
+exactly `{request_id, origin, expires_at, fields:[{id,kind,selector}]}`. Display labels
+are app-owned. The client submits `{request_id, values:{card,expiry,cvc}}`; the map
+must match the bound field IDs exactly. The aggregate encoded JSON limit is
+32 KiB, including envelope and escaping, in addition to each 4096-character limit.
+Legacy password requests still use `{request_id,value}`.
+
+Typed requests require `submit:false` and never invoke form submission or click
+a payment button. They dispatch native input/change events, so the approved
+website's own handlers still run. Receipts are `filled`, `outcome_unknown`, or
+`cancelled`; downstream sign-in/payment actions need separate authorization.
+The same quarantine, one-use consumption, loader binding and restart failure
+behavior apply. All entered values stay transient; snapshots also redact numeric
+values after common space, slash, dot or hyphen formatting changes.
+
+The iOS sheet rises from the conversation, starts at medium height, expands for
+review, and clears masked inputs on submission, dismissal or backgrounding.
+Password-manager AutoFill metadata is supplied without requiring a Vault item;
+third-party password-manager behavior still needs physical-device verification.
+The simulator password/card/native journeys use synthetic inputs and share the
+production sheet shell. The card receipt is a fixture; actual browser fill and
+zero explicit submission are separately exercised by the Chrome/runtime journey.
 
 ## Enrolled native sudo
 

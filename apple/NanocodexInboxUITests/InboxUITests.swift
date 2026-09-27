@@ -6,7 +6,22 @@ final class InboxUITests: XCTestCase {
         let app = XCUIApplication()
         app.launchArguments = ["--native-secure-input-ui-fixture"]
         app.launch()
+        let open = app.buttons["secure-input-open"]
+        XCTAssertTrue(open.waitForExistence(timeout: 5))
+        XCTAssertFalse(app.secureTextFields["secure-input-password"].exists)
+        let conversation = XCTAttachment(screenshot: app.screenshot())
+        conversation.name = "native-password-conversation"; conversation.lifetime = .keepAlways
+        add(conversation)
+        open.tap()
         XCTAssertTrue(app.staticTexts["Machine: fixture-machine"].waitForExistence(timeout: 5))
+        let sheet = app.descendants(matching: .any)["secure-input-sheet"].firstMatch
+        XCTAssertTrue(sheet.exists)
+        let presentation = XCTAttachment(screenshot: app.screenshot())
+        presentation.name = "native-password-conversation-sheet"; presentation.lifetime = .keepAlways
+        add(presentation)
+        // Expand the native sheet before reviewing all command details.
+        sheet.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.02))
+            .press(forDuration: 0.1, thenDragTo: app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.08)))
         let executable = app.descendants(matching: .any)["native-secure-command-executable"].firstMatch
         XCTAssertTrue(executable.waitForExistence(timeout: 5))
         XCTAssertTrue(executable.label.contains("\"/usr/bin/id\""), executable.label)
@@ -15,10 +30,12 @@ final class InboxUITests: XCTestCase {
         XCTAssertTrue(cwd.label.contains("\"/\""), cwd.label)
         XCTAssertTrue(app.staticTexts["Local user ID: 501"].exists)
         let arguments = app.descendants(matching: .any)["native-secure-command-arguments"].firstMatch
+        if !arguments.isHittable { app.scrollViews["secure-input-review"].swipeUp() }
         XCTAssertTrue(arguments.exists)
         XCTAssertTrue(arguments.label.contains("\\u202e"))
         XCTAssertFalse(arguments.label.contains("\u{202e}"))
         let field = app.secureTextFields["secure-input-password"]
+        if !field.isHittable { app.scrollViews["secure-input-review"].swipeDown() }
         field.tap(); field.typeText("synthetic-native-secret")
         app.buttons["secure-input-submit"].tap()
         XCTAssertTrue(app.staticTexts["Authentication denied"].waitForExistence(timeout: 5))
@@ -27,22 +44,72 @@ final class InboxUITests: XCTestCase {
         let attachment = XCTAttachment(screenshot: app.screenshot())
         attachment.name = "native-command-auth-denied"; attachment.lifetime = .keepAlways
         add(attachment)
+        app.buttons["Cancel"].tap()
+        XCTAssertTrue(open.waitForExistence(timeout: 5))
+        XCTAssertTrue(open.isHittable)
+        XCTAssertFalse(field.exists)
+        let dismissed = XCTAttachment(screenshot: app.screenshot())
+        dismissed.name = "native-password-back-to-conversation"; dismissed.lifetime = .keepAlways
+        add(dismissed)
     }
 
     func testPrivatePasswordFieldAndSafeReceipt() throws {
         let app = XCUIApplication()
         app.launchArguments = ["--secure-input-ui-fixture"]
         app.launch()
-        let field = app.secureTextFields["secure-input-password"]
+        app.buttons["secure-input-open"].tap()
+        let field = app.secureTextFields["secure-input-field:password"]
         XCTAssertTrue(field.waitForExistence(timeout: 5), "Password input must use native secure text entry")
         field.tap(); field.typeText("synthetic-password")
         XCTAssertNotEqual(field.value as? String, "synthetic-password")
         app.buttons["secure-input-submit"].tap()
-        XCTAssertTrue(app.staticTexts["Password filled in browser."].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["Sensitive fields filled in browser."].waitForExistence(timeout: 5))
         XCTAssertFalse(app.staticTexts["synthetic-password"].exists)
         let attachment = XCTAttachment(screenshot: app.screenshot())
         attachment.name = "secure-input-safe-receipt"; attachment.lifetime = .keepAlways
         add(attachment)
+    }
+
+    func testPrivateCardFormFillsOnlyBoundFields() throws {
+        let app = XCUIApplication()
+        app.launchArguments = ["--card-secure-input-ui-fixture"]
+        app.launch()
+        let open = app.buttons["secure-input-open"]
+        XCTAssertTrue(open.waitForExistence(timeout: 5))
+        open.tap()
+        let sheet = app.descendants(matching: .any)["secure-input-sheet"].firstMatch
+        XCTAssertTrue(sheet.waitForExistence(timeout: 5))
+        sheet.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.02))
+            .press(forDuration: 0.1, thenDragTo: app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.08)))
+        let submit = app.buttons["secure-input-submit"]
+        XCTAssertFalse(submit.isEnabled)
+        let samples = [("card", "4242424242424242"), ("expiry", "1230"), ("cvc", "123")]
+        for (id, sample) in samples {
+            let field = app.secureTextFields["secure-input-field:" + id]
+            XCTAssertTrue(field.exists)
+            if !field.isHittable { app.scrollViews["secure-input-review"].swipeUp() }
+            field.tap(); field.typeText(sample)
+            XCTAssertNotEqual(field.value as? String, sample)
+            XCTAssertFalse(app.staticTexts[sample].exists)
+        }
+        XCTAssertTrue(submit.isEnabled)
+        submit.tap()
+        XCTAssertTrue(app.staticTexts["Sensitive fields filled in browser."].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["Fixture: 3 bound fields filled; form submissions: 0"].exists)
+        XCTAssertFalse(submit.isEnabled)
+        XCTAssertFalse(app.keyboards.firstMatch.exists)
+        for (id, sample) in samples {
+            let field = app.secureTextFields["secure-input-field:" + id]
+            let remaining = field.value as? String ?? ""
+            XCTAssertTrue(remaining.isEmpty || remaining == field.placeholderValue, "Private field must be cleared")
+            XCTAssertFalse(app.staticTexts[sample].exists)
+        }
+        let attachment = XCTAttachment(screenshot: app.screenshot())
+        attachment.name = "private-card-fields-filled-only"; attachment.lifetime = .keepAlways
+        add(attachment)
+        app.buttons["Cancel"].tap()
+        XCTAssertTrue(open.waitForExistence(timeout: 5))
+        XCTAssertFalse(app.secureTextFields["secure-input-field:card"].exists)
     }
 
     private func selectedConversationTab(_ app: XCUIApplication) -> XCUIElement {

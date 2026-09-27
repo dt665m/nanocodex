@@ -13,6 +13,8 @@ struct NanocodexInboxApp: App {
             #if DEBUG && targetEnvironment(simulator)
             if ProcessInfo.processInfo.arguments.contains("--native-secure-input-ui-fixture") {
                 NativeSecureInputUIFixture()
+            } else if ProcessInfo.processInfo.arguments.contains("--card-secure-input-ui-fixture") {
+                CardSecureInputUIFixture()
             } else if ProcessInfo.processInfo.arguments.contains("--secure-input-ui-fixture") {
                 SecureInputUIFixture()
             } else if ProcessInfo.processInfo.arguments.contains("--voice-clone-ui-fixture") {
