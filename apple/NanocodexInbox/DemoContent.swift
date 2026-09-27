@@ -411,7 +411,7 @@ private final class StartupFixtureProtocol: URLProtocol, @unchecked Sendable {
             let isStream = path.hasSuffix("/events")
             var status = 200, delay = 0.05, body = "{}"
             if path == "/v1/crm" {
-                body = #"{"records":[{"id":"alex","kind":"person","name":"Alex Morgan","title":"Designer"}],"next_cursor":null}"#
+                body = #"{"records":[{"id":"alex","kind":"person","name":"Alex Morgan","title":"Product designer · Example Studio"},{"id":"sam","kind":"person","name":"Sam Rivera","title":"Landscape architect"},{"id":"maya","kind":"person","name":"Maya Chen","title":"Engineer · Northstar"}],"next_cursor":null}"#
                 let query = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?.queryItems ?? []
                 if ProcessInfo.processInfo.environment["NANOCODEX_CRM_RETRY_FIXTURE"] == "1", !Self.crmFailed {
                     Self.crmFailed = true; status = 503; body = #"{"error":"crm_unavailable"}"#
@@ -421,9 +421,9 @@ private final class StartupFixtureProtocol: URLProtocol, @unchecked Sendable {
                     body = #"{"records":[{"id":"studio","kind":"company","name":"Example Studio"}],"next_cursor":null}"#
                 }
             } else if path == "/v1/crm/alex" {
-                body = #"{"record":{"id":"alex","kind":"person","name":"Alex Morgan"},"identities":[{"id":"social","kind":"github","value":"example"}],"facts":[{"id":"education","predicate":"bio.education","value":"Example University","origin":"user"}],"relationships":[{"id":"friend","from_id":"alex","to_id":"sam","to_name":"Sam Rivera","type":"worked_with","description":"Designed the community garden.","origin":"user"}],"notes":[{"id":"note","body":"Met at the design workshop.","created_at":"2026-09-01"}]}"#
+                body = #"{"record":{"id":"alex","kind":"person","name":"Alex Morgan","title":"Product designer · Example Studio"},"identities":[{"id":"social","kind":"github","value":"example"}],"facts":[{"id":"education","predicate":"bio.education","value":"Example University","origin":"user"}],"relationships":[{"id":"friend","from_id":"alex","to_id":"sam","to_name":"Sam Rivera","type":"worked_with","description":"Designed the community garden.","origin":"user"}],"notes":[{"id":"note","body":"Met at the design workshop.","created_at":"2026-09-01"}]}"#
             } else if path == "/v1/crm/sam" {
-                body = #"{"record":{"id":"sam","kind":"person","name":"Sam Rivera"},"identities":[],"facts":[],"relationships":[],"notes":[]}"#
+                body = #"{"record":{"id":"sam","kind":"person","name":"Sam Rivera","title":"Landscape architect"},"identities":[],"facts":[],"relationships":[{"id":"friend","from_id":"alex","from_name":"Alex Morgan","to_id":"sam","to_name":"Sam Rivera","type":"worked_with","description":"Designed the community garden together.","origin":"user"}],"notes":[{"id":"sam-note","body":"Interested in making shared spaces feel more welcoming.","created_at":"2026-09-12"}]}"#
             } else if path == "/v1/agents" {
                 delay = 6
                 if ProcessInfo.processInfo.environment["NANOCODEX_STARTUP_REJECT"] == "1" { status = 401 }

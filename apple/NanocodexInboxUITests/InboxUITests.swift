@@ -15,6 +15,7 @@ final class InboxUITests: XCTestCase {
         XCTAssertTrue(app.buttons["Retry"].waitForExistence(timeout: 10))
         app.buttons["Retry"].tap()
         XCTAssertTrue(app.buttons["crm-record-alex"].waitForExistence(timeout: 10))
+        capture(app, "crm-directory")
         app.buttons["crm-filter-company"].tap()
         XCTAssertTrue(app.buttons["crm-record-studio"].waitForExistence(timeout: 5))
         XCTAssertFalse(app.buttons["crm-record-alex"].exists)
@@ -27,6 +28,7 @@ final class InboxUITests: XCTestCase {
         XCTAssertTrue(app.buttons["crm-record-alex"].waitForExistence(timeout: 5))
         app.buttons["crm-record-alex"].tap()
         XCTAssertTrue(app.staticTexts["Example University"].waitForExistence(timeout: 5))
+        capture(app, "crm-profile")
         for _ in 0..<4 where !app.staticTexts["Met at the design workshop."].isHittable { app.swipeUp() }
         XCTAssertTrue(app.staticTexts["Met at the design workshop."].exists)
         for _ in 0..<4 where !app.buttons["crm-related-sam"].isHittable { app.swipeDown() }
