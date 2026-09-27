@@ -256,7 +256,11 @@ struct NativeConversationTranscript: UIViewRepresentable {
                 guard let self else { return }
                 self.applying = false
                 self.view?.layoutIfNeeded()
-                if case let .reading(id, offset) = self.viewport { self.restore(id, offset: offset) }
+                switch self.viewport {
+                case let .reading(id, offset), let .target(id, offset, false):
+                    self.restore(id, offset: offset)
+                default: break
+                }
                 self.layoutFinished()
                 if let update = self.queuedUpdate {
                     self.queuedUpdate = nil
