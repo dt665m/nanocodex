@@ -43,9 +43,11 @@ ownership to an obsolete delegated answer.
 ## Integration differences
 
 Nanocodex retains its managed-agent admission, durable task routing, and prepared
-personalization. Browser/managed history context is an embedding extension;
-Codex's TUI uses client-managed handoffs with startup context disabled. Native
-Nanocodex defaults follow that TUI selection. Optional ElevenLabs adapters remain
+personalization. Prepared personalization is an embedding extension.
+Codex's TUI uses client-managed handoffs with startup context disabled; Nanocodex
+TUI and browser clients select that behavior explicitly. The reusable native
+builder follows app-server policy defaults instead (provider-managed handoffs,
+startup context enabled, and tail delegation disabled). Optional ElevenLabs adapters remain
 separate from direct ChatGPT output. Matching the provider contract does not mean
 these embeddings or their audio-device implementations are identical.
 
@@ -55,9 +57,32 @@ those separately.
 
 ## Validation
 
-- `cargo test --locked -p nanocodex-voice-protocol -p nanocodex-voice --lib`: 48 protocol and 25 native voice tests passed.
-- `cargo test -p nanocodex-oai-api --features realtime realtime:: --lib`: 41 transport tests passed.
-- Rebuilt WASM with `bash js/nanocodex-vite/scripts/build-js-package.sh`; browser voice, managed voice, and optional synthesis isolation suites: 59 tests passed.
-- Managed realtime transport and credential ownership suites: 42 tests passed.
+- `cargo test --locked -p nanocodex-voice-protocol -p nanocodex-voice --lib`: 51 protocol and 26 native voice tests passed.
+- `cargo test -p nanocodex-oai-api --features realtime realtime:: --lib`: 43 transport tests passed.
+- Rebuilt WASM with `bash js/nanocodex-vite/scripts/build-js-package.sh`; browser voice, managed voice, and optional synthesis isolation suites: 64 tests passed.
+- Managed realtime transport, credential ownership, transcript validation, and durable stop/replay suites: 53 tests passed.
+- Managed TypeScript typecheck and both native CLI package checks passed.
+- Worker dry-run bundle validated with container rollout disabled (no container code changed).
 
 No authenticated live call or production deployment was performed for this change.
+
+## App-server lifecycle pass
+
+| Boundary | Upstream reference | Alignment |
+| --- | --- | --- |
+| Reusable lifecycle defaults | `app-server/src/request_processors/turn_processor.rs`, realtime start | Handoffs default to provider-managed; startup context enabled; tail-flush work disabled. TUI/browser explicitly select client-managed handoffs. |
+| Text appended to V3 | `codex-api/src/endpoint/realtime_websocket/methods_frameless_bidi.rs` | Native and browser use UTF-8-safe `session.context.append` chunks, without V2 user prefixes. |
+| Standalone speech | `core/src/realtime_conversation.rs`, append speech; `core/src/realtime_context.rs` | Whitespace is ignored; browser speech now has the same 1,000 approximate-token middle-truncation budget. |
+| Session instructions | `core/src/context/realtime_start_with_instructions.rs`, `realtime_end_instructions.rs` | Native start/end overrides retain lifecycle wrappers and the 8,192 approximate-token input limit. |
+| Reconnect queue | `codex-api/src/endpoint/realtime_websocket/methods.rs` | Native buffered commands drain without waiting for a new socket event. Browser rejects controls from a closed/replaced transport after asynchronous classification. |
+| Replacement startup | app-server/core session lifecycle | Failed browser startup cleanup cannot detach the next session's event watcher. |
+| Steering and cancellation | core client-managed handoff ownership | Steering an unrelated typed turn releases cancellation ownership of the earlier voice turn. |
+| Stop and history | `core/src/realtime_conversation.rs`, transcript-tail flush; `core/src/realtime_history.rs` | Stop finalizes partial captions, preserves remaining history, and does not automatically launch a backend task. Managed history writes use the stop receipt and reject conflicting replay. |
+
+History storage remains an embedding difference: Nanocodex retains a bounded,
+escaped transcript as durable background context at stop, rather than copying
+Codex's app-server realtime history-item schema. The optional legacy explicit
+`tailDelegation` formatter still exists; it does not make default stop launch work.
+The protocol and client layers preserve independently running delegated work
+when media stops. None of these checks claims JSON-RPC API identity, audio-device
+implementation identity, or a verified production microphone/speaker experience.

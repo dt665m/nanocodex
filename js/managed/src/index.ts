@@ -1,3 +1,4 @@
+import { parseRealtimeTranscript, realtimeTranscriptContext, type RealtimeTranscriptEntry } from "./realtime-transcript";
 import { liveAgentSettings, liveAgentFailure, liveAgentRequest } from "nanocodex/cloudflare/managed-live";
 import { durablePlacementOptions, withIngressPlacement } from "nanocodex/cloudflare/durable-placement";
 import { routerDashboard } from "./router-dashboard";
@@ -718,6 +719,7 @@ type ManagedRealtimeOperationRow = {
 
 type ManagedRealtimeRequest = {
   input?: string;
+  transcript?: RealtimeTranscriptEntry[];
   operationId: string;
   voiceSessionId: string;
 };
@@ -5702,7 +5704,7 @@ export class DurableAgentSession extends DurableComputerSession {
     const allowed =
       kind === "delegate"
         ? new Set(["voice_session_id", "operation_id", "input"])
-        : new Set(["voice_session_id", "operation_id"]);
+        : new Set(["voice_session_id", "operation_id", ...(kind === "stop" ? ["transcript"] : [])]);
     if (Object.keys(body).some((key) => !allowed.has(key))) {
       return json(
         {
@@ -5744,7 +5746,11 @@ export class DurableAgentSession extends DurableComputerSession {
       return json({ error: "invalid_request" }, { status: 400 });
     }
 
+    let transcript: RealtimeTranscriptEntry[] | undefined;
+    try { transcript = parseRealtimeTranscript(body.transcript); }
+    catch { return json({ error: "invalid_transcript" }, { status: 400 }); }
     const parsed: ManagedRealtimeRequest = {
+      ...(transcript === undefined ? {} : { transcript }),
       voiceSessionId: body.voice_session_id,
       operationId: body.operation_id,
       ...(kind === "delegate" ? { input: body.input as string } : {}),
@@ -5755,6 +5761,7 @@ export class DurableAgentSession extends DurableComputerSession {
         operation_id: parsed.operationId,
         voice_session_id: parsed.voiceSessionId,
         ...(parsed.input === undefined ? {} : { input: parsed.input }),
+        ...(parsed.transcript === undefined ? {} : { transcript: parsed.transcript }),
       }),
     );
     if (this.#durabilityExported || this.#durabilityImportState === "pending") {
@@ -5820,6 +5827,10 @@ export class DurableAgentSession extends DurableComputerSession {
               };
             }
             this.#requireRealtimeAuthorization(active, authorization);
+            const transcriptContext = realtimeTranscriptContext(parsed.transcript ?? []);
+            if (transcriptContext) {
+              await agent.session.appendDeveloperMessage(transcriptContext);
+            }
             const context = await this.#endManagedRealtimeSession(
               agent,
               parsed.voiceSessionId,

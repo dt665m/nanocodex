@@ -415,7 +415,9 @@ test("the public managed voice forwards prepared Markdown and ignores retired re
     assert.match(background, /Current Markdown voice preference/);
     assert.ok(frames.some((frame) => frame.channel === "speakable" && frame.content[0].text === "Read this aloud."));
     assert.ok(frames.some((frame) => frame.type === "session.context.append" && frame.content[0].text === "Selected README.md" && !("channel" in frame)));
-    await assert.rejects(voice.speak(" "), /voice text/);
+    const beforeEmptySpeech = fixture.channel.sent.length;
+    await voice.speak(" ");
+    assert.equal(fixture.channel.sent.length, beforeEmptySpeech, "empty speech is a no-op like app-server");
     assert.equal(voice.getSnapshot().status, "active");
     await waitFor(() => events !== undefined);
     const cursor = "9007199254740993";
@@ -1564,4 +1566,66 @@ test("interruption during frame acknowledgement cannot restore direct speaker pl
       restoreGlobal("Audio", previousAudio); restoreGlobal("document", previousDocument);
     }
   }
+});
+
+test("control classification cannot admit frames after their transport closes", async () => {
+  for (const direct of [false, true]) {
+    for (const requiresAdmission of [false, true]) {
+      const fixture = installBrowserVoiceFixture();
+      const calls = [];
+      let classify;
+      const core = fakeVoiceCore(calls, {
+        dataChannelControl: direct,
+        requiresAgentAdmission(payload) {
+          if (JSON.parse(payload).type === "session.started") return false;
+          return new Promise(resolve => { classify = resolve; });
+        },
+      });
+      const session = new BrowserVoiceSession({ core, voice: "cove",
+        captureMicrophone: async () => fakeMicrophone(calls),
+        onStatus() {}, onTranscript() {}, onTerminated() {} });
+      try {
+        await session.start();
+        const transport = direct ? fixture.channel : fixture.sideband;
+        transport.message({ type: "delegation.created" });
+        await waitFor(() => classify !== undefined);
+        transport.close();
+        classify(requiresAdmission);
+        await new Promise(resolve => setTimeout(resolve, 0));
+        assert.equal(calls.some(([kind, payload]) => kind === "realtimeMessage"
+          && JSON.parse(payload).type === "delegation.created"), false);
+      } finally { classify?.(requiresAdmission); await session.close(); fixture.restore(); }
+    }
+  }
+});
+
+test("replacement startup waits for a failed attempt's lifecycle cleanup", async () => {
+  const fixture = installBrowserVoiceFixture();
+  const calls = [];
+  let releaseStop;
+  const stopping = new Promise(resolve => { releaseStop = resolve; });
+  let starts = 0;
+  let stops = 0;
+  let captures = 0;
+  const core = fakeVoiceCore(calls, {
+    async start() { if (++starts === 1) throw new Error("startup rejected"); },
+    async stop() { if (++stops === 1) await stopping; },
+  });
+  const { agent } = await testAgent(core, calls);
+  const voice = Voice.create(agent, { captureMicrophone: async () => {
+    captures++;
+    return fakeMicrophone(calls);
+  } });
+  try {
+    const rejected = assert.rejects(voice.start(), /startup rejected/);
+    await waitFor(() => stops === 1);
+    const replacement = voice.start();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.equal(captures, 1, "failed attempt still owns lifecycle cleanup");
+    releaseStop();
+    await rejected;
+    await replacement;
+    assert.equal(captures, 2);
+    assert.equal(voice.getSnapshot().status, "active");
+  } finally { releaseStop(); await voice.destroy(); agent.dispose(); fixture.restore(); }
 });

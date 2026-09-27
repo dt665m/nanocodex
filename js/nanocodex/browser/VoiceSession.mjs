@@ -268,7 +268,7 @@ export class BrowserVoiceSession {
     const channel = this.#channel;
     channel.addEventListener("message", (event) => {
       if (this.#directControl && !this.#closed && this.#channel === channel) {
-        this.#receiveControl(event.data, () => this.#channel === channel);
+        this.#receiveControl(event.data, () => this.#channel === channel && channel.readyState === "open");
       }
     });
     channel.addEventListener("close", () => {
@@ -500,7 +500,7 @@ export class BrowserVoiceSession {
     let opened = false;
     sideband.addEventListener("message", (event) => {
       if (!this.#closed && generation === this.#sidebandGeneration) {
-        this.#receiveControl(event.data, () => generation === this.#sidebandGeneration);
+        this.#receiveControl(event.data, () => generation === this.#sidebandGeneration && sideband.readyState === WebSocket.OPEN);
       }
     });
     sideband.addEventListener("close", () => {
@@ -526,7 +526,11 @@ export class BrowserVoiceSession {
     this.#applyLive(async () => {
       if (!this.#directControl) await this.#admission;
       if (this.#closed || !isCurrent()) return;
-      if (await this.#core.requiresAgentAdmission(payload)) {
+      const requiresAdmission = await this.#core.requiresAgentAdmission(payload);
+      // Classification can yield while this transport closes or is replaced.
+      // Only requests accepted on the current connection may enter the queue.
+      if (this.#closed || !isCurrent()) return;
+      if (requiresAdmission) {
         // Retain accepted requests on close, but keep captions and interruptions
         // independent of the durable route and its ordered task queue.
         void this.#enqueue(async () => {

@@ -1529,9 +1529,10 @@ fn validate_realtime_configuration(
             "text output modality requires realtime v2".to_owned(),
         ));
     }
-    if version != RealtimeVersion::V2 && session_mode == RealtimeSessionMode::Transcription {
+    if transport == RealtimeTransport::WebRtc && session_mode == RealtimeSessionMode::Transcription
+    {
         return Err(RealtimeError::InvalidConfiguration(
-            "transcription mode requires realtime v2".to_owned(),
+            "AVAS realtime calls require conversational realtime".to_owned(),
         ));
     }
     if version != RealtimeVersion::V3 && !initial_items.is_empty() {
@@ -2122,7 +2123,9 @@ async fn run_socket_with_pending(
                 )
                 .await
                 {
-                    SocketCommandExit::Continue => {}
+                    // Buffered commands must drain without waiting for fresh socket
+                    // traffic or another producer to wake the select below.
+                    SocketCommandExit::Continue => continue,
                     SocketCommandExit::Terminal { returned_tail } => {
                         tail_returned = returned_tail;
                         break 'session;
@@ -2504,7 +2507,11 @@ async fn handle_command(
             } else {
                 Cow::Borrowed(text.as_str())
             };
-            send_conversation_text(socket, *role, &text).await?;
+            if protocol == RealtimeProtocol::Frameless {
+                send_session_context(socket, &text, None).await?;
+            } else {
+                send_conversation_text(socket, *role, &text).await?;
+            }
             Ok(CommandOutcome::Continue)
         }
         CommandKind::Speech { text } => {
@@ -3955,6 +3962,48 @@ mod tests {
     }
 
     #[test]
+    fn websocket_legacy_modes_normalize_but_webrtc_requires_conversation() {
+        for version in [RealtimeVersion::V1, RealtimeVersion::V3] {
+            assert!(
+                validate_realtime_configuration(
+                    version,
+                    RealtimeTransport::WebSocket,
+                    RealtimeSessionMode::Transcription,
+                    RealtimeOutputModality::Audio,
+                    &[],
+                )
+                .is_ok()
+            );
+            assert!(
+                validate_realtime_configuration(
+                    version,
+                    RealtimeTransport::WebRtc,
+                    RealtimeSessionMode::Transcription,
+                    RealtimeOutputModality::Audio,
+                    &[],
+                )
+                .is_err()
+            );
+            let update = |mode| {
+                configured_session_update(
+                    "delegate",
+                    "model",
+                    RealtimeVoice::Cove,
+                    version,
+                    mode,
+                    RealtimeOutputModality::Audio,
+                    &[],
+                    None,
+                )
+            };
+            assert_eq!(
+                update(RealtimeSessionMode::Transcription),
+                update(RealtimeSessionMode::Conversational)
+            );
+        }
+    }
+
+    #[test]
     fn validates_version_transport_mode_and_modality() {
         assert!(
             validate_realtime_configuration(
@@ -4275,7 +4324,7 @@ mod tests {
             let Message::Text(payload) = message else {
                 panic!("expected text input after reconnect")
             };
-            assert!(payload.contains("conversation.item.create"));
+            assert!(payload.contains("session.context.append"));
             assert!(payload.contains("after reconnect"));
             second
                 .send(Message::Close(Some(CloseFrame {
@@ -4768,6 +4817,64 @@ mod tests {
             }]
         );
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn buffered_sideband_commands_drain_without_new_traffic() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            for expected in ["first", "second", "third"] {
+                let message = tokio::time::timeout(Duration::from_secs(1), socket.next())
+                    .await
+                    .expect("all buffered text must drain without incoming traffic")
+                    .unwrap()
+                    .unwrap()
+                    .into_text()
+                    .unwrap();
+                let value: serde_json::Value = serde_json::from_str(&message).unwrap();
+                assert_eq!(value["type"], "session.context.append");
+                assert_eq!(value["content"][0]["text"], expected);
+            }
+        });
+        let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
+            .await
+            .unwrap();
+        let (_commands_tx, commands) = mpsc::channel(1);
+        let (events, _events_rx) = mpsc::channel(1);
+        let pending = ["first", "second", "third"]
+            .into_iter()
+            .map(|text| {
+                let (result, _received) = oneshot::channel();
+                super::Command {
+                    kind: super::CommandKind::Text {
+                        role: RealtimeInputTextRole::User,
+                        text: text.to_owned(),
+                    },
+                    result,
+                }
+            })
+            .collect();
+        let task = tokio::spawn(super::run_socket_with_pending(
+            socket,
+            commands,
+            events,
+            RealtimeProtocol::Frameless,
+            None,
+            None,
+            OutputPolicy {
+                codex_responses_as_items: false,
+                codex_response_item_prefix: None,
+                handoff_mode: RealtimeResponseHandoffMode::Thinking,
+                channel_prefixes: BTreeMap::new(),
+            },
+            super::SessionOwnership::External,
+            pending,
+        ));
+        server.await.unwrap();
+        task.await.unwrap();
     }
 
     #[tokio::test]

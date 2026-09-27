@@ -338,9 +338,12 @@ impl BrowserVoiceProtocol {
 
     /// Explicit speech is independent of background narration preferences.
     pub fn append_speech(&mut self, text: &str) -> Result<BrowserVoiceEffects, String> {
+        if text.trim().is_empty() {
+            return Ok(BrowserVoiceEffects::default());
+        }
         validate_text(text)?;
         let mut effects = self.enqueue_frames(
-            session_context_frames(text, "speakable")
+            session_context_frames(&bounded_speech(text), "speakable")
                 .into_iter()
                 .map(|frame| frame.to_string())
                 .collect(),
@@ -359,7 +362,8 @@ impl BrowserVoiceProtocol {
     }
 
     /// Codex's subscription adapter sends text as chunked context, regardless
-    /// of its API role. Background-only callers should use `append_context`.
+    /// of its API role. FramelessBidi maps to core V1, so the V2-only
+    /// `[USER] ` prefix does not apply. Background-only callers use `append_context`.
     pub fn append_text(
         &mut self,
         _role: VoiceTextRole,
@@ -703,7 +707,17 @@ impl BrowserVoiceProtocol {
             .as_mut()
             .map(|delivery| delivery.close())
             .unwrap_or_default();
+        let mut transcripts = Vec::new();
+        for (role, live) in [
+            ("user", &mut self.input),
+            ("assistant", &mut self.output_transcript),
+        ] {
+            if !live.complete && !live.text.is_empty() {
+                transcripts.push(live.update(role, "", false));
+            }
+        }
         BrowserVoiceEffects {
+            transcripts,
             frames: vec![json!({ "type": "session.close" }).to_string()],
             status: Some("Voice stopped".to_owned()),
             ..recovery
@@ -816,6 +830,27 @@ impl BrowserVoiceProtocol {
         self.pending_frames.extend(new_frames.iter().cloned());
         effects.frames.extend(new_frames);
         effects.acknowledge_frames = true;
+    }
+}
+
+// Match core's 1,000-token standalone-speech cap, including its middle
+// truncation marker and retry with a tightened content budget.
+fn bounded_speech(text: &str) -> String {
+    let mut budget = REALTIME_OUTPUT_BYTE_LIMIT / APPROX_BYTES_PER_TOKEN;
+    loop {
+        let maximum = budget * APPROX_BYTES_PER_TOKEN;
+        if text.len() <= maximum {
+            return text.to_owned();
+        }
+        let head = take_first_bytes(text, maximum / 2);
+        let tail = take_last_bytes(text, maximum - maximum / 2);
+        let removed = (text.len() - maximum).div_ceil(APPROX_BYTES_PER_TOKEN);
+        let candidate = format!("{head}…{removed} tokens truncated…{tail}");
+        let excess = tokens(&candidate).saturating_sub(1_000);
+        if excess == 0 {
+            return candidate;
+        }
+        budget = budget.saturating_sub(excess);
     }
 }
 
@@ -1214,6 +1249,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn explicit_speech_budget_matches_core_middle_truncation() {
+        assert_eq!(bounded_speech(&"x".repeat(4_000)), "x".repeat(4_000));
+        assert_eq!(
+            bounded_speech(&"x".repeat(4_001)),
+            format!(
+                "{}…7 tokens truncated…{}",
+                "x".repeat(1_988),
+                "x".repeat(1_988)
+            )
+        );
+        for text in ["🦊".repeat(2_000), "a".repeat(100_000)] {
+            let result = bounded_speech(&text);
+            assert!(result.len() <= REALTIME_OUTPUT_BYTE_LIMIT);
+            assert!(result.contains("tokens truncated"));
+        }
+    }
+
+    #[test]
+    fn close_finishes_both_partial_captions_once_and_preserves_tail() {
+        let mut voice = BrowserVoiceProtocol::new("cove").unwrap();
+        voice.realtime_message(r#"{"type":"input_transcript.added","item":{"text":"hello"}}"#);
+        voice.realtime_message(r#"{"type":"output_transcript.added","item":{"text":"hi"}}"#);
+        let close = voice.close_effects();
+        assert_eq!(close.transcripts.len(), 2);
+        assert!(close.transcripts.iter().all(|entry| !entry.is_partial));
+        assert!(voice.close_effects().transcripts.is_empty());
+        assert_eq!(voice.take_transcript_tail().len(), 2);
+    }
+
+    #[test]
     fn malformed_turn_done_does_not_complete_an_active_caption() {
         for client_managed in [false, true] {
             let mut protocol = BrowserVoiceProtocol::new("cove").unwrap();
@@ -1278,7 +1343,14 @@ mod tests {
         voice.frames_sent(3);
         assert!(voice.sideband_opened().frames.is_empty());
         for invalid in [" ".to_owned(), "bad\0text".to_owned()] {
-            assert!(voice.append_speech(&invalid).is_err());
+            if invalid.trim().is_empty() {
+                assert_eq!(
+                    voice.append_speech(&invalid).unwrap(),
+                    BrowserVoiceEffects::default()
+                );
+            } else {
+                assert!(voice.append_speech(&invalid).is_err());
+            }
             assert!(voice.append_text(VoiceTextRole::User, &invalid).is_err());
         }
         let long = "🦊".repeat(4096);
@@ -1297,7 +1369,16 @@ mod tests {
                     text.to_owned()
                 })
                 .collect::<String>();
-            assert_eq!(chunks, long);
+            if effects
+                .frames
+                .iter()
+                .any(|frame| frame.contains("speakable"))
+            {
+                assert_eq!(chunks, bounded_speech(&long));
+                assert!(chunks.len() <= REALTIME_OUTPUT_BYTE_LIMIT);
+            } else {
+                assert_eq!(chunks, long);
+            }
             voice.frames_sent(effects.frames.len());
         }
         for role in [
