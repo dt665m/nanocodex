@@ -460,7 +460,13 @@ function createCellBinding(
     const screen = resolveScreenTool(machine.id, context);
     const upstreamCua = resolveMachineTool(machine.id, CUA_JS_NAME, context);
     const upstreamReset = resolveMachineTool(machine.id, CUA_RESET_NAME, context);
+    // A retained/legacy route can expose handlers without discovered contracts.
+    // Such a pair must not hide a controllable screen during provider discovery.
     const upstream = upstreamCua !== undefined && upstreamReset !== undefined
+      && (screen === undefined || [upstreamCua, upstreamReset].every(tool =>
+        typeof tool.definition?.description === "string"
+        && tool.definition.parameters !== null
+        && typeof tool.definition.parameters === "object"))
       ? { cua: upstreamCua, cuaReset: upstreamReset } : undefined;
     const fallback = upstream === undefined && screen !== undefined
       ? nativeScreenCua(screen) : undefined;

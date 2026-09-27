@@ -61,6 +61,31 @@ describe("cwd-root namespace execution", () => {
     expect(screen).toHaveBeenLastCalledWith({ action: "release" }, expect.anything());
   });
 
+  it("falls back when both upstream handlers lack discovered contracts", async () => {
+    const upstream = vi.fn();
+    const screen = vi.fn();
+    const definition = { description: "Native desktop", parameters: {
+      type: "object", properties: { action: { enum: ["observe", "release"] } }, required: ["action"],
+    } };
+    const runtime = createNamespaceExecutionRuntime(
+      () => [{ id: "screen", workspace: "/workspace" }],
+      (_id, name) => name === CUA_JS_NAME || name === CUA_RESET_NAME
+        ? { handler: upstream } : undefined,
+      undefined, () => ({ handler: screen, definition }),
+    );
+    await expect(runtime.tools[CUA_JS_NAME]!.handler({ workdir: "/screen" }, context()))
+      .resolves.toMatchObject({ definitions: [
+        expect.objectContaining({ parameters: definition.parameters }),
+        expect.objectContaining({ parameters: { type: "object", properties: {}, additionalProperties: false } }),
+      ] });
+    expect(screen).not.toHaveBeenCalled();
+    await runtime.tools[CUA_JS_NAME]!.handler({ workdir: "/screen", action: "observe" }, context());
+    await runtime.tools[CUA_RESET_NAME]!.handler({ workdir: "/screen" }, context());
+    expect(screen).toHaveBeenNthCalledWith(1, { action: "observe" }, expect.anything());
+    expect(screen).toHaveBeenNthCalledWith(2, { action: "release" }, expect.anything());
+    expect(upstream).not.toHaveBeenCalled();
+  });
+
   it("returns discovered provider instructions and accepts provider-owned schemas", async () => {
     const handler = vi.fn();
     const screen = vi.fn();
