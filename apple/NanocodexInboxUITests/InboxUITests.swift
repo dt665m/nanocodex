@@ -15,10 +15,10 @@ final class InboxUITests: XCTestCase {
         XCTAssertTrue(app.buttons["Retry"].waitForExistence(timeout: 10))
         app.buttons["Retry"].tap()
         XCTAssertTrue(app.buttons["crm-record-alex"].waitForExistence(timeout: 10))
-        app.segmentedControls.buttons["Companies"].tap()
+        app.buttons["crm-filter-company"].tap()
         XCTAssertTrue(app.buttons["crm-record-studio"].waitForExistence(timeout: 5))
         XCTAssertFalse(app.buttons["crm-record-alex"].exists)
-        app.segmentedControls.buttons["People"].tap()
+        app.buttons["crm-filter-person"].tap()
         XCTAssertTrue(app.buttons["crm-record-alex"].waitForExistence(timeout: 5))
         let search = app.textFields["crm-search"]
         search.tap(); search.typeText("missing")

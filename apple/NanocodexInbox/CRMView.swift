@@ -18,10 +18,10 @@ struct CRMView: View {
         List {
             Section {
                 Text("CRM").font(.largeTitle.bold())
-                Picker("Records", selection: $kind) {
-                    Text("People").tag("person")
-                    Text("Companies").tag("company")
-                }.pickerStyle(.segmented)
+                HStack(spacing: 8) {
+                    filterButton("People", value: "person")
+                    filterButton("Companies", value: "company")
+                }
                 TextField("Search CRM", text: $query)
                     .textInputAutocapitalization(.never)
                     .accessibilityIdentifier("crm-search")
@@ -53,6 +53,18 @@ struct CRMView: View {
             await load(more: false)
         }
         .refreshable { revision += 1 }
+    }
+
+    private func filterButton(_ title: String, value: String) -> some View {
+        Button { kind = value } label: {
+            Text(title).font(.subheadline.weight(.medium))
+                .frame(maxWidth: .infinity).padding(.vertical, 8)
+                .background(kind == value ? Color.accentColor.opacity(0.15) : Color.clear,
+                            in: RoundedRectangle(cornerRadius: 8))
+        }
+        .buttonStyle(.borderless)
+        .accessibilityAddTraits(kind == value ? .isSelected : [])
+        .accessibilityIdentifier("crm-filter-\(value)")
     }
 
     @MainActor private func load(more: Bool) async {
