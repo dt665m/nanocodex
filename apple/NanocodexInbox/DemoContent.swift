@@ -476,7 +476,9 @@ private final class StartupFixtureProtocol: URLProtocol, @unchecked Sendable {
         }
         if historyMedia {
             let slot = (cursor - 1) % historyPageSize
-            let call = "history-image-\((cursor - 1) / historyPageSize * 3 + max(0, slot - 121) / 2 + 1)"
+            let pageOffset: Int = (cursor - 1) / historyPageSize * 3
+            let imageOffset: Int = max(0, slot - 121) / 2
+            let call = "history-image-\(pageOffset + imageOffset + 1)"
             if slot >= 121 && slot <= 126 {
                 let index = (cursor - 1) / historyPageSize * 3 + (slot - 121) / 2 + 1
                 let type = slot % 2 == 1 ? "tool.call" : "tool.result"
