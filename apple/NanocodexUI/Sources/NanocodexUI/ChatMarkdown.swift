@@ -37,8 +37,10 @@ private struct ChatMarkdownContent: View, Equatable {
             }
         }
         .frame(maxWidth: compact ? nil : .infinity, alignment: .leading)
-        .task(id: text) { renderer.update(text) }
-        .onDisappear { renderer.cancel() }
+        .onChange(of: text) { _, source in renderer.update(source) }
+        // A native collection can prefetch then temporarily detach a host.
+        // Finish its bounded parse so reattachment has formatted content; there
+        // is no ongoing subscription once the latest source has been parsed.
     }
 }
 
@@ -192,6 +194,10 @@ final class ChatMarkdownRenderer: ObservableObject {
 
     init(initialSource: String = "") {
         rendered = ChatMarkdownSnapshotCache.shared.snapshot(for: initialSource)
+        // UIHostingConfiguration can size a prefetched host before SwiftUI runs
+        // its appearance task. Start cold parsing when the owned renderer is
+        // created, so a reused cell cannot remain an empty placeholder.
+        if rendered == nil, !initialSource.isEmpty { update(initialSource) }
     }
 
     func update(_ text: String) {

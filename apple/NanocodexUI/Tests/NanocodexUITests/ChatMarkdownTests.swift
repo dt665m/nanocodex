@@ -62,6 +62,19 @@ final class ChatMarkdownTests: XCTestCase {
         XCTAssertTrue(renderer.rendered?.content.renderHTML().contains("<strong>formatted</strong>") == true)
     }
 
+    @MainActor
+    func testColdRendererParsesBeforeNativeCellAppearance() async throws {
+        let source = "## Cold cell " + UUID().uuidString
+        let renderer = ChatMarkdownRenderer(initialSource: source)
+        defer { renderer.cancel() }
+        let deadline = Date().addingTimeInterval(2)
+        while renderer.rendered == nil, Date() < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(renderer.rendered?.source, source,
+                       "A prefetched native host cannot depend on SwiftUI appearance to start parsing")
+    }
+
     func testInlineMarkdownImagesDoNotLoad() async {
         do {
             _ = try await ChatMarkdownInlineImageProvider().image(

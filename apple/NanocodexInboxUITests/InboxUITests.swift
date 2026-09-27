@@ -3060,7 +3060,7 @@ final class InboxUITests: XCTestCase {
     }
 
     func testLongThreadKeepsPlaceAcrossUpdatesHistoryAndForeground() {
-        let app = launch(["NANOCODEX_DEMO_LONG_THREAD": "1", "NANOCODEX_DEMO_HISTORY_DELAY_MS": "6000"]); selectInbox(app)
+        let app = launch(["NANOCODEX_DEMO_LONG_THREAD": "1", "NANOCODEX_DEMO_HISTORY_DELAY_MS": "6000", "NANOCODEX_RENDER_COUNTER": "1"]); selectInbox(app)
 
         XCTAssertTrue(app.descendants(matching: .any)["conversation"].firstMatch.waitForExistence(timeout: 5))
         let conversation = app.descendants(matching: .any)["conversation"].firstMatch
@@ -3089,9 +3089,19 @@ final class InboxUITests: XCTestCase {
         // catching a transient progress indicator after the request finished.
         XCTAssertTrue(loading.exists || earlier.exists, "Reaching earlier history loads the next page automatically")
         if loading.exists {
-            let first = conversation.staticTexts.allElementsBoundByIndex.first {
-                $0.isHittable && $0.label.hasPrefix("Progress note ") && $0.frame.minY >= conversation.frame.minY
-            }!
+            var visibleAnchor: XCUIElement?
+            let materialized = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+                visibleAnchor = conversation.staticTexts.allElementsBoundByIndex.first {
+                    $0.isHittable && $0.label.hasPrefix("Progress note ") && $0.frame.minY >= conversation.frame.minY
+                }
+                return visibleAnchor != nil
+            }, object: nil)
+            guard XCTWaiter.wait(for: [materialized], timeout: 3) == .completed,
+                  let first = visibleAnchor else {
+                capture(app, "history-loading-missing-anchor")
+                return XCTFail("Existing messages must remain readable while older history loads: "
+                    + app.staticTexts["conversation-native-scroll-state"].label + "\n" + conversation.debugDescription)
+            }
             let firstLabel = first.label
             let before = first.frame.minY
             gone(loading)
