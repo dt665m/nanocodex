@@ -7,6 +7,30 @@ final class InboxUITests: XCTestCase {
     }
     override func setUp() { super.setUp(); continueAfterFailure = false }
 
+    // A wide markdown table must not widen the transcript or hide the final
+    // paragraph beneath the composer, before or after the keyboard appears.
+    func testWideTableKeepsTailAboveComposer() {
+        let app = launch(["NANOCODEX_DEMO_WIDE_TABLE": "1"])
+        let input = composer(app)
+        let tail = app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "End of table review")).firstMatch
+        XCTAssertTrue(tail.waitForExistence(timeout: 10))
+        let table = app.scrollViews["markdown-table"].firstMatch
+        XCTAssertTrue(table.waitForExistence(timeout: 5))
+        table.swipeLeft()
+        let license = table.staticTexts["License"]
+        XCTAssertTrue(license.isHittable, "The final column must be reachable inside the table")
+        capture(app, "wide-table-final-columns")
+        table.swipeRight()
+        for typing in [false, true] {
+            if typing { input.tap(); input.typeText("Keep this draft") }
+            let visibleTail = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+                tail.exists && tail.frame.maxY <= input.frame.minY && tail.frame.minX >= app.frame.minX && tail.frame.maxX <= app.frame.maxX
+            }, object: nil)
+            XCTAssertEqual(XCTWaiter.wait(for: [visibleTail], timeout: 5), .completed)
+            capture(app, typing ? "wide-table-keyboard" : "wide-table-idle")
+        }
+    }
+
     func testSelectionBarStaysBelowComposerWhileTyping() {
         let app = launch()
         let input = composer(app)
@@ -1007,7 +1031,7 @@ final class InboxUITests: XCTestCase {
     private func launch(_ environment: [String: String] = [:], arguments: [String] = []) -> XCUIApplication {
         let app = XCUIApplication()
         app.launchArguments = ["--demo"] + arguments
-        app.launchEnvironment = ["NANOCODEX_DEMO_COMPLETE_AFTER_MS": "120000", "NANOCODEX_DEMO_DELAY_MS": "600"].merging(environment) { _, new in new }
+        app.launchEnvironment = ["NANOCODEX_DEMO_PROFILE": UUID().uuidString, "NANOCODEX_DEMO_COMPLETE_AFTER_MS": "120000", "NANOCODEX_DEMO_DELAY_MS": "600"].merging(environment) { _, new in new }
         app.launch()
         XCTAssertTrue(app.buttons["conversation-drawer-open"].waitForExistence(timeout: 10))
         if environment["NANOCODEX_DEMO_EMPTY_AGENTS"] != "1" {
@@ -2304,9 +2328,12 @@ final class InboxUITests: XCTestCase {
         XCTAssertTrue(card.staticTexts["First item"].exists)
         XCTAssertFalse(card.staticTexts["# Markdown check"].exists)
         capture(app, "markdown-inbox")
-        for _ in 0..<3 {
+        for _ in 0..<12 {
             if card.buttons["Copy code"].isHittable { break }
-            card.swipeUp()
+            // Short drags locate the code header without flinging past it as
+            // renderer typography and the keyboard-safe viewport change.
+            card.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.7))
+                .press(forDuration: 0.01, thenDragTo: card.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)))
         }
         XCTAssertTrue(card.buttons["Copy code"].isHittable)
         XCTAssertTrue(card.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "let marker = \"**literal**\"")).firstMatch.exists)
@@ -2333,13 +2360,17 @@ final class InboxUITests: XCTestCase {
         let latest = conversation.staticTexts["Review note 80"]
         XCTAssertTrue(latest.waitForExistence(timeout: 5))
         XCTAssertTrue(latest.isHittable, "Lazy rich messages must open at the latest reply")
-        let initialY = latest.frame.minY
         capture(app, "long-markdown-before-keyboard")
         composer(app).tap()
         composer(app).typeText("Keep the latest reply in view")
         capture(app, "long-markdown-after-keyboard")
-        XCTAssertTrue(latest.isHittable)
-        XCTAssertEqual(latest.frame.minY, initialY, accuracy: 4, "Opening the keyboard retains the visible reply")
+        // Following keeps the reply's tail above the keyboard. The heading of
+        // a reply taller than this viewport may legitimately move offscreen.
+        // Reading-anchor stability is exercised separately while browsing history.
+        let tail = conversation.staticTexts.matching(NSPredicate(format: "label == %@", "Retained")).allElementsBoundByIndex.last
+        XCTAssertNotNil(tail)
+        XCTAssertTrue(tail?.isHittable == true)
+        XCTAssertLessThanOrEqual(tail?.frame.maxY ?? .infinity, composer(app).frame.minY)
         capture(app, "long-markdown-latest-with-keyboard")
 
         XCTAssertEqual(composer(app).value as? String, "Keep the latest reply in view")

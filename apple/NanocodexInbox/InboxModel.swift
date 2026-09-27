@@ -235,6 +235,22 @@ final class InboxModel: ObservableObject {
     private var eventsRevision = UUID()
     private var projectedFirstCursor: Cursor?
     private let preferences = InboxPreferencesWriter()
+    private var outboxStore: MobileOutboxStore?
+    private var outboxRestoredScope: String?
+    private var committedOutbox: MobileOutboxStore.Snapshot?
+    private var outboxPersistenceError: Error?
+
+    private func durableOutbox() throws -> MobileOutboxStore {
+        if let outboxStore { return outboxStore }
+        let store = try MobileOutboxStore.applicationStore()
+        outboxStore = store
+        return store
+    }
+
+    private func requireDurableOutbox() throws {
+        if let outboxPersistenceError { throw outboxPersistenceError }
+        guard outboxRestoredScope == scope else { throw CocoaError(.coderReadCorrupt) }
+    }
     private var eventBytes: [Int] = []
     private var retainedBytes = 0
     private var projection: Task<Void, Never>?
@@ -811,6 +827,8 @@ final class InboxModel: ObservableObject {
             UserDefaults.standard.set(id, forKey: "inbox.lockedVoiceLastTarget." + scope)
         }
         persist()
+        // Retain voice recovery if the durable command checkpoint failed.
+        guard outboxPersistenceError == nil, outboxRestoredScope == scope else { return }
         // Keep the journal until the normal preferences write has completed.
         Task { [preferences] in
             await preferences.flush()
@@ -884,6 +902,7 @@ final class InboxModel: ObservableObject {
             try Task.checkCancellation()
             guard generation == epoch, scope == expected,
                   pending.first(where: { $0.id == captureID })?.phase == .submitting else { throw CancellationError() }
+            try requireDurableOutbox()
             let receipt = try await client.command(current.submission)
             guard generation == epoch, scope == expected else { throw APIError.invalidCredential }
             guard receipt["turn_id"].string == captureID,
@@ -1184,7 +1203,7 @@ final class InboxModel: ObservableObject {
         }
         let retainedImages = Set((Array(attachmentDrafts.values).flatMap { $0 } + pending.flatMap { $0.attachments ?? [] }).map(\.id))
         if let store = try? AttachmentStore(scope: scope) {
-            try? store.prune(keeping: retainedImages)
+            if outboxRestoredScope == scope { try? store.prune(keeping: retainedImages) }
             for attachment in Array(attachmentDrafts.values).flatMap({ $0 }) + pending.flatMap({ $0.attachments ?? [] }) {
                 cacheAttachment(attachment, scope: scope)
             }
@@ -1335,6 +1354,7 @@ final class InboxModel: ObservableObject {
         for task in attachmentProviderTasks.values { task.cancel() }
         attachmentProviderTasks = [:]
         attachmentDrafts = [:]; attachmentURLs = [:]; attachmentMovieURLs = [:]; attachmentImports = [:]; attachmentErrors = [:]
+        outboxRestoredScope = nil; committedOutbox = nil; outboxPersistenceError = nil
         scope = ""; error = nil; notice = nil; busy = []; retries = [:]; refreshing = false
         newerAfter = nil; latestJumpEvents = nil
         hasOlder = false; hasNewer = false; additionalHistoryGaps = []; loadingOlder = false; loadingNewer = false; followingLatest = true; connection = "Disconnected"; pending = []; pinnedThreadID = nil; demoRows = [:]; demoFaults = []
@@ -2733,6 +2753,7 @@ final class InboxModel: ObservableObject {
                       pending[pendingIndex].phase != .cancelling else { throw CancellationError() }
                 let usePhone = pending[pendingIndex].resolveAttachmentTransport(phoneEnabled: deviceHandEnabled)
                 persist()
+                try requireDurableOutbox()
                 await preferences.flush()
                 guard generation == epoch, !Task.isCancelled else { throw CancellationError() }
                 var retained = attachments
@@ -3110,18 +3131,24 @@ final class InboxModel: ObservableObject {
         if pending.count != previousCount { persist() }
     }
     private func restorePending() {
-        if let data = UserDefaults.standard.data(forKey: "inbox.pending." + scope),
-           let saved = try? JSONDecoder().decode([PendingMessage].self, from: data) {
-            pending = saved
+        do {
+            let saved = try durableOutbox().restore(scope: scope)
+            pending = saved.pending
+            cancellations = saved.cancellations
+            steeringTransfers = saved.steeringTransfers
+            pendingCreations = saved.pendingCreations
+            outboxRestoredScope = scope
+            committedOutbox = saved
+            outboxPersistenceError = nil
             for index in pending.indices { pending[index].restore() }
-        }
-        if let data = UserDefaults.standard.data(forKey: "inbox.cancellations." + scope) {
-            cancellations = (try? JSONDecoder().decode([PendingTurnCancellation].self, from: data)) ?? []
             for index in cancellations.indices { cancellations[index].error = nil }
-        }
-        if let data = UserDefaults.standard.data(forKey: "inbox.steering." + scope) {
-            steeringTransfers = (try? JSONDecoder().decode([SteeringTransfer].self, from: data)) ?? []
             for index in steeringTransfers.indices { steeringTransfers[index].restore() }
+        } catch {
+            outboxRestoredScope = nil
+            committedOutbox = nil
+            outboxPersistenceError = error
+            self.error = "Could not restore pending commands: " + error.localizedDescription
+            return
         }
         // A crash can occur after the steering acknowledgement is persisted but
         // before its source leaves pending. Complete that local bookkeeping.
@@ -3141,6 +3168,7 @@ final class InboxModel: ObservableObject {
         }
     }
     private func execute(_ command: AgentCommand) async throws -> JSON {
+        try requireDurableOutbox()
         voice.noteTypedInput(conversationID: command.agentID)
         if isDemo {
             let delayKey = command.kind == .stop ? "NANOCODEX_DEMO_CANCEL_DELAY_MS" : command.kind == .steer ? "NANOCODEX_DEMO_STEER_DELAY_MS" : "NANOCODEX_DEMO_DELAY_MS"
@@ -3304,12 +3332,14 @@ final class InboxModel: ObservableObject {
     }
     func retryCreation() {
         guard let id = focused?.id, pendingCreations.contains(id) else { return }
+        persist()
         prepareAgent(id)
     }
     private func prepareAgent(_ id: String) {
         Task { _ = try? await readyAgent(id) }
     }
     private func readyAgent(_ localID: String) async throws -> String {
+        try requireDurableOutbox()
         if let id = createdAgentIDs[localID] { return id }
         guard pendingCreations.contains(localID) else { return localID }
         if let task = creationTasks[localID] { return try await task.value }
@@ -3393,7 +3423,6 @@ final class InboxModel: ObservableObject {
         persist(); observeFocused()
     }
     private func restoreCreations() {
-        pendingCreations = Set(UserDefaults.standard.stringArray(forKey: "inbox.creations." + scope) ?? [])
         cards.insert(contentsOf: pendingCreations.sorted().map(newConversationCard), at: 0)
     }
     private func persist() {
@@ -3401,7 +3430,21 @@ final class InboxModel: ObservableObject {
         let scope = scope, drafts = drafts, attachmentDrafts = attachmentDrafts, seen = seen
         let closedConversationIDs = closedConversationIDs
         let selectedContext = selectedContext, excludedContext = excludedContext
-        let pending = pending, cancellations = cancellations, steeringTransfers = steeringTransfers, pendingCreations = pendingCreations
+        do {
+            guard outboxRestoredScope == scope else { throw outboxPersistenceError ?? CocoaError(.coderReadCorrupt) }
+            let snapshot = MobileOutboxStore.Snapshot(pending: pending, cancellations: cancellations,
+                                                     steeringTransfers: steeringTransfers, pendingCreations: pendingCreations)
+            // Draft typing also calls persist. Only changed command state needs
+            // JSON encoding and a synchronous SQLite durability checkpoint.
+            if committedOutbox != snapshot {
+                try durableOutbox().save(snapshot, scope: scope)
+                committedOutbox = snapshot
+            }
+            outboxPersistenceError = nil
+        } catch {
+            outboxPersistenceError = error
+            self.error = "Could not save pending commands: " + error.localizedDescription
+        }
         let isDemo = isDemo, demoRows = demoRows
         let demoTurns = isDemo ? Dictionary(uniqueKeysWithValues: cards.map { ($0.id, $0.activeTurns) }) : [:]
         preferences.enqueue { defaults in
@@ -3411,10 +3454,6 @@ final class InboxModel: ObservableObject {
             defaults.set(seen, forKey: "inbox.seen." + scope)
             defaults.set(selectedContext, forKey: "inbox.contextSelection." + scope)
             defaults.set(excludedContext, forKey: "inbox.contextExclusions." + scope)
-            if let data = try? JSONEncoder().encode(pending) { defaults.set(data, forKey: "inbox.pending." + scope) }
-            if let data = try? JSONEncoder().encode(cancellations) { defaults.set(data, forKey: "inbox.cancellations." + scope) }
-            if let data = try? JSONEncoder().encode(steeringTransfers) { defaults.set(data, forKey: "inbox.steering." + scope) }
-            defaults.set(Array(pendingCreations), forKey: "inbox.creations." + scope)
             if isDemo {
                 if let data = try? JSONEncoder().encode(demoRows) { defaults.set(data, forKey: "inbox.demoRows." + scope) }
                 defaults.set(demoTurns, forKey: "inbox.demoTurns." + scope)
@@ -3438,6 +3477,7 @@ final class InboxModel: ObservableObject {
         scope = "demo." + (ProcessInfo.processInfo.environment["NANOCODEX_DEMO_PROFILE"] ?? "default")
         closedConversationIDs = Set(UserDefaults.standard.stringArray(forKey: "inbox.closedTabs." + scope) ?? [])
         cards = DemoContent.cards()
+        restorePending()
         #if DEBUG
         if ProcessInfo.processInfo.environment["NANOCODEX_DEMO_COMPOSER_PHOTOS"] == "1",
            let prepared = try? DemoContent.composerPhotoFixtures(), let store = try? AttachmentStore(scope: scope) {
@@ -3450,7 +3490,6 @@ final class InboxModel: ObservableObject {
         #endif
         if let profile = ProcessInfo.processInfo.environment["NANOCODEX_DEMO_PROFILE"] {
             scope = "demo." + profile
-            restorePending()
             drafts = UserDefaults.standard.dictionary(forKey: "inbox.drafts." + scope) as? [String: String] ?? [:]
             if let data = UserDefaults.standard.data(forKey: "inbox.demoRows." + scope) { demoRows = (try? JSONDecoder().decode([String: [TranscriptRow]].self, from: data)) ?? [:] }
             if let turns = UserDefaults.standard.dictionary(forKey: "inbox.demoTurns." + scope) as? [String: [String]] {

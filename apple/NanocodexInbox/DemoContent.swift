@@ -85,7 +85,7 @@ enum DemoContent {
                 | --- | --- |
                 | **Result** | `42` |
 
-                """ + String(repeating: "Keep the beginning of this long response intact. ", count: 35)
+                """ + "\n\n" + String(repeating: "Keep the beginning of this long response intact. ", count: 35)
             }
             card.latestCursor = Cursor(rawValue: "12")!; card.stateCursor = card.latestCursor
             if value.2 == "Running" { card.activeTurns = ["demo-turn-" + value.0] }
@@ -277,6 +277,19 @@ enum DemoContent {
         if ProcessInfo.processInfo.environment["NANOCODEX_DEMO_LOCAL_PHOTOS"] == "1" { return localPhotoRows() }
         #endif
         if ProcessInfo.processInfo.environment["NANOCODEX_DEMO_GENERATED_OUTPUTS"] == "1" { return generatedOutputRows() }
+        if ProcessInfo.processInfo.environment["NANOCODEX_DEMO_WIDE_TABLE"] == "1" {
+            return [.init(id: "wide-table", role: "Agent", text: """
+            ## Library review
+
+            | Library | Replaces | Mobile behavior | License |
+            | --- | --- | --- | --- |
+            | MarkdownUI | Custom Markdown parser and table layout | Long descriptive cells wrap; wide tables scroll horizontally | MIT |
+            | Nuke | Duplicate attachment download and thumbnail caches | Shared decoding, cancellation and bounded image memory | MIT |
+            | GRDB | Separate pending-command preference writes | Atomic recovery of messages and steering after restart | MIT |
+
+            End of table review. The final paragraph remains above the composer.
+            """)]
+        }
         if ProcessInfo.processInfo.environment["NANOCODEX_DEMO_RENDER_PROFILE"] == "1" {
             // Keep the default fixture stable; allow deterministic long-session
             // profiling without account data or a live managed turn.
@@ -476,7 +489,9 @@ private final class StartupFixtureProtocol: URLProtocol, @unchecked Sendable {
         }
         if historyMedia {
             let slot = (cursor - 1) % historyPageSize
-            let call = "history-image-\((cursor - 1) / historyPageSize * 3 + max(0, slot - 121) / 2 + 1)"
+            let pageOffset: Int = ((cursor - 1) / historyPageSize) * 3
+            let imageOffset: Int = max(0, slot - 121) / 2
+            let call = "history-image-\(pageOffset + imageOffset + 1)"
             if slot >= 121 && slot <= 126 {
                 let index = (cursor - 1) / historyPageSize * 3 + (slot - 121) / 2 + 1
                 let type = slot % 2 == 1 ? "tool.call" : "tool.result"

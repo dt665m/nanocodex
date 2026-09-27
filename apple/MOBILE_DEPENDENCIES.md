@@ -1,0 +1,34 @@
+# Mobile open-source dependencies
+
+These integrations use free, open-source libraries without a paid SDK or service requirement. Versions are pinned in the Xcode project, `InboxCore/Package.swift`, and `NanocodexUI/Package.swift`; the corresponding `Package.resolved` files record exact revisions.
+
+| Library | Version | Use | License |
+| --- | --- | --- | --- |
+| [MarkdownUI](https://github.com/gonzalezreal/swift-markdown-ui) | 2.4.1 | SwiftUI Markdown rendering | MIT |
+| [Nuke](https://github.com/kean/Nuke) | 13.2.0 | Image loading and caching | MIT |
+| [GRDB](https://github.com/groue/GRDB.swift) | 7.8.0 | SQLite-backed mobile outbox | MIT, with bundled notices |
+| [DSWaveformImage](https://github.com/dmrschmidt/DSWaveformImage) | 14.5.0 | Audio waveform rendering | MIT |
+
+MarkdownUI is a maintenance dependency; keep its renderer behind the app's adapter and review upstream maintenance before upgrading.
+
+## Transitive dependencies and notices
+
+MarkdownUI's runtime products use NetworkImage 6.0.1 (MIT) and swift-cmark 0.9.0 (`cmark-gfm` and `cmark-gfm-extensions`). cmark includes BSD and MIT component notices; its complete `COPYING` also describes separately licensed test/specification material that is not part of those runtime targets. MarkdownUI's SnapshotTesting dependency is for upstream tests, not the application product.
+
+
+GRDB's standard SwiftPM product uses the platform SQLite library through `GRDBSQLite`, not its optional custom SQLite source tree. GRDB includes MIT inflection-rule notices and Swift-derived code under Apache-2.0 with Runtime Library Exception. Nuke and DSWaveformImage declare no external runtime package dependencies.
+
+[Full third-party notices](MOBILE_DEPENDENCY_NOTICES.md) preserve the checked-out copyright, permission, and disclaimer texts, including bundled components. The app bundles this notices file for its Settings licenses link. Preserve it in source distributions and materials accompanying redistributed binaries. Refresh notices when changing package versions.
+
+## Setup
+
+Use Xcode 26.2 / Swift 6.2 for these pins. Follow the app's deployment target and signing instructions in [README.md](README.md#run). Open `apple/NanocodexInbox.xcodeproj` and select the `NanocodexInbox` scheme. Swift Package Manager resolves the linked products; GRDB is also declared by the local InboxCore package.
+
+From the repository root, resolve the app packages through the shared-machine Xcode guard:
+
+```sh
+scripts/xcodebuild-guard.sh -resolvePackageDependencies \
+  -project apple/NanocodexInbox.xcodeproj -scheme NanocodexInbox
+```
+
+Keep the committed resolution files with dependency updates so transitive versions remain reproducible. These libraries do not require license keys or paid accounts.
