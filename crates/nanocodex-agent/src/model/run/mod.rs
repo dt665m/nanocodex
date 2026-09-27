@@ -13,7 +13,7 @@ use tool_calls::*;
 
 use std::{
     any::Any,
-    collections::{HashMap, VecDeque},
+    collections::{BTreeSet, HashMap, VecDeque},
     panic::AssertUnwindSafe,
     path::Path,
     sync::{Arc, Mutex},
@@ -176,6 +176,7 @@ pub(crate) struct ModelCheckpoint {
     preserve_inherited_delta: bool,
     global_instructions: Option<Arc<str>>,
     context_baseline: ContextBaseline,
+    source_staged_calls: BTreeSet<String>,
     pending_late_wake: Option<String>,
     pending_late_jobs: Vec<LateWakeJob>,
     pending_late_batch: Option<PendingLateBatch>,
@@ -275,6 +276,15 @@ impl ModelCheckpoint {
         self.pending_late_batch = batch;
     }
 
+    pub(crate) const fn source_staged_calls(&self) -> &BTreeSet<String> {
+        &self.source_staged_calls
+    }
+
+    pub(crate) fn restore_source_staged_calls(&mut self, calls: BTreeSet<String>) {
+        self.source_staged_calls = calls.clone();
+        self.conversation.source_staged_calls = calls;
+    }
+
     pub(crate) fn snapshot_history(&self) -> Vec<ResponseItem> {
         self.conversation.flattened_history()
     }
@@ -315,6 +325,7 @@ impl ModelCheckpoint {
             preserve_inherited_delta: false,
             global_instructions,
             context_baseline,
+            source_staged_calls: BTreeSet::new(),
             pending_late_wake: None,
             pending_late_jobs: Vec::new(),
             pending_late_batch: None,
@@ -518,6 +529,7 @@ impl<S> ModelRun<S> {
             preserve_inherited_delta: true,
             global_instructions: self.global_instructions.clone(),
             context_baseline: session.context.baseline(),
+            source_staged_calls: session.conversation.source_staged_calls.clone(),
             pending_late_wake: session.pending_late_wake.clone(),
             pending_late_jobs: session.pending_late_jobs.clone(),
             pending_late_batch: session.pending_late_batch.clone(),

@@ -49,7 +49,7 @@ const bound = (value: string) => value.length > MAX_STATUS_RESULT ? `${value.sli
 
 type Job = { id: string; invocation: string; original_turn: string; execution_turn: string | null; call_id: string | null;
   tool: string; args: string; state: string; result: string | null; attempts: number; started_at: number | null; created_at: number;
-  terminal_state: string | null; delivered_at: number | null; continuation_started: number | null; wake_generation: number; lease_id: string | null; context_json: string | null; replay_safe: number; ready_at: number | null; };
+  terminal_state: string | null; delivered_at: number | null; continuation_started: number | null; wake_generation: number; lease_id: string | null; context_json: string | null; replay_safe: number; ready_at: number | null; stage_probe_at: number | null; };
 type StatusRow = Pick<Job, "id" | "state" | "tool" | "result" | "continuation_started">;
 // SQLite substr counts code points, while JS bound() counts UTF-16 code units.
 // Fetch one *extra code point*: it is always enough for bound() to retain the
@@ -73,6 +73,7 @@ export type FinalToolResultReceipt = Readonly<{ operation_id: string; call_id: s
 export type DeliverFinalToolResult = (intent: FinalToolResultIntent) => Promise<unknown>;
 export type DeliverFinalToolResults = (intents: readonly FinalToolResultIntent[]) => Promise<unknown>;
 export type OutputStatus = (intent: FinalToolResultIntent) => Promise<unknown>;
+export type SourceStageStatus = (originalTurn: string, callId: string) => Promise<boolean>;
 export class TypedIngestionUnavailable extends Error {
   constructor() { super("typed same-call-ID result ingestion is not available"); }
 }
@@ -97,13 +98,14 @@ export class AsyncJobs {
     private readonly idleOutputStatus?: OutputStatus,
     private readonly deliverIdleBatch?: DeliverFinalToolResults,
     private readonly maxDatabaseBytes = MAX_ASYNC_DATABASE_BYTES,
-    private readonly maxImmutableBytes = MAX_ASYNC_IMMUTABLE_BYTES) {
+    private readonly maxImmutableBytes = MAX_ASYNC_IMMUTABLE_BYTES,
+    private readonly sourceStageStatus?: SourceStageStatus) {
     storage.sql.exec(`CREATE TABLE IF NOT EXISTS async_jobs (
       id TEXT PRIMARY KEY, invocation TEXT NOT NULL UNIQUE, original_turn TEXT NOT NULL,
       execution_turn TEXT, call_id TEXT, tool TEXT NOT NULL, args TEXT NOT NULL,
       state TEXT NOT NULL, result TEXT, terminal_state TEXT, attempts INTEGER NOT NULL DEFAULT 0,
       started_at INTEGER, created_at INTEGER NOT NULL, delivered_at INTEGER, continuation_started INTEGER, wake_generation INTEGER NOT NULL DEFAULT -1, lease_id TEXT, context_json TEXT, replay_safe INTEGER NOT NULL DEFAULT 0,
-      integration_probe_epoch TEXT, ready_at INTEGER
+      integration_probe_epoch TEXT, ready_at INTEGER, stage_probe_at INTEGER
     )`);
     // Pilot rows used synthetic user turns, not typed tool results. Preserve
     // their status but never replay them into the new same-call-ID path.
@@ -111,7 +113,7 @@ export class AsyncJobs {
       .toArray().map(column => column.name));
     this.legacyContinuationColumn = columns.has("continuation_turn");
     for (const [name, kind] of [["execution_turn", "TEXT"], ["call_id", "TEXT"], ["delivered_at", "INTEGER"], ["continuation_started", "INTEGER"], ["wake_generation", "INTEGER NOT NULL DEFAULT -1"], ["lease_id", "TEXT"], ["context_json", "TEXT"], ["replay_safe", "INTEGER NOT NULL DEFAULT 0"],
-      ["integration_probe_epoch", "TEXT"], ["ready_at", "INTEGER"]] as const) {
+      ["integration_probe_epoch", "TEXT"], ["ready_at", "INTEGER"], ["stage_probe_at", "INTEGER"]] as const) {
       if (!columns.has(name)) storage.sql.exec(`ALTER TABLE async_jobs ADD COLUMN ${name} ${kind}`);
     }
     storage.sql.exec("UPDATE async_jobs SET state = 'legacy_uninjectable' WHERE execution_turn IS NULL");
@@ -162,6 +164,11 @@ export class AsyncJobs {
     if (!tombstoneColumns.has("call_id")) storage.sql.exec(
       "ALTER TABLE async_job_tombstones ADD COLUMN call_id TEXT");
     storage.sql.exec("CREATE INDEX IF NOT EXISTS async_job_tombstones_original_call ON async_job_tombstones(original_turn, call_id)");
+    // An adapter error is not a definitive negative proof. Park it for this
+    // owner, then retry once on a later cold construction (including upgrade),
+    // never on a one-second alarm loop while an old kernel is still installed.
+    if (this.sourceStageStatus) storage.sql.exec(
+      "UPDATE async_jobs SET stage_probe_at = NULL WHERE stage_probe_at = -1 AND ready_at IS NULL");
     // Deployment alone does not wake an idle DO. On its next construction,
     // recheck one old checkpoint or an output parked against an older kernel.
     // If the capability is still absent, park again without a polling alarm.
@@ -170,8 +177,10 @@ export class AsyncJobs {
         state IN ('running', 'completed', 'failed', 'uncertain')
         OR (state IN ('queued', 'cancelled') AND ready_at IS NOT NULL)
         OR (state = 'awaiting_integration' AND (integration_probe_epoch IS NULL OR integration_probe_epoch != ?))
-        OR (state = 'checkpointed' AND wake_generation < ? AND ${terminalOrigin})`,
-      this.probeEpoch, this.wakeGeneration).toArray()[0]!.n > 0) {
+        OR (state = 'checkpointed' AND wake_generation < ? AND ${terminalOrigin})
+        OR (state IN ('queued', 'cancelled') AND ready_at IS NULL AND stage_probe_at IS NULL
+          AND ? = 1 AND ${terminalOrigin})`,
+      this.probeEpoch, this.wakeGeneration, this.sourceStageStatus ? 1 : 0).toArray()[0]!.n > 0) {
       this.waitUntil((async () => {
         const nextAt = Date.now() + 1_000;
         const alarm = await storage.getAlarm();
@@ -409,6 +418,34 @@ export class AsyncJobs {
     // All running work is examined on every tick. Terminal records rotate
     // through a durable keyset, so neither a page of unconfirmed checkpoints
     // nor a page of ready results can starve the other after DO eviction.
+    // On a cold constructor, an old migration, or source settlement, recover
+    // only from the native *durable*, source-scoped pending proof. Never infer
+    // readiness from the tool.result callback or a timer. Failed/unknown
+    // probes remain queued without trying a mutable side effect.
+    if (this.sourceStageStatus) {
+      const unstaged = this.storage.sql.exec<Job>(
+        `SELECT * FROM async_jobs WHERE state IN ('queued', 'cancelled') AND ready_at IS NULL
+          AND (stage_probe_at IS NULL OR NOT ${terminalOrigin})
+          ORDER BY created_at, id LIMIT ?`,
+        MAX_JOBS).toArray();
+      for (const job of unstaged) {
+        if (!job.call_id) continue;
+        let staged = false;
+        let inconclusive = false;
+        try { staged = await this.sourceStageStatus(job.original_turn, job.call_id); }
+        catch { inconclusive = true; /* Old kernels and transient failures fail closed. */ }
+        if (staged) this.activateAfterPendingStage(job.original_turn, [job.call_id]);
+        // A nonterminal source can still stage later; do not let a premature
+        // negative probe suppress recovery after cancellation or completion.
+        // An adapter error is neither a negative proof nor a license to spin:
+        // -1 re-arms on a later cold owner, not this owner's alarm loop.
+        if (this.storage.sql.exec<{ n: number }>(
+          `SELECT COUNT(*) AS n FROM async_jobs WHERE id = ? AND ${terminalOrigin}`, job.id,
+        ).toArray()[0]!.n > 0) this.storage.sql.exec(
+          "UPDATE async_jobs SET stage_probe_at = ? WHERE id = ? AND ready_at IS NULL",
+          inconclusive ? -1 : Date.now(), job.id);
+      }
+    }
     const activeRows = this.storage.sql.exec<Job>(
       "SELECT * FROM async_jobs WHERE (state = 'running' OR (state = 'queued' AND ready_at IS NOT NULL)) ORDER BY created_at, id LIMIT ?",
       MAX_ACTIVE).toArray();

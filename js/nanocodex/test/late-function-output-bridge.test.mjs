@@ -243,3 +243,32 @@ test("private bounded batch stages exact typed outputs without prompts and rejec
   await assert.rejects(batchFunctionCallOutputCapability(older).submit([rows[0]]), /does not support batch/);
   older.dispose();
 });
+
+test("host-only source pending status validates the original source and call without a prompt", async () => {
+  const calls = [];
+  const agent = await makeAgent({ agentId: "agent", sessionId: "session", free() {},
+    prompt() { throw new Error("not a prompt"); },
+    async sourcePendingFunctionOutput(...args) {
+      calls.push(args);
+      return args[0] === "source" && args[1] === "original";
+    },
+  });
+  const capability = functionCallOutputCapability(agent, "original");
+  assert.equal(agent.extend(Actions.agentActions()).turn.pendingStatus, undefined);
+  assert.equal(await capability.pendingStatus({ originalTurnId: "source" }), true);
+  assert.equal(await capability.pendingStatus({ originalTurnId: "different" }), false);
+  assert.deepEqual(calls, [["source", "original"], ["different", "original"]]);
+  await assert.rejects(capability.pendingStatus({ originalTurnId: "" }), /originalTurnId/);
+  await assert.rejects(capability.pendingStatus({ originalTurnId: "source", callId: "forged" }), /requires/);
+  agent.dispose();
+  const malformed = await makeAgent({ agentId: "agent", sessionId: "session", free() {}, prompt() {},
+    async sourcePendingFunctionOutput() { return "true"; },
+  });
+  await assert.rejects(functionCallOutputCapability(malformed, "original").pendingStatus({ originalTurnId: "source" }),
+    /invalid source pending status/);
+  malformed.dispose();
+  const older = await makeAgent({ agentId: "agent", sessionId: "session", free() {}, prompt() {} });
+  await assert.rejects(functionCallOutputCapability(older, "original").pendingStatus({ originalTurnId: "source" }),
+    /does not support source pending/);
+  older.dispose();
+});

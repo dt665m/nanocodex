@@ -1,4 +1,4 @@
-import { activeFunctionCallOutputStatus, idleFunctionCallOutputStatus, submitFunctionCallOutput, submitFunctionCallOutputs } from "../internal.mjs";
+import { activeFunctionCallOutputStatus, idleFunctionCallOutputStatus, sourcePendingFunctionOutput, submitFunctionCallOutput, submitFunctionCallOutputs } from "../internal.mjs";
 import { trustedStagedUnrealOutput } from "../runtime/code-runtime.mjs";
 
 /**
@@ -14,6 +14,7 @@ export function functionCallOutputCapability(agent, callId) {
     submit: (options) => submitFunctionCallOutput(agent, callId, options),
     activeStatus: (options) => activeFunctionCallOutputStatus(agent, callId, options),
     idleStatus: (options) => idleFunctionCallOutputStatus(agent, callId, options),
+    pendingStatus: (options) => sourcePendingFunctionOutput(agent, callId, options),
   });
 }
 

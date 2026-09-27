@@ -75,6 +75,30 @@ pub struct ExecutionContinuation {
     pub prefix: Vec<nanocodex_oai_api::responses::ResponseItem>,
 }
 
+impl ExecutionContinuation {
+    /// Whether this exact active operation retained its own trusted pending call.
+    /// Old continuation formats lacking source provenance fail closed.
+    #[must_use]
+    pub fn has_source_staged_unreal_call(&self, call_id: &str) -> bool {
+        #[derive(Deserialize)]
+        struct SourceStage {
+            #[serde(default)]
+            unreal_function_outputs: bool,
+            #[serde(default)]
+            source_staged_calls: std::collections::BTreeSet<String>,
+        }
+        let Ok(stage) = serde_json::from_str::<SourceStage>(&self.state_json) else {
+            return false;
+        };
+        crate::session::has_source_staged_unreal_call(
+            &self.history,
+            stage.unreal_function_outputs,
+            &stage.source_staged_calls,
+            call_id,
+        )
+    }
+}
+
 /// One live steering input retained for deterministic operation recovery.
 #[derive(Clone, Debug)]
 pub struct ExecutionSteer {

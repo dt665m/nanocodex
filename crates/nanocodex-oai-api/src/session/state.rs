@@ -275,6 +275,42 @@ impl ManagedSessionState {
         Ok(())
     }
 
+    /// Checks that a trusted stage still has an exact, open typed original call.
+    /// Provenance must be verified separately: this is only transcript shape.
+    #[must_use]
+    pub fn has_open_unreal_function_output(&self, call_id: &str) -> bool {
+        if !self.unreal_function_outputs || call_id.is_empty() {
+            return false;
+        }
+        let mut calls = 0;
+        let mut pending = 0;
+        let mut terminal = 0;
+        for item in self.context.iter() {
+            match item {
+                ResponseItem::FunctionCall { call_id: id, .. } if id.as_ref() == call_id => {
+                    calls += 1
+                }
+                ResponseItem::FunctionCallOutput {
+                    call_id: id,
+                    output,
+                    status,
+                    ..
+                } if id.as_ref() == call_id => {
+                    if status.is_some() {
+                        return false;
+                    }
+                    if is_unreal_running_output(output) {
+                        pending += 1;
+                    } else {
+                        terminal += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        calls == 1 && pending == 1 && terminal == 0
+    }
+
     /// Whether this transcript was explicitly opted into Unreal pending output replay.
     #[must_use]
     pub const fn unreal_function_outputs(&self) -> bool {
@@ -775,6 +811,8 @@ mod unreal_function_output_tests {
     fn late_receipt_id_survives_checkpoint_replay() {
         let mut state = session();
         state.stage_unreal_function_output("job-1").unwrap();
+        assert!(state.has_open_unreal_function_output("job-1"));
+        assert!(!state.has_open_unreal_function_output("different-call"));
         state.commit_tail();
         let receipt_id = crate::ResponseItemId::from_server("late:stable-receipt");
         state
@@ -784,6 +822,7 @@ mod unreal_function_output_tests {
                 Some(receipt_id.clone()),
             )
             .unwrap();
+        assert!(!state.has_open_unreal_function_output("job-1"));
         let encoded = serde_json::to_value(state.flattened_history()).unwrap();
         let mut replay = ManagedSessionState::resume_unreal_function_outputs(
             serde_json::from_value(encoded).unwrap(),
@@ -793,6 +832,7 @@ mod unreal_function_output_tests {
             replay.flattened_history().last().unwrap().id(),
             Some(&receipt_id)
         );
+        assert!(!replay.has_open_unreal_function_output("job-1"));
         assert!(
             replay
                 .complete_unreal_function_output("job-1", text("again"))

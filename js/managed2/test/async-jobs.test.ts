@@ -1258,3 +1258,133 @@ it("reconstructs an admitted staged job without replaying a mutation", async () 
     expect(resumed.status(id)).toMatchObject({ state: "completed" });
   });
 });
+
+it("recovers an exact native staged pending call after a lost event without dispatching another call", async () => {
+  await runInDurableObject(stub(), async (_session, state) => {
+    const tasks: Promise<unknown>[] = [];
+    const staged = new Set<string>();
+    const observed: string[] = [];
+    let effects = 0;
+    const tool: NamedTool = { name: "exec_command", description: "mutable", handler: () => {
+      effects++; return "done";
+    } };
+    const create = () => new AsyncJobs(state.storage, { exec_command: tool }, () => "source",
+      async intent => accepted(intent), task => { tasks.push(task); },
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      async (source, call) => { observed.push(`${source}:${call}`); return staged.has(`${source}:${call}`); });
+    const first = create();
+    first.tool(tool).handler({ cmd: "one" }, context("exact"));
+    first.tool(tool).handler({ cmd: "two" }, context("other"));
+    const exact = jobId(state, "exact");
+    const other = jobId(state, "other");
+    // A cold owner receives no volatile staging event; durable source proof is
+    // the only authority. An unrelated staged call cannot release another.
+    let resumed = create();
+    await resumed.reconcile();
+    await Promise.all(tasks.splice(0));
+    expect(effects).toBe(0);
+    expect(resumed.status(exact)).toMatchObject({ state: "queued" });
+    staged.add("source:exact");
+    resumed = create();
+    await resumed.reconcile();
+    await Promise.all(tasks.splice(0));
+    expect(observed).toContain("source:exact");
+    expect(resumed.status(exact)).toMatchObject({ state: "completed" });
+    expect(resumed.status(other)).toMatchObject({ state: "queued" });
+    expect(effects).toBe(1);
+    await resumed.reconcile();
+    await Promise.all(tasks.splice(0));
+    expect(effects).toBe(1);
+  });
+});
+
+it("native proof of a cancelled staged call releases terminal delivery but not its handler", async () => {
+  await runInDurableObject(stub(), async (_session, state) => {
+    const tasks: Promise<unknown>[] = [];
+    let effects = 0;
+    const tool: NamedTool = { name: "exec_command", description: "mutable", handler: () => {
+      effects++; return "should-not-run";
+    } };
+    const create = (proof: boolean) => new AsyncJobs(state.storage, { exec_command: tool }, () => "source",
+      async intent => accepted(intent), task => { tasks.push(task); },
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      async (source, call) => proof && source === "source" && call === "cancelled-call");
+    const first = create(false);
+    first.tool(tool).handler({ cmd: "cancel" }, context("cancelled-call"));
+    const id = jobId(state, "cancelled-call");
+    await first.cancel(id);
+    const unproven = create(false);
+    await unproven.reconcile();
+    expect(state.storage.sql.exec<{ ready_at: number | null }>(
+      "SELECT ready_at FROM async_jobs WHERE id = ?", id).toArray()[0]!.ready_at).toBeNull();
+    const proven = create(true);
+    await proven.reconcile();
+    await Promise.all(tasks.splice(0));
+    expect(state.storage.sql.exec<{ ready_at: number | null }>(
+      "SELECT ready_at FROM async_jobs WHERE id = ?", id).toArray()[0]!.ready_at).not.toBeNull();
+    expect(proven.status(id)).toMatchObject({ state: "checkpointed" });
+    expect(state.storage.sql.exec<{ terminal_state: string }>(
+      "SELECT terminal_state FROM async_jobs WHERE id = ?", id).toArray()[0]!.terminal_state).toBe("cancelled");
+    expect(effects).toBe(0);
+  });
+});
+
+it("does not let a negative active-source proof suppress a later terminal-source recovery", async () => {
+  await runInDurableObject(stub(), async (_session, state) => {
+    state.storage.sql.exec("INSERT INTO turns (id, input, state) VALUES ('source', 'work', 'accepted')");
+    let staged = false;
+    let effects = 0;
+    const tasks: Promise<unknown>[] = [];
+    const tool: NamedTool = { name: "exec_command", description: "mutable", handler: () => {
+      effects++; return "once";
+    } };
+    const create = () => new AsyncJobs(state.storage, { exec_command: tool }, () => "source",
+      async intent => accepted(intent), task => { tasks.push(task); },
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      async (_source, call) => staged && call === "exact");
+    const first = create();
+    first.tool(tool).handler({ cmd: "once" }, context("exact"));
+    const id = jobId(state, "exact");
+    await first.reconcile();
+    expect(effects).toBe(0);
+    expect(state.storage.sql.exec<{ stage_probe_at: number | null }>(
+      "SELECT stage_probe_at FROM async_jobs WHERE id = ?", id).toArray()[0]!.stage_probe_at).toBeNull();
+    // Native stage committed but the volatile event was lost while the turn
+    // settled. A cold owner must still validate the original call and run it.
+    staged = true;
+    state.storage.sql.exec("UPDATE turns SET state = 'completed' WHERE id = 'source'");
+    const resumed = create();
+    await resumed.reconcile();
+    await Promise.all(tasks.splice(0));
+    expect(effects).toBe(1);
+    expect(resumed.status(id)).toMatchObject({ state: "completed" });
+  });
+});
+
+it("parks an inconclusive native-stage read without a retry alarm loop, then retries after cold owner", async () => {
+  await runInDurableObject(stub(), async (_session, state) => {
+    state.storage.sql.exec("INSERT INTO turns (id, input, state) VALUES ('source', 'work', 'completed')");
+    const tasks: Promise<unknown>[] = [];
+    let effects = 0;
+    const tool: NamedTool = { name: "exec_command", description: "mutable", handler: () => {
+      effects++; return "once";
+    } };
+    const create = (proof: () => Promise<boolean>) => new AsyncJobs(state.storage,
+      { exec_command: tool }, () => "source", async intent => accepted(intent),
+      task => { tasks.push(task); }, undefined, undefined, undefined, undefined, undefined,
+      undefined, undefined, proof);
+    const first = create(async () => { throw new Error("transient native read unavailable"); });
+    first.tool(tool).handler({ cmd: "once" }, context("exact"));
+    const id = jobId(state, "exact");
+    await first.reconcile();
+    expect(state.storage.sql.exec<{ stage_probe_at: number }>(
+      "SELECT stage_probe_at FROM async_jobs WHERE id = ?", id).toArray()[0]!.stage_probe_at).toBe(-1);
+    await first.reconcile();
+    expect(effects).toBe(0);
+    const restored = create(async () => true);
+    await restored.reconcile();
+    await Promise.all(tasks.splice(0));
+    expect(restored.status(id)).toMatchObject({ state: "completed" });
+    expect(effects).toBe(1);
+  });
+});

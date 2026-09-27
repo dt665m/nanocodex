@@ -6,6 +6,8 @@ export function functionCallOutputCapability(agent: object, callId: string): Rea
     output: FunctionCallOutput;
     operationId: string;
   }>): Promise<FunctionCallOutputReceipt>;
+  /** Exact source operation retained the original-call pending output; no provider uptake implied. */
+  pendingStatus(options: Readonly<{ originalTurnId: string }>): Promise<boolean>;
   /** Source-turn durable receipt only; this cannot confirm idle wake uptake. */
   activeStatus(options: Readonly<{ originalTurnId: string; operationId: string }>): Promise<Readonly<{
     state: "accepted_unbound" | "bound_unconfirmed" | "confirmed" | "discarded" | "pruned_or_unknown";

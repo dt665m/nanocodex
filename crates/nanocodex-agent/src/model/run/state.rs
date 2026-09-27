@@ -39,6 +39,8 @@ pub(super) struct ConversationState {
     pub(super) canonical_context: Arc<ResponseItem>,
     pub(super) managed: ManagedSessionState,
     pub(super) continuation_policy: Option<ContinuationPolicy>,
+    /// Per-operation host-provenance; only trusted native stage inserts IDs.
+    pub(super) source_staged_calls: BTreeSet<String>,
 }
 
 impl ConversationState {
@@ -47,6 +49,7 @@ impl ConversationState {
             canonical_context: Arc::new(canonical_context),
             managed: ManagedSessionState::new(Vec::new()),
             continuation_policy: None,
+            source_staged_calls: BTreeSet::new(),
         }
     }
 
@@ -62,6 +65,7 @@ impl ConversationState {
             canonical_context: Arc::new(canonical_context),
             managed: ManagedSessionState::new(history),
             continuation_policy: None,
+            source_staged_calls: BTreeSet::new(),
         })
     }
 
@@ -86,6 +90,7 @@ impl ConversationState {
             canonical_context: Arc::new(canonical_context),
             managed,
             continuation_policy: None,
+            source_staged_calls: BTreeSet::new(),
         };
         state.prepare_replay_images();
         Ok(state)

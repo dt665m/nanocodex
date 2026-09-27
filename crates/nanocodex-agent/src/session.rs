@@ -126,6 +126,7 @@ impl CommittedSession {
             history: self.model.snapshot_history(),
             client_authored: self.model.client_authored().clone(),
             unreal_function_outputs: self.model.unreal_function_outputs(),
+            source_staged_calls: self.model.source_staged_calls().clone(),
             context_snapshot: Some(self.model.context_baseline().clone()),
             context_usage: Some(self.model.context_usage()),
             pending_late_wake: self.model.late_wake_id().map(str::to_owned),
@@ -176,6 +177,10 @@ pub struct SessionSnapshot {
     client_authored: std::collections::BTreeSet<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     unreal_function_outputs: bool,
+    /// Host-set per-operation stage provenance. An inherited pending output
+    /// from another turn is never proof for this operation.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    source_staged_calls: std::collections::BTreeSet<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     context_snapshot: Option<ContextBaseline>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -218,7 +223,40 @@ impl fmt::Debug for SessionSnapshot {
     }
 }
 
+/// Returns a source-operation-scoped proof of an open trusted pending call.
+/// Legacy snapshots without source provenance deliberately fail closed.
+#[cfg(feature = "openai")]
+#[doc(hidden)]
+#[must_use]
+pub fn has_source_staged_unreal_call(
+    history: &[ResponseItem],
+    enabled: bool,
+    source_calls: &std::collections::BTreeSet<String>,
+    call_id: &str,
+) -> bool {
+    if !enabled || !source_calls.contains(call_id) {
+        return false;
+    }
+    nanocodex_oai_api::__private::ManagedSessionState::resume_unreal_function_outputs(
+        history.to_vec(),
+    )
+    .is_ok_and(|state| state.has_open_unreal_function_output(call_id))
+}
+
 impl SessionSnapshot {
+    /// Whether this exact source operation durably staged an open original call.
+    /// This does not prove that any provider request consumed its output.
+    #[cfg(feature = "openai")]
+    #[must_use]
+    pub fn has_source_staged_unreal_call(&self, call_id: &str) -> bool {
+        has_source_staged_unreal_call(
+            &self.history,
+            self.unreal_function_outputs,
+            &self.source_staged_calls,
+            call_id,
+        )
+    }
+
     /// Separates metadata from conversation bodies for record-based persistence.
     #[must_use]
     pub fn into_context_parts(
@@ -266,6 +304,7 @@ impl SessionSnapshot {
             history,
             client_authored,
             unreal_function_outputs: false,
+            source_staged_calls: std::collections::BTreeSet::new(),
             context_snapshot,
             context_usage: None,
             pending_late_wake: None,
@@ -385,6 +424,7 @@ impl SessionSnapshot {
                     None,
                     self.context_snapshot.clone(),
                 )?;
+                checkpoint.restore_source_staged_calls(self.source_staged_calls.clone());
                 checkpoint.restore_late_wake(self.pending_late_wake.clone());
                 checkpoint.restore_late_wake_jobs(self.pending_late_jobs.clone());
                 checkpoint.restore_late_batch(self.pending_late_batch.clone());

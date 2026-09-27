@@ -210,6 +210,7 @@ pub(super) fn append_tool_result(
             .managed
             .stage_unreal_function_output(call_id)
             .map_err(|error| NanocodexError::InvalidRequest(error.to_string()))?;
+        conversation.source_staged_calls.insert(call_id.to_owned());
     } else {
         conversation.append(items);
     }
@@ -897,6 +898,72 @@ mod trusted_unreal_staging_tests {
         assert!(
             matches!(&items[2], ResponseItem::FunctionCallOutput { call_id, .. } if call_id.as_ref() == "original")
         );
+    }
+
+    #[test]
+    fn source_stage_proof_requires_this_operation_and_an_open_original_call() {
+        use crate::session::has_source_staged_unreal_call;
+
+        let mut source = conversation();
+        append_tool_result(
+            &mut source,
+            "original",
+            true,
+            vec![function_tool_output(
+                "original".into(),
+                ToolOutputBody::Text("host provisional text".into()),
+            )],
+        )
+        .unwrap();
+        let history = source.flattened_history();
+        assert!(has_source_staged_unreal_call(
+            &history,
+            source.managed.unreal_function_outputs(),
+            &source.source_staged_calls,
+            "original",
+        ));
+        assert!(!has_source_staged_unreal_call(
+            &history,
+            false,
+            &source.source_staged_calls,
+            "original",
+        ));
+        assert!(!has_source_staged_unreal_call(
+            &history,
+            true,
+            &Default::default(),
+            "original",
+        ));
+        assert!(!has_source_staged_unreal_call(
+            &history,
+            true,
+            &source.source_staged_calls,
+            "another-call",
+        ));
+        // An inherited history is not provenance of staging by a new source.
+        let inherited = history;
+        source.source_staged_calls.clear();
+        assert!(!has_source_staged_unreal_call(
+            &inherited,
+            true,
+            &source.source_staged_calls,
+            "original",
+        ));
+        source.source_staged_calls.insert("original".into());
+        source.commit_tail();
+        source
+            .managed
+            .complete_unreal_function_output(
+                "original",
+                nanocodex_oai_api::responses::FunctionOutputBody::Text("done".into()),
+            )
+            .unwrap();
+        assert!(!has_source_staged_unreal_call(
+            &source.flattened_history(),
+            true,
+            &source.source_staged_calls,
+            "original",
+        ));
     }
 
     #[test]

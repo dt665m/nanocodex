@@ -2059,6 +2059,48 @@ impl DurableSession {
         receiver.await.map_err(|_| Error::DriverStopped)
     }
 
+    /// Read-only proof that this *source operation*, rather than an inherited
+    /// transcript item, durably staged an open pending output for this call.
+    /// No provider uptake is implied. Missing and legacy provenance fail closed.
+    pub async fn source_pending_function_output_for_call(
+        &self,
+        original_turn_id: &str,
+        call_id: &str,
+    ) -> Result<bool> {
+        if original_turn_id.is_empty() || call_id.is_empty() {
+            return Ok(false);
+        }
+        let state = self.state().await?;
+        let Some(operation) = state.operation(original_turn_id) else {
+            return Ok(false);
+        };
+        match &operation.status {
+            OperationStatus::Pending => {
+                let Some(reference) = operation.continuation.as_ref() else {
+                    return Ok(false);
+                };
+                let payload = self.resolve(reference).await?;
+                let (continuation, _) =
+                    crate::context::load_continuation(self.into(), payload).await?;
+                Ok(continuation.has_source_staged_unreal_call(call_id))
+            }
+            OperationStatus::Completed { checkpoint, .. }
+            | OperationStatus::Failed { checkpoint, .. } => {
+                let payload = self.resolve(checkpoint).await?;
+                let snapshot = crate::context::load_snapshot(self.into(), payload).await?;
+                Ok(snapshot.has_source_staged_unreal_call(call_id))
+            }
+            OperationStatus::Cancelled {
+                checkpoint: Some(checkpoint),
+            } => {
+                let payload = self.resolve(checkpoint).await?;
+                let snapshot = crate::context::load_snapshot(self.into(), payload).await?;
+                Ok(snapshot.has_source_staged_unreal_call(call_id))
+            }
+            OperationStatus::Cancelled { checkpoint: None } => Ok(false),
+        }
+    }
+
     /// Reads the exact idle-wake job/call's uptake from its retained journal.
     /// Neither checkpoint submission nor a started model request is confirmation.
     /// Missing, mismatched, or pruned evidence fails closed.
@@ -3929,6 +3971,147 @@ mod tests {
         };
 
         assert!(matches!(owner.shutdown().await, Err(Error::DriverStopped)));
+    }
+
+    #[tokio::test]
+    async fn source_pending_proof_survives_reopen_and_cancel_without_inherited_false_positive() {
+        let store = MemoryStore::new().unwrap();
+        let session = DurableSession::open(store.clone(), "source-stage-reopen")
+            .await
+            .unwrap();
+        let (owner, _) = session.acquire_agent().await.unwrap();
+        owner
+            .admit_typed::<_, u32, String>("source".to_owned(), &"prompt")
+            .await
+            .unwrap();
+        owner.begin_attempt("source".to_owned()).await.unwrap();
+        let history: Vec<nanocodex_oai_api::responses::ResponseItem> =
+            serde_json::from_value(serde_json::json!([
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"prompt"}]},
+                {"type":"function_call","call_id":"exact","name":"exec_command","arguments":"{}"},
+                {"type":"function_call_output","call_id":"exact","output":
+                    "Tool call is still running. Its result arrives in a later turn: continue with independent work, or end your turn to wait for it."}
+            ])).unwrap();
+        let continuation = nanocodex_agent::execution::ExecutionContinuation {
+            state_json: serde_json::json!({
+                "unreal_function_outputs":true, "source_staged_calls":["exact"]
+            })
+            .to_string(),
+            history: history.clone(),
+            prefix: Vec::new(),
+        };
+        let prepared =
+            crate::context::prepare_continuation(continuation, &Default::default()).unwrap();
+        owner
+            .advance("source".to_owned(), prepared.payload)
+            .await
+            .unwrap();
+        let revision = session.state().await.unwrap().revision();
+        assert!(
+            session
+                .source_pending_function_output_for_call("source", "exact")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !session
+                .source_pending_function_output_for_call("other-source", "exact")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !session
+                .source_pending_function_output_for_call("source", "other-call")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            session.state().await.unwrap().revision(),
+            revision,
+            "proof is read-only"
+        );
+        owner.shutdown().await.unwrap();
+        drop(session);
+        let session = DurableSession::open(store.clone(), "source-stage-reopen")
+            .await
+            .unwrap();
+        assert!(
+            session
+                .source_pending_function_output_for_call("source", "exact")
+                .await
+                .unwrap()
+        );
+        // The checkpoint for a different source may inherit this open output.
+        // That inherited shape cannot confer source-operation provenance.
+        let (owner, _) = session.acquire_agent().await.unwrap();
+        assert!(matches!(
+            owner
+                .admit_typed::<_, u32, String>("source".to_owned(), &"prompt")
+                .await
+                .unwrap(),
+            Admission::Pending
+        ));
+        owner.begin_attempt("source".to_owned()).await.unwrap();
+        let mut interrupted_history = history.clone();
+        interrupted_history.push(serde_json::from_value(serde_json::json!({
+            "type":"message", "role":"user", "content":[{"type":"input_text", "text":"<turn_aborted>"}]
+        })).unwrap());
+        let snapshot_value = serde_json::json!({
+            "version": 1, "model": "test", "lineage_id": "lineage", "prompt_cache_key": "key",
+            "workspace": "/workspace", "canonical_context": history[0], "history": interrupted_history,
+            "unreal_function_outputs": true, "source_staged_calls": ["exact"]
+        });
+        let mut inherited_value = snapshot_value.clone();
+        inherited_value["source_staged_calls"] = serde_json::json!([]);
+        let snapshot: nanocodex_agent::session::SessionSnapshot =
+            serde_json::from_value(snapshot_value).unwrap();
+        let checkpoint = crate::context::prepare_snapshot(snapshot, &Default::default()).unwrap();
+        owner
+            .cancel("source".to_owned(), Some(checkpoint.payload))
+            .await
+            .unwrap();
+        assert!(
+            session
+                .source_pending_function_output_for_call("source", "exact")
+                .await
+                .unwrap()
+        );
+        owner
+            .admit_typed::<_, u32, String>("inheriting".to_owned(), &"other prompt")
+            .await
+            .unwrap();
+        owner.begin_attempt("inheriting".to_owned()).await.unwrap();
+        let inherited: nanocodex_agent::session::SessionSnapshot =
+            serde_json::from_value(inherited_value).unwrap();
+        let inherited_checkpoint =
+            crate::context::prepare_snapshot(inherited, &Default::default()).unwrap();
+        owner
+            .cancel("inheriting".to_owned(), Some(inherited_checkpoint.payload))
+            .await
+            .unwrap();
+        assert!(
+            !session
+                .source_pending_function_output_for_call("inheriting", "exact")
+                .await
+                .unwrap()
+        );
+        assert!(
+            session
+                .source_pending_function_output_for_call("source", "exact")
+                .await
+                .unwrap()
+        );
+        owner.shutdown().await.unwrap();
+        drop(session);
+        let reopened = DurableSession::open(store, "source-stage-reopen")
+            .await
+            .unwrap();
+        assert!(
+            reopened
+                .source_pending_function_output_for_call("source", "exact")
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]

@@ -204,6 +204,25 @@ export async function idleFunctionCallOutputStatus(agent, callId, options) {
   return parseFunctionOutputStatus(encoded, "idle");
 }
 
+/** Host-only read of a durable, source-scoped original-call pending stage. */
+export async function sourcePendingFunctionOutput(agent, callId, options) {
+  const state = agentState(agent);
+  if (!options || typeof options !== "object" || Array.isArray(options)
+    || Object.keys(options).some(key => key !== "originalTurnId")) {
+    throw new TypeError("source pending status requires originalTurnId");
+  }
+  const { originalTurnId } = options;
+  if (typeof callId !== "string" || !callId.trim()
+    || typeof originalTurnId !== "string" || !originalTurnId.trim()) {
+    throw new TypeError("source pending status requires nonempty originalTurnId and callId");
+  }
+  if (typeof state.raw.sourcePendingFunctionOutput !== "function")
+    throw new Error("this Nanocodex runtime does not support source pending function-call status");
+  const status = await state.raw.sourcePendingFunctionOutput(originalTurnId, callId);
+  if (typeof status !== "boolean") throw new TypeError("the runtime returned invalid source pending status");
+  return status;
+}
+
 /** Private read-only status; a staged idle result is never counted as model uptake. */
 export async function activeFunctionCallOutputStatus(agent, callId, options) {
   const state = agentState(agent);

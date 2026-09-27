@@ -581,6 +581,7 @@ where
             session
         };
         if !resumed {
+            session.conversation.source_staged_calls.clear();
             self.retain_execution(&session, ExecutionPhase::Generate)
                 .await?;
         }
@@ -708,6 +709,9 @@ where
         };
 
         if !resumed {
+            // A new source operation cannot claim a prior turn's staged call
+            // merely because its inherited transcript contains that pending ID.
+            session.conversation.source_staged_calls.clear();
             self.retain_execution(&session, phase).await?;
         }
         match phase {
@@ -936,6 +940,7 @@ where
             pending_late_batch: session.pending_late_batch.clone(),
             global_instructions,
             context_baseline: session.context.baseline(),
+            source_staged_calls: session.conversation.source_staged_calls.clone(),
         }
     }
 
@@ -957,6 +962,7 @@ where
             pending_late_batch: session.pending_late_batch.clone(),
             global_instructions: global_instructions.cloned(),
             context_baseline: session.context.baseline(),
+            source_staged_calls: session.conversation.source_staged_calls.clone(),
         }));
     }
 

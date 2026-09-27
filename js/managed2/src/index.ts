@@ -612,6 +612,11 @@ export class Session extends DurableObject<Env> {
             }
             throw error;
           }
+        },
+        undefined, undefined,
+        async (originalTurn, callId) => {
+          const agent = await this.#ready(owner);
+          return functionCallOutputCapability(agent, callId).pendingStatus({ originalTurnId: originalTurn });
         });
     }
     return this.#asyncJobs;

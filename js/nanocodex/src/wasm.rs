@@ -2070,6 +2070,28 @@ impl WasmNanocodex {
         serde_json::to_string(&status).map_err(js_error)
     }
 
+    /// Reads source-operation-scoped, durable original-call pending stage proof.
+    /// Never treats a tool event, inherited prior-turn output or provider send
+    /// as evidence. The returned boolean does not imply provider uptake.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a non-durable runtime or a failed durable-state query.
+    #[wasm_bindgen(js_name = sourcePendingFunctionOutput)]
+    pub async fn source_pending_function_output(
+        &self,
+        original_turn_id: &str,
+        call_id: &str,
+    ) -> Result<bool, JsValue> {
+        let state = self.durable_status.as_ref().ok_or_else(|| {
+            js_error("durable source pending function-call status is unavailable")
+        })?;
+        state
+            .source_pending_function_output_for_call(original_turn_id, call_id)
+            .await
+            .map_err(js_error)
+    }
+
     /// Reads exact idle-wake uptake from a durable completed provider model step.
     /// A submitted checkpoint or pending step alone never confirms consumption.
     ///

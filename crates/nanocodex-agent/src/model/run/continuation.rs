@@ -13,6 +13,8 @@ struct CurrentExecution {
     client_authored: std::collections::BTreeSet<String>,
     #[serde(default)]
     unreal_function_outputs: bool,
+    #[serde(default)]
+    source_staged_calls: BTreeSet<String>,
     context_baseline: ContextBaseline,
     #[serde(default)]
     context_usage: Option<Usage>,
@@ -108,6 +110,7 @@ where
                 saved.unreal_function_outputs,
             )?
         };
+        session.conversation.source_staged_calls = saved.source_staged_calls;
         session
             .conversation
             .managed
@@ -192,6 +195,7 @@ where
             canonical_context: (*session.conversation.canonical_context).clone(),
             client_authored: session.conversation.managed.client_authored().clone(),
             unreal_function_outputs: session.conversation.managed.unreal_function_outputs(),
+            source_staged_calls: session.conversation.source_staged_calls.clone(),
             context_baseline: session.context.baseline(),
             context_usage: session.conversation.managed.context_usage().0.cloned(),
             server_reasoning_included: session.conversation.managed.context_usage().1,
@@ -239,6 +243,7 @@ mod tests {
             ),
             client_authored: Default::default(),
             unreal_function_outputs: false,
+            source_staged_calls: BTreeSet::new(),
             context_baseline: ContextBaseline::Missing,
             context_usage: Some(Usage {
                 total_tokens: 150007,
@@ -262,8 +267,11 @@ mod tests {
             force_compaction: false,
             tool_call_indices: HashMap::new(),
         };
+        let mut saved = saved;
+        saved.source_staged_calls.insert("original-call".to_owned());
         let mut encoded = serde_json::to_value(saved).unwrap();
         let restored: CurrentExecution = serde_json::from_value(encoded.clone()).unwrap();
+        assert!(restored.source_staged_calls.contains("original-call"));
         assert!(restored.context_usage_is_estimate);
         assert!(restored.server_reasoning_included);
         assert_eq!(restored.context_usage.unwrap().total_tokens, 150007);
@@ -271,9 +279,17 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("context_usage_is_estimate");
+        encoded
+            .as_object_mut()
+            .unwrap()
+            .remove("source_staged_calls");
         let legacy: CurrentExecution = serde_json::from_value(encoded).unwrap();
         assert!(!legacy.context_usage_is_estimate);
         assert!(legacy.server_reasoning_included);
         assert_eq!(legacy.context_usage.unwrap().total_tokens, 150007);
+        assert!(
+            legacy.source_staged_calls.is_empty(),
+            "legacy provenance fails closed"
+        );
     }
 }
