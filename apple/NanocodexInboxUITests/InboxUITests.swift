@@ -16,11 +16,19 @@ final class InboxUITests: XCTestCase {
         XCTAssertTrue(tail.waitForExistence(timeout: 10))
         let table = app.scrollViews["markdown-table"].firstMatch
         XCTAssertTrue(table.waitForExistence(timeout: 5))
+        let conversation = app.descendants(matching: .any)["conversation"].firstMatch
+        for _ in 0..<5 {
+            if table.staticTexts["Library"].isHittable { break }
+            conversation.swipeDown()
+        }
+        XCTAssertTrue(table.staticTexts["Library"].isHittable)
         table.swipeLeft()
         let license = table.staticTexts["License"]
         XCTAssertTrue(license.isHittable, "The final column must be reachable inside the table")
         capture(app, "wide-table-final-columns")
         table.swipeRight()
+        let latest = app.buttons["latest-messages"]
+        if latest.isHittable { latest.tap() }
         for typing in [false, true] {
             if typing { input.tap(); input.typeText("Keep this draft") }
             let visibleTail = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
