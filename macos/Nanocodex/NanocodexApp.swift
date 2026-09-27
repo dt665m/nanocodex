@@ -1,4 +1,5 @@
 import AppKit
+import OSLog
 import SwiftUI
 import NanocodexRemote
 
@@ -9,6 +10,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var openMainWindow: (() -> Void)?
     private var handStatusItem: HandStatusItem?
     private var terminating = false
+    private let activationLog = Logger(subsystem: "xyz.paradigm.nanocodex.macos", category: "Activation")
+    static func shouldOrderWindowOnReopen(hasVisibleWindows: Bool) -> Bool { !hasVisibleWindows }
     func start(model: AppModel, openMainWindow: @escaping () -> Void) {
         self.openMainWindow = openMainWindow
         guard self.model == nil else { return }
@@ -47,9 +50,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Finder/Dock launches are activated by AppKit; the status-panel Open
         // action explicitly activates the app when the user requests it.
     }
+    func applicationDidBecomeActive(_ notification: Notification) {
+        activationLog.info("App became active")
+    }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        if !flag { openMainWindow?() }
+        activationLog.info("Reopen requested; hasVisibleWindows=\(flag)")
+        // AppKit handles an ordinary Dock/launch-services activation when the
+        // window is already visible. Do not explicitly re-order it on every
+        // reopen request, which can needlessly move focus between Spaces.
+        guard Self.shouldOrderWindowOnReopen(hasVisibleWindows: flag) else { return true }
+        openMainWindow?()
         if let window = sender.windows.first(where: { $0.canBecomeMain }) {
             window.deminiaturize(nil); window.makeKeyAndOrderFront(nil)
         }
