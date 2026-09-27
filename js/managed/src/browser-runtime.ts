@@ -580,7 +580,7 @@ export async function createManagedBrowserRuntime(
         quarantine: async quarantine => { await options.ctx.storage.put(quarantineKey,{...quarantine,mode:"one_time"}); isolated = true; oneTime = {pending,password:value.value as string}; },
       });
       return {type:"secure_input_receipt",request_id:pending.id,status:"submission" in result && result.submission === "action_required" ? "action_required" : result.status};
-    } catch { throw new Error("Secure input could not be confirmed; request a new form before retrying"); }
+    } catch { throw new Error("Secure input could not be confirmed; inspect the private destination before any further attempt"); }
     finally { signal.removeEventListener("abort",abort); cdp?.close(); }
   });
   if (options.resolveVaultLogin) tools.push({
