@@ -16,19 +16,24 @@ public struct ChatMarkdown: View {
 private struct ChatMarkdownContent: View, Equatable {
     let text: String
     let compact: Bool
-    @StateObject private var renderer = ChatMarkdownRenderer()
+    @StateObject private var renderer: ChatMarkdownRenderer
+    init(text: String, compact: Bool) {
+        self.text = text
+        self.compact = compact
+        _renderer = StateObject(wrappedValue: ChatMarkdownRenderer(initialSource: text))
+    }
     static func == (lhs: Self, rhs: Self) -> Bool { lhs.text == rhs.text && lhs.compact == rhs.compact }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             if let rendered = renderer.rendered, text.hasPrefix(rendered.source) {
                 ChatMarkdownDocument(content: rendered.content, compact: compact)
-                // Keep the stable parsed document mounted while the next revision
-                // is computed. Never lose incoming bytes or append prose to code.
-                let pending = String(text.dropFirst(rendered.source.count))
-                if !pending.isEmpty { Text(pending).textSelection(.enabled) }
+                // Keep the last parsed tree until its replacement is ready.
+                // Displaying an unparsed suffix leaks fences and table syntax.
             } else {
-                Text(text).textSelection(.enabled)
+                // Reserve approximate space on a cold parse without flashing
+                // Markdown source. Recycled messages use the synchronous cache.
+                Text(text).hidden().accessibilityHidden(true)
             }
         }
         .frame(maxWidth: compact ? nil : .infinity, alignment: .leading)
@@ -137,8 +142,9 @@ struct ChatMarkdownSnapshot: @unchecked Sendable {
     let content: MarkdownContent
 }
 
-actor ChatMarkdownParser {
-    static let shared = ChatMarkdownParser()
+/// NSCache synchronizes access; only immutable parsed snapshots cross threads.
+private final class ChatMarkdownSnapshotCache: @unchecked Sendable {
+    static let shared = ChatMarkdownSnapshotCache()
     private final class Cached {
         let snapshot: ChatMarkdownSnapshot
         init(_ snapshot: ChatMarkdownSnapshot) { self.snapshot = snapshot }
@@ -149,21 +155,29 @@ actor ChatMarkdownParser {
         cache.totalCostLimit = 8 * 1024 * 1024
         return cache
     }()
+    func snapshot(for source: String) -> ChatMarkdownSnapshot? {
+        cache.object(forKey: source as NSString)?.snapshot
+    }
+    func insert(_ snapshot: ChatMarkdownSnapshot) {
+        guard snapshot.source.utf8.count <= 1_000_000 else { return }
+        let key = snapshot.source as NSString
+        cache.setObject(Cached(snapshot), forKey: key, cost: max(1, key.length * 16))
+    }
+}
 
+actor ChatMarkdownParser {
+    static let shared = ChatMarkdownParser()
     func content(for source: String) throws -> ChatMarkdownSnapshot {
         assert(!Thread.isMainThread)
         try Task.checkCancellation()
-        let key = source as NSString
-        if let cached = cache.object(forKey: key) { return cached.snapshot }
+        if let cached = ChatMarkdownSnapshotCache.shared.snapshot(for: source) { return cached }
         let signpost = OSSignpostID(log: markdownPerformanceLog)
         os_signpost(.begin, log: markdownPerformanceLog, name: "ChatMarkdownParse", signpostID: signpost)
         let snapshot = ChatMarkdownSnapshot(source: source, content: MarkdownContent(source))
         os_signpost(.end, log: markdownPerformanceLog, name: "ChatMarkdownParse", signpostID: signpost)
         try Task.checkCancellation()
         // Approximate immutable tree/string cost; NSCache also evicts on pressure.
-        if source.utf8.count <= 1_000_000 {
-            cache.setObject(Cached(snapshot), forKey: key, cost: max(1, key.length * 16))
-        }
+        ChatMarkdownSnapshotCache.shared.insert(snapshot)
         return snapshot
     }
 }
@@ -175,6 +189,10 @@ final class ChatMarkdownRenderer: ObservableObject {
     private var latest = ""
     private var task: Task<Void, Never>?
     private var generation = 0
+
+    init(initialSource: String = "") {
+        rendered = ChatMarkdownSnapshotCache.shared.snapshot(for: initialSource)
+    }
 
     func update(_ text: String) {
         latest = text

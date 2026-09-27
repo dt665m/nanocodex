@@ -50,6 +50,18 @@ final class ChatMarkdownTests: XCTestCase {
         XCTAssertEqual(renderer.rendered?.content.renderPlainText(), "replacement")
     }
 
+    // Recycled chat hosts must show the already-parsed document on first paint,
+    // without exposing source markers while an asynchronous cache lookup runs.
+    @MainActor
+    func testRecycledRendererStartsWithCachedMarkdown() async throws {
+        let source = "## Recycled heading\n\nA **formatted** response."
+        _ = try await ChatMarkdownParser.shared.content(for: source)
+        let renderer = ChatMarkdownRenderer(initialSource: source)
+        XCTAssertEqual(renderer.rendered?.source, source)
+        XCTAssertTrue(renderer.rendered?.content.renderHTML().contains("<h2>Recycled heading</h2>") == true)
+        XCTAssertTrue(renderer.rendered?.content.renderHTML().contains("<strong>formatted</strong>") == true)
+    }
+
     func testInlineMarkdownImagesDoNotLoad() async {
         do {
             _ = try await ChatMarkdownInlineImageProvider().image(
