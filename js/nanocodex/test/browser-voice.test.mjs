@@ -1519,3 +1519,49 @@ test('Connect cannot synthesize with visitor account credentials by default', as
     assert.equal(voice.getSnapshot().status, 'idle');
   } finally { await voice.destroy(); }
 });
+
+test("interruption during frame acknowledgement cannot restore direct speaker playback", async () => {
+  for (const interruption of ["typed", "speech"]) {
+    const fixture = installBrowserVoiceFixture();
+    const previousAudio = Object.getOwnPropertyDescriptor(globalThis, "Audio");
+    const previousDocument = Object.getOwnPropertyDescriptor(globalThis, "document");
+    const speaker = { muted: false, play: async () => {}, pause() {} };
+    globalThis.Audio = class { constructor() { return speaker; } };
+    globalThis.document = new EventTarget();
+    const calls = [];
+    let acknowledge;
+    const captions = [];
+    const core = fakeVoiceCore(calls, {
+      parallelStartup: true, dataChannelControl: true,
+      framesSent: () => new Promise(resolve => { acknowledge = resolve; }),
+      noteTypedInput: () => JSON.stringify({ input_generation: 2, playback_enabled: false }),
+      agentEvent: () => JSON.stringify({ input_generation: 1, playback_enabled: true,
+        frames: ['{"type":"session.context.append"}'], acknowledge_frames: true,
+        transcripts: [{ speaker: "assistant", text: "Stale answer", id: 1 }] }),
+      realtimeMessage: payload => JSON.stringify(JSON.parse(payload).type === "session.started"
+        ? { ready: true } : { input_generation: 2, playback_enabled: false }),
+    });
+    const session = new BrowserVoiceSession({ core, voice: "cove",
+      captureMicrophone: async () => fakeMicrophone(calls), onStatus() {},
+      onTranscript: (...entry) => captions.push(entry), onTerminated: assert.fail });
+    try {
+      await session.start();
+      fixture.peer.emit("track", { track: {}, streams: [{}] });
+      session.observe({ type: "run.completed" });
+      await waitFor(() => acknowledge !== undefined);
+      if (interruption === "typed") await session.noteTypedInput();
+      else {
+        fixture.channel.message({ type: "input_transcript.added", item: { text: "New question" } });
+        await new Promise(resolve => setTimeout(resolve, 0));
+      }
+      acknowledge();
+      await new Promise(resolve => setTimeout(resolve, 0));
+      assert.equal(speaker.muted, true);
+      assert.equal(captions.length, 1, "accepted captions remain visible after interruption");
+      assert.equal(captions[0][1], "Stale answer");
+    } finally {
+      acknowledge?.(); await session.close(); fixture.restore();
+      restoreGlobal("Audio", previousAudio); restoreGlobal("document", previousDocument);
+    }
+  }
+});

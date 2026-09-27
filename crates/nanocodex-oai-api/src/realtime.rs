@@ -1060,11 +1060,7 @@ impl RealtimeSessionBuilder {
                     .as_str()
                     .into_client_request()
                     .map_err(|error| RealtimeError::InvalidUrl(error.to_string()))?;
-                request.headers_mut().insert(
-                    header::AUTHORIZATION,
-                    HeaderValue::from_str(&format!("Bearer {}", auth.bearer()))
-                        .map_err(|error| RealtimeError::InvalidAuthorization(error.to_string()))?,
-                );
+                webrtc::add_auth_headers(request.headers_mut(), &auth)?;
                 match version {
                     RealtimeVersion::V1 => {
                         request
@@ -3049,7 +3045,7 @@ async fn handle_server_message(
                 {
                     return Ok(false);
                 }
-                state.active_transcript.update(&mut event);
+                state.active_transcript.update(&mut event, protocol);
                 if matches!(protocol, RealtimeProtocol::Direct) {
                     match &event {
                         RealtimeEvent::ResponseStarted => state.response_create.mark_started(),
@@ -3238,12 +3234,20 @@ impl ActiveTranscript {
             .collect()
     }
 
-    fn update(&mut self, event: &mut RealtimeEvent) {
+    fn update(&mut self, event: &mut RealtimeEvent, protocol: RealtimeProtocol) {
         match event {
             RealtimeEvent::SpeechStarted => self.new_input_entry = true,
             RealtimeEvent::InputTranscriptDelta(delta) => {
-                append_transcript_delta(&mut self.entries, "user", delta, self.new_input_entry);
-                self.new_input_entry = false;
+                append_transcript_delta(
+                    &mut self.entries,
+                    "user",
+                    delta,
+                    self.new_input_entry,
+                    protocol,
+                );
+                if !delta.is_empty() || protocol != RealtimeProtocol::Frameless {
+                    self.new_input_entry = false;
+                }
             }
             RealtimeEvent::OutputTranscriptDelta(delta) => {
                 append_transcript_delta(
@@ -3251,36 +3255,31 @@ impl ActiveTranscript {
                     "assistant",
                     delta,
                     self.new_output_entry,
+                    protocol,
                 );
-                self.new_output_entry = false;
+                if !delta.is_empty() || protocol != RealtimeProtocol::Frameless {
+                    self.new_output_entry = false;
+                }
             }
             RealtimeEvent::InputTranscriptDone(text) => {
-                apply_transcript_done(&mut self.entries, "user", text, self.new_input_entry);
-                self.new_input_entry = true;
+                apply_transcript_done(
+                    &mut self.entries,
+                    "user",
+                    text,
+                    self.new_input_entry,
+                    protocol,
+                );
+                self.new_input_entry = protocol == RealtimeProtocol::Frameless;
             }
             RealtimeEvent::OutputTranscriptDone(text) => {
-                // Frameless turn boundaries can start after already-spoken
-                // output. Preserve an exact missing prefix, never unheard tails.
-                if !self.new_output_entry
-                    && !text.trim().is_empty()
-                    && let Some(last) = self
-                        .entries
-                        .iter()
-                        .rev()
-                        .find(|entry| entry.role == "assistant")
-                    && !last.text.starts_with(TRUNCATED_TRANSCRIPT_PREFIX)
-                    && last
-                        .text
-                        .trim_end()
-                        .strip_suffix(text.trim())
-                        .is_some_and(|prefix| {
-                            prefix.is_empty() || prefix.ends_with(char::is_whitespace)
-                        })
-                {
-                    text.clone_from(&last.text);
-                }
-                apply_transcript_done(&mut self.entries, "assistant", text, self.new_output_entry);
-                self.new_output_entry = true;
+                apply_transcript_done(
+                    &mut self.entries,
+                    "assistant",
+                    text,
+                    self.new_output_entry,
+                    protocol,
+                );
+                self.new_output_entry = protocol == RealtimeProtocol::Frameless;
             }
             RealtimeEvent::AgentRequest {
                 prompt, transcript, ..
@@ -3339,11 +3338,17 @@ fn append_transcript_delta(
     role: &str,
     delta: &str,
     force_new: bool,
+    protocol: RealtimeProtocol,
 ) {
     if delta.is_empty() {
         return;
     }
-    if !force_new && let Some(last) = entries.iter_mut().rev().find(|entry| entry.role == role) {
+    let entry = if protocol == RealtimeProtocol::Frameless {
+        entries.iter_mut().rev().find(|entry| entry.role == role)
+    } else {
+        entries.last_mut().filter(|entry| entry.role == role)
+    };
+    if !force_new && let Some(last) = entry {
         last.text.push_str(delta);
         return;
     }
@@ -3358,12 +3363,22 @@ fn apply_transcript_done(
     role: &str,
     text: &str,
     force_new: bool,
+    protocol: RealtimeProtocol,
 ) {
     if text.is_empty() {
         return;
     }
-    if !force_new && let Some(last) = entries.iter_mut().rev().find(|entry| entry.role == role) {
-        last.text = text.to_owned();
+    let entry = if protocol == RealtimeProtocol::Frameless {
+        entries.iter_mut().rev().find(|entry| entry.role == role)
+    } else {
+        entries.last_mut().filter(|entry| entry.role == role)
+    };
+    if !force_new && let Some(last) = entry {
+        // A delayed V3 final may precede already accumulated speech. Only
+        // replace it when the final extends that speech; leave live events intact.
+        if protocol != RealtimeProtocol::Frameless || text.starts_with(&last.text) {
+            last.text = text.to_owned();
+        }
         return;
     }
     entries.push(RealtimeTranscriptEntry {
@@ -3818,27 +3833,81 @@ mod tests {
     }
 
     #[test]
-    fn final_output_preserves_only_an_exact_spoken_prefix() {
-        for (streamed, completed, expected) in [
-            (
-                " Sure thing. Starting now. One...",
-                " thing. Starting now. One...",
-                " Sure thing. Starting now. One...",
-            ),
-            ("One. Two. Three.", "One. Two.", "One. Two."),
-            ("cannot", "not", "not"),
-        ] {
+    fn frameless_finals_preserve_accumulated_speech_without_mutating_events() {
+        for role in ["user", "assistant"] {
+            for (streamed, completed, expected) in [
+                (
+                    "Sure. Starting now.",
+                    "Starting now.",
+                    "Sure. Starting now.",
+                ),
+                ("One. Two. Three.", "One. Two.", "One. Two. Three."),
+                ("cannot", "not", "cannot"),
+                ("Hello", "Hello there.", "Hello there."),
+                ("", "Final only.", "Final only."),
+            ] {
+                let mut transcript = ActiveTranscript::default();
+                let mut delta = if role == "user" {
+                    RealtimeEvent::InputTranscriptDelta(streamed.into())
+                } else {
+                    RealtimeEvent::OutputTranscriptDelta(streamed.into())
+                };
+                transcript.update(&mut delta, RealtimeProtocol::Frameless);
+                let mut done = if role == "user" {
+                    RealtimeEvent::InputTranscriptDone(completed.into())
+                } else {
+                    RealtimeEvent::OutputTranscriptDone(completed.into())
+                };
+                let original = done.clone();
+                transcript.update(&mut done, RealtimeProtocol::Frameless);
+                assert_eq!(done, original);
+                assert_eq!(transcript.take_tail()[0].text, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn frameless_empty_deltas_do_not_reopen_completed_utterances() {
+        for role in ["user", "assistant"] {
             let mut transcript = ActiveTranscript::default();
-            transcript.update(&mut RealtimeEvent::OutputTranscriptDelta(
-                streamed.to_owned(),
-            ));
-            let mut done = RealtimeEvent::OutputTranscriptDone(completed.to_owned());
-            transcript.update(&mut done);
+            for _ in 0..3 {
+                let mut done = if role == "user" {
+                    RealtimeEvent::InputTranscriptDone("Again.".into())
+                } else {
+                    RealtimeEvent::OutputTranscriptDone("Again.".into())
+                };
+                transcript.update(&mut done, RealtimeProtocol::Frameless);
+                let mut empty = if role == "user" {
+                    RealtimeEvent::InputTranscriptDelta(String::new())
+                } else {
+                    RealtimeEvent::OutputTranscriptDelta(String::new())
+                };
+                transcript.update(&mut empty, RealtimeProtocol::Frameless);
+            }
+            assert_eq!(transcript.take_tail().len(), 3);
+        }
+    }
+
+    #[test]
+    fn legacy_transcript_finals_replace_deltas_and_keep_adjacent_speaker_runs() {
+        for protocol in [RealtimeProtocol::V1, RealtimeProtocol::Direct] {
+            let mut transcript = ActiveTranscript::default();
+            for mut event in [
+                RealtimeEvent::InputTranscriptDelta("User".into()),
+                RealtimeEvent::OutputTranscriptDelta("First".into()),
+                RealtimeEvent::InputTranscriptDelta("Second user".into()),
+                RealtimeEvent::OutputTranscriptDelta("Uncorrected output".into()),
+                RealtimeEvent::OutputTranscriptDone("Corrected".into()),
+            ] {
+                transcript.update(&mut event, protocol);
+            }
+            let tail = transcript.take_tail();
             assert_eq!(
-                done,
-                RealtimeEvent::OutputTranscriptDone(expected.to_owned())
+                tail.iter()
+                    .map(|entry| entry.text.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["User", "First", "Second user", "Corrected"]
             );
-            assert_eq!(transcript.take_tail()[0].text, expected);
         }
     }
 
@@ -4065,18 +4134,20 @@ mod tests {
     #[test]
     fn attaches_only_new_active_transcript_to_each_delegation() {
         let mut transcript = ActiveTranscript::default();
-        transcript.update(&mut RealtimeEvent::InputTranscriptDelta(
-            "delegate ".to_owned(),
-        ));
-        transcript.update(&mut RealtimeEvent::InputTranscriptDone(
-            "delegate this".to_owned(),
-        ));
+        transcript.update(
+            &mut RealtimeEvent::InputTranscriptDelta("delegate ".to_owned()),
+            RealtimeProtocol::Frameless,
+        );
+        transcript.update(
+            &mut RealtimeEvent::InputTranscriptDone("delegate this".to_owned()),
+            RealtimeProtocol::Frameless,
+        );
         let mut first = RealtimeEvent::AgentRequest {
             call_id: "call_1".to_owned(),
             prompt: "delegate this".to_owned(),
             transcript: Vec::new(),
         };
-        transcript.update(&mut first);
+        transcript.update(&mut first, RealtimeProtocol::Frameless);
         assert_eq!(
             first,
             RealtimeEvent::AgentRequest {
@@ -4089,18 +4160,20 @@ mod tests {
             }
         );
 
-        transcript.update(&mut RealtimeEvent::OutputTranscriptDone(
-            "On it.".to_owned(),
-        ));
-        transcript.update(&mut RealtimeEvent::InputTranscriptDone(
-            "also run tests".to_owned(),
-        ));
+        transcript.update(
+            &mut RealtimeEvent::OutputTranscriptDone("On it.".to_owned()),
+            RealtimeProtocol::Frameless,
+        );
+        transcript.update(
+            &mut RealtimeEvent::InputTranscriptDone("also run tests".to_owned()),
+            RealtimeProtocol::Frameless,
+        );
         let mut second = RealtimeEvent::AgentRequest {
             call_id: "call_2".to_owned(),
             prompt: "also run tests".to_owned(),
             transcript: Vec::new(),
         };
-        transcript.update(&mut second);
+        transcript.update(&mut second, RealtimeProtocol::Frameless);
         assert_eq!(
             second,
             RealtimeEvent::AgentRequest {
@@ -4132,7 +4205,7 @@ mod tests {
             RealtimeEvent::OutputTranscriptDone("I will check.".to_owned()),
             RealtimeEvent::InputTranscriptDone("Then test.".to_owned()),
         ] {
-            transcript.update(&mut event);
+            transcript.update(&mut event, RealtimeProtocol::Frameless);
         }
         let tail = transcript.take_tail();
         assert_eq!(
@@ -4153,10 +4226,13 @@ mod tests {
     #[test]
     fn active_transcript_retains_a_bounded_suffix() {
         let mut transcript = ActiveTranscript::default();
-        transcript.update(&mut RealtimeEvent::InputTranscriptDelta(format!(
-            "old{}new",
-            "x".repeat(MAX_ACTIVE_TRANSCRIPT_BYTES)
-        )));
+        transcript.update(
+            &mut RealtimeEvent::InputTranscriptDelta(format!(
+                "old{}new",
+                "x".repeat(MAX_ACTIVE_TRANSCRIPT_BYTES)
+            )),
+            RealtimeProtocol::Frameless,
+        );
 
         let tail = transcript.take_tail();
         assert!(transcript_entries_bytes(&tail) <= MAX_ACTIVE_TRANSCRIPT_BYTES);

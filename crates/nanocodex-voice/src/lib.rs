@@ -1005,7 +1005,12 @@ async fn run_active_voice(
                         drop(result.send(session.send_text(role, text).await));
                     }
                     VoiceCommand::AppendSpeech { text, result } => {
-                        drop(result.send(session.append_speech(text).await));
+                        let outcome = session.append_speech(text).await;
+                        if outcome.is_ok() {
+                            agent_bridge.delivery.allow_explicit_speech();
+                            audio.resume();
+                        }
+                        drop(result.send(outcome));
                     }
                 }
             }

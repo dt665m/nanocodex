@@ -90,6 +90,7 @@ export class BrowserVoiceSession {
   #elevenLabs;
   #muted = false;
   #inputGeneration = 0;
+  #playbackRevision = 0;
   #meterTimer;
   #backendReady;
   #resolveBackendReady;
@@ -311,6 +312,7 @@ export class BrowserVoiceSession {
   }
 
   noteTypedInput() {
+    this.#playbackRevision++;
     this.#playbackEnabled = false;
     this.#elevenLabs?.interrupt();
     this.#speaker?.setEnabled(false);
@@ -429,14 +431,19 @@ export class BrowserVoiceSession {
     for (const text of effects.undelivered_answers ?? []) this.#options.onUndeliveredAnswer?.(text);
     if (effects.input_generation !== undefined) {
       if (effects.input_generation < this.#inputGeneration) return;
-      if (effects.input_generation > this.#inputGeneration) this.#elevenLabs?.interrupt();
+      if (effects.input_generation > this.#inputGeneration) {
+        this.#playbackRevision++;
+        this.#elevenLabs?.interrupt();
+      }
       this.#inputGeneration = effects.input_generation;
     }
     if (effects.playback_enabled === false) {
+      this.#playbackRevision++;
       this.#playbackEnabled = false;
       this.#elevenLabs?.interrupt();
       this.#speaker?.setEnabled(false);
     }
+    const playbackRevision = this.#playbackRevision;
     let sent = 0;
     for (const frame of effects.frames ?? []) {
       if (this.#directControl && this.#channel?.readyState === "open") {
@@ -448,12 +455,15 @@ export class BrowserVoiceSession {
       }
     }
     if (effects.acknowledge_frames && sent > 0) await this.#core?.framesSent(sent);
-    if (!this.#closed && effects.playback_enabled === true && sent === (effects.frames?.length ?? 0)) {
+    // A live interruption can overtake asynchronous frame acknowledgement.
+    // Keep its speaker gate authoritative while retaining accepted captions.
+    const currentPlayback = playbackRevision === this.#playbackRevision;
+    if (currentPlayback && !this.#closed && effects.playback_enabled === true && sent === (effects.frames?.length ?? 0)) {
       this.#playbackEnabled = true;
       this.#speaker?.setEnabled(!this.#elevenLabs);
     }
     for (const entry of effects.transcripts ?? []) {
-      if (this.#playbackEnabled && !this.#closed) this.#elevenLabs?.transcript(entry);
+      if (currentPlayback && this.#playbackEnabled && !this.#closed) this.#elevenLabs?.transcript(entry);
       this.#options.onTranscript(entry.speaker, entry.text, entry);
     }
     if (effects.status) this.#status(effects.status);
