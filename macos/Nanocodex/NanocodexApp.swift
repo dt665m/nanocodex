@@ -41,7 +41,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSWindow.allowsAutomaticWindowTabbing = false
         NSApp.setActivationPolicy(.regular)
-        NSApp.activate(ignoringOtherApps: true)
+        // Do not force foreground activation on every process launch. This app
+        // is also started by its login item to keep Hands running, and activating
+        // it here can pull the user into Nanocodex's AeroSpace/Spaces workspace.
+        // Finder/Dock launches are activated by AppKit; the status-panel Open
+        // action explicitly activates the app when the user requests it.
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
