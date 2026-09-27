@@ -52,3 +52,25 @@ This API does not support sudo, terminal stdin, native CUA input, arbitrary
 application fields, or CAPTCHA. Ordinary Hand RPC persists tool input, and
 same-user shell access could observe a FIFO or helper process. Secure native
 input requires a separately protected native execution boundary.
+
+## Local verification
+
+Use synthetic passwords only. Run the account contract tests with
+`node --experimental-strip-types --test js/account/src/secureInput.test.ts`
+and the browser form journey with
+`node js/account/scripts/secure-input-smoke.mjs`.
+The browser journey uses an isolated headless Chrome profile and accepts
+`CHROME_PATH` for the browser executable; evidence is written under
+`output/secure-input/`.
+
+The managed boundary scenarios are in `js/managed/test/secure-input.test.ts`
+and `js/managed/test/browser-vault-route.test.ts`. The real Chrome/runtime
+journey is `node js/managed/scripts/secure-input-chrome-e2e.mjs`.
+The latter covers private CDP injection and observation isolation; HTTP account
+admission remains covered separately through the Worker route tests.
+
+`swift test --package-path apple/InboxCore --filter SecureInputTests` exercises
+the native client contract. The `InboxUITests.testPrivatePasswordFieldAndSafeReceipt`
+simulator test exercises the production secure field and receipt presentation
+using synthetic input; it does not authenticate with a password-manager app or
+exercise a live account. Invoke Xcode through `scripts/xcodebuild-guard.sh`.
