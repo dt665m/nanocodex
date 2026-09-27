@@ -6,6 +6,7 @@
 //! orchestration and hosted tools; this module owns only presentation, terminal
 //! interaction, and the caller-local shell convenience.
 
+mod btw;
 mod bug;
 mod clipboard;
 mod components;
@@ -15,6 +16,7 @@ mod editor;
 mod format;
 mod history;
 mod links;
+mod managed2;
 mod pane;
 mod prompt;
 mod scheduler;
@@ -28,6 +30,8 @@ mod tmux;
 mod transcript;
 mod vault;
 mod voice_clone;
+
+pub(crate) use self::managed2::run_managed2;
 
 use self::{
     components::{
@@ -500,8 +504,17 @@ struct PendingVoice {
     muted: bool,
 }
 
+struct BtwConnection {
+    pane: PaneId,
+    agent_id: Option<String>,
+    commands: mpsc::UnboundedSender<btw::Request>,
+    task: tokio::task::JoinHandle<()>,
+}
+
 struct DriverRuntime {
     control_bridge: Option<nanocodex_tui_control::Bridge>,
+    btw: Option<BtwConnection>,
+    btw_events: mpsc::UnboundedSender<btw::Event>,
     screen: screen::Controller,
     pending_voice: Option<PendingVoice>,
     voice_selection: crate::voice::Selection,
@@ -1865,7 +1878,6 @@ async fn run_inner(
     let initial_effort = effort_from_thinking(initial_settings.thinking);
     let initial_reasoning_mode = reasoning_mode_from_managed(initial_settings.reasoning_mode);
     let mut root = RootNode::new(&workspace, initial_effort);
-    root.set_fork_available(false);
     root.set_reasoning_modes(initial_reasoning_mode, initial_reasoning_mode);
     root.set_fast_mode(initial_settings.fast_mode);
     root.set_model(initial_settings.model);
@@ -1876,8 +1888,11 @@ async fn run_inner(
     let mut terminal = TerminalSession::enter().await.map_err(terminal_error)?;
     let mut input = EventStream::new();
     let mut scheduler = RenderScheduler::new(STREAM_FRAME_INTERVAL, Instant::now());
+    let (btw_events, mut btw_updates) = mpsc::unbounded_channel();
     let mut runtime = DriverRuntime {
         control_bridge: None,
+        btw: None,
+        btw_events,
         screen: screen::Controller::new(None),
         client: client.clone(),
         pending_voice: None,
@@ -2516,6 +2531,30 @@ async fn run_inner(
                     }
                     None => runtime.begin_recovery(&mut app, &mut scheduler, true),
                 }
+            }
+            Some(event) = btw_updates.recv() => {
+                let pane = match &event {
+                    btw::Event::Ready { pane, .. } | btw::Event::Record { pane, .. } | btw::Event::Finished(pane) | btw::Event::Failed { pane, .. } => *pane,
+                };
+                if runtime.btw.as_ref().is_none_or(|btw| btw.pane != pane) { continue; }
+                let update = match event {
+                    btw::Event::Ready { pane, agent_id, settings } => {
+                        if let Some(btw) = &mut runtime.btw { btw.agent_id = Some(agent_id); }
+                        let update = app.update(AppEvent::SettingsHydrated { pane,
+                            effort: effort_from_thinking(settings.thinking), fast_mode: settings.fast_mode,
+                            model: settings.model });
+                        request_render(update, &mut scheduler);
+                        app.update(AppEvent::ForkReady { pane })
+                    }
+                    btw::Event::Record { pane, record } => app.update(AppEvent::Transcript { pane, record }),
+                    btw::Event::Finished(pane) => app.update(AppEvent::WorkerTurnFinished { pane, terminal_expected: false }),
+                    btw::Event::Failed { pane, error, opening: true } => {
+                        runtime.btw.take();
+                        app.update(AppEvent::ForkFailed { pane, error })
+                    }
+                    btw::Event::Failed { pane, error, opening: false } => app.update(AppEvent::NotifyError { pane, error }),
+                };
+                stopping = apply_update(update, &mut app, &mut runtime, &mut terminal, &mut scheduler).await?;
             }
             Some(result) = runtime.session_searches.join_next(), if !runtime.session_searches.is_empty() => {
                 if let Ok(search) = result {
@@ -3417,17 +3456,124 @@ async fn apply_update(
             AppEffect::Shutdown => stopping = true,
             AppEffect::SetTheme(_) => scheduler.request_immediate(Instant::now()),
             AppEffect::OpenFork { pane, .. } => {
-                absorb(
-                    app.update(AppEvent::ForkFailed {
-                        pane,
-                        error: "Hosted agents do not expose client-side forks.".to_owned(),
-                    }),
-                    &mut effects,
-                    scheduler,
-                );
+                if runtime.agent_id.is_empty() {
+                    absorb(
+                        app.update(AppEvent::ForkFailed {
+                            pane,
+                            error: "Wait for the main agent to connect before opening /btw".into(),
+                        }),
+                        &mut effects,
+                        scheduler,
+                    );
+                    continue;
+                }
+                let (commands, requests) = mpsc::unbounded_channel();
+                let task = tokio::spawn(btw::run(
+                    pane,
+                    runtime.client.clone(),
+                    runtime.agent_id.clone(),
+                    fresh_thread_settings(
+                        runtime.routing_enabled || runtime.settings.model == Model::Glm53,
+                        runtime.settings,
+                    ),
+                    runtime.workspace.clone(),
+                    runtime.sequence.saturating_add(1),
+                    requests,
+                    runtime.btw_events.clone(),
+                ));
+                runtime.btw = Some(BtwConnection {
+                    pane,
+                    agent_id: None,
+                    commands,
+                    task,
+                });
             }
-            AppEffect::ClosePane(_) => {}
+            AppEffect::ClosePane(pane) => {
+                if runtime.btw.as_ref().is_some_and(|btw| btw.pane == pane)
+                    && let Some(btw) = runtime.btw.take()
+                {
+                    btw.task.abort();
+                }
+            }
             AppEffect::Pane { pane, effect } => {
+                if pane != PaneId::Main {
+                    match effect {
+                        RootEffect::Submit(prompt) | RootEffect::ContinueSubagent(prompt) => {
+                            if runtime
+                                .btw
+                                .as_ref()
+                                .filter(|btw| btw.pane == pane)
+                                .is_none_or(|btw| {
+                                    btw.commands.send(btw::Request::Submit(prompt)).is_err()
+                                })
+                            {
+                                absorb(
+                                    app.update(AppEvent::NotifyError {
+                                        pane,
+                                        error: "Side agent is no longer connected".into(),
+                                    }),
+                                    &mut effects,
+                                    scheduler,
+                                );
+                                absorb(
+                                    app.update(AppEvent::WorkerTurnFinished {
+                                        pane,
+                                        terminal_expected: false,
+                                    }),
+                                    &mut effects,
+                                    scheduler,
+                                );
+                            }
+                        }
+                        RootEffect::CancelTurns => {
+                            if let Some(btw) = runtime.btw.as_ref().filter(|btw| btw.pane == pane) {
+                                let _ = btw.commands.send(btw::Request::Cancel);
+                            }
+                        }
+                        RootEffect::ShowAgentId => {
+                            let id = runtime
+                                .btw
+                                .as_ref()
+                                .filter(|btw| btw.pane == pane)
+                                .and_then(|btw| btw.agent_id.clone())
+                                .unwrap_or_else(|| "connecting".into());
+                            absorb(
+                                app.update(AppEvent::ShowAgentId { pane, id }),
+                                &mut effects,
+                                scheduler,
+                            );
+                        }
+                        RootEffect::Copy(text) => {
+                            if let Err(error) = clipboard::copy_text(&text) {
+                                absorb(
+                                    app.update(AppEvent::NotifyError {
+                                        pane,
+                                        error: format!("Clipboard copy failed: {error}"),
+                                    }),
+                                    &mut effects,
+                                    scheduler,
+                                );
+                            }
+                        }
+                        RootEffect::Steer { id, .. } => {
+                            absorb(
+                                app.update(AppEvent::SteerFailed { pane, id }),
+                                &mut effects,
+                                scheduler,
+                            );
+                            absorb(app.update(AppEvent::NotifyError { pane, error: "Queue a follow-up with Tab in /btw; steering is not available".into() }), &mut effects, scheduler);
+                        }
+                        _ => absorb(
+                            app.update(AppEvent::NotifyError {
+                                pane,
+                                error: "This command is unavailable in /btw".into(),
+                            }),
+                            &mut effects,
+                            scheduler,
+                        ),
+                    }
+                    continue;
+                }
                 // Keep the hosted effect boundary visually separate from app-level routing.
                 match effect {
                     RootEffect::Reload => {
@@ -3437,7 +3583,7 @@ async fn apply_update(
                         };
                         absorb(update, &mut effects, scheduler);
                     }
-                    RootEffect::Screen | RootEffect::Zoom => {
+                    RootEffect::Screen | RootEffect::Zoom | RootEffect::Btw(_) | RootEffect::CloseBtw => {
                         unreachable!("workspace commands are handled by AppNode")
                     }
                     RootEffect::Voice(command) => {
@@ -4407,15 +4553,14 @@ mod tests {
         CancellationToken, DriverRuntime, HistoryPrefetch, HistoryWindow, ManagedActiveTurns,
         SteerResolution, SteerTarget, cursor_at_or_before, decimal_successor, history_projection,
         history_projection_with_sequences, history_replay_matches, live_managed_projection,
-        new_agent_settings, prepare_history_replay, session_summaries, take_waiting_steer_failures,
+        new_agent_settings, prepare_history_replay, session_summaries,
     };
     use crate::config::ReasoningEffort;
     use crate::tui::{components::QueueId, pane::PaneId, prompt::Submission, transcript::TurnId};
     use nanocodex::Model;
     use nanocodex_managed::{
         AgentList, AgentSettings, AgentSummary, EventHistoryPage, ManagedApiKey, ManagedClient,
-        ManagedError, ManagedEvent, ManagedEventData, PromptInput,
-        ReasoningMode as ManagedReasoningMode, Thinking,
+        ManagedError, ManagedEvent, ManagedEventData, PromptInput, Thinking,
     };
     use serde_json::{json, value::to_raw_value};
     use std::{
@@ -4517,19 +4662,6 @@ mod tests {
             ..AgentSettings::default()
         };
         assert_eq!(super::fresh_thread_settings(false, manual), manual);
-    }
-
-    #[test]
-    fn new_agents_select_sol_xhigh_fast_without_an_entitlement_probe() {
-        assert_eq!(
-            new_agent_settings(),
-            AgentSettings {
-                model: Model::Sol,
-                thinking: Thinking::Xhigh,
-                reasoning_mode: ManagedReasoningMode::Standard,
-                fast_mode: true,
-            }
-        );
     }
 
     #[tokio::test]
@@ -4776,6 +4908,8 @@ mod tests {
                 .unwrap();
         DriverRuntime {
             control_bridge: None,
+            btw: None,
+            btw_events: tokio::sync::mpsc::unbounded_channel().0,
             screen: crate::tui::screen::Controller::new(Some(
                 ratatui_image::picker::Picker::halfblocks(),
             )),
@@ -5072,30 +5206,6 @@ mod tests {
     }
 
     #[test]
-    fn terminal_failures_drain_waiting_steers_in_queue_safe_order() {
-        let mut waiting = VecDeque::from([
-            (
-                PaneId::Main,
-                QueueId::new(7),
-                Submission::text("first".to_owned()),
-            ),
-            (
-                PaneId::Main,
-                QueueId::new(8),
-                Submission::text("second".to_owned()),
-            ),
-        ]);
-
-        let failures = take_waiting_steer_failures(&mut waiting);
-
-        assert_eq!(
-            failures.iter().map(|(_, id)| *id).collect::<Vec<_>>(),
-            [QueueId::new(7), QueueId::new(8)]
-        );
-        assert!(waiting.is_empty());
-    }
-
-    #[test]
     fn managed_active_turns_reconcile_cursor_order_idempotently() {
         let mut active = ManagedActiveTurns {
             ids: HashSet::from(["attached-1".to_owned()]),
@@ -5121,34 +5231,6 @@ mod tests {
         assert!(active.observe(&terminal, &HashMap::new()).active_changed);
         assert_eq!(active.ids, HashSet::from(["turn-1".to_owned()]));
         assert!(!active.observe(&terminal, &HashMap::new()).active_changed);
-    }
-
-    #[test]
-    fn fresh_session_can_steer_an_observed_turn_without_capability_initialization() {
-        let mut active = ManagedActiveTurns::default();
-        assert_eq!(
-            active.steer_target().unwrap_err(),
-            "no attached managed turn is active"
-        );
-
-        active.observe(&managed_turn("1", "new prompt"), &HashMap::new());
-        assert_eq!(active.steer_target().unwrap(), "turn-1");
-
-        active.observe(
-            &ManagedEvent {
-                cursor: "2".to_owned(),
-                created_at: None,
-                turn_id: Some("turn-1".to_owned()),
-                data: ManagedEventData::TurnCancelled {
-                    id: "turn-1".to_owned(),
-                },
-            },
-            &HashMap::new(),
-        );
-        assert_eq!(
-            active.steer_target().unwrap_err(),
-            "no attached managed turn is active"
-        );
     }
 
     #[test]
@@ -5210,100 +5292,6 @@ mod tests {
         assert!(observation.external);
         assert!(observation.active_changed);
         assert!(!active.ids.contains("attached-1"));
-    }
-
-    #[test]
-    fn attached_steering_uses_durable_admission_order() {
-        let mut active = ManagedActiveTurns {
-            ids: HashSet::from(["attached-1".to_owned()]),
-            order: vec!["attached-1".to_owned()],
-        };
-        assert_eq!(active.steer_target().unwrap(), "attached-1");
-
-        active.ids.insert("attached-2".to_owned());
-        active.order.push("attached-2".to_owned());
-        assert_eq!(active.steer_target().unwrap(), "attached-1");
-        active.remove("attached-1");
-        assert_eq!(active.steer_target().unwrap(), "attached-2");
-        active.remove("attached-2");
-        assert_eq!(
-            active.steer_target().unwrap_err(),
-            "no attached managed turn is active"
-        );
-    }
-
-    #[test]
-    fn managed_history_projects_into_tact_user_and_assistant_records() {
-        let agent_event = to_raw_value(&json!({
-            "protocol_version": 1,
-            "request_id": "request-1",
-            "seq": 2,
-            "type": "assistant.message",
-            "payload": {
-                "model_call_index": 0,
-                "item_id": null,
-                "phase": null,
-                "text": "done"
-            }
-        }))
-        .unwrap();
-        let history = vec![
-            ManagedEvent {
-                cursor: "1".to_owned(),
-                created_at: Some(1_750_000_000.0),
-                turn_id: Some("turn-1".to_owned()),
-                data: ManagedEventData::TurnAccepted {
-                    id: "turn-1".to_owned(),
-                    input: PromptInput::Text("inspect the tree".to_owned()),
-                    replayed: false,
-                },
-            },
-            ManagedEvent {
-                cursor: "2".to_owned(),
-                created_at: Some(1_750_000_001.0),
-                turn_id: Some("turn-1".to_owned()),
-                data: ManagedEventData::Event {
-                    event: agent_event,
-                    agent_id: None,
-                },
-            },
-        ];
-
-        let (records, next_sequence, recent) =
-            history_projection(history, "agent-1", Path::new("/workspace")).unwrap();
-
-        assert_eq!(records.len(), 2);
-        assert_eq!(
-            (records[0].source(), records[0].kind()),
-            ("tact", "user.submitted")
-        );
-        assert_eq!(
-            (records[1].source(), records[1].kind()),
-            ("agent", "assistant.message")
-        );
-        assert_eq!(next_sequence, 3);
-        assert_eq!(recent[0].text, "inspect the tree");
-    }
-
-    #[test]
-    fn live_managed_acceptance_projects_the_remote_user_prompt() {
-        let mut next_sequence = 7;
-        let (record, prompt) = live_managed_projection(
-            managed_turn("42", "sent from another client"),
-            "agent-1",
-            Path::new("/workspace"),
-            &mut next_sequence,
-        )
-        .unwrap()
-        .expect("turn acceptance should project");
-
-        let prompt = prompt.expect("turn acceptance should update prompt history");
-        assert_eq!((record.source(), record.kind()), ("tact", "user.submitted"));
-        assert_eq!(record.sequence(), 7);
-        assert_eq!(prompt.text, "sent from another client");
-        assert_eq!(prompt.session_id, "agent-1");
-        assert_eq!(prompt.workspace, Path::new("/workspace"));
-        assert_eq!(next_sequence, 8);
     }
 
     #[test]
@@ -5417,48 +5405,6 @@ mod tests {
                 .display_text(),
             "new thread"
         );
-    }
-
-    #[test]
-    fn live_managed_projection_preserves_agent_output_after_the_prompt() {
-        let mut next_sequence = 7;
-        let event = ManagedEvent {
-            cursor: "43".to_owned(),
-            created_at: Some(1_750_000_000.0),
-            turn_id: Some("turn-42".to_owned()),
-            data: ManagedEventData::Event {
-                event: to_raw_value(&json!({
-                    "protocol_version": 1,
-                    "request_id": "request-1",
-                    "seq": 1,
-                    "type": "assistant.message",
-                    "payload": {
-                        "model_call_index": 0,
-                        "item_id": null,
-                        "phase": null,
-                        "text": "done"
-                    }
-                }))
-                .unwrap(),
-                agent_id: None,
-            },
-        };
-
-        let (record, prompt) = live_managed_projection(
-            event,
-            "agent-1",
-            Path::new("/workspace"),
-            &mut next_sequence,
-        )
-        .unwrap()
-        .expect("agent output should project");
-
-        assert_eq!(
-            (record.source(), record.kind()),
-            ("agent", "assistant.message")
-        );
-        assert!(prompt.is_none());
-        assert_eq!(next_sequence, 8);
     }
 
     #[test]

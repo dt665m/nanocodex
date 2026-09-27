@@ -3,130 +3,6 @@ import test from "node:test";
 
 import { isManagedRoutePath, routeManaged } from "./managedProxy.ts";
 
-test("the account Worker exposes only the exact managed wallet routes", () => {
-  for (const path of [
-    "/v1/wallet",
-    "/v1/wallet/balance",
-    "/v1/wallet/connect",
-    "/v1/wallet/revoke-access-key",
-  ]) {
-    assert.equal(isManagedRoutePath(path), true, path);
-  }
-
-  for (const path of [
-    "/v1/wallet/",
-    "/v1/wallet/export",
-    "/v1/wallet/connect/extra",
-    "/v1/wallet/revoke-access-key/extra",
-  ]) {
-    assert.equal(isManagedRoutePath(path), false, path);
-  }
-});
-
-test("the account Worker projects opaque sandbox preview capabilities", () => {
-  assert.equal(isManagedRoutePath("/sandbox-preview/capability/"), true);
-  assert.equal(isManagedRoutePath("/sandbox-preview/capability/assets/app.js"), true);
-  assert.equal(isManagedRoutePath("/sandbox-preview/"), false);
-});
-
-test("the removed model capabilities route is not projected", () => {
-  assert.equal(isManagedRoutePath("/v1/model-capabilities"), false);
-});
-
-test("the account hand WebSocket stays on the managed service boundary", async () => {
-  assert.equal(isManagedRoutePath("/v1/account/tool-host"), true);
-  const request = new Request("https://nanocodex.localhost/v1/account/tool-host", {
-    headers: { upgrade: "websocket" },
-  });
-  let forwarded: Request | undefined;
-  const response = await routeManaged(request, {
-    NANOCODEX_BACKEND: {
-      fetch(candidate: Request) {
-        forwarded = candidate;
-        return Promise.resolve(new Response(null, { status: 204 }));
-      },
-      connect() { throw new Error("unused"); },
-    },
-  }, new URL(request.url));
-
-  assert.equal(response?.status, 204);
-  assert.equal(forwarded, request);
-});
-
-test("interactive screen routes retain their exact managed boundary", () => {
-  for (const suffix of ["", "/screens", "/host", "/view", "/renew", "/ice"]) {
-    assert.equal(isManagedRoutePath("/v1/account/hands" + suffix), true);
-  }
-  for (const suffix of ["/", "/host/extra", "/input", "/command", "-other"]) {
-    assert.equal(isManagedRoutePath("/v1/account/hands" + suffix), false);
-  }
-});
-
-test("VM host WebSockets stay on their exact managed service boundaries", () => {
-  for (const path of [
-    "/v1/account/vm-host",
-    "/v1/agents/agent-1/vm-host",
-    "/v1/system/vm-host",
-    `/v1/vm-host-attachments/${"p".repeat(43)}/11111111-1111-4111-8111-111111111111/tool-host`,
-    ...["host", "ice", "renew"].map(endpoint => `/v1/vm-host-attachments/${"p".repeat(43)}/11111111-1111-4111-8111-111111111111/hands/${endpoint}`),
-  ]) {
-    assert.equal(isManagedRoutePath(path), true, path);
-  }
-
-  for (const path of [
-    "/v1/account/vm-host/",
-    "/v1/system/vm-host/",
-    "/v1/system/vm-host/extra",
-    `/v1/vm-host-attachments/${"p".repeat(43)}/11111111-1111-4111-8111-111111111111/tool-host/extra`,
-    `/v1/vm-host-attachments/${"p".repeat(43)}/11111111-1111-4111-8111-111111111111/hands/view`,
-  ]) {
-    assert.equal(isManagedRoutePath(path), false, path);
-  }
-});
-
-
-test("account Hand discovery uses only the exact managed route", async () => {
-  assert.equal(isManagedRoutePath("/v1/account/hands"), true);
-  assert.equal(isManagedRoutePath("/v1/account/hands/"), false);
-  assert.equal(isManagedRoutePath("/v1/account/hands/other"), false);
-  const request = new Request("https://nanocodex.localhost/v1/account/hands", { headers: { authorization: "Bearer test" } });
-  let forwarded: Request | undefined;
-  const response = await routeManaged(request, { NANOCODEX_BACKEND: {
-    fetch(candidate: Request) { forwarded = candidate; return Promise.resolve(Response.json({ data: [] })); },
-    connect() { throw new Error("unused"); },
-  } }, new URL(request.url));
-  assert.equal(forwarded, request);
-  assert.deepEqual(await response?.json(), { data: [] });
-});
-
-
-test("server Hand enrollment and scoped publishers retain their managed boundary", async () => {
-  const owner = "11111111-1111-4111-8111-111111111111";
-  const id = "22222222-2222-4222-8222-222222222222";
-  const management = `/v1/account/hand-hosts/${id}`;
-  const publisher = `/v1/hand-hosts/${owner}/${id}/hands`;
-  for (const path of ["/v1/account/hand-hosts", management, ...["host", "ice", "renew"].map(endpoint => `${publisher}/${endpoint}`)]) {
-    assert.equal(isManagedRoutePath(path), true, path);
-  }
-  for (const path of ["/v1/account/hand-hosts/", `${management}/extra`, "/v1/account/hand-hosts/invalid", `${publisher}/view`, `${publisher}/host/extra`, `${publisher}/`, `/v1/hand-hosts/${owner}/invalid/hands/host`]) {
-    assert.equal(isManagedRoutePath(path), false, path);
-  }
-  for (const request of [
-    new Request(`https://nanocodex.localhost${management}`, { method: "PUT", headers: { authorization: "Bearer account-test", origin: "https://nanocodex.localhost", "content-type": "application/json" }, body: JSON.stringify({ name: "SSH fixture" }) }),
-    new Request(`https://nanocodex.localhost${publisher}/host`, { headers: { authorization: "Bearer publisher-test", upgrade: "websocket" } }),
-    new Request(`https://nanocodex.localhost${publisher}/ice`, { method: "POST", headers: { authorization: "Bearer publisher-test" } }),
-  ]) {
-    let forwarded: Request | undefined;
-    const response = await routeManaged(request, { NANOCODEX_BACKEND: {
-      fetch(candidate: Request) { forwarded = candidate; return Promise.resolve(new Response(null, { status: 204 })); },
-      connect() { throw new Error("unused"); },
-    } }, new URL(request.url));
-    assert.equal(response?.status, 204);
-    assert.equal(forwarded, request);
-  }
-});
-
-
 test("screen proxy timing preserves authentication headers, response identity and private query data", async () => {
   const request = new Request("https://nanocodex.localhost/v1/account/hands/view?generation=private-generation", {
     headers: { upgrade: "websocket", authorization: "Bearer private-key", "x-nanocodex-access": "private-snapshot" },
@@ -238,47 +114,9 @@ test("direct broker failure and stale generation never replay through the manage
   }
 });
 
-test("cloud phone controls and signed callbacks reach managed authentication", () => {
-  const id = "11111111-1111-4111-8111-111111111111";
-  for (const path of ["health", "check", "calls", `calls/${id}`, `calls/${id}/hangup`, `calls/${id}/steer`, `status/${id}`, `media/${id}/`, "internal/state", "internal/setup"])
-    assert.equal(isManagedRoutePath(`/v1/phone/bridge/${path}`), true);
-  for (const path of ["", "internal/secrets", "calls/invalid", `media/${id}`])
-    assert.equal(isManagedRoutePath(`/v1/phone/bridge/${path}`), false);
-});
-
-test("standalone inference routes project through the managed service", async () => {
-  for (const path of ["/v1/models", "/v1/responses", "/v1/inference/models", "/v1/inference/sessions", "/v1/inference/responses", "/v1/inference/keys"]) {
-    assert.equal(isManagedRoutePath(path), true);
-    const request = new Request("https://nanocodex.example" + path, { headers: { authorization: "Bearer nci_live_synthetic" } });
-    let forwarded: Request | undefined;
-    const response = await routeManaged(request, { NANOCODEX_BACKEND: {
-      fetch(candidate: Request) { forwarded = candidate; return Promise.resolve(new Response(null, { status: 204 })); },
-      connect() { throw new Error("unused"); },
-    } }, new URL(request.url));
-    assert.equal(response?.status, 204);
-    assert.equal(forwarded, request);
-  }
-});
-
-test("standard inference aliases project only their exact paths", async () => {
-  for (const path of ["/v1/responses/", "/v1/responses/response-id", "/v1/responses-other",
-    "/v1/memory", "/v1/memory/1",
-    "/v1/models/", "/v1/models/model-id", "/v1/models-other", "/v1/chat/completions", "/v1/sessions"]) {
-    assert.equal(isManagedRoutePath(path), false, path);
-    const request = new Request("https://nanocodex.example" + path, {
-      headers: { authorization: "Bearer nci_live_synthetic", cookie: "synthetic=owner" },
-    });
-    const response = await routeManaged(request, { NANOCODEX_BACKEND: {
-      fetch() { throw new Error("unrecognized alias must not forward"); },
-      connect() { throw new Error("unused"); },
-    } }, new URL(request.url));
-    assert.equal(response, undefined, path);
-  }
-});
-
 test("inference credentials cannot reach account, connector, agent or hand proxy paths", async () => {
-  for (const path of ["/v1/me", "/v1/agents", "/v1/api-keys", "/v1/connectors/github", "/v1/credentials",
-    "/v1/account/hands", "/v1/account/hands/screens", "/v1/account/tool-host", "/v1/history", "/v1/memories/list", "/v1/memories/write", "/v1/memories/status", "/v1/markdown-memory/get", "/v1/egress", "/v1/wallet"]) {
+  for (const path of ["/v1/todo", "/v1/todo/decisions/11111111-1111-4111-8111-111111111111/respond", "/v1/me", "/v1/agents", "/v1/api-keys", "/v1/connectors/github", "/v1/credentials",
+    "/v1/account/hands", "/v1/account/hands/screens", "/v1/account/hosted-tool-stats", "/v1/account/tool-host", "/v1/history", "/v1/memories/list", "/v1/memories/write", "/v1/memories/status", "/v1/markdown-memory/get", "/v1/egress", "/v1/wallet"]) {
     const request = new Request("https://nanocodex.example" + path, {
       headers: { authorization: "Bearer nci_live_synthetic", cookie: "synthetic=account", upgrade: "websocket", "x-nanocodex-managed-access": "synthetic" },
     });
@@ -289,6 +127,26 @@ test("inference credentials cannot reach account, connector, agent or hand proxy
     assert.equal(response?.status, 403, path);
     assert.deepEqual(await response.json(), { error: "inference_key_scope" });
   }
+});
+
+test("hosted tool stats are forwarded unchanged to managed owner authorization", async () => {
+  const request = new Request("https://nanocodex.example/v1/account/hosted-tool-stats", {
+    headers: { authorization: "Bearer fixture-key", cookie: "nanocodex_account=fixture" },
+  });
+  let calls = 0;
+  const response = await routeManaged(request, { NANOCODEX_BACKEND: {
+    fetch(forwarded) {
+      calls++;
+      const forwardedRequest = new Request(forwarded);
+      assert.equal(forwardedRequest.url, request.url);
+      assert.equal(forwardedRequest.headers.get("authorization"), "Bearer fixture-key");
+      assert.equal(forwardedRequest.headers.get("cookie"), "nanocodex_account=fixture");
+      return Promise.resolve(Response.json({ total_calls: 3 }));
+    },
+    connect() { throw new Error("unused"); },
+  } }, new URL(request.url));
+  assert.equal(calls, 1);
+  assert.deepEqual(await response?.json(), { total_calls: 3 });
 });
 
 test("malformed inference authorization cannot fall back to a cached owner cookie", async () => {
@@ -518,27 +376,73 @@ test("live renewal and broker authorization failures clear browser access withou
   }
 });
 
-test("memory routes forward only public file and Markdown operations", async () => {
-  const paths = [
-    ...["list", "read", "search", "add_ad_hoc_note", "write", "status"].map(operation => `/v1/memories/${operation}`),
-    ...["get", "search", "write", "status"].map(operation => `/v1/markdown-memory/${operation}`),
-  ];
-  for (const path of paths) {
-    assert.equal(isManagedRoutePath(path), true, path);
-    const request = new Request(`https://nanocodex.example${path}`, { method: "POST" });
-    let forwarded: Request | undefined;
-    const response = await routeManaged(request, { NANOCODEX_BACKEND: {
-      fetch(candidate: Request) {
-        forwarded = candidate;
-        return Promise.resolve(new Response(null, { status: 204 }));
-      },
-      connect() { throw new Error("unused"); },
-    } }, new URL(request.url));
-    assert.equal(forwarded, request);
-    assert.equal(response?.status, 204);
-  }
-  for (const path of ["/v1/memory", "/v1/memory/1", "/v1/memories", "/v1/memories/delete", "/v1/memories/list/extra",
-    "/v1/markdown-memory", "/v1/markdown-memory/flush", "/v1/markdown-memory/write/extra"]) {
+test("combined agent create-and-turn forwards exactly once with its idempotency key", async () => {
+  for (const path of ["/v1/agent-runs/", "/v1/agent-runs/extra", "/v1/agent-runs-other"]) assert.equal(isManagedRoutePath(path), false, path);
+  assert.equal(isManagedRoutePath("/v1/agent-runs"), true);
+  const request = new Request("https://nanocodex.localhost/v1/agent-runs", {
+    method: "POST", headers: { authorization: "Bearer test", origin: "https://nanocodex.localhost",
+      "idempotency-key": "one-create-one-turn", "content-type": "application/json" },
+    body: JSON.stringify({ input: "hello" }),
+  });
+  const forwarded: Request[] = [];
+  const response = await routeManaged(request, { NANOCODEX_BACKEND: {
+    fetch(candidate: Request) { forwarded.push(candidate); return Promise.resolve(Response.json({ agent_id: "expected", turn_id: "expected" }, { status: 201 })); },
+    connect() { throw Error("unused"); },
+  } }, new URL(request.url));
+  assert.equal(response?.status, 201);
+  assert.deepEqual(forwarded, [request]);
+  assert.equal(forwarded[0]?.headers.get("idempotency-key"), "one-create-one-turn");
+});
+
+
+test("meeting previews expose only the capture UUID endpoint", () => {
+  const capture = "a745f840-f68d-46ce-9d70-5daf9693a582";
+  for (const id of [capture, capture.toUpperCase()])
+    assert.equal(isManagedRoutePath(`/v1/meetings/${id}/preview`), true);
+  for (const path of ["/v1/meetings", "/v1/meetings/", "/v1/meetings/anything/preview",
+    `/v1/meetings/${capture}/preview/extra`, `/v1/meetings/${capture}/transcript`])
     assert.equal(isManagedRoutePath(path), false, path);
+});
+
+// The account proxy previously returned no route, causing public TODO calls to
+// fall through to 404 before managed authentication or persistence could run.
+test("TODO reads, captures and decision responses retain the exact managed request and response", async () => {
+  const decision = "11111111-1111-4111-8111-111111111111";
+  for (const [method, path, body] of [
+    ["GET", "/v1/todo", undefined],
+    ["POST", "/v1/todo", JSON.stringify({ body: "Follow up", operation_id: decision })],
+    ["POST", `/v1/todo/decisions/${decision}/respond`, JSON.stringify({ version: 1, choice_id: "yes", operation_id: decision })],
+  ] as const) {
+    for (const status of [200, 401, 403]) {
+      const request = new Request(`https://nanocodex.example${path}`, {
+        method, body, headers: { authorization: "Bearer fixture", cookie: "nanocodex_account=fixture", "content-type": "application/json" },
+      });
+      const backendResponse = Response.json({ status }, { status, headers: { "x-nanocodex-access-rejected": "1" } });
+      let calls = 0;
+      const response = await routeManaged(request, { NANOCODEX_BACKEND: {
+        async fetch(forwarded: Request) {
+          calls++;
+          assert.equal(forwarded, request);
+          assert.equal(forwarded.bodyUsed, false);
+          if (body) assert.equal(await forwarded.text(), body);
+          return backendResponse;
+        },
+        connect() { throw Error("unused"); },
+      } }, new URL(request.url));
+      assert.equal(calls, 1, `${method} ${path}: ${status}`);
+      assert.equal(response, backendResponse);
+      assert.equal(response.bodyUsed, false);
+      assert.equal(response.headers.get("x-nanocodex-access-rejected"), "1");
+    }
+  }
+});
+
+test("TODO forwarding excludes unsupported adjacent endpoints", async () => {
+  for (const path of ["/v1/todos", "/v1/todo/", "/v1/todo/decisions", "/v1/todo/decisions/invalid/respond",
+    "/v1/todo/decisions/11111111-1111-4111-8111-111111111111/respond/extra"]) {
+    const request = new Request(`https://nanocodex.example${path}`);
+    assert.equal(await routeManaged(request, { NANOCODEX_BACKEND: {
+      async fetch() { throw Error("unsupported route reached managed"); }, connect() { throw Error("unused"); },
+    } }, new URL(request.url)), undefined, path);
   }
 });

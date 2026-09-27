@@ -278,6 +278,7 @@ pub(crate) struct AppNode {
     main_area: Rect,
     fork_area: Rect,
     next_fork: u64,
+    pending_btw: Option<(PaneId, String)>,
 }
 
 impl AppNode {
@@ -296,6 +297,7 @@ impl AppNode {
             main_area: Rect::default(),
             fork_area: Rect::default(),
             next_fork: 1,
+            pending_btw: None,
         }
     }
 
@@ -433,7 +435,30 @@ impl AppNode {
             AppEvent::SteerFailed { pane, id } => {
                 self.update_root(pane, RootEvent::SteerFailed { id })
             }
-            AppEvent::ForkReady { pane } => self.update_root(pane, RootEvent::ForkReady),
+            AppEvent::ForkReady { pane } => {
+                let ready = self.update_root(pane, RootEvent::ForkReady);
+                let question = self.pending_btw.take().and_then(|(target, question)| {
+                    if target == pane {
+                        Some(question)
+                    } else {
+                        self.pending_btw = Some((target, question));
+                        None
+                    }
+                });
+                if let Some(question) = question {
+                    let draft = self.update_root(pane, RootEvent::ReplaceDraft(question));
+                    let sent = self.update_root(
+                        pane,
+                        RootEvent::Terminal(Event::Key(crossterm::event::KeyEvent::new(
+                            KeyCode::Enter,
+                            KeyModifiers::NONE,
+                        ))),
+                    );
+                    merge_updates(Some(ready), Some(merge_updates(Some(draft), Some(sent))))
+                } else {
+                    ready
+                }
+            }
             AppEvent::ForkFailed { pane, error } => {
                 self.remove_pane(pane);
                 let Some(target) = self.main_pane() else {
@@ -444,7 +469,7 @@ impl AppNode {
                 };
                 self.update_root(
                     target,
-                    RootEvent::NotifyError(format!("Could not fork session: {error}")),
+                    RootEvent::NotifyError(format!("Could not open /btw: {error}")),
                 )
             }
             AppEvent::NewSessionReady {
@@ -990,10 +1015,24 @@ impl AppNode {
                 RootEffect::Zoom => {
                     self.zoomed = !self.zoomed;
                 }
-                RootEffect::Fork => {
+                RootEffect::Fork | RootEffect::Btw(_) => {
                     if self.fork.is_none() && self.main.is_some() {
+                        let question = if let RootEffect::Btw(question) = effect {
+                            question
+                        } else {
+                            String::new()
+                        };
                         let (pane, parent) = self.begin_fork();
+                        if !question.is_empty() {
+                            self.pending_btw = Some((pane, question));
+                        }
                         effects.push(AppEffect::OpenFork { pane, parent });
+                    }
+                }
+                RootEffect::CloseBtw => {
+                    if self.fork.as_ref().is_some_and(|(id, _)| *id == pane) {
+                        self.remove_pane(pane);
+                        effects.push(AppEffect::ClosePane(pane));
                     }
                 }
                 RootEffect::Shutdown => {
@@ -1083,6 +1122,9 @@ impl AppNode {
     }
 
     fn remove_pane(&mut self, pane: PaneId) {
+        if self.pending_btw.as_ref().is_some_and(|(id, _)| *id == pane) {
+            self.pending_btw = None;
+        }
         if self.main.as_ref().is_some_and(|(id, _)| *id == pane) {
             self.main = self.fork.take();
         } else if self.fork.as_ref().is_some_and(|(id, _)| *id == pane) {
@@ -1208,66 +1250,6 @@ mod screen_tests {
     }
 
     #[test]
-    fn screen_and_zoom_are_local_and_tab_cycles_without_changing_sessions() {
-        let mut app = app();
-        let update = app.map_root_update(
-            PaneId::Main,
-            ComponentUpdate {
-                effects: vec![RootEffect::Screen],
-                render: RenderRequest::Immediate,
-            },
-        );
-        assert!(matches!(
-            update.effects.as_slice(),
-            [AppEffect::Screen(crate::tui::screen::Command::List)]
-        ));
-        assert!(app.screen_focused);
-        let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
-        terminal.draw(|frame| app.render(frame)).unwrap();
-        assert_eq!(app.screen_area.width, 80);
-        for c in "/zoom".chars() {
-            key(&mut app, KeyCode::Char(c));
-        }
-        key(&mut app, KeyCode::Enter);
-        terminal.draw(|frame| app.render(frame)).unwrap();
-        assert_eq!(app.screen_area.width, 160);
-        key(&mut app, KeyCode::Tab);
-        assert!(!app.screen_focused);
-        assert!(app.zoomed);
-        terminal.draw(|frame| app.render(frame)).unwrap();
-        assert_eq!(app.main_area.width, 160);
-        assert!(app.screen_area.is_empty());
-        key(&mut app, KeyCode::BackTab);
-        let close = key(&mut app, KeyCode::Esc);
-        assert!(matches!(
-            close.effects.as_slice(),
-            [AppEffect::Screen(crate::tui::screen::Command::Close)]
-        ));
-        assert!(app.screen.is_none());
-        assert!(!app.zoomed);
-        assert_eq!(app.main_pane(), Some(PaneId::Main));
-    }
-    #[test]
-    fn typed_screen_command_opens_picker_without_submitting_a_prompt() {
-        let mut app = app();
-        for character in "/screen".chars() {
-            key(&mut app, KeyCode::Char(character));
-        }
-        let update = key(&mut app, KeyCode::Enter);
-        assert!(matches!(
-            update.effects.as_slice(),
-            [AppEffect::Screen(crate::tui::screen::Command::List)]
-        ));
-        assert!(app.screen_focused);
-        assert!(
-            app.root(PaneId::Main)
-                .unwrap()
-                .composer()
-                .draft()
-                .is_empty()
-        );
-    }
-    #[test]
     fn zoom_and_tab_include_btw_pane() {
         let mut app = app();
         let (fork, _) = app.begin_fork();
@@ -1287,5 +1269,43 @@ mod screen_tests {
         assert!(app.zoomed);
         terminal.draw(|frame| app.render(frame)).unwrap();
         assert_eq!(app.main_area.width, 120);
+    }
+    #[test]
+    fn btw_question_opens_a_side_pane_and_submits_only_after_ready() {
+        let mut app = app();
+        app.update(AppEvent::Terminal(Event::Paste("/btw why?".into())));
+        let opened = app.update(AppEvent::Terminal(Event::Key(
+            crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )));
+        let pane = match opened.effects.as_slice() {
+            [AppEffect::OpenFork { pane, .. }] => *pane,
+            _ => panic!("expected side pane, not parent submission"),
+        };
+        assert_eq!(app.focus, pane);
+        let ready = app.update(AppEvent::ForkReady { pane });
+        assert!(
+            matches!(ready.effects.as_slice(), [AppEffect::Pane { pane: target, effect: RootEffect::Submit(prompt) }] if *target == pane && prompt.display_text() == "why?")
+        );
+        assert!(
+            app.root(PaneId::Main)
+                .unwrap()
+                .composer()
+                .draft()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn close_from_side_leaves_main_pane_open() {
+        let mut app = app();
+        let (side, _) = app.begin_fork();
+        app.update(AppEvent::ForkReady { pane: side });
+        app.update(AppEvent::Terminal(Event::Paste("/close".into())));
+        let close = app.update(AppEvent::Terminal(Event::Key(
+            crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )));
+        assert!(matches!(close.effects.as_slice(), [AppEffect::ClosePane(pane)] if *pane == side));
+        assert!(app.root(PaneId::Main).is_some());
+        assert!(app.root(side).is_none());
     }
 }

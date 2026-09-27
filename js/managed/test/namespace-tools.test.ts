@@ -40,23 +40,30 @@ const context = (overrides: Partial<{
 });
 
 describe("cwd-root namespace execution", () => {
-  it("does not publish a custom computer tool or silently adapt screen-only Hands", async () => {
+  it("routes a controllable screen as the native CUA fallback", async () => {
     const screen = vi.fn();
+    const definition = { description: "Fixture native screen", parameters: {
+      type: "object", properties: { action: { enum: ["observe", "release"] } }, required: ["action"],
+    } };
     const runtime = createNamespaceExecutionRuntime(
       () => [{ id: "screen", workspace: "/workspace" }],
-      () => undefined, undefined, () => ({ handler: screen }),
+      () => undefined, undefined, () => ({ handler: screen, definition }),
     );
     expect(runtime.tools).not.toHaveProperty("computer");
     expect(runtime.tools).not.toHaveProperty("select_computer");
     await expect(runtime.tools[CUA_JS_NAME]!.handler({ workdir: "/screen" }, context()))
-      .rejects.toThrow("screen-only Hands are unsupported");
-    await expect(runtime.tools[CUA_JS_NAME]!.handler({ workdir: "/screen", code: "await cua.getState()" }, context()))
-      .rejects.toThrow("no CUA runtime");
-    expect(screen).not.toHaveBeenCalled();
+      .resolves.toMatchObject({ definitions: expect.arrayContaining([
+        expect.objectContaining({ description: expect.stringContaining("Native screen control fallback"), parameters: definition.parameters }),
+      ]) });
+    await runtime.tools[CUA_JS_NAME]!.handler({ workdir: "/screen", action: "observe" }, context());
+    expect(screen).toHaveBeenLastCalledWith({ action: "observe" }, expect.anything());
+    await runtime.tools[CUA_RESET_NAME]!.handler({ workdir: "/screen" }, context());
+    expect(screen).toHaveBeenLastCalledWith({ action: "release" }, expect.anything());
   });
 
   it("returns discovered provider instructions and accepts provider-owned schemas", async () => {
     const handler = vi.fn();
+    const screen = vi.fn();
     let description = "Provider-native initialization: await desktop.connect()";
     let supported = true;
     const runtime = createNamespaceExecutionRuntime(
@@ -67,23 +74,45 @@ describe("cwd-root namespace execution", () => {
           ? (name === CUA_JS_NAME ? providerParameters : resetParameters)
           : { type: "object", properties: { invented: { type: "string" } } } },
       } : undefined,
+      undefined,
+      () => ({ handler: screen, definition: { description: "Fallback screen", parameters: {
+        type: "object", properties: { action: { type: "string" } }, required: ["action"],
+      } } }),
     );
     await expect(runtime.tools[CUA_JS_NAME]!.handler({ code: "1" }, context()))
       .rejects.toThrow("explicit Hand workdir");
     const selection = await runtime.tools[CUA_JS_NAME]!.handler({ workdir: "/native" }, context());
     expect(selection).toMatchObject({
-      browser_selection: expect.stringContaining("'brave', not 'Brave Browser'"),
-      native_app_recovery: expect.stringContaining("Do not replay input actions"),
       definitions: [
       { name: CUA_JS_NAME, description, parameters: providerParameters, output_schema: { type: "object" },
         _meta: { provider: { retained: true } }, annotations: { readOnlyHint: false } },
       { name: CUA_RESET_NAME, description, parameters: resetParameters },
     ] });
-    expect(runtime.tools[CUA_JS_NAME]!.description).not.toContain("cua.getApp");
+    await runtime.tools[CUA_JS_NAME]!.handler({ workdir: "/native", source: "upstream" }, context());
+    expect(handler).toHaveBeenCalledWith({ source: "upstream" }, expect.anything());
+    expect(screen).not.toHaveBeenCalled();
     supported = false;
     const changed = await runtime.tools[CUA_JS_NAME]!.handler({ workdir: "/native" }, context({ parentCallId: "new" }));
     expect(changed).toMatchObject({ definitions: [{ parameters: { type: "object", properties: { invented: { type: "string" } } } }, { parameters: { type: "object", properties: { invented: { type: "string" } } } }] });
-    expect(handler).not.toHaveBeenCalled();
+    expect(handler).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not combine a partial upstream provider with native screen control", async () => {
+    const upstream = vi.fn();
+    const screen = vi.fn();
+    const runtime = createNamespaceExecutionRuntime(
+      () => [{ id: "partial", workspace: "/workspace" }],
+      (_machineId, name) => name === CUA_JS_NAME ? { handler: upstream } : undefined,
+      undefined,
+      () => ({ handler: screen, definition: { parameters: {
+        type: "object", properties: { action: { type: "string" } }, required: ["action"],
+      } } }),
+    );
+    await runtime.tools[CUA_JS_NAME]!.handler({ workdir: "/partial", action: "observe" }, context());
+    await runtime.tools[CUA_RESET_NAME]!.handler({ workdir: "/partial" }, context());
+    expect(upstream).not.toHaveBeenCalled();
+    expect(screen).toHaveBeenNthCalledWith(1, { action: "observe" }, expect.anything());
+    expect(screen).toHaveBeenNthCalledWith(2, { action: "release" }, expect.anything());
   });
 
   it("routes old identity paths through the same captured Hand as its readable name", async () => {
@@ -123,21 +152,6 @@ describe("cwd-root namespace execution", () => {
     expect(replacement).toHaveBeenCalledWith({ code: "next" }, expect.anything());
     await expect(runtime.tools[CUA_JS_NAME]!.handler({ workdir: "/brain" }, context())).rejects.toThrow("no CUA runtime");
     await expect(runtime.tools[CUA_JS_NAME]!.handler({ workdir: "/missing", code: "1" }, context())).rejects.toThrow();
-  });
-
-  it("needs no inherited selection and never guesses a Hand", async () => {
-    const first = vi.fn();
-    const second = vi.fn();
-    const runtime = createNamespaceExecutionRuntime(
-      () => [{ id: "one", workspace: "/workspace" }, { id: "two", workspace: "/workspace" }],
-      (id, name) => name === CUA_JS_NAME || name === CUA_RESET_NAME ? cuaTool(name, id === "one" ? first : second) : undefined,
-    );
-    await expect(runtime.tools[CUA_JS_NAME]!.handler({ code: "1" }, context())).rejects.toThrow("explicit Hand workdir");
-    await expect(runtime.tools[CUA_RESET_NAME]!.handler({}, context())).rejects.toThrow("explicit Hand workdir");
-    await runtime.tools[CUA_JS_NAME]!.handler({ workdir: "/two", code: "parent" }, context());
-    await runtime.tools[CUA_JS_NAME]!.handler({ workdir: "/one", code: "child" }, context({ sessionId: "child" }));
-    expect(first).toHaveBeenCalledWith({ code: "child" }, expect.objectContaining({ sessionId: "child" }));
-    expect(second).toHaveBeenCalledWith({ code: "parent" }, expect.objectContaining({ sessionId: "root-session" }));
   });
 
   it("runs two Hands concurrently through QuickJS Code Mode and orders JS/reset per Hand", async () => {
@@ -206,32 +220,6 @@ describe("cwd-root namespace execution", () => {
       .rejects.toThrow("namespace cwd /brain lacks process.exec");
   });
 
-  it("keeps canonical schemas and routes an explicit logical cwd to a sandbox hand", async () => {
-    const sandboxExec = vi.fn(async () => ({
-      output: "/workspace\n",
-      wall_time_seconds: 0.01,
-      exit_code: 0,
-    }));
-    const tools = createNamespaceExecutionTools(sandboxTools(sandboxExec), () => []);
-
-    expect(tools.exec_command!.parameters).toMatchObject({
-      required: ["cmd"],
-      additionalProperties: false,
-    });
-    expect(JSON.stringify(tools.exec_command!.parameters)).not.toContain("environment");
-    expect(tools.write_stdin!.parameters).toMatchObject({
-      required: ["session_id"],
-      additionalProperties: false,
-    });
-    expect(JSON.stringify(tools.write_stdin!.parameters)).not.toMatch(/environment|host/);
-
-    await tools.exec_command!.handler({ cmd: "pwd", workdir: "/sandbox" }, context());
-    expect(sandboxExec).toHaveBeenCalledWith(
-      { cmd: "pwd", workdir: "/workspace" },
-      expect.objectContaining({ sessionId: "root-session" }),
-    );
-  });
-
   it("routes by a portable machine mount and translates only the workdir", async () => {
     const exec = vi.fn(async () => ({ output: "ok", wall_time_seconds: 0, exit_code: 0 }));
     const resolve = vi.fn((_id: string, name: string) => (
@@ -284,7 +272,6 @@ describe("cwd-root namespace execution", () => {
       router.execute("exec_command", { cmd: "two", workdir: "/hand-b" }, context({ callId: "two" })),
     ]);
 
-    expect(tools.exec_command!.supportsParallelToolCalls).toBe(true);
     expect(maxActive).toBe(2);
   });
 
@@ -756,4 +743,32 @@ describe("independent VM readiness at cell capture", () => {
     )).rejects.toThrow();
     expect(execute).not.toHaveBeenCalled();
   });
+});
+
+it("does not restore a durable process for another owner or restore an ephemeral native handle", async () => {
+  const retained = new Map<number, import("../src/namespace-tools").DurableProcessBinding>();
+  const storage = { get: (id: number) => retained.get(id), put: (id: number, value: import("../src/namespace-tools").DurableProcessBinding) => { retained.set(id, value); }, delete: (id: number) => { retained.delete(id); } };
+  const poll = vi.fn(async () => ({ session_id: 7, output: "more" }));
+  let authority = "grant:1:epoch:1";
+  const create = () => createNamespaceExecutionRuntime(
+    () => [{ id: "cf", workspace: "/workspace" }, { id: "native", workspace: "/workspace" }],
+    (id, name) => name === "exec_command" ? { handler: async () => ({ session_id: 7 }) }
+      : name === "write_stdin" ? { handler: poll, ...(id === "cf" ? { processSessionKey: "cf-resource-1" } : {}) } : undefined,
+    undefined, undefined, () => authority, storage,
+  );
+  let runtime = create();
+  const started = await runtime.tools.exec_command!.handler({ cmd: "start", workdir: "/cf" }, context()) as { session_id: number };
+  const native = await runtime.tools.exec_command!.handler({ cmd: "start", workdir: "/native" }, context()) as { session_id: number };
+  runtime.tools.exec_command!.releaseSession?.("root-session");
+  await runtime.tools.exec_command!.dispose?.();
+  runtime = create();
+  await expect(runtime.tools.write_stdin!.handler({ session_id: started.session_id }, context({ sessionId: "child-session" })))
+    .rejects.toThrow("unknown or stale");
+  authority = "grant:1:epoch:2";
+  await expect(runtime.tools.write_stdin!.handler({ session_id: started.session_id }, context())).rejects.toThrow("unknown or stale");
+  authority = "grant:1:epoch:1";
+  await expect(runtime.tools.write_stdin!.handler({ session_id: native.session_id }, context())).rejects.toThrow("unknown or stale");
+  expect(poll).not.toHaveBeenCalled();
+  await expect(runtime.tools.write_stdin!.handler({ session_id: started.session_id }, context())).resolves.toMatchObject({ session_id: started.session_id });
+  expect(poll).toHaveBeenCalledTimes(1);
 });

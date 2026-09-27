@@ -1,3 +1,4 @@
+import { observeHandCall } from "./hand-call-observation";
 import { getSandbox, type ProcessOptions } from "@cloudflare/sandbox";
 import { performanceScope, performanceStage } from "./performance";
 import type { ToolMap } from "nanocodex";
@@ -135,7 +136,7 @@ type SandboxToolClient = {
   };
 };
 
-type SandboxOutputCursorStorage = {
+export type SandboxOutputCursorStorage = {
   delete(key: string): void;
   get(key: string): unknown;
   put(key: string, value: unknown): void;
@@ -152,12 +153,13 @@ export function cloudflareSandboxTools(
   brainWorkspace?: CloudflareBrainWorkspace,
   accountSubject?: string,
   desktop?: { owner: string; name: string },
+  connectGrantId?: string,
 ): ToolMap {
   return createCloudflareSandboxTools(
     async () => {
       // Bind before provisioning or running any user process. The SDK retains
       // this outbound handler across container sleep and Durable Object reload.
-      if (accountSubject !== undefined) await sandboxHandle(namespace, sessionId).bindAccountEgress(accountSubject);
+      if (accountSubject !== undefined) await sandboxHandle(namespace, sessionId).bindAccountEgress(accountSubject, connectGrantId);
       const sandbox = await (namespaceMounts === undefined
       ? prepareSandbox(namespace, sessionId, localBucket)
       : prepareSandboxNamespace(
@@ -213,8 +215,9 @@ async function prepareMeasuredCloudflareSandboxHand(
   brainWorkspace?: CloudflareBrainWorkspace,
   accountSubject?: string,
   desktop?: { owner: string; name: string },
+  connectGrantId?: string,
 ): Promise<void> {
-  if (accountSubject !== undefined) await performanceStage("sandbox.bind_egress", () => sandboxHandle(namespace, resourceId).bindAccountEgress(accountSubject));
+  if (accountSubject !== undefined) await performanceStage("sandbox.bind_egress", () => sandboxHandle(namespace, resourceId).bindAccountEgress(accountSubject, connectGrantId));
   const normalized = validateNamespaceMounts(mounts);
   if (brainWorkspace === undefined) {
     throw new Error("Cloudflare namespace requires a shared brain workspace");
@@ -314,9 +317,16 @@ export function createCloudflareSandboxTools(
         context?.signal.throwIfAborted();
         const sandbox = await createSandbox();
         context?.signal.throwIfAborted();
-        await assertSandboxWorkdirAvailable(sandbox, cwd);
+        const preflightAt = performance.now();
+        try {
+          await assertSandboxWorkdirAvailable(sandbox, cwd);
+          observeHandCall("sandbox.preflight", "exec_command", preflightAt, "ok", context?.callId);
+        } catch (error) {
+          observeHandCall("sandbox.preflight", "exec_command", preflightAt, "unavailable", context?.callId);
+          throw error;
+        }
         context?.signal.throwIfAborted();
-        const sessionId = await availableSessionId(sandbox);
+        const sessionId = await availableSessionId(sandbox, outputCursorStorage);
         outputCursorStorage.put(`${OUTPUT_CURSOR_PREFIX}${sessionId}`, 0);
         let process: SandboxProcess | undefined;
         try {
@@ -1107,9 +1117,12 @@ function sandboxProcessId(sessionId: number): string {
   return `nanocodex-${sessionId}`;
 }
 
-async function availableSessionId(sandbox: SandboxToolClient): Promise<number> {
+async function availableSessionId(sandbox: SandboxToolClient, cursors: SandboxOutputCursorStorage): Promise<number> {
   for (let attempt = 0; attempt < 32; attempt += 1) {
     const sessionId = crypto.getRandomValues(new Uint32Array(1))[0]! || 1;
+    // A container restart may forget a process that still has a durable owner.
+    // Do not let a new command take that retained numeric provider ID.
+    if (cursors.get(`${OUTPUT_CURSOR_PREFIX}${sessionId}`) !== undefined) continue;
     if (await sandbox.getProcess(sandboxProcessId(sessionId)) === null) return sessionId;
   }
   throw new Error("could not allocate a sandbox command session");

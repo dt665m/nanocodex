@@ -1,6 +1,6 @@
 {
   "name": "nanocodex",
-  "version": "0.6.4",
+  "version": "0.6.5",
   "description": "Viem-style Node and browser bindings for the Nanocodex WASM agent",
   "type": "module",
   "sideEffects": [
@@ -162,6 +162,10 @@
     "./cloudflare/managed-live": {
       "types": "./cloudflare/managed-live.d.mts",
       "import": "./cloudflare/managed-live.mjs"
+    },
+    "./cloudflare/tracing": {
+      "types": "./cloudflare/tracing.d.mts",
+      "import": "./cloudflare/tracing.mjs"
     }
   },
   "files": [

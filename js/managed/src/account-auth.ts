@@ -4,6 +4,8 @@ export { isOrganizationCapabilities, forwardPrincipalAssertions };
 import { durablePlacementOptions, placementHeaders, TRUSTED_INGRESS_HEADER, type IngressPlacement } from "nanocodex/cloudflare/durable-placement";
 import { LAST_USER_PROMPT_LIMIT, type AgentPresentation } from "./agent-presentation";
 import { retireAccountProjects } from "./retired-projects";
+import { initializeTodoInbox, handleTodoInbox, proposeTodoDecision, type TodoDecisionProposal } from "./todo-inbox";
+import { recordGmailDecisionTrace, type GmailDecisionTrace } from "./gmail-firehose-traces";
 import { recordHandTiming } from "./hand-timing";
 import { configurationCatalog } from "./agent-configuration";
 import { performanceState } from "./performance";
@@ -115,6 +117,9 @@ export type ConnectGrantSlice = Readonly<{
   connectorConnections?: ConnectorConnectionSelection;
   mcpIds: readonly string[];
   appToolCatalogDigest?: `0x${string}`;
+  /** Set only by the Connect service after explicit signed resource approval. */
+  sandboxExecution?: true;
+  outputCheckpoints?: true;
 }>;
 
 const OWNER_CAPABILITIES = [
@@ -724,7 +729,13 @@ async function authenticateLive(request: Request, env: AccountAuthEnv, url: URL)
   let record: StoredApiKey | undefined;
   const rpc = stub.resolveAuthorizedKey;
   if (typeof rpc === "function") {
-    record = consumeRpcData(await Reflect.apply(rpc, stub, []));
+    const observeCreate = request.method === "POST"
+      && (url.pathname === "/v1/agents" || url.pathname === "/v1/agent-runs");
+    const rpcStartedAt = performance.now();
+    record = consumeRpcData(await Reflect.apply(rpc, stub, [observeCreate]));
+    if (observeCreate) console.info({ type: "managed.auth.api_key_rpc",
+      resolve_rpc_ms: Math.round((performance.now() - rpcStartedAt) * 100) / 100 });
+
   } else {
     const response = await stub.fetch("https://api-key.internal/resolve?authorize=1");
     if (!response.ok) {
@@ -898,6 +909,45 @@ export async function attachAgent(
       if (!response.ok) throw new Error("agent attachment failed");
     },
   );
+}
+
+/**
+ * A speculative ingress hint. It is deliberately absent from agent_registry:
+ * account discovery must never see an agent before Session commits ownership.
+ * A lost/late hint does not authorize publication; only Session calls publish.
+ */
+export async function prepareAgentRegistration(
+  env: AccountAuthEnv, userId: string, agentId: string,
+  timeoutMs = DEFAULT_OWNERSHIP_IO_TIMEOUT_MS,
+): Promise<void> {
+  await fetchResponseWithDeadline(
+    env.NANOCODEX_USERS.getByName(userId, durablePlacementOptions(env.trustedClientIngressColo)),
+    `https://user.internal/agents/${agentId}/prepare`,
+    { method: "POST" }, timeoutMs, "agent registration preparation",
+    (response) => { if (!response.ok) throw new Error(`agent registration preparation failed: ${response.status}`); },
+  );
+}
+
+/** Publication is idempotent, including when the speculative hint is lost or late. */
+export async function publishAgentRegistration(
+  env: AccountAuthEnv, userId: string, agentId: string,
+  timeoutMs = DEFAULT_OWNERSHIP_IO_TIMEOUT_MS, hasCronTriggers?: boolean,
+): Promise<void> {
+  const result = await fetchResponseWithDeadline(
+    env.NANOCODEX_USERS.getByName(userId, durablePlacementOptions(env.trustedClientIngressColo)),
+    `https://user.internal/agents/${agentId}/publish`,
+    { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ hasCronTriggers }) },
+    timeoutMs, "agent registration publication",
+    (response) => {
+      // During a rolling deployment an old account DO may not have /publish
+      // yet. Legacy attachment still runs only after Session's durable commit;
+      // unlike speculative prepare it cannot expose an uninitialized agent.
+      if (response.status === 404) return "legacy" as const;
+      if (!response.ok) throw new Error(`agent registration publication failed: ${response.status}`);
+      return "published" as const;
+    },
+  );
+  if (result === "legacy") await attachAgent(env, userId, agentId, timeoutMs, hasCronTriggers);
 }
 
 /** Presence is monotonic: a late empty read cannot hide a concurrently saved cron. */
@@ -1693,6 +1743,7 @@ export async function revokeApiKey(
   return true;
 }
 
+
 export class UserAccount extends DurableObject<AccountAuthEnv> {
   constructor(ctx: DurableObjectState, env: AccountAuthEnv) {
     super(ctx, env);
@@ -1710,7 +1761,13 @@ export class UserAccount extends DurableObject<AccountAuthEnv> {
       CREATE INDEX IF NOT EXISTS agent_registry_active_created
         ON agent_registry (created_at, id) WHERE deleted_at IS NULL;
     `);
+    // Separate storage makes pending entries invisible to every existing account
+    // discovery path, not merely to the GET /agents projection.
+    ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS agent_registry_pending (
+      id TEXT PRIMARY KEY, expires_at INTEGER NOT NULL
+    )`);
     retireAccountProjects(ctx.storage);
+    initializeTodoInbox(ctx.storage);
     // Existing agents stay candidates until their first schedule read. New
     // registrations supply their actual presence; omitted legacy values stay unknown.
     const columns = new Set(ctx.storage.sql.exec<{ name: string }>("PRAGMA table_info(agent_registry)").toArray().map(({ name }) => name));
@@ -1720,6 +1777,24 @@ export class UserAccount extends DurableObject<AccountAuthEnv> {
     }
   }
 
+  async alarm(): Promise<void> {
+    this.ctx.storage.sql.exec("DELETE FROM agent_registry_pending WHERE expires_at <= ?", Date.now());
+    const next = this.ctx.storage.sql.exec<{ expires_at: number }>(
+      "SELECT MIN(expires_at) AS expires_at FROM agent_registry_pending",
+    ).toArray()[0]?.expires_at;
+    if (next !== null && next !== undefined) await this.ctx.storage.setAlarm(next);
+  }
+
+  /** Accepts proposals only from trusted Worker code with this account's DO stub. */
+  async proposeTodoDecision(input: TodoDecisionProposal): Promise<{ id: string; status: string; version: number }> {
+    return proposeTodoDecision(this.ctx.storage, input);
+  }
+
+  /** Internal, privacy-safe audit; never accepts mail text or model output. */
+  async recordTodoDecisionTrace(input: GmailDecisionTrace): Promise<void> {
+    recordGmailDecisionTrace(this.ctx.storage, input);
+  }
+
   // Live storage read in a single RPC reply, without a streamed HTTP body.
   async readAccount(): Promise<UserRecord | undefined> {
     return this.ctx.storage.get<UserRecord>("account");
@@ -1727,6 +1802,9 @@ export class UserAccount extends DurableObject<AccountAuthEnv> {
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
+    if (url.pathname === "/todo" || url.pathname.startsWith("/todo/")) {
+      return handleTodoInbox(request, this.ctx.storage);
+    }
     if (/^\/(agent-definitions|environment-templates)(?:\/|$)/.test(url.pathname)) {
       return configurationCatalog(request, this.ctx.storage);
     }
@@ -1817,6 +1895,54 @@ export class UserAccount extends DurableObject<AccountAuthEnv> {
         await this.ctx.storage.put("apiKeys", keys);
         return new Response(null, { status: 204 });
       }
+    }
+    const preparation = url.pathname.match(/^\/agents\/([0-9a-f-]{36})\/prepare$/);
+    if (preparation && request.method === "POST") {
+      const agentId = preparation[1]!;
+      const existing = this.ctx.storage.sql.exec<{ deleted_at: number | null }>(
+        "SELECT deleted_at FROM agent_registry WHERE id = ?", agentId,
+      ).toArray()[0];
+      if (existing && existing.deleted_at !== null) return json({ error: "agent_deleted" }, { status: 410 });
+      if (!existing) {
+        const expiresAt = Date.now() + 5 * 60_000;
+        this.ctx.storage.sql.exec(
+          `INSERT INTO agent_registry_pending (id, expires_at) VALUES (?, ?)
+           ON CONFLICT(id) DO UPDATE SET expires_at = MAX(expires_at, excluded.expires_at)`,
+          agentId, expiresAt,
+        );
+        const alarm = await this.ctx.storage.getAlarm();
+        if (alarm === null || alarm > expiresAt) await this.ctx.storage.setAlarm(expiresAt);
+      }
+      return new Response(null, { status: 204 });
+    }
+    const publication = url.pathname.match(/^\/agents\/([0-9a-f-]{36})\/publish$/);
+    if (publication && request.method === "POST") {
+      const agentId = publication[1]!;
+      const body = await request.json<{ hasCronTriggers?: unknown }>();
+      if (body.hasCronTriggers !== undefined && typeof body.hasCronTriggers !== "boolean") {
+        return json({ error: "invalid_agent" }, { status: 400 });
+      }
+      // Do not depend on the hint arriving first: a lost ingress response,
+      // cold account activation or a replay may reorder the two RPCs.
+      // The registry row/tombstone is the one authoritative publication fence.
+      this.ctx.storage.transactionSync(() => {
+        const now = Date.now();
+        this.ctx.storage.sql.exec(
+          `INSERT INTO agent_registry
+             (id, title, created_at, updated_at, turn_count, deleted_at, cron_candidate)
+           VALUES (?, '', ?, ?, 0, NULL, ?)
+           ON CONFLICT(id) DO UPDATE SET
+             cron_candidate = CASE WHEN agent_registry.deleted_at IS NULL AND excluded.cron_candidate = 1
+               THEN 1 ELSE agent_registry.cron_candidate END`,
+          agentId, now, now, typeof body.hasCronTriggers === "boolean" ? Number(body.hasCronTriggers) : null,
+        );
+        this.ctx.storage.sql.exec("DELETE FROM agent_registry_pending WHERE id = ?", agentId);
+      });
+      const row = this.ctx.storage.sql.exec<{ deleted_at: number | null }>(
+        "SELECT deleted_at FROM agent_registry WHERE id = ?", agentId,
+      ).toArray()[0];
+      return row?.deleted_at === null ? new Response(null, { status: 204 })
+        : json({ error: "agent_deleted" }, { status: 410 });
     }
     if (url.pathname === "/agents") {
       if (request.method === "GET") {
@@ -1929,6 +2055,7 @@ export class UserAccount extends DurableObject<AccountAuthEnv> {
         now,
         now,
       );
+      this.ctx.storage.sql.exec("DELETE FROM agent_registry_pending WHERE id = ?", agentId);
       return new Response(null, { status: 204 });
     }
     return json({ error: "not_found" }, { status: 404 });
@@ -2074,12 +2201,26 @@ export class Organization extends DurableObject<AccountAuthEnv> {
 }
 
 export class ApiKeyRecord extends DurableObject<AccountAuthEnv> {
-  async resolveAuthorizedKey(): Promise<StoredApiKey | undefined> {
+  /** No credentials are read or written: same-Worker cold DO dispatch control. */
+  async activationProbe(): Promise<number> {
+    const enteredAt = Date.now();
+    await this.ctx.storage.deleteAll();
+    return enteredAt;
+  }
+
+  async resolveAuthorizedKey(observeCreate = false): Promise<StoredApiKey | undefined> {
+    const startedAt = performance.now();
     const record = await this.ctx.storage.get<StoredApiKey>("record");
+    const storageMs = performance.now() - startedAt;
     // Read current key, account and membership on every request, including
     // repeated voice starts. RPC changes transport, not revocation semantics.
-    return isStoredApiKey(record) && await apiKeyAuthorized(this.env, record)
-      ? record : undefined;
+    const authorized = isStoredApiKey(record) && await apiKeyAuthorized(this.env, record);
+    if (observeCreate) console.info({ type: "managed.auth.api_key_handler",
+      storage_ms: Math.round(storageMs * 100) / 100,
+      membership_ms: Math.round((performance.now() - startedAt - storageMs) * 100) / 100,
+      handler_ms: Math.round((performance.now() - startedAt) * 100) / 100,
+      authorized });
+    return authorized ? record : undefined;
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -2272,7 +2413,11 @@ function parseConnectGrantAssertions(headers: Headers): Readonly<{
     : parseConnectorConnectionSelection(encodedConnectorConnections);
   const mcpIds = parseUniqueJsonArray(headers.get(CONNECT_MCP_IDS_HEADER));
   const appToolCatalogDigest = headers.get(CONNECT_APP_TOOL_CATALOG_DIGEST_HEADER);
-  if (!grantId || !CONNECT_GRANT_ID.test(grantId)
+  const outputCheckpoints = headers.get("x-nanocodex-connect-output-checkpoints");
+  if (outputCheckpoints !== null && outputCheckpoints !== "true") return undefined;
+  const sandboxExecution = headers.get("x-nanocodex-connect-sandbox-execution");
+  if ((sandboxExecution !== null && sandboxExecution !== "true")
+    || !grantId || !CONNECT_GRANT_ID.test(grantId)
     || !capabilities || !capabilities.every((value): value is OrganizationCapability => (
       CONNECT_CAPABILITIES.has(value as OrganizationCapability)
     ))
@@ -2292,6 +2437,8 @@ function parseConnectGrantAssertions(headers: Headers): Readonly<{
     capabilities,
     slice: {
       grantId: grantId.toLowerCase(),
+      ...(sandboxExecution === "true" ? { sandboxExecution: true as const } : {}),
+      ...(outputCheckpoints === "true" ? { outputCheckpoints: true as const } : {}),
       connectors,
       ...(connectorConnections === undefined ? {} : { connectorConnections }),
       mcpIds,

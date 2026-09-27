@@ -332,6 +332,10 @@ export default defineConfig({
               if (body.get("refresh_token") === "gmail-revoked-refresh") {
                 return Response.json({ error: "invalid_grant" }, { status: 400 });
               }
+              if (body.get("refresh_token") === "google-reduced-refresh") {
+                return Response.json({ access_token: "gmail-refreshed-access", expires_in: 3_600,
+                  token_type: "Bearer", scope: "openid email https://mail.google.com/" });
+              }
               const drive = body.get("refresh_token") === "gdrive-connector-refresh";
               return Response.json({
                 access_token: drive ? "gdrive-refreshed-access" : "gmail-refreshed-access",
@@ -340,6 +344,16 @@ export default defineConfig({
               });
             }
             const code = String(body.get("code") ?? "");
+            if (code.startsWith("google-scope-")) {
+              return Response.json({
+                access_token: "google-alpha-access",
+                ...(code.includes("omit") ? {} : { refresh_token: code.includes("reduced")
+                  ? "google-reduced-refresh" : "google-alpha-refresh" }),
+                expires_in: code.includes("expiring") ? 1 : 3_600,
+                token_type: "Bearer",
+                scope: "openid email https://mail.google.com/ https://www.googleapis.com/auth/gmail.settings.basic arbitrary-provider-value",
+              });
+            }
             if (code.startsWith("google-")) {
               const account = code.includes("routes") ? "routes"
                 : code.includes("beta") ? "beta" : "alpha";
@@ -480,6 +494,65 @@ export default defineConfig({
               },
             });
           }
+          if (url.hostname === "mercator.sh") {
+            if (url.pathname === "/mcp/auth" && request.method === "GET") {
+              return new Response(null, { status: 401, headers: {
+                "www-authenticate": 'Bearer resource_metadata="https://mercator.sh/.well-known/oauth-protected-resource/mcp/auth"',
+              } });
+            }
+            if (url.pathname === "/.well-known/oauth-protected-resource/mcp/auth" && request.method === "GET") {
+              return Response.json({ resource: "https://mercator.sh/mcp/auth",
+                authorization_servers: ["https://mercator.sh"], scopes_supported: ["mercator:tools"] });
+            }
+            if (url.pathname === "/.well-known/oauth-authorization-server" && request.method === "GET") {
+              return Response.json({ issuer: "https://mercator.sh",
+                authorization_endpoint: "https://mercator.sh/authorize",
+                token_endpoint: "https://mercator.sh/oauth/token",
+                registration_endpoint: "https://mercator.sh/oauth/register",
+                code_challenge_methods_supported: ["S256"], scopes_supported: ["mercator:tools"] });
+            }
+            if (url.pathname === "/oauth/register" && request.method === "POST") {
+              const registration = await request.json() as Record<string, unknown>;
+              return registration.token_endpoint_auth_method === "none"
+                ? Response.json({ client_id: "mercator-test-client", token_endpoint_auth_method: "none" }, { status: 201 })
+                : Response.json({ error: "invalid_client_metadata" }, { status: 400 });
+            }
+            if (url.pathname === "/oauth/token" && request.method === "POST") {
+              const body = await request.formData();
+              return body.get("client_id") === "mercator-test-client" && body.get("code_verifier")
+                ? Response.json({ access_token: "mercator-test-access", token_type: "Bearer",
+                  scope: "mercator:tools", expires_in: 3600 })
+                : Response.json({ error: "invalid_grant" }, { status: 400 });
+            }
+            if (url.pathname === "/mcp" && request.method === "POST") {
+              const body = await request.json() as { id?: string | number; method?: string };
+              if (body.method === "initialize") {
+                return Response.json({ jsonrpc: "2.0", id: body.id, result: {
+                  protocolVersion: "2025-06-18", capabilities: { tools: {} },
+                  serverInfo: { name: "mercator", version: "1.0.0" },
+                } });
+              }
+              if (body.method === "tools/list") {
+                return Response.json({ jsonrpc: "2.0", id: body.id, result: { tools: [{
+                  name: "search_services", description: "Discover services through Mercator.",
+                  inputSchema: { type: "object", properties: { query: { type: "string" } } },
+                }] } });
+              }
+              return Response.json({ jsonrpc: "2.0", id: body.id, result: {
+                content: [{ type: "text", text: "Mercator is connected." }],
+                structuredContent: { connected: true },
+              } });
+            }
+            if (url.pathname === "/mcp/auth" && request.method === "POST") {
+              if (!request.headers.has("authorization")) return new Response(null, { status: 401,
+                headers: { "www-authenticate": 'Bearer resource_metadata="https://mercator.sh/.well-known/oauth-protected-resource/mcp/auth"' },
+              });
+              return request.headers.get("authorization") === "Bearer mercator-test-access"
+                ? Response.json({ jsonrpc: "2.0", id: 7, result: { tools: [{ name: "search_services",
+                    inputSchema: { type: "object", properties: { query: { type: "string" } } } }] } })
+                : Response.json({ error: "unauthorized" }, { status: 401 });
+            }
+          }
           if (["mcp-fixture.nanocodex.dev", "mcp.linear.app", "mcp-standard.nanocodex.dev"].includes(url.hostname)
             && request.method === "GET" && url.pathname === "/mcp") {
             const authorization = request.headers.get("authorization");
@@ -542,6 +615,9 @@ export default defineConfig({
           if (["mcp-fixture.nanocodex.dev", "mcp.linear.app", "mcp-standard.nanocodex.dev"].includes(url.hostname)
             && request.method === "POST" && url.pathname === "/mcp") {
             const authorization = request.headers.get("authorization");
+            if (!authorization) return new Response(null, { status: 401, headers: {
+              "www-authenticate": `Bearer resource_metadata="${url.origin}/.well-known/oauth-protected-resource/mcp"`,
+            } });
             if (authorization === "Bearer mcp-stale-access") {
               return Response.json({ error: "expired" }, { status: 401 });
             }

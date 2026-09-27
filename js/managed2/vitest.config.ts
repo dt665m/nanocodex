@@ -1,0 +1,161 @@
+import { createHash } from "node:crypto";
+import { fixtureKeys } from "./test/fixtures/auth.ts";
+import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
+import { defineConfig } from "vitest/config";
+import { build } from "esbuild";
+
+// The secondary Worker keeps real routing/DO code. Its Rust subscription
+// runtime is tested in egress2 itself; this multi-Worker test substitutes a
+// deterministic subscription manager to avoid loading two WASM modules here.
+const egressScript = (await build({
+  entryPoints: [new URL("../egress2/src/index.ts", import.meta.url).pathname],
+  bundle: true, format: "esm", platform: "browser", write: false,
+  external: ["cloudflare:workers"],
+  plugins: [{ name: "subscription-fixture", setup(build) {
+    build.onResolve({ filter: /^\.\/subscriptionRuntime$/ }, args => args.importer.endsWith("/egress2/src/index.ts")
+      ? { path: new URL("test/fixtures/subscription-runtime.ts", import.meta.url).pathname }
+      : undefined);
+    build.onResolve({ filter: /^\.\/relay$/ }, args => args.importer.endsWith("/egress2/src/index.ts")
+      ? { path: new URL("test/fixtures/relay.ts", import.meta.url).pathname }
+      : undefined);
+  } }],
+})).outputFiles[0]!.text;
+
+export default defineConfig({
+  plugins: [cloudflareTest({
+    wrangler: { configPath: "./wrangler.jsonc" },
+    miniflare: {
+      bindings: { RESPONSES_TRANSPORT: process.env.MANAGED2_TEST_TRANSPORT === "websocket" ? "websocket" : "http", AUTH_API_KEY_HASHES: JSON.stringify(Object.fromEntries(
+        Object.entries(fixtureKeys).map(([owner, key]) => [createHash("sha256").update(key).digest("base64url"), owner]),
+      )) },
+      serviceBindings: { EGRESS: { name: "nanocodex-egress2" } },
+      workers: [
+        { name: "nanocodex-egress2", modules: true, script: egressScript, compatibilityDate: "2026-07-29", outboundService: "test-provider",
+          durableObjects: { USER_CREDENTIALS: { className: "UserCredentials", useSQLite: true } },
+          bindings: { CREDENTIAL_ENCRYPTION_KEY: btoa("0123456789abcdef0123456789abcdef") } },
+        { name: "test-provider", modules: true, script: `
+          export default { async fetch(request) {
+            const url = new URL(request.url);
+            if (url.href === "https://api.openai.com/v1/alpha/search" && request.method === "POST") {
+              if (request.headers.get("authorization") !== "Bearer sk-fixture-only"
+                || request.headers.has("x-managed2-owner") || request.headers.has("x-managed2-trace-id")) {
+                return Response.json({ error: "search authentication or privacy failure" }, { status: 401 });
+              }
+              const body = await request.json();
+              if (body.settings?.external_web_access !== true || body.settings?.allowed_callers?.[0] !== "direct"
+                || body.commands?.search_query?.[0]?.q !== "a synthetic question") {
+                return Response.json({ error: "invalid search body" }, { status: 400 });
+              }
+              return Response.json({ output: "Found [synthetic citation](https://example.org/source)", hidden: "provider-only" });
+            }
+            if (url.href === "https://chatgpt.com/backend-api/codex/alpha/search" && request.method === "POST") {
+              if (request.headers.get("chatgpt-account-id") !== "account-fixture"
+                || request.headers.has("x-managed2-owner") || !request.headers.get("authorization")?.startsWith("Bearer eyJ")) {
+                return Response.json({ error: "subscription search authentication failure" }, { status: 401 });
+              }
+              const body = await request.json();
+              if (body.commands?.search_query?.[0]?.q !== "a synthetic question") {
+                return Response.json({ error: "invalid search body" }, { status: 400 });
+              }
+              return Response.json({ output: "Found [synthetic citation](https://example.org/source)", hidden: "provider-only" });
+            }
+            const platform = url.hostname === "api.openai.com"
+              && url.pathname === "/v1/responses"
+              && request.headers.get("authorization") === "Bearer sk-fixture-only"
+              && !request.headers.has("x-nanocodex-egress-request-id")
+              && !request.headers.has("x-managed2-trace-id");
+            const subscription = url.hostname === "chatgpt.com"
+              && url.pathname === "/backend-api/codex/responses"
+              && request.headers.get("authorization") === "Bearer eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJleHAiOjQxMDI0NDQ4MDAsImh0dHBzOi8vYXBpLm9wZW5haS5jb20vYXV0aCI6eyJjaGF0Z3B0X2FjY291bnRfaWQiOiJhY2NvdW50LWZpeHR1cmUiLCJjaGF0Z3B0X2FjY291bnRfaXNfZmVkcmFtcCI6ZmFsc2V9fQ.fixture"
+              && request.headers.get("chatgpt-account-id") === "account-fixture"
+              && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(request.headers.get("x-nanocodex-egress-request-id") || "")
+              && !request.headers.has("x-managed2-trace-id");
+            if (!platform && !subscription) {
+              return new Response("bad upstream authentication", { status: 401 });
+            }
+            const respond = body => {
+              const input = body.input || [];
+              const latestUser = input.findLastIndex(item => item.role === "user");
+              const currentTurn = input.slice(Math.max(0, latestUser));
+              const shellContinuation = currentTurn.find(item => item.type === "function_call_output" && item.call_id === "call-shell");
+              const shellTool = input.find(item => item.type === "additional_tools")?.tools?.find(tool => tool.name === "exec_command");
+              const shellMatch = JSON.stringify(currentTurn).match(/Use exec_command: ([^"\\\\]+)/);
+              if (shellContinuation) {
+                let result;
+                try { result = JSON.parse(shellContinuation.output); } catch { result = shellContinuation.output; }
+                const text = "Shell: " + JSON.stringify(result);
+                return [{ type: "response.completed", response: { id: "fixture-shell-result", status: "completed", end_turn: true,
+                  output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text }] }],
+                  usage: { input_tokens: 10, output_tokens: 4, total_tokens: 14 } } }];
+              }
+              if (shellMatch) {
+                if (!shellTool) throw new Error("exec_command was not offered to the provider");
+                return [{ type: "response.completed", response: { id: "fixture-shell-call", status: "completed", end_turn: false,
+                  output: [{ type: "function_call", call_id: "call-shell", name: "exec_command", arguments: JSON.stringify({ cmd: shellMatch[1] }) }],
+                  usage: { input_tokens: 10, output_tokens: 4, total_tokens: 14 } } }];
+              }
+              const continuation = input.find(item => item.type === "function_call_output" && item.call_id === "call-time");
+              const timeTool = input.find(item => item.type === "additional_tools")?.tools?.find(tool => tool.name === "current_time");
+              const webTool = input.find(item => item.type === "additional_tools")?.tools?.find(tool => tool.name === "web__run");
+              const webContinuation = input.find(item => item.type === "function_call_output" && item.call_id === "call-web");
+              if (webContinuation) {
+                const result = webContinuation.output;
+                const text = "Search: " + result;
+                return [{ type: "response.completed", response: { id: "fixture-web-result", status: "completed", end_turn: true,
+                  output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text }] }],
+                  usage: { input_tokens: 10, output_tokens: 4, total_tokens: 14 } } }];
+              }
+              if (JSON.stringify(input).includes("Use web__run")) {
+                if (!webTool) throw new Error("web__run was not offered");
+                return [{ type: "response.completed", response: { id: "fixture-web-call", status: "completed", end_turn: false,
+                  output: [{ type: "function_call", call_id: "call-web", name: "web__run",
+                    arguments: JSON.stringify({ search_query: [{ q: "a synthetic question" }] }) }],
+                  usage: { input_tokens: 10, output_tokens: 4, total_tokens: 14 } } }];
+              }
+              const requested = JSON.stringify(input).includes("Use current_time");
+              if (continuation) {
+                const utc = JSON.parse(continuation.output).utc;
+                const text = "Current UTC: " + utc;
+                return [
+                  { type: "response.output_item.added", output_index: 0, item: { id: "fixture-message", type: "message", role: "assistant", status: "in_progress", content: [{ type: "output_text", text: "" }] } },
+                  { type: "response.output_text.delta", output_index: 0, item_id: "fixture-message", content_index: 0, delta: text },
+                  { type: "response.completed", response: { id: "fixture-time-result", status: "completed", end_turn: true,
+                    output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text }] }],
+                    usage: { input_tokens: 10, output_tokens: 4, total_tokens: 14 } } },
+                ];
+              }
+              if (requested) {
+                if (!timeTool) throw new Error("current_time was not offered to the provider");
+                return [{ type: "response.completed", response: { id: "fixture-time-call", status: "completed", end_turn: false,
+                  output: [{ type: "function_call", call_id: "call-time", name: "current_time", arguments: "{}" }],
+                  usage: { input_tokens: 10, output_tokens: 4, total_tokens: 14 } } }];
+              }
+              const text = "hello from test model";
+              return [
+                { type: "response.output_item.added", output_index: 0, item: { id: "fixture-message", type: "message", role: "assistant", status: "in_progress", content: [{ type: "output_text", text: "" }] } },
+                { type: "response.output_text.delta", output_index: 0, item_id: "fixture-message", content_index: 0, delta: text },
+                { type: "response.completed", response: { id: "fixture-response", status: "completed", end_turn: true,
+                  output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text }] }],
+                  usage: { input_tokens: 10, output_tokens: 4, total_tokens: 14 } } },
+              ];
+            };
+            if (request.method === "POST") {
+              const frames = respond(await request.json());
+              return new Response(frames.map(frame => "data: " + JSON.stringify(frame) + "\\n\\n").join(""),
+                { status: 200, headers: { "content-type": "text/event-stream" } });
+            }
+            const pair = new WebSocketPair();
+            const [client, server] = Object.values(pair);
+            server.accept();
+            server.addEventListener("message", event => {
+              const frame = JSON.parse(event.data);
+              for (const reply of respond(frame.response ?? frame)) server.send(JSON.stringify(reply));
+            });
+            return new Response(null, { status: 101, webSocket: client });
+          } }
+        ` },
+      ],
+    },
+  })],
+  test: { include: ["test/**/*.test.ts"] },
+});

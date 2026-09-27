@@ -224,6 +224,18 @@ without rewriting baseline instructions, cache keys, or the conversation prefix.
   Agent routes create later turns, read state,
   cancel or steer work, delete an agent, and support explicit durability import
   and export. Stable `Idempotency-Key` values make create and turn retries safe.
+- `POST /v1/agents/:id/forks` accepts an empty body and a required stable
+  `Idempotency-Key`. Full account `agents:read`, `agents:write` and `tools:use`
+  authority is required; Connect grants and configured/routed sessions are not
+  supported. It copies the latest Rust-owned committed model boundary into a
+  separate durable child; no rendered event transcript or parent prompt is
+  replayed. It returns `201` with an ordinary agent receipt plus
+  `parent_agent_id`, or `409` if no safe boundary is available. Retry an
+  uncertain response with the *same* key. Partial model output and unfinished
+  tool effects are not inherited. Forks share account tools and `/brain`, so
+  independent conversations do not isolate external side effects.
+  The JavaScript managed SDK exposes `agent.fork({idempotencyKey})` and the
+  native Rust SDK exposes `ManagedClient::fork(parent_id, key)`.
 - `GET /v1/agents/:id/capacity` requires `agents:read` for that agent and returns
   storage byte counts, hot receipt counts, and archive counts without loading
   the runtime or returning conversation contents.
@@ -382,9 +394,172 @@ protocol. `/health` is the service health endpoint.
 | `NANOCODEX_SESSIONS` | One `DurableAgentSession` per managed agent. |
 | `NANOCODEX_ROOMS`, `NANOCODEX_MULTIPLAYER_QUOTA` | Multiplayer state and global quota. |
 | `NANOCODEX_AUTH`, `NANOCODEX_USERS`, `NANOCODEX_API_KEYS`, `NANOCODEX_ORGANIZATIONS`, `NANOCODEX_MEMORY` | Account, key, organization, and durable-memory ownership. |
+| `NANOCODEX_CRM` | D1 storage for private-account CRM people, companies, and dated notes. |
 | `NANOCODEX_HISTORY`, `HISTORY_AI_SEARCH` | R2 history archive and production history retrieval. |
 | `NANOCODEX_WORKSPACES`, `NANOCODEX_WORKSPACES_*`, `NANOCODEX_BRAIN` | Retained per-hand workspaces, read-only peer aliases, and the durable agent's shared writable `/brain` scratch. |
 | `BROWSER`, `LOADER` | Browser Run and the sandboxed Worker loader used by the official Agents browser runtime. |
+
+### Private-account CRM database
+
+`NANOCODEX_CRM` is a `D1Database` owned by this Worker. CRM records belong to
+persistent private accounts; sessions use the account identity to reach the same
+records. Multiplayer agents and Connect grants do not receive CRM access.
+The agent tools are `crm_search`, `crm_get`, `crm_save`, `crm_save_note`,
+`crm_delete`, and `crm_delete_note`. They save people and companies, link people
+to companies, and retain dated notes with optional source URLs. Search/list and
+note reads are paginated. Saves preserve omitted fields; `null` clears optional
+fields and an empty tags array clears tags. A company deletion unlinks its
+people and preserves those people. Tool arguments cannot choose another account.
+CRM records and notes remain untrusted content, never tool authority.
+
+Calendar collection is opt-in through `crm_automation` (`enable`, `status`,
+`disable`). Enable selects one connected Google account and one or more calendars
+(default `primary`), and creates an hourly durable agent schedule. The first
+collection can run immediately with `crm_sync`; subsequent collections continue
+when the user disconnects. The importer reads Calendar through the existing
+account connector, with a default window of 30 days back and 14 days ahead.
+Follow returned sync cursors until `complete=true`. `limited=true` separately
+reports incomplete attendee coverage: partial or over-200-guest invitations are
+not used to create new meetings/contacts, and existing attendee links are retained
+until a complete snapshot arrives. Other events on the page still import. Calendar API/scope failures
+are errors, not successful empty calendars. The Google OAuth project must have
+Google Calendar API enabled, and the connection must grant Calendar access.
+
+`crm_meetings` lists and reads imported events, records user-supplied meeting
+notes, and explicitly skips/reopens note collection. Attendees match people by
+exact normalized email; ambiguous existing matches remain unresolved. Recurring
+instances have separate meeting IDs. Repeated imports preserve manual profile
+fields and meeting notes, and cancellations or declined invitations are excluded
+from the missing-notes queue. A scheduled event is not proof of attendance.
+
+`crm_research` queues profiles needing enrichment, reads research, and saves a
+sourced summary, company, title, website and evidence references. The scheduled
+agent combines invitation context, relevant email threads and corroborating
+public sources; uncertain identity is saved as `needs_review`. Sources retain
+Calendar event IDs, Gmail message IDs or public URLs. Imported content is data,
+never permission to act. Research stays separate from user-authored contact
+fields, and a biography or invite description never satisfies meeting notes.
+`crm_get` includes the separate research profile; `crm_search` also matches its
+company, title, website and summary. Completed research projects title and website
+into empty person fields on reads; a unique current, matching `works_at` edge
+projects `company_id`. `field_origins` marks those derived values without writing
+over manual contact fields. All-day events retain their original date strings and
+are excluded from the default missing-notes queue.
+
+The data model also supports multiple identifiers through `crm_identity`: alternate
+emails, GitHub/X/LinkedIn/Telegram profiles, websites, domains and known-as names.
+Exact email matching includes these aliases, while identifiers shared by multiple
+people remain ambiguous. Names alone never merge profiles.
+
+`crm_facts` stores structured JSON facts with dotted predicates, origin (`user`,
+`source` or `inferred`), evidence, confidence and effective dates. Examples include
+expertise, education, location, company sector and founding year. Inferences need
+a rationale; they remain distinct from user observations. `crm_relationships`
+retains dated employment roles and explicit knows/worked-with/referral links.
+Listing by either endpoint retrieves a person's history or a company's roster.
+Identities, facts and relationships use the same private D1 database and
+conversational tools. Simple collections use tags.
+`crm_get` includes bounded pages of identities, facts and relationships, with
+separate continuation cursors; `crm_search` matches these details too.
+
+`crm_events` (`list`, `get`, `save`, `delete`) stores conferences and other event
+containers with title, start/end, location and provenance. `get` returns a bounded
+participation roster; pass its `next_cursor` as `roster_cursor` to continue.
+`crm_event_participation` (`list`, `save`, `delete`) links an event to a `record_id`:
+a person, or a company with `role="organizer"`. Role is separate from attendance
+status (`unknown`, `invited`, `expected`, `attended`, `declined`). An invitation,
+public attendee list, or organizer role does not establish that someone attended.
+List existing participation before saving; edit its ID to update the assertion.
+
+`crm_interactions` (`list`, `get`, `save`, `delete`) stores one shared observation
+with `participants: [{record_id, role}]`, flexible `type`, optional `summary`,
+`body`, and `occurred_at`. A single `person_id` is a convenience for one participant.
+For example, a synthetic proposal can have `type="proposal"`, proposer and
+recipient roles, and `occurred_at="2026-09-20"`; the same interaction appears in
+both people's timelines. `YYYY-MM-DD` preserves date-only precision; RFC3339
+preserves a supplied time. Date-only entries sort at UTC midnight and expose
+`precision="date"`. Do not invent a time when the user supplied only a date.
+
+Interactions optionally link an owned `event_id`, an imported `meeting_id`, or
+an imported email's paired `connection_id`/`message_id`. Meeting/email links must
+relate to a participant. Event membership is not required to record an independent
+observation. Participant/link identity and origin are immutable on edits.
+Deleting an event or imported source detaches its link and preserves the
+independent interaction; deleting one participant preserves shared history for
+remaining participants. Interactions with no remaining participants remain in
+account-wide history. Shared interaction provenance also covers participant roles.
+
+Events, participation and interactions keep `origin` (`user`, `source`,
+`inferred`), `sources`, `confidence`, and `rationale`. Source assertions need
+references; inferences also need confidence and rationale. User statements stay
+separate from research. An interaction does not fill a meeting's missing notes
+or implicitly assert attendance.
+
+`crm_timeline({person_id?, event_id?, limit, cursor, from, to})` reads a bounded
+newest-first history. Omit person_id for account-wide history; event_id restricts
+event participation and associated interactions; it does not transitively include
+linked native Calendar or email records. A shared interaction appears
+once in the global timeline. `crm_get` includes its first page as `timeline`, with
+`timeline_next_cursor`; continue with `timeline_limit`/`timeline_cursor` or use
+the dedicated tool. Notes retain their independent cursor. Timeline cursors are
+scoped to the account, person, event and time filters; `from` is inclusive and `to`
+exclusive. Equal timestamps use stable kind/ID ordering. The timeline queries
+native Calendar meetings, meeting notes and surviving contact/email notes alongside
+event participation and shared interactions, without duplicating source records.
+Legacy contact notes have no recorded origin, so the timeline does not classify
+them as user observations.
+Repeated attendee aliases yield one Calendar entry. Calendar entries retain the
+matched person’s response status and the account’s declined flag; acceptance
+does not assert attendance. Conflicting alias responses remain unresolved. Newly imported emails retain
+the provider's receipt timestamp; older imports use their import timestamp with
+an explicit `timestamp_basis`. Deleting an imported note does not resurrect it
+from its import receipt. Timeline reads do not fetch a mailbox or expand Calendar
+collection beyond its existing opt-in scope.
+
+For example, after "automatically collect my meetings", the agent enables the
+schedule, imports events and researches attendees. "Which meetings need notes?"
+uses `crm_meetings({operation:"list",needs_notes:true})`. "For Jamie's meeting,
+we discussed benchmarks and I owe them the results" creates a note for that
+specific meeting; an ambiguous name/date is resolved before saving. The meeting
+then leaves the missing-notes queue. The workflow has no UI and sends no messages
+to other people.
+
+The schema lives in `migrations/`; D1 SQL migrations are separate from the
+Durable Object migration tags in `wrangler.jsonc`.
+
+Use `pnpm deploy:managed` from the repository root for production. Both this
+command and the normal Cloudflare release job run
+`scripts/cloudflare/managed-crm.mjs deploy`. The helper resolves
+`nanocodex-crm-production` in `CLOUDFLARE_ACCOUNT_ID`, creates it only when the
+provider reports it missing, then applies pending migrations with `--remote`
+before uploading the Worker. The deploy token needs D1 edit access in addition
+to the existing Worker/container permissions. Local production deployment also
+requires `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` in the environment.
+The database UUID is resolved at deployment time and pinned in an ephemeral
+Wrangler config shared by migrations and upload; no production UUID needs to be
+committed. CI checks the current release before each mutation. Failed migration
+or provisioning stops the upload. An uncertain creation is not retried in the
+same run; the next release resolves the database by name.
+
+From `js/managed`, run `pnpm run db:migrate:local` before development. This
+applies the same migrations to `nanocodex-crm-development` in
+`js/account/.wrangler/state`, the Vite development stack’s persistence directory.
+For a standalone managed `wrangler dev`, run the same Wrangler migration command
+without `--persist-to ../account/.wrangler/state` to use managed’s own state. The test binding uses the distinct local identity `nanocodex-crm-test`.
+Neither local identity is a cloud database UUID.
+
+`pnpm --filter nanocodex-managed-service run preview` applies migrations to
+`nanocodex-crm-preview` locally, then dry-runs the full managed Worker bundle.
+The CI preview job uses this same command. It replaces the production D1
+binding, removes named environments and cloud credentials, and never provisions
+or migrates a remote database. Managed previews remain validation-only because
+this Worker uses Durable Objects and containers.
+
+Use the deployment helper for uploads, rather than invoking `wrangler deploy`
+directly: Wrangler's automatic resource provisioning does not apply the schema.
+Keep future migrations compatible with the currently deployed Worker, since
+migrations finish before the new Worker receives traffic. Rollbacks do not undo
+SQL migrations.
 
 ### SMS OTP delivery
 
@@ -509,9 +684,11 @@ before the Connect API and the host application so exchanges do not fail with
 ## Development and operation
 
 This package participates in the checkout-isolated local platform rather than
-running as an independent product surface. Use the repository operator commands,
-deployment order, secret handling, and required browser evidence in
-[`../../AGENTS.md`](../../AGENTS.md). The package scripts provide its focused
+running as an independent product surface. Use the root
+[README.md](../../README.md) for checkout setup, the root
+[package scripts](../../package.json) for repository commands, and
+[AGENTS.md](../../AGENTS.md) for deployment order and verification guidance.
+The package scripts provide its focused
 typecheck, test, and Wrangler dry-run build when that boundary changes.
 
 ### Sandbox development tools
@@ -632,3 +809,40 @@ owner-only authorization and bounded payload policy as Spotify. The broker uses
 its configured SoundCloud app and the fixed `http://127.0.0.1:8788/callback`
 redirect. Both music providers' connection tools return native app links; no
 credentials or renewable tokens pass through the agent or phone API.
+
+## Connect sandbox execution
+
+A Connect app can request `urn:nanocodex:agent:execution:sandbox` in its hosted approval resources. The dialog displays **Cloud sandbox**; only the signed resource grants `agent.execution.sandbox`. Existing grants do not acquire this permission automatically.
+
+The verified grant can provision `cf_sandbox` execution hands owned by that approval. Discovery, command dispatch, process sessions, captured Code Mode cells, and native peer mounts remain in that authorization. Personal computers, VM factories, account-owned sandbox workspaces, and desktop enrollment are unavailable. Sandbox network traffic uses public egress without account connector or Vault injection; approved connector tools continue through the brain's existing grant checks.
+
+The durable agent's `/brain` remains shared across its conversations and authorization cohorts. Native workspace isolation does not make separate brain storage. Mount names and namespace slots remain agent-wide; another approval cannot adopt an existing approval's named mount.
+
+Connect apps with sandbox execution can upload durable inputs through
+`PUT /v1/grants/{grant}/agents/{agent}/inputs/{generationUUID}/{filename}`.
+The JSON body contains exactly `data_base64` (canonical base64) and `sha256`
+(lowercase SHA-256 hex). The server verifies the digest and derives the path
+`/brain/connect/{grant}/inputs/{generationUUID}/{filename}`. Generation IDs are
+UUIDs; filenames contain 1–128 ASCII letters, digits, dots, underscores or
+hyphens and start with a letter or digit. Paths and URL-encoded names are not
+accepted. The response is `{path,sha256,size}`: 201 on creation, 200 on an
+identical retry, and 409 if an immutable name is reused with different bytes.
+Retry an interrupted upload with the same body before admitting a turn.
+
+Uploads allow 600,000 decoded bytes and a 1,000,000-byte JSON body. Quotas are
+8 files/4.8 MB per generation, 256 files/30 MB per grant, and 1,024 files/120 MB
+per agent. Incomplete reservations count toward these quotas and remain
+retryable. Reservations and inputs are removed when the agent is deleted.
+
+Connect turns publish only `/brain/connect/{grant}/outputs/{turn_id}/`, with
+ownership derived from retained turn authorization. Apps should put this exact
+output directory in the turn prompt. The ordinary immutable artifact limits
+remain 50 files, 1 MB per file, 10 MB total. With `agent.output.final`, the app
+can request `GET /v1/grants/{grant}/agents/{agent}/artifacts?turn_id={turn_id}`
+and `GET /v1/grants/{grant}/agents/{agent}/artifacts/{artifact_id}/content`.
+The turn filter is required; metadata, publication status and bytes are
+restricted to that agent and grant, including after turn archival. Downloads
+retain digest ETags and content lengths. Revoked/expired grants cannot access
+these routes. Generic `/files`, attachments and configuration stay unavailable
+to Connect. These HTTP boundaries do not change the agent's shared `/brain`
+execution model described above.

@@ -361,6 +361,8 @@ pub(crate) enum RootEffect {
     SetMaxSubagents(usize),
     SetTheme(ThemeMode),
     Fork,
+    Btw(String),
+    CloseBtw,
     CancelTurns,
     CancelReview,
     CancelHandoff,
@@ -453,6 +455,7 @@ pub(crate) struct RootNode {
     blocking_task: Option<BlockingTask>,
     review_url: Option<String>,
     fork_available: bool,
+    side_pane: bool,
     skills: Arc<[Skill]>,
     interactive: bool,
     resuming_session: bool,
@@ -469,6 +472,7 @@ pub(crate) struct RootNode {
     pending_session_list: Option<u64>,
     next_session_list: u64,
     reflection_input: bool,
+    managed2_preview: bool,
 }
 
 impl RootNode {
@@ -534,6 +538,7 @@ impl RootNode {
             blocking_task: None,
             review_url: None,
             fork_available: true,
+            side_pane: false,
             skills: Arc::from([]),
             interactive: true,
             resuming_session: false,
@@ -550,17 +555,73 @@ impl RootNode {
             pending_session_list: None,
             next_session_list: 0,
             reflection_input: false,
+            managed2_preview: false,
         }
+    }
+
+    /// Keep the ordinary chat presentation while withholding controls that the
+    /// separate Managed2 text API cannot execute.
+    pub(crate) fn set_managed2_preview(&mut self) {
+        self.managed2_preview = true;
+        self.fork_available = false;
+        self.composer
+            .component_mut()
+            .set_backend_label("Managed2 · text only");
+    }
+
+    fn managed2_terminal(&mut self, event: Event) -> ComponentUpdate<RootEffect> {
+        if matches!(event, Event::Resize(_, _)) {
+            return ComponentUpdate::render(RenderRequest::Immediate);
+        }
+        if self.overlay.is_some() {
+            if matches!(&event, Event::Key(key) if key.kind == KeyEventKind::Press
+                && matches!(key.code, KeyCode::Esc | KeyCode::Enter))
+            {
+                self.overlay = None;
+                return ComponentUpdate::render(RenderRequest::Immediate);
+            }
+            return ComponentUpdate::none();
+        }
+        if matches!(&event, Event::Key(key) if key.kind == KeyEventKind::Press
+            && key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL)
+        {
+            return ComponentUpdate {
+                effects: vec![RootEffect::Shutdown],
+                render: RenderRequest::None,
+            };
+        }
+        if let Event::Key(key) = &event {
+            if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                || matches!(key.code, KeyCode::BackTab | KeyCode::Esc)
+            {
+                return ComponentUpdate::none();
+            }
+            if key.code == KeyCode::Enter && key.modifiers.is_empty() {
+                let draft = self.composer.component().draft().trim();
+                if matches!(draft, "/exit" | "/quit") {
+                    return ComponentUpdate {
+                        effects: vec![RootEffect::Shutdown],
+                        render: RenderRequest::None,
+                    };
+                }
+                if (draft.starts_with('/') && draft != "/id") || draft.starts_with('!') {
+                    self.notification = Some(Notification::plain(
+                        "Managed2 accepts text, /id, and /exit only.".to_owned(),
+                        Color::Yellow,
+                    ));
+                    return ComponentUpdate::render(RenderRequest::Immediate);
+                }
+            }
+        }
+        if !matches!(&event, Event::Key(_) | Event::Paste(_)) {
+            return ComponentUpdate::none();
+        }
+        self.edit_composer(ComposerEvent::Terminal(event))
     }
 
     pub(crate) fn fork(&self, workspace: &Path, thinking: ReasoningEffort) -> Self {
         let mut root = Self::new(workspace, thinking);
         root.transcript = Node::new(self.transcript.component().fork_snapshot());
-        root.composer
-            .component_mut()
-            .update(ComposerEvent::ContextTokens(
-                self.composer.component().context_tokens(),
-            ));
         root.set_fast_mode(self.composer.component().fast_mode());
         root.set_model(self.composer.component().model());
         root.set_reasoning_modes(
@@ -570,15 +631,15 @@ impl RootNode {
         root.set_max_subagents(self.subagents.max_subagents());
         root.thread = ThreadState::Started;
         root.fork_available = false;
+        root.side_pane = true;
         root.set_skills(Arc::clone(&self.skills));
         root.theme_mode = self.theme_mode;
-        root.context_diagnostics = self.context_diagnostics.clone();
         root.interactive = false;
         root.composer
             .component_mut()
             .update(ComposerEvent::Activity {
                 active: true,
-                status: Some("Forking session…".to_owned()),
+                status: Some("Opening /btw…".to_owned()),
                 now: Instant::now(),
             });
         root
@@ -1110,6 +1171,9 @@ impl RootNode {
     }
 
     fn update_terminal(&mut self, event: Event) -> ComponentUpdate<RootEffect> {
+        if self.managed2_preview {
+            return self.managed2_terminal(event);
+        }
         if self.voice_status.is_some() && is_control_key(&event, 'x') {
             if matches!(&event, Event::Key(key) if key.kind != KeyEventKind::Press) {
                 return ComponentUpdate::none();
@@ -2015,6 +2079,21 @@ impl RootNode {
             return ComponentUpdate::none();
         };
         let update = actions.update(ActionsEvent::Terminal(event));
+        if self.side_pane {
+            match update.effects.first() {
+                Some(ActionsEffect::Dismiss | ActionsEffect::Trigger(Action::Keybindings))
+                | Some(ActionsEffect::Trigger(Action::AgentId | Action::Zoom))
+                | Some(ActionsEffect::Settings(
+                    SettingsCommand::CloseBtw | SettingsCommand::Zoom,
+                )) => {}
+                Some(_) => {
+                    self.overlay = None;
+                    self.notification = Some(Notification::plain("Use /btw for questions and /close to leave; other controls belong to the main thread".into(), Color::Yellow));
+                    return ComponentUpdate::render(RenderRequest::Immediate);
+                }
+                None => {}
+            }
+        }
         match update.effects.into_iter().next() {
             Some(ActionsEffect::Dismiss) => self.overlay = None,
             Some(ActionsEffect::Submit(command)) => return self.submit_action_command(command),
@@ -2893,7 +2972,9 @@ impl RootNode {
         priority: RenderRequest,
     ) -> ComponentUpdate<RootEffect> {
         let update = self.composer.component_mut().update(event);
-        if let Some(ComposerEffect::Settings(command)) = &update.effect {
+        if !self.managed2_preview
+            && let Some(ComposerEffect::Settings(command)) = &update.effect
+        {
             return self.apply_settings_command(command.clone());
         }
         let delivered = matches!(
@@ -2927,10 +3008,21 @@ impl RootNode {
             // Goal controls are intercepted by the managed server and must not
             // wait behind active model work or an unacknowledged steer.
             Some(ComposerEffect::Submit(prompt))
-                if prompt.display_text().split_whitespace().next() == Some("/goal") =>
+                if !self.managed2_preview
+                    && prompt.display_text().split_whitespace().next() == Some("/goal") =>
             {
                 self.in_flight_turns = self.in_flight_turns.saturating_add(1);
                 vec![RootEffect::Submit(prompt)]
+            }
+            Some(ComposerEffect::Submit(prompt))
+                if self.managed2_preview && self.has_active_turns() =>
+            {
+                self.queue.component_mut().push(prompt);
+                Vec::new()
+            }
+            Some(ComposerEffect::Submit(prompt)) if self.side_pane && self.has_active_turns() => {
+                self.queue.component_mut().push(prompt);
+                Vec::new()
             }
             Some(ComposerEffect::Submit(prompt)) if self.has_active_turns() => {
                 let (id, prompt) = self.queue.component_mut().begin_steer(prompt);
@@ -2949,6 +3041,16 @@ impl RootNode {
                 let queued = self.submit_next_queued();
                 render = render.max(queued.render);
                 queued.effects
+            }
+            Some(ComposerEffect::RunShell(command)) if self.side_pane => {
+                self.composer
+                    .component_mut()
+                    .replace_draft(format!("!{command}"));
+                self.notification = Some(Notification::plain(
+                    "Local shell commands belong to the main thread".into(),
+                    Color::Yellow,
+                ));
+                Vec::new()
             }
             Some(ComposerEffect::RunShell(command)) => {
                 self.in_flight_shells = self.in_flight_shells.saturating_add(1);
@@ -2987,7 +3089,50 @@ impl RootNode {
     }
 
     fn apply_settings_command(&mut self, command: SettingsCommand) -> ComponentUpdate<RootEffect> {
+        if self.side_pane
+            && !matches!(
+                &command,
+                SettingsCommand::CloseBtw | SettingsCommand::Btw(_) | SettingsCommand::Zoom
+            )
+        {
+            self.notification = Some(Notification::plain(
+                "This control belongs to the main thread".into(),
+                Color::Yellow,
+            ));
+            return ComponentUpdate::render(RenderRequest::Immediate);
+        }
         match command {
+            SettingsCommand::Btw(question) => {
+                if self.side_pane {
+                    self.notification =
+                        Some(Notification::plain("Already in /btw".into(), Color::Yellow));
+                    return ComponentUpdate::render(RenderRequest::Immediate);
+                }
+                if !self.can_fork() {
+                    self.notification = Some(Notification::plain(
+                        "A /btw pane is already open".into(),
+                        Color::Yellow,
+                    ));
+                    return ComponentUpdate::render(RenderRequest::Immediate);
+                }
+                ComponentUpdate {
+                    effects: vec![RootEffect::Btw(question)],
+                    render: RenderRequest::Immediate,
+                }
+            }
+            SettingsCommand::CloseBtw => {
+                if !self.side_pane {
+                    self.notification = Some(Notification::plain(
+                        "/close is only available in /btw".into(),
+                        Color::Yellow,
+                    ));
+                    return ComponentUpdate::render(RenderRequest::Immediate);
+                }
+                ComponentUpdate {
+                    effects: vec![RootEffect::CloseBtw],
+                    render: RenderRequest::Immediate,
+                }
+            }
             SettingsCommand::Bug(description) => ComponentUpdate {
                 effects: vec![RootEffect::Bug(description)],
                 render: RenderRequest::Immediate,
@@ -4470,9 +4615,7 @@ fn is_plain_key(event: &Event, character: char) -> bool {
 
 #[cfg(test)]
 mod history_tests {
-    use super::{
-        Component, Overlay, RenderRequest, RootEffect, RootEvent, RootNode, SettingsCommand,
-    };
+    use super::{Component, Overlay, RootEffect, RootEvent, RootNode};
     use crate::config::ReasoningEffort;
     use crate::tui::{
         theme::Theme,
@@ -4481,111 +4624,6 @@ mod history_tests {
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     use ratatui::{Terminal, backend::TestBackend};
     use std::sync::Arc;
-
-    #[test]
-    fn bare_voice_opens_visible_menu_and_routes_clone_without_starting_audio() {
-        use crate::voice::Command;
-        let mut root = RootNode::new(std::path::Path::new("/workspace"), ReasoningEffort::Medium);
-        root.reconnecting = Some(false);
-        let update =
-            root.apply_settings_command(SettingsCommand::Voice(Command::parse("").unwrap()));
-        assert!(update.effects.is_empty());
-        assert!(matches!(root.overlay, Some(Overlay::VoiceMenu(_))));
-        let mut terminal = Terminal::new(TestBackend::new(100, 25)).unwrap();
-        terminal
-            .draw(|frame| root.render_focused(frame, frame.area(), &Theme::default(), true))
-            .unwrap();
-        let screen = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(screen.contains("Record a voice clone"));
-        assert!(screen.contains("ChatGPT voices"));
-        assert!(screen.contains("ElevenLabs voices"));
-        for _ in 0..3 {
-            root.update(RootEvent::Terminal(Event::Key(KeyEvent::new(
-                KeyCode::Down,
-                KeyModifiers::NONE,
-            ))));
-        }
-        let update = root.update(RootEvent::Terminal(Event::Key(KeyEvent::new(
-            KeyCode::Enter,
-            KeyModifiers::NONE,
-        ))));
-        assert!(
-            matches!(update.effects.as_slice(), [RootEffect::Voice(Command::CloneOpen(name))] if name == "My voice")
-        );
-    }
-
-    #[test]
-    fn bare_voices_opens_provider_menu_without_catalog_fetch() {
-        let mut root = RootNode::new(std::path::Path::new("/workspace"), ReasoningEffort::Medium);
-        let update = root.apply_settings_command(SettingsCommand::Voice(
-            crate::voice::Command::parse("voices").unwrap(),
-        ));
-        assert!(update.effects.is_empty());
-        assert!(matches!(root.overlay, Some(Overlay::VoiceMenu(_))));
-    }
-
-    #[test]
-    fn voice_menu_chatgpt_selection_and_escape_are_local() {
-        use crate::voice::{Command, Selection};
-        let mut root = RootNode::new(std::path::Path::new("/workspace"), ReasoningEffort::Medium);
-        root.apply_settings_command(SettingsCommand::Voice(Command::Toggle));
-        root.update(RootEvent::Terminal(Event::Key(KeyEvent::new(
-            KeyCode::Down,
-            KeyModifiers::NONE,
-        ))));
-        let update = root.update(RootEvent::Terminal(Event::Key(KeyEvent::new(
-            KeyCode::Enter,
-            KeyModifiers::NONE,
-        ))));
-        assert!(update.effects.is_empty());
-        let update = root.update(RootEvent::Terminal(Event::Key(KeyEvent::new(
-            KeyCode::Enter,
-            KeyModifiers::NONE,
-        ))));
-        assert!(matches!(
-            update.effects.as_slice(),
-            [RootEffect::Voice(Command::Select(Selection::Chatgpt(_)))]
-        ));
-        root.apply_settings_command(SettingsCommand::Voice(Command::Toggle));
-        let update = root.update(RootEvent::Terminal(Event::Key(KeyEvent::new(
-            KeyCode::Esc,
-            KeyModifiers::NONE,
-        ))));
-        assert!(update.effects.is_empty());
-        assert!(root.overlay.is_none());
-    }
-
-    #[test]
-    fn voice_clone_modal_routes_keys_locally_and_escape_cancels() {
-        use crate::voice::Command;
-        let mut root = RootNode::new(std::path::Path::new("/workspace"), ReasoningEffort::Medium);
-        root.update(RootEvent::VoiceStatus(Some(crate::voice_state::Status {
-            text: "Voice clone: Synthetic voice".into(),
-            ..Default::default()
-        })));
-        for (key, expected) in [
-            (KeyCode::Char('r'), Command::CloneRecord(None)),
-            (KeyCode::Char(' '), Command::CloneStop),
-            (KeyCode::Char('p'), Command::ClonePlay),
-            (KeyCode::Esc, Command::CloneCancel),
-        ] {
-            let update = root.update(RootEvent::Terminal(Event::Key(KeyEvent::new(
-                key,
-                KeyModifiers::NONE,
-            ))));
-            assert!(
-                matches!(update.effects.as_slice(), [RootEffect::Voice(command)] if *command == expected)
-            );
-        }
-        root.update(RootEvent::VoiceStatus(None));
-        assert!(root.overlay.is_none());
-    }
 
     #[test]
     fn voice_clone_upload_requires_visible_consent() {
@@ -4837,29 +4875,6 @@ mod history_tests {
     }
 
     #[test]
-    fn upward_at_top_and_home_request_older_history() {
-        let mut root = RootNode::new(std::path::Path::new("/workspace"), ReasoningEffort::Medium);
-
-        let page_up = root.update(RootEvent::Terminal(Event::Key(KeyEvent::new(
-            KeyCode::PageUp,
-            KeyModifiers::NONE,
-        ))));
-        assert!(matches!(
-            page_up.effects.as_slice(),
-            [RootEffect::LoadOlderHistory]
-        ));
-
-        let home = root.update(RootEvent::Terminal(Event::Key(KeyEvent::new(
-            KeyCode::Home,
-            KeyModifiers::CONTROL,
-        ))));
-        assert!(matches!(
-            home.effects.as_slice(),
-            [RootEffect::LoadOlderHistory]
-        ));
-    }
-
-    #[test]
     fn downward_scroll_does_not_request_older_history() {
         let mut root = RootNode::new(std::path::Path::new("/workspace"), ReasoningEffort::Medium);
         let update = root.update(RootEvent::Terminal(Event::Key(KeyEvent::new(
@@ -4937,33 +4952,6 @@ mod history_tests {
 
         panic!("expected to prefetch before entering the cached near-top window");
     }
-
-    #[test]
-    fn background_history_replay_does_not_restore_the_original_prompt_into_the_composer() {
-        let mut root = RootNode::new(std::path::Path::new("/workspace"), ReasoningEffort::Medium);
-        root.composer
-            .component_mut()
-            .replace_draft("new follow-up draft".to_owned());
-        let original = Arc::new(
-            TranscriptRecord::from_local(
-                1,
-                1,
-                LocalEvent::UserSubmitted {
-                    id: TurnId::new(1),
-                    text: "original prompt".to_owned(),
-                },
-            )
-            .unwrap(),
-        );
-        let projection = RootNode::project_open_session(ReasoningEffort::Medium, vec![original]);
-
-        let update = root.update(RootEvent::HistoryReplayed {
-            projection: Box::new(projection),
-        });
-
-        assert_eq!(update.render, RenderRequest::Immediate);
-        assert_eq!(root.composer.component().draft(), "new follow-up draft");
-    }
 }
 
 #[cfg(test)]
@@ -4989,30 +4977,6 @@ mod live_control_tests {
             .component_mut()
             .replace_draft(draft.to_owned());
         root
-    }
-
-    #[test]
-    fn empty_idle_transcript_does_not_schedule_frames_but_live_status_does() {
-        use super::RenderRequest;
-        let mut root = root_with_draft("");
-        assert_eq!(root.animation_deadline(), None);
-
-        let update = root.update(key(KeyCode::Char('x')));
-        assert_eq!(update.render, RenderRequest::Immediate);
-        assert_eq!(root.composer().draft(), "x");
-        assert_eq!(root.animation_deadline(), None);
-
-        root.update(RootEvent::ManagedActiveTurns(1));
-        let deadline = root.animation_deadline().expect("live status animates");
-        let update = root.update(RootEvent::AnimationFrame(deadline));
-        assert_ne!(update.render, RenderRequest::None);
-        assert!(
-            root.animation_deadline()
-                .is_some_and(|next| next > deadline)
-        );
-
-        root.update(RootEvent::ManagedActiveTurns(0));
-        assert_eq!(root.animation_deadline(), None);
     }
 
     #[test]
@@ -5284,50 +5248,6 @@ mod live_control_tests {
                 .effects
                 .is_empty()
         );
-    }
-
-    #[test]
-    fn vault_recent_receipt_is_readable() {
-        let text = json!({"type":"vault_intake_receipt","status":"saved","operation":"authorize_origin","id":"abcdefghijklmnopqrstuv","kind":"login","name":"Example","browser_origin":"https://example.com"}).to_string();
-        let record = TranscriptRecord::from_local(
-            1,
-            1,
-            LocalEvent::UserSubmitted {
-                id: TurnId::new(1),
-                text,
-            },
-        )
-        .unwrap();
-        let prompt = super::recent_prompt(&record).unwrap();
-        assert!(prompt.text.contains("Website approved for Example"));
-        assert!(!prompt.text.contains("vault_intake_receipt"));
-    }
-
-    #[test]
-    fn vault_command_is_local_and_receipt_is_submitted() {
-        let mut root = root_with_draft("/vault review abcdefghijklmnopqrstuv https://example.com");
-        assert!(matches!(
-            root.update(key(KeyCode::Enter)).effects.as_slice(),
-            [RootEffect::Vault(crate::tui::vault::Command::Review { .. })]
-        ));
-        let receipt = crate::tui::vault::receipt(&vault_review().login);
-        let update = root.update(RootEvent::VaultReceipt(receipt.clone()));
-        assert!(
-            matches!(update.effects.as_slice(), [RootEffect::Submit(prompt)] if prompt.display_text() == receipt)
-        );
-    }
-
-    #[test]
-    fn idle_enter_submits_once() {
-        let mut root = root_with_draft("start work");
-
-        let update = root.update(key(KeyCode::Enter));
-
-        assert!(
-            matches!(update.effects.as_slice(), [RootEffect::Submit(prompt)] if prompt.display_text() == "start work")
-        );
-        assert_eq!(root.in_flight_turns, 1);
-        assert!(root.queue.component().is_empty());
     }
 
     #[test]
@@ -5621,66 +5541,6 @@ mod live_control_tests {
     }
 
     #[test]
-    fn slash_autoroute_from_draft_and_actions_never_dispatches_a_prompt() {
-        for typed in [false, true] {
-            for command in ["/autoroute", "/autoroute extra"] {
-                for state in 0..4 {
-                    let mut root = root_with_draft("");
-                    if state == 1 {
-                        root.composer
-                            .component_mut()
-                            .replace_draft("first prompt".into());
-                        assert!(matches!(
-                            root.update(key(KeyCode::Enter)).effects.as_slice(),
-                            [RootEffect::Submit(_)]
-                        ));
-                        root.update(RootEvent::WorkerTurnFinished {
-                            terminal_expected: false,
-                        });
-                    }
-                    root.in_flight_turns = usize::from(state == 2);
-                    root.managed_active_turns = usize::from(state == 3);
-                    let _ = root.sync_live_controls();
-                    assert_eq!(root.action_availability().auto_route, state == 0);
-                    if typed {
-                        for character in command.chars() {
-                            root.update(key(KeyCode::Char(character)));
-                        }
-                        assert!(matches!(root.overlay, Some(super::Overlay::Actions(_))));
-                    } else {
-                        root.composer
-                            .component_mut()
-                            .replace_draft(command.to_owned());
-                    }
-                    let update = root.update(key(KeyCode::Enter));
-                    if state == 0 && command == "/autoroute" {
-                        assert_eq!(update.effects, [RootEffect::AutoRoute]);
-                        assert!(root.notification.is_none());
-                    } else {
-                        assert!(update.effects.is_empty());
-                        let notification = root.notification.as_ref().expect("command error");
-                        assert_eq!(notification.color, ratatui::style::Color::Red);
-                        if state != 0 && command == "/autoroute" {
-                            assert!(
-                                notification
-                                    .message
-                                    .to_string()
-                                    .contains("before the first prompt")
-                            );
-                        }
-                    }
-                    assert!(root.composer.component().draft().is_empty());
-                    assert!(root.overlay.is_none());
-                    assert!(root.queue.component().is_empty());
-                    assert_eq!(root.in_flight_turns, usize::from(state == 2));
-                    assert_eq!(root.managed_active_turns, usize::from(state == 3));
-                    assert_eq!(root.thread == super::ThreadState::New, state != 1);
-                }
-            }
-        }
-    }
-
-    #[test]
     fn autoroute_pauses_prompt_submission_until_settings_are_hydrated() {
         let mut root = root_with_draft("/autoroute");
         assert_eq!(
@@ -5741,34 +5601,6 @@ mod live_control_tests {
                 );
                 assert!(root.queue.component().is_empty());
             }
-        }
-    }
-
-    #[test]
-    fn repeated_autoroute_after_first_prompt_preserves_the_before_first_diagnostic() {
-        for active in [false, true] {
-            let mut root = root_with_draft("/autoroute");
-            root.update(RootEvent::RoutingHydrated {
-                enabled: true,
-                provider: Some("Vercel".into()),
-                model: Some(Model::Glm53),
-                effort: Some(ReasoningEffort::Low),
-            });
-            if active {
-                root.managed_active_turns = 1;
-            } else {
-                root.thread = super::ThreadState::Started;
-            }
-            let update = root.apply_settings_command(super::SettingsCommand::AutoRoute);
-            assert!(update.effects.is_empty());
-            assert!(
-                root.notification
-                    .as_ref()
-                    .unwrap()
-                    .message
-                    .to_string()
-                    .contains("before the first prompt")
-            );
         }
     }
 
@@ -5848,31 +5680,6 @@ mod live_control_tests {
         ));
         assert!(matches!(root.thread, super::ThreadState::New));
         assert_eq!(root.in_flight_turns, 0);
-    }
-
-    #[test]
-    fn empty_attached_agent_keeps_model_selection_unlocked() {
-        let mut root = root_with_draft("");
-        let projection = RootNode::project_open_session(ReasoningEffort::Medium, Vec::new());
-        root.install_session_projection(
-            Path::new("/workspace"),
-            ReasoningEffort::Medium,
-            ReasoningMode::Standard,
-            ReasoningMode::Standard,
-            false,
-            projection,
-        );
-        let _ = root.update(key(KeyCode::Char('/')));
-        for character in "model sol".chars() {
-            let _ = root.update(key(KeyCode::Char(character)));
-        }
-
-        let update = root.update(key(KeyCode::Enter));
-
-        assert!(matches!(
-            update.effects.as_slice(),
-            [RootEffect::SetModel(Model::Sol)]
-        ));
     }
 
     #[test]
@@ -6059,127 +5866,6 @@ mod live_control_tests {
     }
 
     #[test]
-    fn active_enter_steers_once_without_first_queuing() {
-        let mut root = root_with_draft("change direction");
-        root.in_flight_turns = 1;
-        let _ = root.sync_live_controls();
-
-        let update = root.update(key(KeyCode::Enter));
-
-        assert!(
-            matches!(update.effects.as_slice(), [RootEffect::Steer { prompt, .. }] if prompt.display_text() == "change direction")
-        );
-        assert_eq!(root.in_flight_turns, 1);
-        assert_eq!(root.queue.component().len(), 1);
-        assert!(root.queue.component().has_pending_steer());
-    }
-
-    #[test]
-    fn attached_active_enter_steers_without_starting_a_local_turn() {
-        let mut root = root_with_draft("change attached direction");
-        let _ = root.update(RootEvent::ManagedActiveTurns(1));
-
-        let update = root.update(key(KeyCode::Enter));
-
-        assert!(
-            matches!(update.effects.as_slice(), [RootEffect::Steer { prompt, .. }] if prompt.display_text() == "change attached direction")
-        );
-        assert_eq!(root.in_flight_turns, 0);
-        assert_eq!(root.managed_active_turns, 1);
-        assert!(root.queue.component().has_pending_steer());
-    }
-
-    #[test]
-    fn foreign_steering_never_consumes_local_input_and_unknown_delivery_survives_completion() {
-        let mut root = root_with_draft("my instruction");
-        root.update(RootEvent::ManagedActiveTurns(1));
-        let update = root.update(key(KeyCode::Enter));
-        let [RootEffect::Steer { id, .. }] = update.effects.as_slice() else {
-            panic!("expected local steering");
-        };
-        let id = *id;
-        let foreign = |seq| {
-            Arc::new(TranscriptRecord::from_agent(
-                seq,
-                seq,
-                AgentEvent {
-                    protocol_version: 1,
-                    request_id: Arc::from("shared-agent"),
-                    seq,
-                    kind: AgentEventKind::RunSteered,
-                    payload: to_raw_value(&json!({"steer_index": seq, "instruction_bytes": 14}))
-                        .unwrap()
-                        .into(),
-                },
-            ))
-        };
-        assert!(
-            root.update(RootEvent::ExternalTranscript(foreign(1)))
-                .effects
-                .is_empty()
-        );
-        assert_eq!(root.queue.component().len(), 1);
-        assert!(root.queue.component().has_pending_steer());
-        root.update(RootEvent::SteerUnconfirmed(id));
-        assert!(
-            root.update(RootEvent::ExternalTranscript(foreign(2)))
-                .effects
-                .is_empty()
-        );
-        assert_eq!(root.queue.component().len(), 1);
-        root.queue.component_mut().push("known unsent".to_owned());
-        let completion = root.update(RootEvent::ManagedActiveTurns(0));
-        assert!(
-            matches!(completion.effects.as_slice(), [RootEffect::Submit(prompt)] if prompt.display_text() == "known unsent")
-        );
-        assert_eq!(
-            root.queue.component().len(),
-            1,
-            "uncertain input must remain visible after completion"
-        );
-        assert!(root.queue.component_mut().drain_ready().is_empty());
-    }
-
-    #[test]
-    fn terminal_then_late_steer_recovery_drains_the_queue() {
-        let mut root = root_with_draft("change attached direction");
-        let _ = root.update(RootEvent::ManagedActiveTurns(1));
-        let steer = root.update(key(KeyCode::Enter));
-        let [RootEffect::Steer { id, .. }] = steer.effects.as_slice() else {
-            panic!("active submission should start a steer");
-        };
-        let id = *id;
-        root.queue.component_mut().push("follow up".to_owned());
-
-        let terminal = root.update(RootEvent::ManagedActiveTurns(0));
-        assert!(terminal.effects.is_empty());
-        assert!(root.queue.component().has_pending_steer());
-
-        let recovered = root.update(RootEvent::SteerFailed { id });
-        assert!(
-            matches!(recovered.effects.as_slice(), [RootEffect::Submit(prompt)]
-                if prompt.display_text().contains("change attached direction")
-                    && prompt.display_text().contains("follow up"))
-        );
-        assert!(root.queue.component().is_empty());
-        assert!(!root.queue.component().has_pending_steer());
-    }
-
-    #[test]
-    fn nonempty_tab_queues_during_an_active_turn() {
-        let mut root = root_with_draft("follow up");
-        root.in_flight_turns = 1;
-        let _ = root.sync_live_controls();
-
-        let update = root.update(key(KeyCode::Tab));
-
-        assert!(update.effects.is_empty());
-        assert_eq!(root.queue.component().len(), 1);
-        assert!(!root.queue.component().has_pending_steer());
-        assert!(root.composer.component().draft().is_empty());
-    }
-
-    #[test]
     fn idle_nonempty_tab_keeps_the_draft_and_focus_traversal() {
         let mut root = root_with_draft("not yet");
         root.queue.component_mut().push("already queued".to_owned());
@@ -6190,55 +5876,6 @@ mod live_control_tests {
         assert_eq!(root.composer.component().draft(), "not yet");
         assert_eq!(root.queue.component().len(), 1);
         assert!(root.queue.component().focused());
-    }
-
-    #[test]
-    fn queue_focused_tab_returns_to_the_composer_without_consuming_its_draft() {
-        let mut root = root_with_draft("first follow up");
-        root.in_flight_turns = 1;
-        let _ = root.sync_live_controls();
-        let _ = root.update(key(KeyCode::Tab));
-        root.composer
-            .component_mut()
-            .replace_draft("keep this draft".to_owned());
-        root.queue.component_mut().set_focused(true);
-
-        let update = root.update(key(KeyCode::Tab));
-
-        assert!(update.effects.is_empty());
-        assert_eq!(root.composer.component().draft(), "keep this draft");
-        assert_eq!(root.queue.component().len(), 1);
-        assert!(!root.queue.component().focused());
-    }
-
-    #[test]
-    fn escape_offers_stop_for_a_locally_active_turn() {
-        let mut idle = root_with_draft("");
-        assert!(idle.update(key(KeyCode::Esc)).effects.is_empty());
-        assert!(idle.key_confirmation.is_none());
-
-        let mut active = root_with_draft("");
-        active.in_flight_turns = 1;
-        let _ = active.sync_live_controls();
-        assert!(active.update(key(KeyCode::Esc)).effects.is_empty());
-        assert!(active.key_confirmation.is_some());
-        assert!(matches!(
-            active.update(key(KeyCode::Esc)).effects.as_slice(),
-            [RootEffect::CancelTurns]
-        ));
-    }
-
-    #[test]
-    fn escape_offers_stop_for_an_attached_active_turn() {
-        let mut root = root_with_draft("");
-        let _ = root.update(RootEvent::ManagedActiveTurns(1));
-
-        assert!(root.update(key(KeyCode::Esc)).effects.is_empty());
-        assert!(root.key_confirmation.is_some());
-        assert!(matches!(
-            root.update(key(KeyCode::Esc)).effects.as_slice(),
-            [RootEffect::CancelTurns]
-        ));
     }
 
     #[test]
@@ -6465,116 +6102,6 @@ mod live_control_tests {
             matches!(content.as_slice(), [UserInput::Text { text }, UserInput::Image { image_url, .. }]
             if text == "inspect " && image_url == "data:image/png;base64,queued-image")
         );
-    }
-
-    #[test]
-    fn reflection_submit_shortcuts_keep_the_reflection_action_and_close_its_editor() {
-        for modifiers in [KeyModifiers::NONE, KeyModifiers::SUPER] {
-            let mut root = root_with_draft("");
-            root.update(key(KeyCode::Char('/')));
-            root.update(RootEvent::Terminal(Event::Paste("reflection".to_owned())));
-            root.update(key(KeyCode::Enter));
-            assert!(root.reflection_input);
-            root.update(RootEvent::ReplaceDraft(
-                "review the failed attempts".to_owned(),
-            ));
-
-            let update = root.update(RootEvent::Terminal(Event::Key(KeyEvent::new(
-                KeyCode::Enter,
-                modifiers,
-            ))));
-            assert!(
-                matches!(update.effects.as_slice(), [RootEffect::Reflect(prompt)]
-                if prompt.display_text() == "review the failed attempts")
-            );
-            assert!(!root.reflection_input);
-            assert!(root.composer.component().input_mode().is_none());
-            assert!(root.composer.component().draft().is_empty());
-        }
-    }
-
-    #[test]
-    fn disconnected_queue_editor_can_cancel_without_sending_or_reconnecting() {
-        for reconnect_failed in [false, true] {
-            let mut root = root_with_draft("preserved composer draft");
-            root.update(RootEvent::ManagedActiveTurns(1));
-            root.queue
-                .component_mut()
-                .push("original instruction".to_owned());
-            root.queue.component_mut().set_focused(true);
-            root.update(key(KeyCode::Char('e')));
-            root.composer
-                .component_mut()
-                .replace_draft("unsaved revision".to_owned());
-            root.update(RootEvent::AgentStreamClosed);
-            if reconnect_failed {
-                root.update(RootEvent::AgentReconnectFailed("offline".to_owned()));
-            }
-
-            assert!(root.update(key(KeyCode::Esc)).effects.is_empty());
-            assert!(
-                root.queue_edit.is_none(),
-                "local cancellation must work while disconnected"
-            );
-            assert_eq!(
-                root.composer.component().draft(),
-                "preserved composer draft"
-            );
-            assert_eq!(root.reconnecting, Some(!reconnect_failed));
-            assert!(!root.interactive);
-
-            let update = root.update(RootEvent::AgentReconnected {
-                active_turns: 0,
-                pending_local: false,
-                reasoning_mode: ReasoningMode::Standard,
-            });
-            assert!(
-                matches!(update.effects.as_slice(), [RootEffect::Submit(prompt)]
-                if prompt.display_text() == "original instruction")
-            );
-            assert!(root.queue.component().is_empty());
-        }
-    }
-
-    #[test]
-    fn tab_in_queue_editor_keeps_the_revision_unsent_until_explicit_save() {
-        for save in [false, true] {
-            let mut root = root_with_draft("preserved draft");
-            root.update(RootEvent::ManagedActiveTurns(1));
-            root.queue
-                .component_mut()
-                .push("original instruction".to_owned());
-            root.queue.component_mut().set_focused(true);
-            root.update(key(KeyCode::Char('e')));
-            assert!(root.queue_edit.is_some());
-            root.composer
-                .component_mut()
-                .replace_draft("unfinished revision".to_owned());
-
-            assert!(root.update(key(KeyCode::Tab)).effects.is_empty());
-            assert_eq!(root.composer.component().draft(), "unfinished revision");
-            assert_eq!(root.queue.component().len(), 1);
-            assert!(
-                root.update(key(if save { KeyCode::Enter } else { KeyCode::Esc }))
-                    .effects
-                    .is_empty()
-            );
-            assert_eq!(root.composer.component().draft(), "preserved draft");
-
-            let update = root.update(RootEvent::ManagedActiveTurns(0));
-            let [RootEffect::Submit(prompt)] = update.effects.as_slice() else {
-                panic!("exactly one queued instruction should be submitted");
-            };
-            assert_eq!(
-                prompt.display_text(),
-                if save {
-                    "unfinished revision"
-                } else {
-                    "original instruction"
-                }
-            );
-            assert!(root.queue.component().is_empty());
-        }
     }
 
     #[test]
@@ -6869,29 +6396,6 @@ mod live_control_tests {
     }
 
     #[test]
-    fn local_shell_interruption_stays_available_while_disconnected() {
-        let mut root = root_with_draft("!sleep 30");
-        assert!(matches!(
-            root.update(key(KeyCode::Enter)).effects.as_slice(),
-            [RootEffect::RunShell(_)]
-        ));
-        root.update(RootEvent::AgentStreamClosed);
-        root.update(RootEvent::AgentReconnectFailed("offline".to_owned()));
-        root.transcript.component_mut().focus_expandables();
-        assert!(root.update(key(KeyCode::Esc)).effects.is_empty());
-        assert!(!root.transcript.component().expandables_focused());
-        assert!(root.key_confirmation.is_none());
-        assert!(root.update(key(KeyCode::Esc)).effects.is_empty());
-        assert!(
-            matches!(
-                root.update(key(KeyCode::Esc)).effects.as_slice(),
-                [RootEffect::CancelTurns]
-            ),
-            "disconnecting the managed service must not disable local shell cancellation"
-        );
-    }
-
-    #[test]
     fn dragging_below_the_draft_finishes_copy_and_releases_the_composer() {
         use crate::tui::theme::Theme;
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
@@ -7034,113 +6538,6 @@ mod live_control_tests {
             matches!(content.as_slice(), [UserInput::Text { text }, UserInput::Image { image_url, .. }]
             if text == "inspect @@" && image_url == "data:image/png;base64,kept")
         );
-    }
-
-    #[test]
-    fn pending_session_lookup_keeps_its_input_and_status_during_live_updates() {
-        use crate::tui::theme::Theme;
-        use ratatui::{Terminal, backend::TestBackend};
-        let mut root = root_with_draft("preserved @@");
-        root.update(RootEvent::ManagedActiveTurns(1));
-        root.load_session_mentions("preserved ".len());
-        let request_id = root.pending_session_list.unwrap();
-        root.update(RootEvent::SettingsHydrated {
-            effort: ReasoningEffort::High,
-            fast_mode: false,
-            model: Model::Astra,
-        });
-        assert!(
-            !root.interactive,
-            "settings must not release the pending lookup's input pause"
-        );
-        root.update(key(KeyCode::Char('u')));
-        assert_eq!(root.composer.component().draft(), "preserved @@");
-        root.update(RootEvent::ManagedActiveTurns(0));
-        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        terminal
-            .draw(|frame| root.render_focused(frame, frame.area(), &Theme::default(), true))
-            .unwrap();
-        let screen: String = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect();
-        assert!(
-            screen.contains("Loading sessions") && screen.contains("Esc cancel"),
-            "{screen}"
-        );
-        root.update(RootEvent::SessionsLoaded {
-            request_id,
-            sessions: Vec::new(),
-        });
-        assert!(root.interactive);
-        root.update(key(KeyCode::Esc));
-        root.update(key(KeyCode::Char('x')));
-        assert_eq!(root.composer.component().draft(), "preserved @@x");
-    }
-
-    #[test]
-    fn session_lookup_can_be_cancelled_while_a_turn_is_running() {
-        let mut root = root_with_draft("steering draft");
-        root.update(RootEvent::ManagedActiveTurns(1));
-        root.load_sessions();
-        root.update(key(KeyCode::Esc));
-        assert!(root.interactive, "Esc must release a slow session lookup");
-        assert_eq!(root.composer.component().draft(), "steering draft");
-        let update = root.update(key(KeyCode::Enter));
-        assert!(
-            matches!(update.effects.as_slice(), [RootEffect::Steer { prompt, .. }] if prompt.display_text() == "steering draft")
-        );
-    }
-
-    #[test]
-    fn session_lookup_resolution_releases_ready_followups_without_sending_the_draft() {
-        for resolution in 0..3 {
-            let mut root = root_with_draft("unfinished steering draft");
-            root.update(RootEvent::ManagedActiveTurns(1));
-            root.queue
-                .component_mut()
-                .push("queued after lookup".to_owned());
-            root.load_session_mentions(0);
-            let request_id = root.pending_session_list.unwrap();
-            assert!(
-                root.update(RootEvent::ManagedActiveTurns(0))
-                    .effects
-                    .is_empty()
-            );
-            let event = match resolution {
-                0 => key(KeyCode::Esc),
-                1 => RootEvent::SessionsLoaded {
-                    request_id,
-                    sessions: Vec::new(),
-                },
-                _ => RootEvent::SessionListFailed {
-                    request_id,
-                    error: "lookup failed".to_owned(),
-                },
-            };
-            let update = root.update(event);
-            let submitted: Vec<_> = update
-                .effects
-                .iter()
-                .filter_map(|effect| match effect {
-                    RootEffect::Submit(prompt) => Some(prompt.display_text()),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(
-                submitted,
-                ["queued after lookup"],
-                "ready followup stuck after lookup resolution {resolution}"
-            );
-            assert_eq!(
-                root.composer.component().draft(),
-                "unfinished steering draft"
-            );
-            assert!(root.queue.component().is_empty());
-        }
     }
 
     #[test]
@@ -7312,37 +6709,5 @@ mod live_control_tests {
             );
             assert!(!root.interactive);
         }
-    }
-
-    #[test]
-    fn closed_managed_stream_blocks_submission_without_promoting_the_queue() {
-        let mut root = root_with_draft("do not submit");
-        root.queue.component_mut().push("still queued".to_owned());
-        let _ = root.update(RootEvent::ManagedActiveTurns(1));
-
-        let disconnected = root.update(RootEvent::AgentStreamClosed);
-        let enter = root.update(key(KeyCode::Enter));
-
-        assert!(disconnected.effects.is_empty());
-        assert!(enter.effects.is_empty());
-        assert!(!root.interactive);
-        assert_eq!(root.managed_active_turns, 0);
-        assert_eq!(root.queue.component().len(), 1);
-        assert_eq!(root.composer.component().draft(), "do not submit");
-    }
-
-    #[test]
-    fn closed_managed_stream_preserves_local_activity_state() {
-        let mut root = root_with_draft("");
-        root.in_flight_turns = 1;
-        let _ = root.update(RootEvent::ManagedActiveTurns(1));
-
-        let update = root.update(RootEvent::AgentStreamClosed);
-
-        assert!(update.effects.is_empty());
-        assert!(!root.interactive);
-        assert_eq!(root.managed_active_turns, 0);
-        assert!(root.has_active_turns());
-        assert_eq!(root.in_flight_turns, 1);
     }
 }

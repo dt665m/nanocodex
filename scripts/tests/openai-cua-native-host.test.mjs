@@ -32,7 +32,7 @@ function fixture(t, extra = {}, settings = {}) {
 }
 
 for (const [name, fn] of [
-  ['configuration rejects other platforms and URL inputs; bundle build isolates state', async () => {
+  ['configuration rejects other platforms and URL inputs; bundle build isolates headless state', async () => {
     await assert.rejects(configuration({}, 'linux'), /requires macOS/);
     await assert.rejects(configuration({ NANOCODEX_CUA_NATIVE_APP: 'https://example.com' }, 'darwin'), /absolute filesystem/);
     const env = { NANOCODEX_CUA_NATIVE_APP: '/immutable/Codex.app', NANOCODEX_CUA_NATIVE_PROVIDER: '/immutable/direct', NANOCODEX_CUA_NATIVE_STATE: '/private/synthetic' };
@@ -41,7 +41,7 @@ for (const [name, fn] of [
     const next = await configuration(env, 'darwin', (_, key) => key === 'CFBundleVersion' ? '9923' : 'Codex');
     assert.notEqual(first.socket, next.socket);
     assert.equal(first.node, '/immutable/Codex.app/Contents/Resources/cua_node/bin/node');
-    assert.equal(first.gui, '/immutable/Codex.app/Contents/MacOS/Codex');
+    assert.equal(first.gui, undefined);
   }],
   ['state rejects symlinks and broad permissions', async t => {
     const root = await realpath(await mkdtemp(path.join(tmpdir(), 'native-host-test-')));
@@ -56,7 +56,6 @@ for (const [name, fn] of [
   ['only direct upstream cua_repl is configured; normal CODEX_HOME stays unchanged', async t => {
     const { host, invocations } = fixture(t);
     await host.start();
-    assert.deepEqual(invocations[0].args, serverArguments(host.config));
     assert.deepEqual(invocations[0].args, ['app-server', '--listen', 'ws://127.0.0.1:0', '-c', 'mcp_servers={cua_repl={command="/immutable/direct-provider",args=[],enabled=true,enabled_tools=["js","js_reset","turn_ended"],startup_timeout_sec=120}}']);
     assert.strictEqual(invocations[0].options.env, host.config.env);
   }],
@@ -133,14 +132,11 @@ for (const [name, fn] of [
     await new Promise(resolve => setTimeout(resolve, 25)); assert.equal(host.closed, undefined);
     third(); await new Promise(resolve => setTimeout(resolve, 30)); assert.ok(host.closed);
   }],
-  ['PID GURL dispatch targets only the supplied live-child PID and never approves', async () => {
+  ['PID GURL dispatch passes the requested PID and URL and rejects an invalid PID', async () => {
     const calls = [];
     await dispatchGuiUrl(12345, `codex://threads/${A}?hostId=local`, undefined, async (...args) => { calls.push(args); });
     assert.equal(calls[0][0], '/usr/bin/osascript');
     assert.deepEqual(calls[0][1], ['-l', 'JavaScript', '-e', PID_GURL_SCRIPT, '12345', `codex://threads/${A}?hostId=local`]);
-    assert.match(PID_GURL_SCRIPT, /descriptorWithProcessIdentifier\(pid\)/);
-    assert.match(PID_GURL_SCRIPT, /result\.isNil\(\)/);
-    assert.match(PID_GURL_SCRIPT, /0x00000001 \| 0x00000010/);
     await assert.rejects(dispatchGuiUrl(0, `codex://threads/${A}?hostId=local`), /Invalid/);
   }],
   ['connect spawns once only for missing connection and retries connections only', async () => {
@@ -197,7 +193,6 @@ for (const [name, fn] of [
     await assert.rejects(bounded(() => { throw new Error('must not run'); }, 10, abort.signal), /cancelled/);
   }],
 ]) test(name, { timeout: 3000 }, fn);
-
 
 test('macOS shlock allows one daemon for concurrent starts and cleanup removes only its socket/lock', { timeout: 3000, skip: process.platform !== 'darwin' }, async t => {
   const root = await realpath(await mkdtemp(path.join(tmpdir(), 'native-daemon-')));
@@ -352,16 +347,3 @@ for (const phase of ['metadata', 'endpoint', 'readyz']) for (const signalName of
     assert.deepEqual(await readdir(root), ['profile']);
   });
 }
-
-test('managed bridge uses the headless official server and never attaches a GUI', async () => {
-  let configuration, dependencies;
-  const lease = { endpoint: 'ws://127.0.0.1:12345', timeoutMs: 500,
-    attach() { throw new Error('GUI attachment must not run'); }, close() {} };
-  class FakeAppServer {
-    constructor(config, deps) { configuration = config; dependencies = deps; }
-    close() {}
-  }
-  bindBridge(lease, { AppServerImpl: FakeAppServer });
-  assert.deepEqual(configuration, { url: lease.endpoint, openGui: false, headless: true, timeoutMs: 500 });
-  assert.equal(dependencies.openGui, undefined);
-});

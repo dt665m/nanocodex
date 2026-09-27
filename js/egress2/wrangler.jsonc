@@ -1,0 +1,52 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "nanocodex-egress2",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-29",
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1,
+    "redact_query_string": false,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1,
+      "invocation_logs": true,
+      "persist": true
+    },
+    "traces": {
+      "enabled": true,
+      "head_sampling_rate": 1,
+      "persist": true
+    }
+  },
+  "vpc_networks": [{ "binding": "GATEWAY", "network_id": "cf1:network", "remote": true }],
+  "workers_dev": false,
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "USER_CREDENTIALS",
+        "class_name": "UserCredentials"
+      },
+      {
+        "name": "CHATGPT_EGRESS",
+        "class_name": "ChatGptEgress",
+        "script_name": "nanocodex"
+      },
+      { "name": "CHATGPT_EGRESS_WNAM", "class_name": "ChatGptEgressWnam", "script_name": "nanocodex" },
+      { "name": "CHATGPT_EGRESS_ENAM", "class_name": "ChatGptEgressEnam", "script_name": "nanocodex" },
+      { "name": "CHATGPT_EGRESS_WEUR", "class_name": "ChatGptEgressWeur", "script_name": "nanocodex" },
+      { "name": "CHATGPT_EGRESS_EEUR", "class_name": "ChatGptEgressEeur", "script_name": "nanocodex" },
+      { "name": "CHATGPT_EGRESS_APAC", "class_name": "ChatGptEgressApac", "script_name": "nanocodex" },
+      { "name": "CHATGPT_EGRESS_SAM", "class_name": "ChatGptEgressSam", "script_name": "nanocodex" },
+      { "name": "CHATGPT_EGRESS_OC", "class_name": "ChatGptEgressOc", "script_name": "nanocodex" }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "UserCredentials"
+      ]
+    }
+  ]
+}

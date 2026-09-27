@@ -1,7 +1,7 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { DurableAgentSession } from "../src/index";
-import { configurationCatalog, networkAllows, normalizeToolNames, parseConfiguration } from "../src/agent-configuration";
+import { configurationCatalog, networkAllows, parseConfiguration } from "../src/agent-configuration";
 import { SessionOperations } from "../src/session-operations";
 import { DurableEventLog } from "../src/durable-events";
 import { createBrainWorkspace } from "../src/brain-workspace";
@@ -106,7 +106,7 @@ it("authorizes operational routes before exposing another session or allowing a 
     expect((await call(resource)).status).toBe(200);
     expect((await call(resource, "GET", { ...principal, userId: "22222222-2222-4222-8222-222222222222" })).status).toBe(404);
     expect((await call(resource, "GET", { ...principal, capabilities: [] })).status).toBe(403);
-    expect((await call(resource, "GET", { ...principal, connectGrant: { grantId: `0x${"a".repeat(64)}`, connectors: ["chatgpt"], mcpIds: [] } })).status).toBe(403);
+    expect((await call(resource, "GET", { ...principal, connectGrant: { grantId: `0x${"a".repeat(64)}`, connectors: ["chatgpt"], mcpIds: [] } })).status).toBe(resource === "artifacts" ? 400 : 403);
   }
   expect((await call("webhook", "PUT", { ...principal, kind: "account_session" }, "https://evil.example")).status).toBe(403);
   expect((await call("webhook", "PUT")).status).toBe(201);
@@ -159,15 +159,6 @@ it("prepares files, skills and actual embedded-shell commands once, under the ne
     expect(state.storage.sql.exec("SELECT state,step FROM managed_environment_setup").one()).toEqual({ state: "ready", step: 3 });
   } finally { runtime.dispose(); }
 }));
-
-
-it("normalizes retained tool names without mutating stored configuration or changing grants", () => {
-  const stored = { instructions: "existing", tools: ["accountInfo", "exec_command"] };
-  expect(normalizeToolNames(stored)).toEqual({ instructions: "existing", tools: ["environment", "exec_command"] });
-  expect(stored.tools).toEqual(["accountInfo", "exec_command"]);
-  const current = { tools: ["environment", "exec_command"] };
-  expect(normalizeToolNames(current)).toBe(current);
-});
 
 it("accepts immutable template retries after discovery tool renaming", () => inside(async state => {
   await configurationCatalog(req("/agent-definitions/legacy"), state.storage);

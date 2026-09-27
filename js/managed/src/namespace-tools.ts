@@ -1,4 +1,5 @@
 import type { ToolMap } from "nanocodex";
+import { observeHandCall } from "./hand-call-observation";
 import { CUA_JS_NAME, CUA_RESET_NAME } from "nanocodex-computer/contract";
 import {
   createNamespaceManifest,
@@ -23,6 +24,8 @@ const DEFAULT_CWD = "/brain";
 export type RoutedTool = Readonly<{
   definition?: Readonly<{ description?: string; parameters?: Record<string, unknown>; [key: string]: unknown }>;
   handler(input: unknown, context: ToolContext): unknown | Promise<unknown>;
+  /** Present only when this exact provider resource can recover process IDs. */
+  processSessionKey?: string;
 }>;
 
 export type NamespaceMachine = Readonly<{
@@ -59,11 +62,50 @@ type CellBinding = Readonly<{
   aliases: ReadonlyMap<string, string>;
 }>;
 
+type AuthorizedCellBinding = CellBinding & Readonly<{ authorizationKey: string }>;
+
+export type DurableProcessBinding = Readonly<{
+  ownerSessionId: string;
+  authorizationKey: string;
+  providerSessionId: number;
+  machineId: string;
+  processSessionKey: string;
+}>;
+
+export type NamespaceProcessStorage = Readonly<{
+  get(id: number): DurableProcessBinding | undefined;
+  put(id: number, binding: DurableProcessBinding): void;
+  delete(id: number): void;
+}>;
+
 type ProcessBinding = Readonly<{
   ownerSessionId: string;
+  authorizationKey: string;
   providerSessionId: number;
   writeStdin: RoutedTool;
+  durable?: DurableProcessBinding;
 }>;
+
+function nativeScreenCua(screen: RoutedTool): Readonly<{ cua: RoutedTool; cuaReset: RoutedTool }> {
+  const parameters = screen.definition?.parameters;
+  const description = screen.definition?.description;
+  const cua: RoutedTool = Object.freeze({
+    definition: {
+      ...(screen.definition ?? {}),
+      description: `Native screen control fallback. ${description ?? "Observe and control this Hand's screen."}`,
+      ...(parameters === undefined ? {} : { parameters }),
+    },
+    handler: (input, context) => screen.handler(input, context),
+  });
+  const cuaReset: RoutedTool = Object.freeze({
+    definition: {
+      description: "Release this Hand's native screen control lease. No input action is replayed or retried.",
+      parameters: { type: "object", properties: {}, additionalProperties: false },
+    },
+    handler: (_input, context) => screen.handler({ action: "release" }, context),
+  });
+  return Object.freeze({ cua, cuaReset });
+}
 
 export type NamespaceCaptureFilter = (machine: NamespaceMachine) => boolean;
 
@@ -82,6 +124,8 @@ export function createNamespaceExecutionRuntime(
   resolveMachineTool: MachineToolResolver = () => undefined,
   brainExec?: RoutedTool,
   resolveScreenTool: ScreenToolResolver = () => undefined,
+  authorizationKey: (context: ToolContext) => string = () => "account",
+  processStorage?: NamespaceProcessStorage,
 ): NamespaceExecutionRuntime {
   const brain = Object.freeze({
     mountId: "mount:brain",
@@ -89,17 +133,24 @@ export function createNamespaceExecutionRuntime(
     workspace: "/brain",
     exec: brainExec,
   }) satisfies MountedHand;
-  const cells = new Map<string, CellBinding>();
+  const cells = new Map<string, AuthorizedCellBinding>();
   const sessions = new Map<number, ProcessBinding>();
   const computerQueues = new Map<string, Promise<unknown>>();
 
-  const cell = (context: ToolContext, filter?: NamespaceCaptureFilter): CellBinding => {
+  const cell = (context: ToolContext, filter?: NamespaceCaptureFilter): AuthorizedCellBinding => {
     // Direct tools have an empty parentCallId. Pin those to their own call,
     // while nested Code Mode tools keep sharing their parent's captured lease.
     const key = `${context.sessionId}\u0000${context.parentCallId || context.callId}`;
     const retained = cells.get(key);
-    if (retained !== undefined) return retained;
-    const created = createCellBinding(brain, machines(context).filter(filter ?? (() => true)), resolveMachineTool, context, key, resolveScreenTool);
+    const authority = authorizationKey(context);
+    if (retained !== undefined) {
+      if (retained.authorizationKey !== authority) throw new Error("namespace cell belongs to another authorization");
+      return retained;
+    }
+    const created = Object.freeze({
+      ...createCellBinding(brain, machines(context).filter(filter ?? (() => true)), resolveMachineTool, context, key, resolveScreenTool),
+      authorizationKey: authority,
+    });
     cells.set(key, created);
     return created;
   };
@@ -130,11 +181,21 @@ export function createNamespaceExecutionRuntime(
     const value = record(input);
     const workdir = optionalString(value.workdir, "workdir");
     if (!workdir) throw new Error('CUA requires an explicit Hand workdir, like exec_command. First call mcp__cua_repl__js({workdir: "/<hand>"}) to read that provider’s contract, then add its arguments to each call.');
-    const binding = cell(context);
-    const route = routeNamespaceCwd(binding.scope, canonicalCwd(binding, workdir), "namespace.discover");
+    const routeStarted = performance.now();
+    let binding: AuthorizedCellBinding;
+    let route: ReturnType<typeof routeNamespaceCwd>;
+    try {
+      binding = cell(context);
+      route = routeNamespaceCwd(binding.scope, canonicalCwd(binding, workdir), "namespace.discover");
+      observeHandCall("namespace.route", name, routeStarted, "ok", context.callId);
+    } catch (error) {
+      observeHandCall("namespace.route", name, routeStarted, "unavailable", context.callId);
+      throw error;
+    }
     const hand = binding.hands.get(route.mount.mountId);
     if (!hand?.cua || !hand.cuaReset) {
-      throw new Error(`namespace mount ${route.mount.root} has no CUA runtime; screen-only Hands are unsupported by cua_repl. Use environment to find a Hand with an attached CUA provider.`);
+      observeHandCall("namespace.invoke", name, routeStarted, "unavailable", context.callId);
+      throw new Error(`namespace mount ${route.mount.root} has no CUA runtime or controllable native screen. Use environment to find a CUA-capable Hand.`);
     }
     const providerInput = without(value, "workdir");
     // JS with only a workdir discovers the actual provider API without executing
@@ -160,9 +221,19 @@ export function createNamespaceExecutionRuntime(
     // queue shared by JS and reset, independent of every other Hand's queue.
     const key = `${context.sessionId}\u0000${hand.mountId}`;
     const previous = computerQueues.get(key) ?? Promise.resolve();
-    const pending = previous.catch(() => {}).then(() => {
+    const queuedAt = performance.now();
+    const pending = previous.catch(() => {}).then(async () => {
+      observeHandCall("namespace.cua.queue", name, queuedAt, "ok", context.callId);
       context.signal.throwIfAborted();
-      return tool.handler(providerInput, context);
+      const invokedAt = performance.now();
+      try {
+        const result = await tool.handler(providerInput, context);
+        observeHandCall("namespace.invoke", name, invokedAt, toolOutcome(result), context.callId);
+        return result;
+      } catch (error) {
+        observeHandCall("namespace.invoke", name, invokedAt, context.signal.aborted ? "cancelled" : "failed", context.callId);
+        throw error;
+      }
     });
     computerQueues.set(key, pending);
     const cleanup = () => { if (computerQueues.get(key) === pending) computerQueues.delete(key); };
@@ -179,7 +250,7 @@ export function createNamespaceExecutionRuntime(
 
   const tools: ToolMap = {
     [CUA_JS_NAME]: {
-      description: "Use a Hand's CUA MCP provider. Set workdir on every call, just like exec_command. First call with only {workdir} to read that provider's descriptions and schemas without executing code; then add its exact arguments alongside workdir. Nanocodex strips only workdir before forwarding. Use Promise.all for different workdirs in Code Mode; JS and reset calls to the same Hand are ordered. Each cell pins its Hand connections; there is no global computer selection. /brain and screen-only Hands have no CUA provider.",
+      description: "Use a Hand's CUA provider. Set workdir on every call, just like exec_command. First call with only {workdir} to read that Hand's exact descriptions and schemas without executing an action; then add those provider arguments alongside workdir. OpenAI CUA is preferred when attached; VM, Cloudflare, and native Hands can fall back to their controllable screen action contract. Nanocodex strips only workdir before forwarding. Use Promise.all for different workdirs in Code Mode; calls to the same Hand are ordered. /brain has no desktop.",
       parameters: computerParameters,
       supportsParallelToolCalls: true,
       handler: (input, context) => computerCall(CUA_JS_NAME, input, context),
@@ -208,16 +279,34 @@ export function createNamespaceExecutionRuntime(
             workdir: resolveNamespaceCwd(DEFAULT_CWD, workdir),
           }, context);
         }
-        const binding = cell(context);
-        const route = routeNamespaceCwd(binding.scope, canonicalCwd(binding, workdir));
+        const routedAt = performance.now();
+        let binding: AuthorizedCellBinding;
+        let route: ReturnType<typeof routeNamespaceCwd>;
+        try {
+          binding = cell(context);
+          route = routeNamespaceCwd(binding.scope, canonicalCwd(binding, workdir));
+          observeHandCall("namespace.route", "exec_command", routedAt, "ok", context.callId);
+        } catch (error) {
+          observeHandCall("namespace.route", "exec_command", routedAt, "unavailable", context.callId);
+          throw error;
+        }
         const hand = binding.hands.get(route.mount.mountId);
         if (hand?.exec === undefined) {
+          observeHandCall("namespace.invoke", "exec_command", routedAt, "unavailable", context.callId);
           throw new Error(`namespace mount ${route.mount.root} is not executable`);
         }
-        const result = await hand.exec.handler({
-          ...without(value, "workdir"),
-          workdir: nativeWorkdir(hand.workspace, route.relativePath),
-        }, context);
+        const invokedAt = performance.now();
+        let result: unknown;
+        try {
+          result = await hand.exec.handler({
+            ...without(value, "workdir"),
+            workdir: nativeWorkdir(hand.workspace, route.relativePath),
+          }, context);
+          observeHandCall("namespace.invoke", "exec_command", invokedAt, toolOutcome(result), context.callId);
+        } catch (error) {
+          observeHandCall("namespace.invoke", "exec_command", invokedAt, context.signal.aborted ? "cancelled" : "failed", context.callId);
+          throw error;
+        }
         const structured = executionResult(result);
         if (structured?.session_id === undefined) return result;
         // Account routing can refresh an unstarted exec before dispatch. Bind
@@ -229,11 +318,26 @@ export function createNamespaceExecutionRuntime(
           throw new Error(`namespace mount ${route.mount.root} cannot retain process sessions`);
         }
         const providerSessionId = positiveSessionId(structured.session_id);
-        const publicSessionId = reserveSessionId(sessions);
+        const publicSessionId = reserveSessionId({
+          has: (id) => sessions.has(id) || processStorage?.get(id) !== undefined,
+        });
+        const durable = processStorage !== undefined && hand.machineId !== undefined
+          && writeStdin.processSessionKey !== undefined ? Object.freeze({
+            ownerSessionId: context.sessionId,
+            authorizationKey: binding.authorizationKey,
+            providerSessionId,
+            machineId: hand.machineId,
+            processSessionKey: writeStdin.processSessionKey,
+          }) : undefined;
+        // Persist before publishing the public ID. Only providers advertising
+        // a recoverable, immutable resource identity cross runtime retirement.
+        if (durable !== undefined) processStorage!.put(publicSessionId, durable);
         sessions.set(publicSessionId, Object.freeze({
           ownerSessionId: context.sessionId,
+          authorizationKey: binding.authorizationKey,
           providerSessionId,
           writeStdin,
+          durable,
         }));
         return replaceExecutionResult(result, { ...structured, session_id: publicSessionId });
       },
@@ -247,11 +351,22 @@ export function createNamespaceExecutionRuntime(
       handler: async (input, context) => {
         const value = record(input);
         const publicSessionId = positiveSessionId(value.session_id);
-        const binding = sessions.get(publicSessionId);
-        if (binding === undefined || binding.ownerSessionId !== context.sessionId) {
+        const retained = sessions.get(publicSessionId);
+        const durable = retained?.durable ?? processStorage?.get(publicSessionId);
+        const binding = durable ?? retained;
+        if (binding === undefined || binding.ownerSessionId !== context.sessionId
+          || binding.authorizationKey !== authorizationKey(context)) {
           throw new Error("unknown or stale namespace process session");
         }
-        const result = await binding.writeStdin.handler({
+        // Recheck mount authority and immutable provider identity on every
+        // durable poll. A matching path/machine ID alone cannot retarget it.
+        const writeStdin = durable === undefined ? retained?.writeStdin
+          : resolveMachineTool(durable.machineId, "write_stdin", context);
+        if (writeStdin === undefined || (durable !== undefined
+          && writeStdin.processSessionKey !== durable.processSessionKey)) {
+          throw new Error("unknown or stale namespace process session");
+        }
+        const result = await writeStdin.handler({
           ...without(value, "session_id"),
           session_id: binding.providerSessionId,
         }, context);
@@ -261,11 +376,13 @@ export function createNamespaceExecutionRuntime(
           // the process exited; keep the original Hand binding so polling can retry.
           if (structured !== undefined && (typeof structured.exit_code === "number" || structured.exit_code === null)) {
             sessions.delete(publicSessionId);
+            processStorage?.delete(publicSessionId);
           }
           return result;
         }
         if (positiveSessionId(structured.session_id) !== binding.providerSessionId) {
           sessions.delete(publicSessionId);
+          processStorage?.delete(publicSessionId);
           throw new Error("execution hand changed its bound process session");
         }
         return replaceExecutionResult(result, { ...structured, session_id: publicSessionId });
@@ -340,6 +457,13 @@ function createCellBinding(
     const root = machine.root ?? machineMountRoot(machine.id);
     if (roots.has(root)) throw new Error(`duplicate namespace mount root ${root}`);
     roots.add(root);
+    const screen = resolveScreenTool(machine.id, context);
+    const upstreamCua = resolveMachineTool(machine.id, CUA_JS_NAME, context);
+    const upstreamReset = resolveMachineTool(machine.id, CUA_RESET_NAME, context);
+    const upstream = upstreamCua !== undefined && upstreamReset !== undefined
+      ? { cua: upstreamCua, cuaReset: upstreamReset } : undefined;
+    const fallback = upstream === undefined && screen !== undefined
+      ? nativeScreenCua(screen) : undefined;
     hands.push(Object.freeze({
       mountId: `mount:user:${machine.id}`,
       machineId: machine.id,
@@ -348,9 +472,9 @@ function createCellBinding(
       exec: resolveMachineTool(machine.id, "exec_command", context),
       writeStdin: resolveMachineTool(machine.id, "write_stdin", context),
       preview: resolveMachineTool(machine.id, "preview", context),
-      cua: resolveMachineTool(machine.id, CUA_JS_NAME, context),
-      cuaReset: resolveMachineTool(machine.id, CUA_RESET_NAME, context),
-      screen: resolveScreenTool(machine.id, context),
+      cua: upstream?.cua ?? fallback?.cua,
+      cuaReset: upstream?.cuaReset ?? fallback?.cuaReset,
+      screen,
     }));
   }
   const manifest = createNamespaceManifest({
@@ -434,7 +558,7 @@ function isToolResult(value: unknown): value is Readonly<{
   return Boolean((value as Record<PropertyKey, unknown> | null)?.[TOOL_RESULT]);
 }
 
-function reserveSessionId(sessions: ReadonlyMap<number, unknown>): number {
+function reserveSessionId(sessions: Readonly<{ has(id: number): boolean }>): number {
   for (let attempt = 0; attempt < 64; attempt += 1) {
     const bytes = crypto.getRandomValues(new Uint32Array(1));
     const candidate = (bytes[0]! & 0x7fff_ffff) || 1;
@@ -492,4 +616,21 @@ export async function prepareNamespaceHostMounts<T extends Readonly<{ id: string
     return [mount.id, result.status === "fulfilled" ? result.value : undefined] as const;
   }));
   return machine => !checks.has(machine.id) || checks.get(machine.id)?.(machine) === true;
+}
+
+function toolOutcome(result: unknown): "ok" | "failed" | "unavailable" | "ambiguous" {
+  if (!result || typeof result !== "object") return "ok";
+  const value = result as Record<PropertyKey, unknown>;
+  if (value[TOOL_RESULT] !== true) {
+    if (value.isError === true || value.success === false) return "failed";
+    if (typeof value.exit_code === "number" && value.exit_code !== 0) return "failed";
+    return "ok";
+  }
+  if (value.success === true) return "ok";
+  const structured = value.structuredResult;
+  if (structured && typeof structured === "object") {
+    const status = (structured as { status?: unknown }).status;
+    if (status === "ambiguous" || status === "unavailable") return status;
+  }
+  return "failed";
 }

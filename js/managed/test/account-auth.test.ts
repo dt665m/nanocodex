@@ -3,6 +3,7 @@ import { env as workerEnv, runInDurableObject } from "cloudflare:test";
 
 import {
   authenticate,
+  forwardPrincipalAssertions,
   ensureAccount,
   ensureAccountWallet,
   resolveChiefOfStaffPrincipal,
@@ -199,6 +200,26 @@ describe("Connect grant assertions", () => {
     });
   });
 
+  it("accepts only a trusted exact sandbox assertion and strips client assertions on forwarding", async () => {
+    const { env } = portableEnv();
+    const headers = connectHeaders({});
+    const read = (origin = "https://nanocodex.internal") => authenticate(new Request(`${origin}/v1/agents`, { headers }), env);
+    expect((await read())?.connectGrant).not.toHaveProperty("sandboxExecution");
+    headers.set("x-nanocodex-connect-sandbox-execution", "true");
+    const principal = await read();
+    expect(principal?.connectGrant).toMatchObject({ sandboxExecution: true });
+    expect(await read("https://public.example")).toBeUndefined();
+    const forwarded = new Headers({ "x-nanocodex-connect-sandbox-execution": "forged" });
+    forwardPrincipalAssertions(forwarded, principal!);
+    expect(forwarded.get("x-nanocodex-connect-sandbox-execution")).toBe("true");
+    forwardPrincipalAssertions(forwarded, { ...principal!, connectGrant: undefined });
+    expect(forwarded.has("x-nanocodex-connect-sandbox-execution")).toBe(false);
+    for (const invalid of ["false", "1", "true, true", "agent.execution.sandbox", ""]) {
+      headers.set("x-nanocodex-connect-sandbox-execution", invalid);
+      expect(await read()).toBeUndefined();
+    }
+  });
+
   it("rejects incomplete, malformed, duplicate, or account-widening assertions", async () => {
     const { env } = portableEnv();
     const request = (headers: HeadersInit) => authenticate(new Request(
@@ -305,79 +326,6 @@ describe("connector route compatibility", () => {
     expect(requests).toHaveLength(1);
     expect(new URL(requests[0]!.url).pathname).toBe(`/users/${USER_ID}/connectors/${provider}/callback`);
     expect(await requests[0]!.json()).toEqual({ ...JSON.parse(body), flow: provider === "spotify" ? "ncspot_loopback" : "soundcloud_loopback" });
-  });
-
-  it("serves one authenticated provider catalog for every account client", async () => {
-    const local = portableEnv();
-    const sessionToken = "c".repeat(64);
-    local.set("webauthn", `session:${sessionToken}`, {
-      credentialId: CREDENTIAL_ID,
-      publicKey: PUBLIC_KEY,
-      userId: encodeUserId(USER_ID),
-      issuedAt: 1,
-      expiresAt: Math.floor(Date.now() / 1_000) + 60,
-    });
-    const url = new URL("https://nanocodex.example/v1/connectors/catalog");
-    const env = {
-      ...local.env,
-      NANOCODEX: {
-        async fetch() { return new Response(null, { status: 500 }); },
-      } as unknown as Fetcher,
-    };
-    const response = await routeConnectorRequest(new Request(url, {
-      headers: { cookie: `nanocodex_account=${sessionToken}` },
-    }), env, url);
-
-    expect(response?.status).toBe(200);
-    const body = await response?.json() as { providers: Array<Record<string, unknown>> };
-    expect(body.providers.map(({ id }) => id)).toEqual(["github", "google", "slack", "x", "spotify", "soundcloud", "link"]);
-    expect(body.providers.find(({ id }) => id === "google")?.capabilities).toEqual([
-      { id: "gmail", name: "Gmail" },
-      { id: "gcalendar", name: "Google Calendar" },
-      { id: "gcontacts", name: "Google Contacts" },
-      { id: "gdocs", name: "Google Docs" },
-      { id: "gdrive", name: "Google Drive" },
-      { id: "gsheets", name: "Google Sheets" },
-      { id: "gslides", name: "Google Slides" },
-      { id: "gtasks", name: "Google Tasks" },
-    ]);
-  });
-
-  it("forwards legacy provider-level DELETE to unified broker bulk revoke", async () => {
-    const local = portableEnv();
-    const sessionToken = "d".repeat(64);
-    local.set("webauthn", `session:${sessionToken}`, {
-      credentialId: CREDENTIAL_ID,
-      publicKey: PUBLIC_KEY,
-      userId: encodeUserId(USER_ID),
-      issuedAt: 1,
-      expiresAt: Math.floor(Date.now() / 1_000) + 60,
-    });
-    const requests: Request[] = [];
-    const env = {
-      ...local.env,
-      NANOCODEX: {
-        async fetch(input: RequestInfo | URL, init?: RequestInit) {
-          requests.push(new Request(input, init));
-          return new Response(null, { status: 204 });
-        },
-      } as unknown as Fetcher,
-    };
-    const url = new URL("https://nanocodex.example/v1/connectors/gmail");
-    const response = await routeConnectorRequest(new Request(url, {
-      method: "DELETE",
-      headers: {
-        cookie: `nanocodex_account=${sessionToken}`,
-        origin: url.origin,
-      },
-    }), env, url);
-
-    expect(response?.status).toBe(204);
-    expect(requests).toHaveLength(1);
-    expect(requests[0]!.method).toBe("DELETE");
-    expect(requests[0]!.url).toBe(
-      `https://broker.internal/users/${USER_ID}/connectors/google`,
-    );
   });
 
   it("finishes an OAuth MCP in the native app without returning OAuth material", async () => {

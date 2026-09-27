@@ -60,6 +60,13 @@ mod transport;
 use transport::JavaScriptResponsesHost;
 
 /// Prunes old replay receipts before the full Agent runtime is constructed.
+/// Capability marker checked against the actual bundled module before deployment.
+/// Older kernels reject the native child route emitted by the current host.
+#[wasm_bindgen(js_name = nativeSpawnContractVersion)]
+pub fn native_spawn_contract_version() -> u32 {
+    1
+}
+
 #[wasm_bindgen(js_name = pruneDurableReceipts)]
 pub async fn prune_durable_receipts(
     durability_host_id: &str,
@@ -1837,6 +1844,16 @@ impl WasmNanocodex {
             .await
             .map_err(js_error)?;
         Ok(Self::from_parts(inner, events, self.subagents.clone()))
+    }
+
+    /// Exports the exact latest committed model boundary without mutating this agent.
+    ///
+    /// # Errors
+    ///
+    /// Rejects before the first safe boundary or after the driver stops.
+    #[wasm_bindgen(js_name = checkpoint)]
+    pub async fn checkpoint(&self) -> Result<String, JsValue> {
+        serde_json::to_string(&self.inner.snapshot().await.map_err(js_error)?).map_err(js_error)
     }
 
     /// Starts a clean sibling with the same private agent policy.

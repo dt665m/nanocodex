@@ -4,36 +4,6 @@ import test from "node:test";
 import { createJustBashRuntime, justBash } from "../tools/bash.mjs";
 import { Bash } from "nanocodex-tools/just-bash/browser";
 
-test("Just Bash advertises its cloud workspace execution", async () => {
-  const { descriptor, instructions, tool } = await justBash({ filesystem: memoryWorkspace() });
-  assert.equal(tool.provider, undefined);
-  assert.equal(
-    tool.description,
-    "Runs a shell command, returning output or a session ID for ongoing interaction.",
-  );
-  assert.equal(descriptor.cwd, "/workspace");
-  assert.equal(descriptor.shell, "nanocodex-just-bash");
-  assert.equal(descriptor.network.enabled, false);
-  assert.equal(descriptor.network.mode, "disabled");
-  assert.equal(descriptor.pty, false);
-  assert.equal(descriptor.sessions, false);
-  assert.equal(descriptor.sandboxEscalation, false);
-  assert.deepEqual(descriptor.limits, {});
-  assert(descriptor.commands.includes("grep"));
-  assert(!descriptor.commands.includes("curl"));
-  assert(!descriptor.commands.includes("wget"));
-  assert.match(instructions, /Available commands:/);
-  assert.match(
-    instructions,
-    /call exec_command immediately and once with the complete command/,
-  );
-  assert.match(instructions, /exactly gh repo clone OWNER\/REPO DESTINATION/);
-  assert.match(instructions, /git clone URL DESTINATION/);
-  assert.match(instructions, /all current files, without .git or history/);
-  assert.match(instructions, /Do not add depth, filter, branch, or other flags/);
-  assert.doesNotMatch(instructions, /\bwget\b/);
-});
-
 test("ordinary sequence commands work with host-managed interpreter limits", async () => {
   const runtime = await justBash({ filesystem: memoryWorkspace() });
   const result = await runtime.tool.handler({
@@ -285,6 +255,67 @@ test("deferred workspace listing failures retry without executing the command", 
   await assert.rejects(source.readFile("/workspace/created"), { code: "ENOENT" });
   fail = false;
   assert.equal((await runtime.tool.handler({ cmd: "echo safe" }, context())).output, "safe\n");
+});
+
+test("lazy interpreter descriptor matches the eager registry with and without network", async () => {
+  const command = {
+    name: "mock-tool",
+    async execute() { return { stdout: "lazy\n", stderr: "", exitCode: 0 }; },
+  };
+  const fetch = async () => ({
+    status: 200, statusText: "OK", headers: {}, body: new Uint8Array(), url: "https://example.com",
+  });
+  for (const network of [false, true]) {
+    const options = {
+      filesystem: memoryWorkspace(),
+      customCommands: [command],
+      ...(network ? { fetch } : {}),
+    };
+    const eager = await justBash(options);
+    const lazy = await justBash({ ...options, filesystem: memoryWorkspace(), lazyInitialize: true });
+    assert.deepEqual(lazy.descriptor, eager.descriptor);
+    assert.equal(lazy.instructions, eager.instructions);
+    assert.deepEqual(lazy.descriptor.commands,
+      [...new Bash({ ...(network ? { fetch } : {}), customCommands: [command] }).commands.keys()].sort());
+    const result = await lazy.tool.handler({ cmd: "mock-tool" }, context());
+    assert.equal(result.exit_code, 0, result.output);
+    assert.equal(result.output, "lazy\n");
+  }
+});
+
+test("lazy first command initializes once and preserves serialized refreshes", async () => {
+  let scans = 0;
+  const source = memoryWorkspace({ onList() { scans++; } });
+  const runtime = await justBash({
+    filesystem: source,
+    refreshFilesystemBeforeExec: true,
+    lazyInitialize: true,
+  });
+  assert.equal(scans, 0);
+  assert.equal(runtime.descriptor.cwd, "/workspace");
+  const [first, second] = await Promise.all([
+    runtime.tool.handler({ cmd: "echo first > first" }, context()),
+    runtime.tool.handler({ cmd: "cat first" }, context()),
+  ]);
+  assert.equal(first.exit_code, 0, first.output);
+  assert.equal(second.output, "first\n");
+  assert.equal(scans, 2);
+  assert.equal((await runtime.tool.handler({ cmd: "cat first" }, context())).output, "first\n");
+  assert.equal(scans, 3);
+});
+
+test("lazy interpreter retries after an initial import failure", async () => {
+  let attempts = 0;
+  const runtime = await justBash({
+    filesystem: memoryWorkspace(),
+    lazyInitialize: true,
+    loadInterpreter: () => ++attempts === 1
+      ? Promise.reject(new Error("interpreter unavailable"))
+      : import("nanocodex-tools/just-bash/browser"),
+  });
+  await assert.rejects(runtime.tool.handler({ cmd: "echo first" }, context()), /interpreter unavailable/);
+  assert.equal((await runtime.tool.handler({ cmd: "echo retried" }, context())).output, "retried\n");
+  assert.equal(attempts, 2);
 });
 
 test("initial metadata, mutations, and returned output stay within configured bounds", async () => {

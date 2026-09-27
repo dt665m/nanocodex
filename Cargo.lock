@@ -3792,7 +3792,7 @@ version = "0.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbc773e24e02d4ddd8395fd30dc147524273a83e54e0f312d986ea30de5f5646"
 dependencies = [
- "roxmltree",
+ "roxmltree 0.20.0",
 ]
 
 [[package]]
@@ -5693,7 +5693,7 @@ dependencies = [
 
 [[package]]
 name = "nanocodex"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "nanocodex-agent",
  "nanocodex-durability",
@@ -5707,7 +5707,7 @@ dependencies = [
 
 [[package]]
 name = "nanocodex-agent"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "async-trait",
  "chrono",
@@ -5735,7 +5735,7 @@ dependencies = [
 
 [[package]]
 name = "nanocodex-bin"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -5811,7 +5811,7 @@ dependencies = [
 
 [[package]]
 name = "nanocodex-browser"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5845,7 +5845,7 @@ dependencies = [
 
 [[package]]
 name = "nanocodex-cli-auth"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "clap",
  "fs2",
@@ -5864,21 +5864,24 @@ dependencies = [
 
 [[package]]
 name = "nanocodex-computer"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
+ "fs2",
  "libc",
  "nanocodex-oai-api",
+ "roxmltree 0.21.1",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "tokio",
+ "url",
 ]
 
 [[package]]
 name = "nanocodex-durability"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "eyre",
  "nanocodex-agent",
@@ -5899,7 +5902,7 @@ dependencies = [
 
 [[package]]
 name = "nanocodex-egress"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "async-trait",
  "axum",
@@ -5921,7 +5924,7 @@ dependencies = [
 
 [[package]]
 name = "nanocodex-eval"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "arcbox-ext4",
  "axum",
@@ -5959,7 +5962,7 @@ dependencies = [
 
 [[package]]
 name = "nanocodex-eval-adapters"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "base64 0.22.1",
  "csv",
@@ -5981,7 +5984,7 @@ dependencies = [
 
 [[package]]
 name = "nanocodex-examples"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "base64 0.22.1",
  "dotenvy",
@@ -6009,7 +6012,7 @@ dependencies = [
 
 [[package]]
 name = "nanocodex-exe-dev"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "axum",
  "chrono",
@@ -6029,7 +6032,7 @@ dependencies = [
 
 [[package]]
 name = "nanocodex-hand"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "base64 0.22.1",
  "block2",
@@ -6053,7 +6056,7 @@ dependencies = [
 
 [[package]]
 name = "nanocodex-managed"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "axum",
  "futures-util",
@@ -6078,7 +6081,7 @@ dependencies = [
 
 [[package]]
 name = "nanocodex-oai-api"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -6114,7 +6117,7 @@ dependencies = [
 
 [[package]]
 name = "nanocodex-observability"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "clap",
  "opentelemetry",
@@ -6133,7 +6136,7 @@ dependencies = [
 
 [[package]]
 name = "nanocodex-phone"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "base64 0.22.1",
  "nanocodex-managed",
@@ -6147,7 +6150,7 @@ dependencies = [
 
 [[package]]
 name = "nanocodex-python"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "nanocodex",
  "pyo3",
@@ -6158,7 +6161,7 @@ dependencies = [
 
 [[package]]
 name = "nanocodex-remote"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6180,7 +6183,7 @@ dependencies = [
 
 [[package]]
 name = "nanocodex-subagents"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -6201,7 +6204,7 @@ dependencies = [
 
 [[package]]
 name = "nanocodex-tools"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -6240,7 +6243,7 @@ dependencies = [
 
 [[package]]
 name = "nanocodex-tools-macros"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -6250,7 +6253,7 @@ dependencies = [
 
 [[package]]
 name = "nanocodex-tui-control"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "clap",
  "libc",
@@ -6263,7 +6266,7 @@ dependencies = [
 
 [[package]]
 name = "nanocodex-vm"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "arcbox-ext4",
  "async-trait",
@@ -6303,7 +6306,7 @@ dependencies = [
 
 [[package]]
 name = "nanocodex-voice"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "cpal",
  "futures-util",
@@ -6320,7 +6323,7 @@ dependencies = [
 
 [[package]]
 name = "nanocodex-voice-ffi"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "nanocodex-voice-protocol",
  "serde_json",
@@ -6328,7 +6331,7 @@ dependencies = [
 
 [[package]]
 name = "nanocodex-voice-native"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "anyhow",
  "ctor",
@@ -6343,7 +6346,7 @@ dependencies = [
 
 [[package]]
 name = "nanocodex-voice-protocol"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "serde",
  "serde_json",
@@ -6351,7 +6354,7 @@ dependencies = [
 
 [[package]]
 name = "nanocodex-wasm"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -6368,7 +6371,7 @@ dependencies = [
 
 [[package]]
 name = "nanocodex2-bin"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "anyhow",
  "arboard",
@@ -6383,6 +6386,7 @@ dependencies = [
  "dotenvy",
  "fs2",
  "futures-util",
+ "hex",
  "image",
  "kvm-ioctls",
  "nanocodex",
@@ -6435,7 +6439,7 @@ dependencies = [
 
 [[package]]
 name = "nanousd"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "alloy-primitives",
  "reqwest",
@@ -6448,7 +6452,7 @@ dependencies = [
 
 [[package]]
 name = "nanousd-api"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "alloy",
  "alloy-primitives",
@@ -9135,6 +9139,15 @@ name = "roxmltree"
 version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
+
+[[package]]
+name = "roxmltree"
+version = "0.21.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1964b10c76125c36f8afe190065a4bf9a87bf324842c05701330bba9f1cacbb"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "rquickjs"

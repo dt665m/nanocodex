@@ -24,6 +24,28 @@ public enum APIError: LocalizedError, Equatable {
     }
 }
 
+/// Versioned rolling recap of finalized meeting Speech segments. This is a
+/// preview, not an agent turn; the final transcript is submitted only on Stop.
+public struct MeetingPreview: Equatable, Sendable {
+    public let revision: Int
+    public let summary: String
+    public let summaryRevision: Int
+    public let status: String
+    init(_ json: JSON, captureID: UUID) throws {
+        guard json["capture_id"].string.lowercased() == captureID.uuidString.lowercased(),
+              let revision = Int(exactly: json["revision"].number), revision >= 0,
+              let summaryRevision = Int(exactly: json["summary_revision"].number),
+              summaryRevision >= 0, summaryRevision <= revision,
+              case .string(let summary) = json["summary"], summary.utf8.count <= 4096,
+              ["updated", "pending", "unavailable", "unchanged"].contains(json["status"].string)
+        else { throw APIError.invalidResponse }
+        self.revision = revision
+        self.summary = summary
+        self.summaryRevision = summaryRevision
+        self.status = json["status"].string
+    }
+}
+
 public struct AccountCredential: Codable, Equatable, Sendable {
     public let origin: String
     public let apiKey: String
@@ -178,6 +200,22 @@ public final class ManagedClient: @unchecked Sendable {
             return card
         }
     }
+    /// Incremental finalized text, never raw PCM or unstable Speech partials.
+    /// Reuse the same capture ID and revision if a network result is uncertain.
+    public func updateMeetingPreview(captureID: UUID, revision: Int, delta: String) async throws -> MeetingPreview {
+        guard revision > 0, revision <= 1024, !delta.isEmpty, delta.utf8.count <= 4096 else { throw APIError.invalidResponse }
+        let result = try await json(path: "/v1/meetings/" + captureID.uuidString.lowercased() + "/preview",
+            method: "POST", body: .object(["revision": .number(Double(revision)), "delta": .string(delta)]))
+        let preview = try MeetingPreview(result, captureID: captureID)
+        guard preview.revision >= revision else { throw APIError.invalidResponse }
+        return preview
+    }
+    public func meetingPreview(captureID: UUID) async throws -> MeetingPreview {
+        try MeetingPreview(await json(path: "/v1/meetings/" + captureID.uuidString.lowercased() + "/preview"), captureID: captureID)
+    }
+    public func closeMeetingPreview(captureID: UUID) async throws {
+        _ = try await json(path: "/v1/meetings/" + captureID.uuidString.lowercased() + "/preview", method: "DELETE")
+    }
     public static func agentPath(_ id: String) throws -> String {
         guard !id.isEmpty, id.count <= 128, id.utf8.allSatisfy({ (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0) || [45, 95].contains($0) }) else { throw APIError.invalidResponse }
         return "/v1/agents/" + id
@@ -306,42 +344,29 @@ public final class ManagedClient: @unchecked Sendable {
         defer { os_signpost(.end, log: historyPerformanceLog, name: "HistoryEventPreparation", signpostID: signpostID) }
         return try EventPage(body)
     }
-    /// Find a readable opening window. Paging has no lifetime/event-count limit;
-    /// discarded newer pages remain addressable using the forward cursor.
+    /// Prepare the latest page so stream observation can begin without waiting
+    /// for older history. Callers backfill from the first retained event's cursor.
     public func conversationHistory(_ id: String) async throws -> ConversationHistory {
         let signpostID = OSSignpostID(log: historyPerformanceLog)
         os_signpost(.begin, log: historyPerformanceLog, name: "HistoryOpening", signpostID: signpostID)
         defer { os_signpost(.end, log: historyPerformanceLog, name: "HistoryOpening", signpostID: signpostID) }
-        var page = try await history(id)
-        let latest = page.latest
+        try Task.checkCancellation()
+        let page = try await history(id)
+        guard !page.hasMore || !page.events.isEmpty else { throw APIError.invalidResponse }
         var events = page.events
         var counts = try await TranscriptPreparation.byteCounts(events)
-        let projector = TranscriptStreamProjection()
-        var readable = events.contains(where: \.producesConversationRow)
-        var hasNewer = false
-        while page.hasMore, !readable {
-            try Task.checkCancellation()
-            guard let before = events.first?.cursor else { throw APIError.invalidResponse }
-            let older = try await history(id, before: before)
-            guard let first = older.events.first?.cursor, first < before,
-                  older.events.allSatisfy({ $0.cursor < before }) else { throw APIError.invalidResponse }
-            page = older
-            events.insert(contentsOf: older.events, at: 0)
-            counts.insert(contentsOf: try await TranscriptPreparation.byteCounts(older.events), at: 0)
-            let removed = TranscriptRetention.removableSuffixCount(byteCounts: counts,
-                retainedBytes: counts.reduce(0, +), byteLimit: 16 * 1024 * 1024)
-            if removed > 0 {
-                events.removeLast(removed); counts.removeLast(removed); hasNewer = true
-            }
-            // Only the newly prepended prefix can introduce conversation text.
-            // Projecting the entire growing window here repeatedly rebuilt every
-            // tool row while walking a long tool-only tail.
-            readable = events.prefix(min(older.events.count, events.count)).contains(where: \.producesConversationRow)
+        // Keep the newest edge while allowing one oversized event to remain whole.
+        let removed = TranscriptRetention.removablePrefixCount(byteCounts: counts,
+            retainedBytes: counts.reduce(0, +), byteLimit: 16 * 1024 * 1024)
+        if removed > 0 {
+            events.removeFirst(removed)
+            counts.removeFirst(removed)
         }
+        let projector = TranscriptStreamProjection()
         let rows = try await projector.rows(events)
         try Task.checkCancellation()
-        return ConversationHistory(events: events, latest: latest, hasMore: page.hasMore,
-                                   byteCounts: counts, rows: rows, hasNewer: hasNewer, projector: projector)
+        return ConversationHistory(events: events, latest: page.latest, hasMore: page.hasMore || removed > 0,
+                                   byteCounts: counts, rows: rows, hasNewer: false, projector: projector)
     }
     @discardableResult
     public func command(_ command: AgentCommand) async throws -> JSON {

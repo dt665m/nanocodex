@@ -252,6 +252,20 @@ normal browser Agent, an account-owned managed Agent, or a grant-scoped
 one-use ticket for that path. The browser binding never receives ChatGPT
 credentials or places its reusable grant bearer in a WebSocket URL.
 
+### Content-free Worker tracing
+
+`nanocodex/cloudflare/tracing` wraps native `tracing.enterSpan(name, callback)`
+with sanitized exception events. Use static operation names: they become
+exception codes on failure. The original error is rethrown; its message and
+stack are never passed to `recordException`.
+
+`setSpanAttributes(span, attributes)` sets bulk metadata, while
+`annotateActiveSpan(attributes)` annotates the current invocation or active
+span without changing nesting. `recordSpanException(span, code)` handles
+failures represented by results rather than thrown errors. Supply only static
+codes and content-free attributes. On older workerd versions, these retain
+individual attributes and `error.type` without requiring the September APIs.
+
 ### Durable Cloudflare Agent
 
 `nanocodex/cloudflare` is the standard Durable Object consumer. It keeps the
@@ -748,8 +762,8 @@ of its wallet adapter, and constructs both payment paths from that provider's
 adapter-neutral `getMppxParameters()` contract. The lower-level
 `createTempoProvider({ session, payment })` remains available when the
 application constructs MPPx itself. Both explicitly select Tempo provider mode.
-In that mode Nanocodex automatically adds its built-in Mercator MCP and wraps it
-with the same wallet and payment policy. The provider also exposes an MPP-aware
+In that mode Nanocodex automatically adds its built-in Mercator MCP at
+`https://mercator.sh/mcp` and wraps it with the same wallet and payment policy. The provider also exposes an MPP-aware
 `fetch`; Mercator's paid REST handoffs use that same method rather than a second
 wallet or payment configuration. Its MCP transport remains wrapped at the MCP
 protocol layer, so browser requests do not need an `Accept-Payment` CORS header.
@@ -1167,7 +1181,7 @@ package manager or build step:
 
 ```html
 <script type="module">
-  import { Agent, Transport } from "https://cdn.jsdelivr.net/npm/nanocodex@0.6.4/host/index.mjs";
+  import { Agent, Transport } from "https://cdn.jsdelivr.net/npm/nanocodex@0.6.5/host/index.mjs";
   const agent = await Agent.create({
     transport: Transport.hostManaged({
       websocketUrl: "/api/responses",
