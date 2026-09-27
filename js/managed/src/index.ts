@@ -1687,6 +1687,10 @@ async function managedFetchRoute(
         new Request(request, { headers }),
       );
     }
+    if (url.pathname === "/v1/crm" || url.pathname.startsWith("/v1/crm/")) {
+      const principal = trustedAgentPrincipal ?? await authenticate(request, env, url);
+      return (await import("./crm-http")).routeCrmRequest(request, env.NANOCODEX_CRM, principal);
+    }
     if (url.pathname === "/v1/todo/decision-backtest") {
       const principal = trustedAgentPrincipal ?? await authenticate(request, env, url);
       return routeGmailDecisionBacktest(request, env.AI
