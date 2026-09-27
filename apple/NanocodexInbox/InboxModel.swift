@@ -446,6 +446,35 @@ final class InboxModel: ObservableObject {
     func openThread() {
         pinnedThreadID = focused?.id
         #if DEBUG
+        if isDemo, ProcessInfo.processInfo.environment["NANOCODEX_DEMO_RICH_STREAM"] == "1", let id = focused?.id,
+           !rows.contains(where: { $0.id == "demo-rich-tool" }) {
+            rows = [.init(id: "demo-rich-intro", role: "Agent", text: "## Reviewing the changes\n\nI’m checking **streaming Markdown** and tool progress together.")]
+            let tool = ToolPresentation(name: "exec_command", arguments: .object(["cmd": .string("synthetic validation; no command executed")]))
+            let turn = focusedTurn
+            var toolRow = TranscriptRow(id: "demo-rich-tool", role: "Tool", text: tool.title, running: true, tool: tool)
+            toolRow.turnID = turn
+            rows.append(toolRow)
+            let epoch = generation
+            Task {
+                try? await Task.sleep(for: .seconds(12))
+                guard generation == epoch, focused?.id == id,
+                      let index = rows.firstIndex(where: { $0.id == "demo-rich-tool" }) else { return }
+                rows[index].running = false
+                rows[index].tool?.finish(.object(["output": .string("Synthetic checks passed."), "exit_code": .number(0)]))
+                var answerRow = TranscriptRow(id: "demo-rich-answer", role: "Agent", text: "## Results\n\n", running: true)
+                answerRow.turnID = turn
+                rows.append(answerRow)
+                let chunks = ["The **layout** keeps rich content readable.\n\n", "- Streaming text\n- Expandable tools\n\n", "```swift\n", "let ready = true\n", "```\n\n", "| Check | Result |\n| --- | --- |\n", "| Markdown | Passed |\n", "| Tool progress | Passed |\n\n", "Rich streaming review complete."]
+                for chunk in chunks {
+                    try? await Task.sleep(for: .milliseconds(700))
+                    guard generation == epoch, focused?.id == id,
+                          let answer = rows.firstIndex(where: { $0.id == "demo-rich-answer" }) else { return }
+                    rows[answer].text += chunk
+                }
+                if let answer = rows.firstIndex(where: { $0.id == "demo-rich-answer" }) { rows[answer].running = false }
+                demoRows[id] = rows
+            }
+        }
         if isDemo, ProcessInfo.processInfo.environment["NANOCODEX_DEMO_TOOL_ARRIVALS"] == "1", let id = focused?.id,
            !rows.contains(where: { $0.id == "demo-tool-history-1" }) {
             // Start beyond one viewport so every arrival exercises tail following.

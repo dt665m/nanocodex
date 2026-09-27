@@ -2863,6 +2863,33 @@ final class InboxUITests: XCTestCase {
         XCTAssertEqual(XCTWaiter.wait(for: [visible], timeout: 5), .completed)
         capture(app, "12-activity-failure")
     }
+    // Streaming Markdown and an expanding tool must share one timeline without
+    // overlapping rows, losing tool state, or covering the final answer.
+    func testStreamingMarkdownAndToolProgressShareTimeline() {
+        let app = launch(["NANOCODEX_DEMO_RICH_STREAM": "1"]); selectInbox(app)
+        let conversation = app.descendants(matching: .any)["conversation"].firstMatch
+        let tool = conversation.buttons["tool-disclosure-demo-rich-tool"]
+        XCTAssertTrue(tool.waitForExistence(timeout: 10))
+        XCTAssertTrue(tool.label.contains("Running"))
+        tool.tap()
+        XCTAssertEqual(tool.value as? String, "Expanded")
+        let done = conversation.staticTexts["Rich streaming review complete."]
+        XCTAssertTrue(done.waitForExistence(timeout: 30))
+        let latest = app.buttons["latest-messages"]
+        if latest.isHittable { latest.tap() }
+        XCTAssertTrue(done.isHittable)
+        XCTAssertLessThanOrEqual(done.frame.maxY, composer(app).frame.minY)
+        for _ in 0..<8 { if tool.isHittable { break }; conversation.swipeDown() }
+        XCTAssertTrue(tool.isHittable)
+        XCTAssertTrue(tool.label.contains("Completed"))
+        XCTAssertEqual(tool.value as? String, "Expanded")
+        XCTAssertTrue(conversation.staticTexts["Synthetic checks passed."].exists)
+        capture(app, "rich-stream-tool-completed")
+        if latest.isHittable { latest.tap() }
+        XCTAssertTrue(done.isHittable)
+        capture(app, "rich-stream-final-markdown")
+    }
+
     func testSuccessiveToolCardsFollowTailWithoutFlashingJump() {
         let app = launch(["NANOCODEX_DEMO_TOOL_ARRIVALS": "1",
                           "NANOCODEX_DEMO_PROFILE": UUID().uuidString]); selectInbox(app)

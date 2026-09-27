@@ -4,12 +4,30 @@ These integrations use free, open-source libraries without a paid SDK or service
 
 | Library | Version | Use | License |
 | --- | --- | --- | --- |
+| [ChatLayout](https://github.com/ekazaev/ChatLayout) | 2.5.2 | Self-sizing chat timeline and viewport restoration | MIT |
 | [MarkdownUI](https://github.com/gonzalezreal/swift-markdown-ui) | 2.4.1 | SwiftUI Markdown rendering | MIT |
 | [Nuke](https://github.com/kean/Nuke) | 13.2.0 | Image loading and caching | MIT |
 | [GRDB](https://github.com/groue/GRDB.swift) | 7.8.0 | SQLite-backed mobile outbox | MIT, with bundled notices |
 | [DSWaveformImage](https://github.com/dmrschmidt/DSWaveformImage) | 14.5.0 | Audio waveform rendering | MIT |
 
 MarkdownUI is a maintenance dependency; keep its renderer behind the app's adapter and review upstream maintenance before upgrading.
+
+## Mobile conversation timeline
+
+`NativeConversationTranscript` adapts the app's stable row identities to ChatLayout's
+`ChatLayoutDiffableDataSource` and `CollectionViewChatLayout`. ChatLayout owns row geometry,
+self-sizing invalidation, batch-update anchoring, and estimated-to-measured position
+restoration. The adapter retains conversation-specific follow/read intent, tab restoration,
+visibility reporting, and native SwiftUI hosting. Hosted content is measured at the proposed
+full width; estimated height must not constrain Markdown, tables, or expanded tool output.
+
+MarkdownUI renders the streamed response through the coalesced parser adapter. Tool cards
+remain native app views in the same collection, preserving progress, disclosure state,
+results, and media. They do not need a second message list or a vendor chat backend.
+
+ChatLayout's automatic self-sizing invalidation is documented upstream as experimental.
+The app exercises it with changing SwiftUI content in the targeted timeline UI journeys;
+package upgrades must retain those checks. UI recordings are exported as CI artifacts.
 
 ## Transitive dependencies and notices
 
