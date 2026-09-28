@@ -34,9 +34,6 @@ final class InboxUITests: XCTestCase {
         XCTAssertTrue(arguments.exists)
         XCTAssertTrue(arguments.label.contains("\\u202e"))
         XCTAssertFalse(arguments.label.contains("\u{202e}"))
-        let field = app.secureTextFields["secure-input-password"]
-        if !field.isHittable { app.scrollViews["secure-input-review"].swipeDown() }
-        field.tap(); field.typeText("synthetic-native-secret")
         let run = app.buttons["secure-input-submit"]
         XCTAssertEqual(run.label, "Authenticate & run as root")
         XCTAssertFalse(run.isEnabled)
@@ -44,6 +41,10 @@ final class InboxUITests: XCTestCase {
         if !confirmation.isHittable { app.scrollViews["secure-input-review"].swipeUp() }
         XCTAssertTrue(confirmation.waitForExistence(timeout: 5))
         confirmation.tap()
+        XCTAssertFalse(run.isEnabled, "Explicit review alone must not enable a root command")
+        let field = app.secureTextFields["secure-input-password"]
+        if !field.isHittable { app.scrollViews["secure-input-review"].swipeUp() }
+        field.tap(); field.typeText("synthetic-native-secret")
         XCTAssertTrue(run.isEnabled)
         run.tap()
         XCTAssertTrue(app.staticTexts["Authentication denied"].waitForExistence(timeout: 5))
@@ -93,7 +94,7 @@ final class InboxUITests: XCTestCase {
         let submit = app.buttons["secure-input-submit"]
         XCTAssertEqual(submit.label, "Fill fields only")
         XCTAssertFalse(submit.isEnabled)
-        let samples = [("card", "4242424242424242"), ("expiry", "1230"), ("cvc", "123")]
+        let samples = [("card", "4242424242424242"), ("expiry", "12/30"), ("cvc", "123")]
         for (id, sample) in samples {
             let field = app.secureTextFields["secure-input-field:" + id]
             XCTAssertTrue(field.exists)

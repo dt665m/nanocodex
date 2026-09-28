@@ -4062,8 +4062,8 @@ private struct SecureInputSheet: View {
     var body: some View {
         SecureInputSheetShell(destination: intake.isNative ? "Machine: " + (intake.machineID ?? "") : intake.origin, password: $password,
                               passwordDisabled: attempted || (intake.isNative ? nativeDescription == nil : browserDescription == nil),
-                              browserFields: intake.isNative ? nil : (browserDescription?.fields ?? []), fieldValues: $fieldValues,
-                              privacy: intake.isNative ? "Encrypted for the enrolled helper, outside chat. This runs as root. Trust the executable and any files it reads. Not saved to Vault. Switching apps cancels this request." : (intake.isForm ? "Fills only the bound browser fields. Does not submit the form or make a payment. Outside chat and not saved to Vault." : "Sent privately to the bound password field, outside chat. The website may submit its sign-in form. Not saved to Vault."),
+                              browserFields: intake.isNative ? nil : (browserDescription?.fields ?? []), fieldValues: $fieldValues, reviewFirst: intake.isNative,
+                              privacy: intake.isNative ? "Encrypted for the enrolled helper, outside chat. This runs as root. Trust the executable and any files it reads. Not saved to Vault. Switching apps cancels this request." : (intake.isForm ? "This app fills only bound fields and does not press Pay. The website may react to input. Outside chat and not saved to Vault." : "Sent privately to the bound password field, outside chat. The website may submit its sign-in form. Not saved to Vault."),
                               cancel: { cancelRequest(); dismiss() }) {
             if let failure { Text(failure).foregroundStyle(.red) }
             if intake.isNative {
@@ -4153,6 +4153,7 @@ private struct SecureInputSheetShell<Review: View, Action: View>: View {
     var passwordDisabled = false
     var browserFields: [BrowserSecureInputField]? = nil
     var fieldValues: Binding<[String: String]> = .constant([:])
+    var reviewFirst = false
     let privacy: String
     let cancel: () -> Void
     @ViewBuilder let review: () -> Review
@@ -4173,6 +4174,7 @@ private struct SecureInputSheetShell<Review: View, Action: View>: View {
             }.padding(.horizontal, 24).padding(.top, 28).padding(.bottom, 16)
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
+                    if reviewFirst { review() }
                     if let browserFields {
                         ForEach(browserFields) { field in
                             VStack(alignment: .leading, spacing: 6) {
@@ -4193,7 +4195,7 @@ private struct SecureInputSheetShell<Review: View, Action: View>: View {
                             .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 14))
                             .disabled(passwordDisabled)
                     }
-                    review()
+                    if !reviewFirst { review() }
                     Text(privacy).font(.footnote).foregroundStyle(.secondary)
                 }.frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 24).padding(.bottom, 16)
             }.scrollDismissesKeyboard(.interactively)
@@ -4265,7 +4267,8 @@ private struct SecureBrowserField: View {
 
     private var keyboard: UIKeyboardType {
         switch field.kind {
-        case .cardNumber, .cardExpiry, .cardCVC: return .numberPad
+        case .cardNumber, .cardCVC: return .numberPad
+        case .cardExpiry: return .numbersAndPunctuation
         case .password, .sensitiveText: return .default
         }
     }
@@ -4279,7 +4282,7 @@ private struct SecureBrowserField: View {
         }
     }
     var body: some View {
-        SecureField(field.kind == .cardExpiry ? "MMYY" : field.label, text: $value)
+        SecureField(field.kind == .cardExpiry ? "MM/YY" : field.label, text: $value)
             .keyboardType(keyboard).textContentType(contentType)
             .textInputAutocapitalization(.never).autocorrectionDisabled().privacySensitive()
             .accessibilityIdentifier("secure-input-field:" + field.id)
@@ -4304,7 +4307,7 @@ struct NativeSecureInputUIFixture: View {
     }
     var body: some View {
         SecureInputFixtureConversation(destination: "fixture-machine") { close in
-            SecureInputSheetShell(destination: "Machine: " + description.machineID, password: $password,
+            SecureInputSheetShell(destination: "Machine: " + description.machineID, password: $password, reviewFirst: true,
                                   privacy: "Encrypted for the enrolled helper, outside chat. Not saved to Vault.", cancel: close) {
                 if !status.isEmpty { Text(status).foregroundStyle(.red) }
                 NativeSecureInputReview(description: description)
@@ -4399,7 +4402,7 @@ struct CardSecureInputUIFixture: View {
         SecureInputFixtureConversation(destination: description.origin) { close in
             SecureInputSheetShell(destination: description.origin, password: $unusedPassword,
                                   passwordDisabled: filled, browserFields: description.fields, fieldValues: $values,
-                                  privacy: "Fills only the bound browser fields. Does not submit the form or make a payment. Outside chat and not saved to Vault.",
+                                  privacy: "This app fills only bound fields and does not press Pay. The website may react to input. Outside chat and not saved to Vault.",
                                   cancel: { values = [:]; close() }) {
                 if filled {
                     Text(receipt?.message ?? "")

@@ -124,19 +124,27 @@ export default {fetch(req,env){return env.TEST.getByName('test').fetch(req);}};`
   assert.equal((await call('/submit',{request_id:cardID,action:'cancel'})).status,200);
   // Unsupported or changed forms fail closed against actual browser DOM.
   for (const markup of [
-    '<form method="post"><input id="pan" hidden></form>',
-    '<form method="post"><input id="pan" readonly></form>',
-    '<form method="get"><input id="pan"></form>',
-    '<form method="post" action="https://example.org/pay"><input id="pan"></form>',
-    '<form method="post"><input id="pan"><input id="pan"></form>',
+    '<form method="post"><input id="pan" autocomplete="cc-number" hidden></form>',
+    '<form method="post"><input id="pan" autocomplete="cc-number" readonly></form>',
+    '<form method="post"><input id="pan" autocomplete="cc-number" style="opacity:0"></form>',
+    '<form method="post"><input id="pan" autocomplete="cc-number" style="position:absolute;left:-500px"></form>',
+    '<form method="post"><div inert><input id="pan" autocomplete="cc-number"></div></form>',
+    '<form method="post"><div style="position:relative"><input id="pan" autocomplete="cc-number"><div style="position:absolute;inset:0;background:white"></div></div></form>',
+    '<form method="post"><input id="pan" autocomplete="off"></form>',
+    '<form method="get"><input id="pan" autocomplete="cc-number"></form>',
+    '<form method="post" action="https://example.org/pay"><input id="pan" autocomplete="cc-number"></form>',
+    '<form method="post"><input id="pan" autocomplete="cc-number"><input id="pan" autocomplete="cc-number"></form>',
     '<iframe srcdoc="<form method=post><input id=pan></form>"></iframe>'
   ]) {
     await page.goto(origin);await page.setContent(markup);
     assert.equal((await call('/request',{...cardRequest,fields:[fields[0]]})).status,409);
   }
-  await page.goto(origin);await page.setContent('<form method="post"><input id="pan"></form><form method="post"><input id="cvc"></form>');
+  await page.goto(origin);await page.setContent('<form method="post"><input id="pan" autocomplete="cc-number"></form><form method="post"><input id="cvc" autocomplete="cc-csc"></form>');
   assert.equal((await call('/request',{...cardRequest,fields:[fields[0],fields[2]]})).status,409);
-  await page.goto(origin);await page.setContent('<form method="post"><input id="pan"></form>');
+  // A model cannot label a generic contact input as a card-number destination.
+  await page.goto(origin);await page.setContent('<form method="post"><input id="message" autocomplete="off"></form>');
+  assert.equal((await call('/request',{...cardRequest,fields:[{...fields[0],selector:'#message'}]})).status,409);
+  await page.goto(origin);await page.setContent('<form method="post"><input id="pan" autocomplete="cc-number"></form>');
   const changed=await call('/request',{...cardRequest,fields:[fields[0]]});assert.equal(changed.status,200);
   await page.locator('#pan').evaluate(el=>el.readOnly=true);
   assert.equal((await call('/submit',{request_id:changed.value.request_id,values:{pan:cardValues.pan}})).value.status,'outcome_unknown');

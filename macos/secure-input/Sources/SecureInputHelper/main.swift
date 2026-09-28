@@ -115,6 +115,7 @@ func run(_ broker: Broker, bytes: Data, uid: UInt32) throws -> Data {
         return try encoder.encode(broker.submit(envelope, uid: uid, now: Int64(Date().timeIntervalSince1970 * 1000)) { command, uid, password in
             let strings = command.arguments.map { strdup($0) }
             defer { strings.forEach { free($0) } }
+            guard strings.allSatisfy({ $0 != nil }) else { throw BoundaryError.unavailable }
             let args: [UnsafePointer<CChar>?] = strings.map { $0.map { UnsafePointer($0) } }
             let result = args.withUnsafeBufferPointer { buffer in
                 password.withUnsafeBytes { secret in

@@ -714,7 +714,21 @@ export function parsePrivateSecureInput(value:unknown): Record<string,unknown> {
 // No page-provided return values or exception details leave this private boundary.
 export const SECURE_FORM_FILL_FUNCTION = `function(origin, fields, values) {
   if (location.origin !== origin || window.top !== window) return false;
-  const visible = el => el instanceof HTMLInputElement && el.isConnected && !el.disabled && !el.readOnly && el.getClientRects().length > 0 && getComputedStyle(el).visibility === 'visible' && getComputedStyle(el).display !== 'none';
+  const visible = el => {
+    if (!(el instanceof HTMLInputElement) || !el.isConnected || el.disabled || el.matches(':disabled') || el.readOnly
+      || el.getRootNode() !== document || el.closest('[inert]')) return false;
+    const style = getComputedStyle(el), rect = el.getBoundingClientRect();
+    if (style.visibility !== 'visible' || style.display === 'none' || Number(style.opacity) === 0
+      || rect.width <= 0 || rect.height <= 0 || rect.left < 0 || rect.top < 0
+      || rect.right > innerWidth || rect.bottom > innerHeight) return false;
+    if (!el.checkVisibility({checkOpacity:true,checkVisibilityCSS:true})) return false;
+    return document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2) === el;
+  };
+  // Never let a model-described card value land in a generic contact/text field.
+  const autocomplete = {card_number:'cc-number',card_expiry:'cc-exp',card_cvc:'cc-csc'};
+  const matchesKind = (el, kind) => kind === 'password' ? el.type === 'password'
+    : ['text','tel','password'].includes(el.type)
+      && (!autocomplete[kind] || el.autocomplete.trim().toLowerCase().split(/\\s+/).includes(autocomplete[kind]));
   const inputs = fields.map(f => { const nodes = document.querySelectorAll(f.selector); return nodes.length === 1 ? nodes[0] : null; });
   const form = inputs[0] && inputs[0].form;
   const valid = () => {
@@ -722,7 +736,7 @@ export const SECURE_FORM_FILL_FUNCTION = `function(origin, fields, values) {
     const action = new URL(form.action, location.href);
     return location.origin === origin && action.origin === origin && !action.username && !action.password && new Set(inputs).size === inputs.length && inputs.every((el,i) => {
       const nodes = document.querySelectorAll(fields[i].selector);
-      return nodes.length === 1 && nodes[0] === el && visible(el) && el.form === form && (fields[i].kind === 'password' ? el.type === 'password' : ['text','tel','password'].includes(el.type));
+      return nodes.length === 1 && nodes[0] === el && visible(el) && el.form === form && matchesKind(el, fields[i].kind);
     });
   };
   if (!valid()) return false;

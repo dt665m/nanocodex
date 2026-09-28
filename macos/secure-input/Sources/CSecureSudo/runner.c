@@ -67,6 +67,8 @@ static int protected_executable(const char *path) {
 int nc_secure_sudo(uint32_t uid, const char *cwd, const char *executable, const char *const *arguments, size_t count, const unsigned char *password, size_t password_len) {
     if (getuid() != 0 || geteuid() != 0 || uid == 0 || count > 128 || password_len < 1 || password_len > 4096) return -1;
     if (!protected_executable(executable)) return -1;
+    if (!arguments && count) return -1;
+    for (size_t i = 0; i < count; ++i) if (!arguments[i]) return -1;
     struct stat st;
     if (lstat(ASKPASS, &st) || !S_ISREG(st.st_mode) || st.st_uid != 0 || (st.st_mode & 07777) != 04755) return -1;
     if (lstat(ROOTDIR, &st) || !S_ISDIR(st.st_mode) || st.st_uid != 0 || (st.st_mode & 0777) != 0700) return -1;

@@ -71,8 +71,12 @@ Supported kinds are `password`, `card_number`, `card_expiry`, `card_cvc`, and
 `sensitive_text`. One to eight fields must be unique visible native inputs in
 one same-origin top-frame HTTPS POST form. Password fields require password
 inputs; other kinds accept text, tel, or password inputs. Iframes, custom controls,
-readonly/disabled fields, duplicate selectors and cross-origin form actions fail
-closed. This is not universal form or native-app support.
+readonly/disabled/inert, transparent, offscreen or occluded fields, duplicate
+selectors and cross-origin form actions fail closed. Card number, expiry and CVC
+inputs must also advertise the corresponding `cc-number`, `cc-exp` and `cc-csc`
+HTML autocomplete tokens; generic text/contact fields cannot be relabeled as
+card destinations. Page markup can still be malicious, so users must trust the
+verified website origin. This is not universal form or native-app support.
 
 The tool returns metadata only with `kind: "browser_form"`. The authenticated
 client posts `{request_id, action: "describe"}` to the private endpoint and gets
@@ -84,7 +88,8 @@ Legacy password requests still use `{request_id,value}`.
 
 Typed requests require `submit:false` and never invoke form submission or click
 a payment button. They dispatch native input/change events, so the approved
-website's own handlers still run. Receipts are `filled`, `outcome_unknown`, or
+website's own handlers still run and can have side effects; a verified origin is
+not a guarantee of benign site behavior. Receipts are `filled`, `outcome_unknown`, or
 `cancelled`; downstream sign-in/payment actions need separate authorization.
 The same quarantine, one-use consumption, loader binding and restart failure
 behavior apply. All entered values stay transient; snapshots also redact numeric
