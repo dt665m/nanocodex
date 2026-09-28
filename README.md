@@ -422,13 +422,12 @@ conversations) include [Mercator](https://mercator.sh/setup.md) discovery at
 override Mercator. In Nanocodex web, Mercator's default MCP server can use the
 account's funded Tempo wallet for an in-band `create_job` payment challenge, without an extra
 payment tool or connection. The broker keeps the signing key private, checks
-the payment challenge against a fresh quote of the unchanged plan and a
-$0.05 per-job ceiling, and retains idempotency across retries. This is an
-automatic per-job spending allowance for full account-owner turns, not a
-cumulative spending cap or proof of separate per-job user approval. No wallet or insufficient funds leaves free discovery available but
-cannot execute a paid job. User budgets and restrictions still apply; a wallet
-balance is not permission to ignore them. Connect grants do not inherit this
-owner-wallet payment path. Native `--provider.tempo` instead
+the payment challenge against a fresh quote of the unchanged plan and
+retains idempotency across retries. Nanocodex adds no separate spending limit;
+Mercator's quoted total and MCP payment challenge govern the job charge. No
+wallet or insufficient funds leaves free discovery available but cannot
+execute a paid job. Connect grants do not inherit this owner-wallet payment
+path. Native `--provider.tempo` instead
 uses a separately configured local Tempo Accounts wallet for MPP challenges.
 
 Stdio and Streamable HTTP servers are discovered in the background; deferred

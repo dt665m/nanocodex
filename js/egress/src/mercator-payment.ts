@@ -9,6 +9,7 @@ const MACH = "0x20c000000000000000000000f37de3740adec032";
 const SWAP = "0xf72e5107c32c655ffa7539a3c8e97b7c3ce16a3f";
 const SWAP_ABI = parseAbi(["function swapTo(address inputToken,uint256 amount,address targetToken,address recipient,bytes32 memo)"]);
 const ADDRESS = /^0x[0-9a-f]{40}$/i;
+const MAX_UINT256 = (1n << 256n) - 1n;
 interface Store { get<T>(key: string): Promise<T | undefined>; put(key: string, value: unknown): Promise<unknown>; }
 interface Options { store: Store; wallet: ReturnType<typeof Provider.create>; signal?: AbortSignal; }
 type RecordState = { fingerprint: string; challenge: string; credential?: string; status: "reserved" | "signed" | "rejected" };
@@ -28,15 +29,15 @@ export class MercatorPaymentInputError extends Error {
  */
 export async function createMercatorMcpCredential(value: unknown, { store, wallet, signal: callerSignal }: Options): Promise<string> {
   if (!record(value) || Object.keys(value).some(k => !["plan", "approved_total", "idempotency_key", "id", "challenge"].includes(k))
-    || !record(value.plan) || !Array.isArray(value.plan.nodes) || value.plan.nodes.length < 1 || value.plan.nodes.length > 10
+    || !record(value.plan) || !Array.isArray(value.plan.nodes) || value.plan.nodes.length < 1
     || typeof value.idempotency_key !== "string" || !/^[A-Za-z0-9_-]{8,200}$/.test(value.idempotency_key)
-    || typeof value.approved_total !== "string" || !/^\d{1,2}(?:\.\d{1,6})?$/.test(value.approved_total)
+    || typeof value.approved_total !== "string" || !/^\d{1,72}(?:\.\d{1,6})?$/.test(value.approved_total)
     || (value.id !== undefined && (typeof value.id !== "string" || !/^[0-9a-f-]{36}$/i.test(value.id)))) {
     throw new MercatorPaymentInputError("invalid_mercator_payment_request", 400);
   }
   const [whole, fraction = ""] = value.approved_total.split(".");
   const amount = BigInt(whole!) * 1_000_000n + BigInt(fraction.padEnd(6, "0"));
-  if (amount <= 0n || amount > 50_000n) throw new MercatorPaymentInputError("invalid_mercator_payment_request", 400);
+  if (amount <= 0n || amount > MAX_UINT256) throw new MercatorPaymentInputError("invalid_mercator_payment_request", 400);
   const planBody = canonical({ plan: value.plan, approved_total: value.approved_total, id: value.id });
   if (new TextEncoder().encode(planBody).length > 64 * 1024) throw new MercatorPaymentInputError("invalid_mercator_payment_request", 400);
   let challenge: ReturnType<typeof Challenge.Schema.parse>;
@@ -47,7 +48,7 @@ export async function createMercatorMcpCredential(value: unknown, { store, walle
   if (challenge.method !== "tempo" || challenge.intent !== "charge" || challenge.realm !== "mercator.sh"
     || typeof challenge.expires !== "string" || !Number.isFinite(Date.parse(challenge.expires))
     || Date.parse(challenge.expires) > Date.now() + 10 * 60_000
-    || typeof request.amount !== "string" || !/^\d{1,10}$/.test(request.amount) || BigInt(request.amount) !== amount
+    || typeof request.amount !== "string" || !/^\d{1,78}$/.test(request.amount) || BigInt(request.amount) !== amount
     || typeof request.currency !== "string" || ![USDC, MACH].includes(request.currency.toLowerCase())
     || typeof request.recipient !== "string" || !ADDRESS.test(request.recipient) || /^0x0{40}$/i.test(request.recipient)
     || !record(details) || details.chainId !== 4217 || details.feePayer !== true

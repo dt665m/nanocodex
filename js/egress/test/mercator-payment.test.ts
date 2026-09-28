@@ -8,7 +8,7 @@ function challenge() { return Challenge.from({ id: "broker-mcp-challenge", realm
     recipient: "0x0000000000000000000000000000000000000002", methodDetails: { chainId: 4217, feePayer: true, supportedModes: ["pull"], machineTokenEnabled: true } },
 }); }
 describe("broker Mercator MCP challenge", () => {
-  it("signs only the bounded in-band credential and replays the exact operation", async () => {
+  it("signs the quoted in-band credential and replays the exact operation", async () => {
     const wallet = await SELF.fetch(base, { method: "PUT" });
     expect(wallet.ok).toBe(true);
     const payload = { ...input, challenge: challenge() };

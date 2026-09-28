@@ -79,6 +79,13 @@ describe("Mercator MCP payment", () => {
     await assert.rejects(sign(f, { ...v, challenge: { ...v.challenge, id: "new" } }),
       e => e instanceof MercatorPaymentInputError && e.status === 503);
   });
+  it("signs a Mercator-quoted total above the removed Nanocodex price ceiling", async () => {
+    const f = fixture(), v = await paymentInput(f, { amount: "60000" });
+    const encoded = await sign(f, { ...v, approved_total: "0.06" });
+    const tx = Transaction.deserialize(Credential.deserialize(encoded).payload.signature);
+    const approve = decodeFunctionData({ abi: Abis.tip20, data: tx.calls[0].data });
+    assert.equal(approve.args[1], 60000n);
+  });
   it("never re-signs a fresh challenge after the original signed credential expires", async () => {
     const f = fixture(), v = await paymentInput(f);
     await sign(f, v);

@@ -7,7 +7,7 @@ type QuoteClient = { callTool: (params: { name: string; arguments: unknown }, sc
   }> };
 
 /** Mercator stays a normal default MCP server. Only its paid create_job call
- * can ask the private account broker to sign a bounded MPP charge. No wallet
+ * can ask the private account broker to sign the validated MPP charge. No wallet
  * material or generic signing capability enters the model or MCP transport. */
 export function mercatorMcpPayment(
   broker: Pick<Fetcher, "fetch">, owner: string, authorize: (context: unknown) => void,
@@ -77,7 +77,7 @@ function isRecord(value: unknown): value is Record<string, any> {
 }
 
 function amountMicros(value: string): bigint | null {
-  if (!/^\d{1,2}(?:\.\d{1,6})?$/.test(value)) return null;
+  if (!/^\d{1,72}(?:\.\d{1,6})?$/.test(value)) return null;
   const [whole, fraction = ""] = value.split(".");
   return BigInt(whole!) * 1_000_000n + BigInt(fraction.padEnd(6, "0"));
 }
