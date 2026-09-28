@@ -8633,6 +8633,8 @@ export class DurableAgentSession extends DurableComputerObject {
   }
 
   #startupAccountInfo(session: SessionRow, authorization: TurnAuthorization): Promise<AccountInfo> {
+    // A public write-link turn inherits neither discovery nor Vault metadata.
+    if (authorization.guestShareLinkId) return accountInfo(this.env.NANOCODEX, session.owner_id, { enabled: false });
     // Cache raw discovery once; project the current turn's authority on every
     // use. A second projected cache would extend an older snapshot's deadline.
     return withHardDeadline("startup accountInfo", 10_000, (signal) => accountInfo(
@@ -9103,6 +9105,7 @@ export class DurableAgentSession extends DurableComputerObject {
       // seeds the next admission with that same metadata and original deadline.
       this.#accountCatalog.invalidate();
       const authorization = this.#authorizationForToolContext(context);
+      if (authorization?.guestShareLinkId) return accountInfo(this.env.NANOCODEX, session.owner_id, { enabled: false });
       return await accountInfo(
         this.env.NANOCODEX,
         session.owner_id,
