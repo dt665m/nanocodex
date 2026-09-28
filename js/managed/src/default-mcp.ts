@@ -17,7 +17,7 @@ export const DEFAULT_MANAGED_MCP_CATALOG = Object.freeze({
   // No payment credentials or MPP client are configured by default.
   mercator: Object.freeze({
     url: "https://mercator.sh/mcp",
-    description: "Discover and quote Mercator API workflows; paid execution needs separate authorization.",
+    description: "Discover and quote Mercator API workflows. With explicit user approval, use mercator_pay for account-wallet paid jobs up to $0.05; reuse the exact quote plan, total and idempotency key.",
     parallelTools: Object.freeze(["get_suggested_queries", "get_connection_status", "search_services"]),
   }),
   cloudflare: Object.freeze({

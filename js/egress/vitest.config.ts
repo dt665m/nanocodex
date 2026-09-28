@@ -1,3 +1,6 @@
+import { decodeFunctionData, parseAbi } from "viem";
+import { Abis, Transaction } from "viem/tempo";
+import { Challenge, Credential } from "mppx";
 import { SPOTIFY_SCOPES, SPOTIFY_LOOPBACK_CLIENT_ID } from "./src/connectors/music";
 import { gitProvider } from "../test-fixtures/git-provider.mjs";
 import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
@@ -6,6 +9,7 @@ import { defineConfig } from "vitest/config";
 const transientGoogleRevocations = new Set<string>();
 const transientSpotifyIdentities = new Set<string>();
 const spotifyRateTestCalls = new Map<string, number>();
+const mercatorPaidSubmissions = new Map<string, number>();
 
 const TEST_KEY = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY";
 const REGIONAL_RELAY_CLASSES = ["ChatGptEgressWnam","ChatGptEgressEnam","ChatGptEgressWeur","ChatGptEgressEeur","ChatGptEgressApac","ChatGptEgressSam","ChatGptEgressOc"];
@@ -494,6 +498,36 @@ export default defineConfig({
               },
             });
           }
+          if (url.hostname === "mercator.sh" && url.pathname === "/v1/jobs") {
+            const submitted = await request.clone().json() as Record<string, unknown>;
+            if (typeof submitted.idempotencyKey !== "string" || !submitted.plan || "idempotency_key" in submitted || "approved_total" in submitted) return Response.json({ error: "invalid_rest_body" }, { status: 400 });
+            const header = request.headers.get("authorization");
+            if (header) {
+              const credential = Credential.deserialize(header);
+              const payload = credential.payload as { type?: string; signature?: string };
+              if (payload.type !== "transaction" || !payload.signature?.startsWith("0x")) return Response.json({ error: "invalid_payment" }, { status: 400 });
+              const tx = Transaction.deserialize(payload.signature as `0x76${string}`);
+              if (tx.chainId !== 4217 || tx.feePayerSignature !== null || tx.calls.length !== 2
+                || tx.calls[0]?.to?.toLowerCase() !== "0x20c000000000000000000000f37de3740adec032"
+                || tx.calls[1]?.to?.toLowerCase() !== "0xf72e5107c32c655ffa7539a3c8e97b7c3ce16a3f") return Response.json({ error: "wrong_route" }, { status: 400 });
+              const approval = decodeFunctionData({ abi: Abis.tip20, data: tx.calls[0]!.data! });
+              const settlement = decodeFunctionData({ abi: parseAbi(["function swapTo(address inputToken,uint256 amount,address targetToken,address recipient,bytes32 memo)"]), data: tx.calls[1]!.data! });
+              if (approval.functionName !== "approve" || approval.args[1] !== 50000n
+                || String(approval.args[0]).toLowerCase() !== tx.calls[1]!.to!.toLowerCase()
+                || settlement.args[0].toLowerCase() !== tx.calls[0]!.to!.toLowerCase() || settlement.args[1] !== 50000n
+                || settlement.args[2].toLowerCase() !== "0x20c000000000000000000000b9537d11c60e8b50"
+                || settlement.args[3].toLowerCase() !== "0x0000000000000000000000000000000000000002") return Response.json({ error: "wrong_amount_or_recipient" }, { status: 400 });
+              const operation = `${credential.source}:${submitted.idempotencyKey}`;
+              const paidSubmissions = (mercatorPaidSubmissions.get(operation) ?? 0) + 1;
+              mercatorPaidSubmissions.set(operation, paidSubmissions);
+              return Response.json({ id: "broker-synthetic-job", payer: credential.source, paidSubmissions }, { status: 201 });
+            }
+            return new Response(null, { status: 402, headers: { "www-authenticate": Challenge.serialize(Challenge.from({
+              id: "broker-synthetic-challenge", realm: "mercator.sh", method: "tempo", intent: "charge", expires: new Date(Date.now() + 60_000).toISOString(),
+              request: { amount: "50000", currency: "0x20c000000000000000000000b9537d11c60e8b50", recipient: "0x0000000000000000000000000000000000000002",
+                methodDetails: { chainId: 4217, feePayer: true, supportedModes: ["pull"], machineTokenEnabled: true } },
+            })) } });
+          }
           if (url.hostname === "mercator.sh") {
             if (url.pathname === "/mcp/auth" && request.method === "GET") {
               return new Response(null, { status: 401, headers: {
@@ -777,6 +811,12 @@ export default defineConfig({
           }
           if (url.hostname === "rpc.tempo.xyz" && request.method === "POST") {
             const body = await request.json() as { id?: unknown; method?: unknown; params?: unknown };
+            if (body.method === "eth_chainId") return Response.json({ jsonrpc: "2.0", id: body.id, result: "0x1079" });
+            if (body.method === "eth_estimateGas") return Response.json({ jsonrpc: "2.0", id: body.id, result: "0x186a0" });
+            if (body.method === "eth_gasPrice" || body.method === "eth_maxPriorityFeePerGas") return Response.json({ jsonrpc: "2.0", id: body.id, result: "0x1" });
+            if (body.method === "eth_getTransactionCount") return Response.json({ jsonrpc: "2.0", id: body.id, result: "0x0" });
+            if (body.method === "eth_getBlockByNumber") return Response.json({ jsonrpc: "2.0", id: body.id, result: { number: "0x1", timestamp: "0x1", baseFeePerGas: "0x1", gasLimit: "0x1000000", gasUsed: "0x0" } });
+            if (body.method === "eth_call" && Array.isArray(body.params) && body.params[0] && typeof body.params[0] === "object" && "calls" in body.params[0]) return Response.json({ jsonrpc: "2.0", id: body.id, result: "0x" });
             const call = Array.isArray(body.params) && body.params[0] && typeof body.params[0] === "object"
               ? body.params[0] as { data?: unknown; to?: unknown }
               : undefined;
@@ -784,7 +824,7 @@ export default defineConfig({
               && Array.isArray(body.params)
               && body.params[1] === "latest"
               && typeof call?.to === "string"
-              && call.to.toLowerCase() === "0x20c000000000000000000000f37de3740adec032"
+              && ["0x20c000000000000000000000f37de3740adec032", "0x20c000000000000000000000b9537d11c60e8b50", "0x20c0000000000000000000006637932de5413804"].includes(call.to.toLowerCase())
               && typeof call.data === "string"
               && /^0x70a082310{24}[0-9a-f]{40}$/i.test(call.data)
               && request.headers.get("content-type")?.startsWith("application/json") === true
@@ -796,7 +836,7 @@ export default defineConfig({
             return Response.json({
               jsonrpc: "2.0",
               id: body.id,
-              result: "0x0000000000000000000000000000000000000000000000000000000000bc614e",
+              result: String(call.to).toLowerCase() === "0x20c000000000000000000000f37de3740adec032" ? "0x0000000000000000000000000000000000000000000000000000000000bc614e" : "0x" + "0".repeat(64),
             });
           }
           if (url.hostname === "api.openai.com" || url.hostname === "chatgpt.com") {

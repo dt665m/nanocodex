@@ -1,3 +1,4 @@
+import { executeMercatorPayment } from "./mercator-payment";
 import type { CloudflareAccountVaultResult } from "nanocodex/cloudflare/egress";
 import { createSshKeyPair, sshPublicKey } from "nanocodex/tools/ssh";
 import { DurableObject } from "cloudflare:workers";
@@ -675,6 +676,17 @@ export class UserCredentialBroker extends DurableObject<BrokerEnv> {
           symbol: "MACH",
           token: MACHINE_USD,
         }, 200);
+      }
+      if (url.pathname === "/v1/wallet/mercator") {
+        if (request.method !== "POST") return jsonError(405, "method_not_allowed");
+        if (!isJsonContentType(request.headers.get("content-type"))) return jsonError(415, "invalid_content_type");
+        const wallet = this.#credentials.wallet;
+        if (!wallet) return jsonError(404, "wallet_not_configured");
+        try {
+          return json(await executeMercatorPayment(await readJson(request, 64 * 1024), {
+            store: this.#state.storage, wallet: rootWalletProvider(wallet), signal: request.signal,
+          }), 200);
+        } catch { return jsonError(503, "mercator_outcome_unknown"); }
       }
       if (url.pathname === "/v1/wallet/connect") {
         if (request.method !== "POST") return jsonError(405, "method_not_allowed");

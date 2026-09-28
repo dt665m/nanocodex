@@ -61,6 +61,7 @@ import { routeTodoRequest } from "./todo-inbox";
 import { phoneAdminConfigured } from "./phone-admin";
 import { phoneTools } from "./phone-tool";
 import { emailTools, type EmailConfig } from "./email-tool";
+import { mercatorPaymentTools } from "./mercator-tool";
 import { PhoneContainer } from "./phone-container";
 export { PhoneContainer };
 import { createVaultIntakeTool } from "./vault-intake-tool";
@@ -9313,7 +9314,7 @@ export class DurableAgentSession extends DurableComputerObject {
       ...(namespaceRuntime?.tools ?? []),
       ...(multiplayer ? [] : [{
         name: "environment",
-        description: "Inspect the current environment: hands keyed by ID with logical path and capabilities, connected accounts, native public APIs, safe Vault references, stablecoin balances, and app authorization boundaries. Vault references may show usernames, addresses, phone numbers, and card last four, but never passwords or complete card data.",
+        description: "Inspect the current environment: hands keyed by ID with logical path and capabilities, connected accounts, native public APIs, safe Vault references, the Nanocodex account wallet address and balance, and app authorization boundaries. Vault references may show usernames, addresses, phone numbers, and card last four, but never passwords or complete card data.",
         parameters: { type: "object", additionalProperties: false },
         handler: async (_input: unknown, context: ToolContext) => projectEnvironment(await currentAccountInfo(context), { runtime: "cloudflare-durable-object", default_cwd: "/brain" }),
       }]),
@@ -9441,6 +9442,16 @@ export class DurableAgentSession extends DurableComputerObject {
       })),
       ...(multiplayer ? [] : this.#memoryTools()),
       ...(multiplayer ? [] : [createVaultIntakeTool(context => this.#authorizeVaultTool(context))]),
+      ...mercatorPaymentTools({
+        broker: this.env.NANOCODEX, owner: session.owner_id, multiplayer,
+        authorize: context => {
+          context.signal.throwIfAborted();
+          const authorization = this.#authorizationForToolContext(context);
+          if (!this.#hasFullAccountAuthority(authorization)
+            || !authorization.capabilities.includes("agents:write") || !authorization.capabilities.includes("tools:use"))
+            throw new ManagedRequestError(403, "forbidden", "Mercator payments require full account tool authority");
+        },
+      }),
       ...emailTools({
         config: this.env, owner: session.owner_id, agentId: session.session_id, multiplayer,
         authorize: context => {
