@@ -154,3 +154,41 @@ it("read-write guest posts a separate annotation without starting an owner agent
   expect((await api(`${path}/${linkId}`, "DELETE", owner, undefined, undefined, "https://nanocodex.example")).status).toBe(204);
   expect((await api(comments, "POST", undefined, { id: "new-comment", input: "hello" }, token, "https://nanocodex.example")).status).toBe(404);
 });
+
+it("streams only safe guest transcript events and closes the feed when its link is revoked", async () => {
+  id = crypto.randomUUID(); await seed();
+  // A real final-answer delta and an unrelated tool event share the durable log.
+  await runInDurableObject(sessions().getByName(id), async (_, state) => {
+    const log = new DurableEventLog<{ type: string; [key: string]: unknown }>(state.storage);
+    log.record({ type: "event", event: { type: "assistant.delta", payload: {
+      phase: "final_answer", text: "safe live token", hidden: "SECRET_DELTA_METADATA",
+    } } }, "synthetic-turn");
+    log.record({ type: "event", event: { type: "reasoning.summary.delta", payload: { text: "SECRET_REASONING" } } }, "synthetic-turn");
+  });
+  const path = `/v1/agents/${id}/share-links`;
+  const created = await api(path, "POST", owner, { permission: "read" }, undefined, "https://nanocodex.example");
+  expect(created.status).toBe(201);
+  const link = await created.json<{ id: string; url: string }>();
+  const token = new URL(link.url).hash.slice(7);
+  expect((await api(`/v1/shared/${id}/events?after=invalid`, "GET", undefined, undefined, token)).status).toBe(400);
+  expect((await api(`/v1/shared/${secondId}/events?after=0`, "GET", undefined, undefined, token)).status).toBe(404);
+  const stream = await api(`/v1/shared/${id}/events?after=0`, "GET", undefined, undefined, token);
+  expect(stream.status).toBe(200);
+  expect(stream.headers.get("content-type")).toContain("text/event-stream");
+  const reader = stream.body!.getReader();
+  let transcript = "";
+  for (let index = 0; index < 12 && !transcript.includes("safe live token"); index++) {
+    const next = await reader.read();
+    if (next.done) break;
+    transcript += new TextDecoder().decode(next.value);
+  }
+  expect(transcript).toContain('event: turn_accepted');
+  expect(transcript).toContain('event: turn_completed');
+  expect(transcript).toContain('event: assistant_delta');
+  expect(transcript).toContain('"delta":"safe live token"');
+  expect(transcript).not.toMatch(/SECRET_TOOL_OUTPUT|SECRET_USAGE|SECRET_ACCEPTED_METADATA|SECRET_DELTA_METADATA|SECRET_REASONING|nsl_/);
+  expect((await api(`${path}/${link.id}`, "DELETE", owner, undefined, undefined, "https://nanocodex.example")).status).toBe(204);
+  const closed = await reader.read().catch(() => ({ done: true }));
+  expect(closed.done).toBe(true);
+  expect((await api(`/v1/shared/${id}/events?after=0`, "GET", undefined, undefined, token)).status).toBe(404);
+});

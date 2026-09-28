@@ -40,6 +40,9 @@ type Subscriber = {
   dirty: boolean;
   keepalive?: ReturnType<typeof setInterval>;
   running: boolean;
+  authorize?: () => boolean;
+  project?: (event: DurableEvent<{ type: string }>) => DurableEvent<{ type: string }> | null;
+  tag?: string;
   removeAbortListener?: () => void;
   page: (after: string, limit: number) => Promise<DurableEvent<{ type: string }>[]>;
   tail: Promise<void>;
@@ -290,6 +293,11 @@ export class DurableEventLog<Message extends { type: string }> {
     latest: string,
     page: (after: string, limit: number) => Promise<DurableEvent<Message>[]>,
     signal?: AbortSignal,
+    options?: {
+      authorize?: () => boolean;
+      project?: (event: DurableEvent<Message>) => DurableEvent<{ type: string }> | null;
+      tag?: string;
+    },
   ): Response {
     const cursor = parseCursor(after);
     if (cursor === undefined) {
@@ -300,6 +308,9 @@ export class DurableEventLog<Message extends { type: string }> {
         { error: "cursor_ahead", latest_cursor: latest },
         { status: 409, headers: { "cache-control": "no-store" } },
       );
+    }
+    if (options?.authorize && !options.authorize()) {
+      return Response.json({ error: "not_found" }, { status: 404, headers: { "cache-control": "no-store" } });
     }
     if (this.#subscribers.size >= MAX_SUBSCRIBERS) {
       return Response.json(
@@ -322,6 +333,9 @@ export class DurableEventLog<Message extends { type: string }> {
       dirty: false,
       page: page as Subscriber["page"],
       running: false,
+      authorize: options?.authorize,
+      project: options?.project as Subscriber["project"],
+      tag: options?.tag,
       tail: Promise.resolve(),
       writer: body.writable.getWriter(),
     };
@@ -356,6 +370,13 @@ export class DurableEventLog<Message extends { type: string }> {
     });
   }
 
+  /** Terminate streams bound to a revoked share link without disturbing owner streams. */
+  closeTagged(tag: string): void {
+    for (const subscriber of this.#subscribers) {
+      if (subscriber.tag === tag) this.#close(subscriber, true);
+    }
+  }
+
   clear(): void {
     for (const subscriber of this.#subscribers) this.#close(subscriber, true);
     this.#storage.sql.exec("DELETE FROM managed_event_chunks");
@@ -386,10 +407,15 @@ export class DurableEventLog<Message extends { type: string }> {
 
   async #catchUp(subscriber: Subscriber): Promise<void> {
     while (!subscriber.closed) {
+      if (subscriber.authorize && !subscriber.authorize()) return this.#close(subscriber, true);
       const events = await subscriber.page(subscriber.after, REPLAY_PAGE_SIZE);
-      if (subscriber.closed || events.length === 0) return;
+      if (subscriber.closed) return;
+      if (subscriber.authorize && !subscriber.authorize()) return this.#close(subscriber, true);
+      if (events.length === 0) return;
       for (const event of events) {
-        await subscriber.writer.write(encodeEvent(event));
+        if (subscriber.authorize && !subscriber.authorize()) return this.#close(subscriber, true);
+        const projected = subscriber.project ? subscriber.project(event) : event;
+        if (projected) await subscriber.writer.write(encodeEvent(projected));
         subscriber.after = event.cursor;
         if (subscriber.closed) return;
       }
@@ -400,6 +426,7 @@ export class DurableEventLog<Message extends { type: string }> {
 
   #enqueueComment(subscriber: Subscriber, encoded: Uint8Array): void {
     if (subscriber.closed) return;
+    if (subscriber.authorize && !subscriber.authorize()) return this.#close(subscriber, true);
     subscriber.tail = subscriber.tail.then(() => subscriber.writer.write(encoded));
     void subscriber.tail.catch(() => this.#close(subscriber));
   }

@@ -743,6 +743,24 @@ type StreamMessage = Extract<ServerMessage,
   | { type: "stream_failed" }
 >;
 
+/** Explicit guest allowlist: never serialize a raw agent event or its payload. */
+type SharedEvent =
+  | { cursor: string; created_at: number; turn_id: string | null; type: "turn_accepted"; id: string; input: string }
+  | { cursor: string; created_at: number; turn_id: string | null; type: "assistant_delta"; delta: string }
+  | { cursor: string; created_at: number; turn_id: string | null; type: "turn_completed"; id: string; final_message: string };
+
+function projectSharedEvent({ cursor, created_at, turn_id, message }: DurableEvent<StreamMessage>): SharedEvent | null {
+  if (message.type === "turn_accepted" && typeof message.id === "string")
+    return { cursor, created_at, turn_id, type: "turn_accepted", id: message.id, input: promptInputText(message.input) };
+  if (message.type === "turn_completed" && typeof message.id === "string")
+    return { cursor, created_at, turn_id, type: "turn_completed", id: message.id, final_message: message.final_message };
+  if (message.type === "event" && message.agent_id === undefined
+    && message.event.type === "assistant.delta" && message.event.payload.phase === "final_answer"
+    && typeof message.event.payload.text === "string" && message.event.payload.text.length > 0)
+    return { cursor, created_at, turn_id, type: "assistant_delta", delta: message.event.payload.text };
+  return null;
+}
+
 type ManagedTurnSubmission = {
   created: boolean;
   row: ManagedTurnRow;
@@ -2406,7 +2424,7 @@ async function managedFetchRoute(
     }
     const shared = url.pathname.match(/^\/v1\/shared\/([^/]+)(?:\/(.*))?$/);
     if (shared) {
-      if (!SESSION_ID.test(shared[1] ?? "") || !["", "events/history", "comments"].includes(shared[2] ?? ""))
+      if (!SESSION_ID.test(shared[1] ?? "") || !["", "events/history", "events", "comments"].includes(shared[2] ?? ""))
         return json({ error: "not_found" }, { status: 404 });
       if (request.method !== "GET" && !(request.method === "POST" && shared[2] === "comments"))
         return json({ error: "forbidden" }, { status: 403 });
@@ -4143,7 +4161,7 @@ export class DurableAgentSession extends DurableComputerObject {
       }
       turnAuthorization = asserted.authorization;
     }
-    if (url.pathname === "/share" || url.pathname === "/share/events/history" || url.pathname === "/share/comments") {
+    if (url.pathname === "/share" || url.pathname === "/share/events/history" || url.pathname === "/share/events" || url.pathname === "/share/comments") {
       const headers = { "cache-control": "no-store" };
       if (ownerAssertion || this.#deleting || this.#deleted || this.#durabilityExported
         || this.#session()?.runtime_profile !== "managed")
@@ -4157,6 +4175,28 @@ export class DurableAgentSession extends DurableComputerObject {
           "SELECT first_prompt FROM session_state WHERE singleton=1").one().first_prompt;
         return json({ agent_id: this.#sessionId(), permission: link.permission,
           title: typeof firstPrompt === "string" ? conversationTitle(firstPrompt) || "Shared thread" : "Shared thread", latest_event_cursor: this.#eventArchive.latestCursor(this.#eventLog) }, { headers });
+      }
+      if (url.pathname === "/share/events") {
+        if (request.method !== "GET" || [...url.searchParams.keys()].some(key => key !== "after")
+          || url.searchParams.getAll("after").length > 1)
+          return json({ error: "invalid_request" }, { status: 400, headers });
+        // A guest starts at the metadata snapshot's cursor and replays from
+        // there. The HTTP header wins on reconnect, just as for owner SSE.
+        const requested = request.headers.get("last-event-id") ?? url.searchParams.get("after") ?? "latest";
+        const cursor = requested === "latest" ? this.#eventArchive.latestCursor(this.#eventLog) : parseCursor(requested);
+        if (cursor === undefined) return json({ error: "invalid_cursor" }, { status: 400, headers });
+        return this.#eventLog.streamWithPage(cursor, this.#eventArchive.latestCursor(this.#eventLog),
+          this.#eventArchive.pageReader(this.#eventLog), request.signal, {
+            tag: link.id,
+            authorize: () => this.#shareLinks.validate(bearer)?.id === link.id
+              && !this.#deleting && !this.#deleted && !this.#durabilityExported,
+            project: event => {
+              const projected = projectSharedEvent(event);
+              if (!projected) return null;
+              const { cursor, created_at, turn_id, ...message } = projected;
+              return { cursor, created_at, turn_id, message };
+            },
+          });
       }
       if (url.pathname === "/share/comments") {
         const before = url.searchParams.get("before");
@@ -4193,17 +4233,9 @@ export class DurableAgentSession extends DurableComputerObject {
         const page = await this.#eventArchive.history(this.#eventLog, beforeParam ?? undefined, Number(limitParam));
         // Never spread the raw event: tool events, reasoning, usage and arbitrary fields
         // are intentionally absent from this separate public projection.
-        const data = page.data.flatMap<
-          { cursor: string; created_at: number; turn_id: string | null; type: "turn_accepted"; id: string; input: string }
-          | { cursor: string; created_at: number; turn_id: string | null; type: "turn_completed"; id: string; final_message: string }
-        >(({ cursor, created_at, turn_id, message }) => {
-          if (message.type === "turn_accepted" && typeof message.id === "string")
-            return [{ cursor, created_at, turn_id, type: "turn_accepted" as const, id: message.id,
-              input: promptInputText(message.input) }];
-          if (message.type === "turn_completed" && typeof message.id === "string")
-            return [{ cursor, created_at, turn_id, type: "turn_completed" as const, id: message.id,
-              final_message: message.final_message }];
-          return [];
+        const data = page.data.flatMap(event => {
+          const projected = projectSharedEvent(event);
+          return projected && projected.type !== "assistant_delta" ? [projected] : [];
         });
         // Revocation during an archived R2 read must not disclose the decoded page.
         if (!this.#shareLinks.validate(bearer)) return json({ error: "not_found" }, { status: 404, headers });
@@ -4230,9 +4262,12 @@ export class DurableAgentSession extends DurableComputerObject {
       }
       if (request.method === "GET" && url.pathname === "/share-links")
         return json({ data: this.#shareLinks.list() }, { headers });
-      if (request.method === "DELETE")
-        return this.#shareLinks.revoke(url.pathname.slice("/share-links/".length))
-          ? new Response(null, { status: 204, headers }) : json({ error: "not_found" }, { status: 404, headers });
+      if (request.method === "DELETE") {
+        const id = url.pathname.slice("/share-links/".length);
+        if (!this.#shareLinks.revoke(id)) return json({ error: "not_found" }, { status: 404, headers });
+        this.#eventLog.closeTagged(id);
+        return new Response(null, { status: 204, headers });
+      }
       if (request.method !== "POST" || url.pathname !== "/share-links")
         return json({ error: "method_not_allowed" }, { status: 405, headers });
       const encoded = await request.text();
