@@ -5,7 +5,7 @@ import { custom, decodeFunctionData, parseAbi } from "viem";
 import { Transaction, Abis } from "viem/tempo";
 import { tempo } from "viem/tempo/chains";
 import { Challenge, Credential } from "mppx";
-import { executeMercatorPayment, MercatorPaymentInputError } from "../src/mercator-payment.ts";
+import { createMercatorMcpCredential, MercatorPaymentInputError } from "../src/mercator-payment.ts";
 // Protocol failures: quote drift, token/chain/recipient escalation, redirects,
 // duplicate/concurrent submission, and lost response after signing. The positive
 // scenario uses the actual Accounts signer; only merchant/RPC transport is fake.
@@ -54,106 +54,69 @@ function fixture(patch = {}, loseResponse = false, challengePatch = {}) {
     };
     return { store, wallet, fetcher, submissions: () => submissions, credential: () => credential };
 }
-describe("bounded account Mercator payments", () => {
-    it("signs a sponsored MACH charge with the account wallet and replays without paying twice", async () => {
-    const f = fixture();
-        const result = await executeMercatorPayment(input, f);
-        assert.equal(result.status, "submitted"); assert.equal(result.result.id, "synthetic-job");
-        assert.equal(f.credential()?.payload.type,"transaction"); assert.match(f.credential().payload.signature,/^0x/);
-        const payload = f.credential().payload;
-        const transaction = Transaction.deserialize(payload.signature);
-        assert.equal(transaction.chainId, 4217);
-        assert.equal(transaction.feePayerSignature, null);
-        assert.equal((transaction.calls).length, 2);
-        assert.equal(transaction.calls[0].to?.toLowerCase(), "0x20c000000000000000000000f37de3740adec032");
-        const approval = decodeFunctionData({ abi: Abis.tip20, data: transaction.calls[0].data });
-        assert.equal(approval.functionName,"approve"); assert.equal(approval.args[1],50000n);
-        const settlement = decodeFunctionData({ abi: parseAbi(["function swapTo(address inputToken,uint256 amount,address targetToken,address recipient,bytes32 memo)"]), data: transaction.calls[1].data });
-        assert.equal(settlement.functionName, "swapTo");
-        assert.deepEqual(settlement.args.slice(1, 4).map(v => typeof v === "string" ? v.toLowerCase() : v), [50000n, "0x20c000000000000000000000b9537d11c60e8b50", payee]);
-        assert.equal(f.credential()?.challenge.request.currency, "0x20c000000000000000000000b9537d11c60e8b50");
-        assert.deepEqual(await executeMercatorPayment(input, f), result);
-        assert.equal(f.submissions(), 1);
-        await assert.rejects(executeMercatorPayment({ ...input, approved_total: "0.04" }, f), /conflict/);
-    });
-    it("refuses a USDC fallback when MACH cannot fund the canonical route", async () => {
-        const f = fixture();
-        f.wallet.getMppxParameters = (() => {
-            const original = f.wallet.getMppxParameters.bind(f.wallet);
-            return () => {
-                const params = original();
-                return { ...params, async getClient(info) {
-                        const client = await params.getClient(info);
-                        return { ...client, request: async (...args) => {
-                                const req = args[0];
-                                if (req.method === "eth_call" && req.params?.[0]?.to?.toLowerCase() === "0x20c000000000000000000000f37de3740adec032")
-                                    return `0x${"0".repeat(64)}`;
-                                return client.request(...args);
-                            } };
-                    } };
-            };
-        })();
-        const result = await executeMercatorPayment(input, f);
-        assert.equal(result.status, "rejected");
-        assert.equal(f.submissions(), 0);
-    });
-    it("does not reserve a key when an already-canceled queued request begins", async () => {
-        const f = fixture();
-        const controller = new AbortController(); controller.abort();
-        await assert.rejects(executeMercatorPayment(input, { ...f, signal: controller.signal }));
-        assert.equal(await f.store.get(`mercator-payment:${input.idempotency_key}`), undefined);
-        assert.equal(f.submissions(), 0);
-    });
-    it("retains the reservation if result persistence fails after merchant acceptance", async () => {
-        const f = fixture();
-        const put = f.store.put;
-        let writes = 0;
-        f.store.put = async (key, value) => { if (++writes === 2)
-            throw new Error("storage interrupted"); return put(key, value); };
-        await assert.rejects(executeMercatorPayment(input, f), /storage interrupted/);
-        assert.equal((await executeMercatorPayment(input, f)).status, "unknown");
-        assert.equal(f.submissions(), 1);
-    });
-    it("rejects session, stale or invalid expiry and redirects without payment", async () => {
-        for (const patch of [{ intent: "session" }, { expires: "not-a-date" }, { expires: new Date(0).toISOString() }, { realm: "foreign.example" }]) {
-            const f = fixture({}, false, patch);
-            assert.equal((await executeMercatorPayment(input, f)).status, "rejected");
-            assert.equal(f.submissions(), 0);
-        }
-        const f = fixture();
-        f.fetcher = async () => new Response(null, { status: 302, headers: { location: "https://foreign.example" } });
-        assert.equal((await executeMercatorPayment(input, f)).status, "rejected");
-    });
-    it("cancels a stalled accepted response body and retains unknown", async () => {
-        const f = fixture();
-        const controller = new AbortController();
-        const fetcher = f.fetcher;
-        let cancelled = false;
-        f.fetcher = async (url, init) => {
-            const response = await fetcher(url, init);
-            if (response.status !== 201)
-                return response;
-            queueMicrotask(() => controller.abort());
-            return new Response(new ReadableStream({ cancel() { cancelled = true; } }), { status: 201 });
-        };
-        assert.equal((await executeMercatorPayment(input, { ...f, signal: controller.signal })).status, "unknown");
-        assert.equal(cancelled, true);
-        assert.equal((await executeMercatorPayment(input, f)).status, "unknown");
-        assert.equal(f.submissions(), 1);
-    });
-    it("retains unknown outcomes without signing again", async () => {
-        const f = fixture({}, true);
-        assert.equal((await executeMercatorPayment(input, f)).status, "unknown");
-        assert.equal((await executeMercatorPayment(input, f)).status, "unknown");
-        assert.equal(f.submissions(), 1);
-    });
-    it("fails closed on changed price, token, recipient, chain, and excessive approval", async () => {
-        for (const patch of [{ amount: "50001" }, { currency: payee }, { recipient: "bad" }, { methodDetails: { chainId: 1, feePayer: true } }]) {
-            const f = fixture(patch);
-            assert.equal((await executeMercatorPayment(input, f)).status, "rejected");
-            assert.equal(f.submissions(), 0);
-        }
-        await assert.rejects(executeMercatorPayment({ ...input, approved_total: "0.050001" }, fixture()),
-            error => error instanceof MercatorPaymentInputError && error.status === 400);
-    });
+
+async function paymentInput(f, patch = {}, top = {}) {
+  const quote = await f.fetcher(null, { body: JSON.stringify({ idempotencyKey: input.idempotency_key, plan: input.plan }) });
+  const challenge = Challenge.deserialize(quote.headers.get("www-authenticate"));
+  return { ...input, challenge: { ...challenge, ...top, request: { ...challenge.request, ...patch } } };
+}
+const sign = (f, v, extra = {}) => createMercatorMcpCredential(v, { store: f.store, wallet: f.wallet, ...extra });
+describe("Mercator MCP payment", () => {
+  it("signs a sponsored MACH pull credential once and replays it", async () => {
+    const f = fixture(), v = await paymentInput(f);
+    const encoded = await sign(f, v), c = Credential.deserialize(encoded);
+    assert.equal(c.payload.type, "transaction");
+    const tx = Transaction.deserialize(c.payload.signature);
+    assert.equal(tx.chainId, 4217); assert.equal(tx.feePayerSignature, null);
+    assert.equal(tx.calls.length, 2);
+    const approve = decodeFunctionData({ abi: Abis.tip20, data: tx.calls[0].data });
+    assert.equal(approve.functionName, "approve"); assert.equal(approve.args[1], 50000n);
+    const swap = decodeFunctionData({ abi: parseAbi(["function swapTo(address inputToken,uint256 amount,address targetToken,address recipient,bytes32 memo)"]), data: tx.calls[1].data });
+    assert.equal(swap.functionName, "swapTo"); assert.equal(swap.args[1], 50000n);
+    assert.equal(swap.args[3].toLowerCase(), payee);
+    assert.equal(await sign(f, v), encoded);
+    await assert.rejects(sign(f, { ...v, plan: { nodes: [{ id: "changed" }] } }), e => e instanceof MercatorPaymentInputError && e.status === 409);
+    await assert.rejects(sign(f, { ...v, challenge: { ...v.challenge, id: "new" } }),
+      e => e instanceof MercatorPaymentInputError && e.status === 503);
+  });
+  it("never re-signs a fresh challenge after the original signed credential expires", async () => {
+    const f = fixture(), v = await paymentInput(f);
+    await sign(f, v);
+    const key = `mercator-mcp-payment:${input.idempotency_key}`;
+    const previous = await f.store.get(key);
+    await f.store.put(key, { ...previous, challenge: JSON.stringify({ ...v.challenge, expires: new Date(0).toISOString() }) });
+    await assert.rejects(sign(f, { ...v, challenge: { ...v.challenge, id: "new" } }),
+      e => e instanceof MercatorPaymentInputError && e.status === 503);
+    assert.equal((await f.store.get(key)).status, "signed");
+  });
+  it("rejects foreign, changed or unsupported charge terms before reservation", async () => {
+    for (const [patch, top] of [[{ amount: "50001" }, {}], [{ currency: payee }, {}], [{ recipient: "bad" }, {}],
+      [{ methodDetails: { chainId: 1, feePayer: true, supportedModes: ["pull"] } }, {}], [{}, { expires: new Date(0).toISOString() }],
+      [{}, { realm: "foreign.example" }], [{ methodDetails: { chainId: 4217, feePayer: true, supportedModes: ["push"] } }, {}]]) {
+      const f = fixture(), v = await paymentInput(f, patch, top);
+      await assert.rejects(sign(f, v), e => e instanceof MercatorPaymentInputError && e.status === 400);
+      assert.equal(await f.store.get(`mercator-mcp-payment:${input.idempotency_key}`), undefined);
+    }
+    const f = fixture(), v = await paymentInput(f);
+    await assert.rejects(sign(f, { ...v, approved_total: "0.050001" }), e => e instanceof MercatorPaymentInputError && e.status === 400);
+  });
+  it("retries the same key after a known pre-sign failure without risking a second paid submission", async () => {
+    const f = fixture(), v = await paymentInput(f), original = f.wallet.request.bind(f.wallet);
+    let fail = true;
+    f.wallet.request = (...args) => { if (fail) { fail = false; throw Error("temporary RPC failure"); } return original(...args); };
+    await assert.rejects(sign(f, v), e => e instanceof MercatorPaymentInputError && e.status === 422);
+    assert.equal((await f.store.get(`mercator-mcp-payment:${input.idempotency_key}`)).status, "rejected");
+    const next = { ...v, challenge: { ...v.challenge, id: "new" } };
+    assert.equal(Credential.deserialize(await sign(f, next)).payload.type, "transaction");
+  });
+  it("does not reserve canceled requests or re-sign uncertain outcomes", async () => {
+    const f = fixture(), v = await paymentInput(f), controller = new AbortController(); controller.abort();
+    await assert.rejects(sign(f, v, { signal: controller.signal }));
+    assert.equal(await f.store.get(`mercator-mcp-payment:${input.idempotency_key}`), undefined);
+    let writes = 0; const put = f.store.put;
+    f.store.put = async (key, value) => { if (++writes === 2) throw Error("storage interrupted"); return put(key, value); };
+    await assert.rejects(sign(f, v), e => e instanceof MercatorPaymentInputError && e.status === 503);
+    await assert.rejects(sign(f, v), e => e instanceof MercatorPaymentInputError && e.status === 503);
+    assert.equal(writes, 2);
+  });
 });

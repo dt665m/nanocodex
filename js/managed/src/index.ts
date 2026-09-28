@@ -61,7 +61,7 @@ import { routeTodoRequest } from "./todo-inbox";
 import { phoneAdminConfigured } from "./phone-admin";
 import { phoneTools } from "./phone-tool";
 import { emailTools, type EmailConfig } from "./email-tool";
-import { mercatorPaymentTools } from "./mercator-tool";
+import { mercatorMcpPayment } from "./mercator-mcp-payment";
 import { PhoneContainer } from "./phone-container";
 export { PhoneContainer };
 import { createVaultIntakeTool } from "./vault-intake-tool";
@@ -130,6 +130,7 @@ import {
   connectedManagedAccountMcps,
   createDefaultManagedTools,
   defaultManagedMcpServers,
+  DEFAULT_MANAGED_MCP_CATALOG,
   managedAccountMcpServerName,
   managedAccountMcpServers,
   type ManagedAccountMcpConnection,
@@ -9174,6 +9175,17 @@ export class DurableAgentSession extends DurableComputerObject {
       ? {}
       : {
           ...defaultManagedMcpServers(),
+          mercator: {
+            ...DEFAULT_MANAGED_MCP_CATALOG.mercator,
+            fetch: globalThis.fetch,
+            payment: mercatorMcpPayment(this.env.NANOCODEX, session.owner_id, context => {
+              const authorization = this.#authorizationForToolContext(context as ToolContext);
+              if (!this.#hasFullAccountAuthority(authorization)
+                || !authorization.capabilities.includes("agents:write") || !authorization.capabilities.includes("tools:use")) {
+                throw new ManagedRequestError(403, "forbidden", "Mercator payments require full account tool authority");
+              }
+            }),
+          },
           ...managedAccountMcpServers(
             accountMcpConnections,
             this.env.NANOCODEX,
@@ -9442,16 +9454,6 @@ export class DurableAgentSession extends DurableComputerObject {
       })),
       ...(multiplayer ? [] : this.#memoryTools()),
       ...(multiplayer ? [] : [createVaultIntakeTool(context => this.#authorizeVaultTool(context))]),
-      ...mercatorPaymentTools({
-        broker: this.env.NANOCODEX, owner: session.owner_id, multiplayer,
-        authorize: context => {
-          context.signal.throwIfAborted();
-          const authorization = this.#authorizationForToolContext(context);
-          if (!this.#hasFullAccountAuthority(authorization)
-            || !authorization.capabilities.includes("agents:write") || !authorization.capabilities.includes("tools:use"))
-            throw new ManagedRequestError(403, "forbidden", "Mercator payments require full account tool authority");
-        },
-      }),
       ...emailTools({
         config: this.env, owner: session.owner_id, agentId: session.session_id, multiplayer,
         authorize: context => {

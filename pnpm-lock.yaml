@@ -492,6 +492,9 @@ importers:
       cron-parser:
         specifier: 5.6.0
         version: 5.6.0
+      mppx:
+        specifier: 0.9.1
+        version: 0.9.1(@modelcontextprotocol/sdk@1.30.0(@cfworker/json-schema@4.1.1)(supports-color@10.2.2)(zod@4.5.4))(express@5.2.1(supports-color@10.2.2))(hono@4.13.5)(typescript@5.9.3)(viem@2.55.19(typescript@5.9.3)(zod@4.5.4))
       nanocodex:
         specifier: workspace:*
         version: link:../nanocodex
@@ -9359,6 +9362,21 @@ snapshots:
       ox: 0.14.33(typescript@5.9.3)(zod@4.5.4)
       structured-headers: 2.0.3
       viem: 2.55.13(typescript@5.9.3)(zod@4.5.4)
+      zod: 4.5.4
+    optionalDependencies:
+      '@modelcontextprotocol/sdk': 1.30.0(@cfworker/json-schema@4.1.1)(supports-color@10.2.2)(zod@4.5.4)
+      express: 5.2.1(supports-color@10.2.2)
+      hono: 4.13.5
+    transitivePeerDependencies:
+      - typescript
+
+  mppx@0.9.1(@modelcontextprotocol/sdk@1.30.0(@cfworker/json-schema@4.1.1)(supports-color@10.2.2)(zod@4.5.4))(express@5.2.1(supports-color@10.2.2))(hono@4.13.5)(typescript@5.9.3)(viem@2.55.19(typescript@5.9.3)(zod@4.5.4)):
+    dependencies:
+      '@stripe/stripe-js': 9.13.0
+      eventsource-parser: 3.1.1
+      ox: 0.14.33(typescript@5.9.3)(zod@4.5.4)
+      structured-headers: 2.0.3
+      viem: 2.55.19(typescript@5.9.3)(zod@4.5.4)
       zod: 4.5.4
     optionalDependencies:
       '@modelcontextprotocol/sdk': 1.30.0(@cfworker/json-schema@4.1.1)(supports-color@10.2.2)(zod@4.5.4)

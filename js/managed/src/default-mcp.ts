@@ -13,11 +13,11 @@ export const DEFAULT_MANAGED_MCP_CATALOG = Object.freeze({
     description: "Tempo network and protocol tools.",
     parallelTools: Object.freeze(["code", "search"]),
   }),
-  // Anonymous MCP discovery, not the separate hosted OAuth/payment endpoint.
-  // No payment credentials or MPP client are configured by default.
+  // Public default MCP endpoint. The managed runtime adds account-wallet MPP
+  // payment handling without an extra model-visible tool or OAuth connection.
   mercator: Object.freeze({
     url: "https://mercator.sh/mcp",
-    description: "Discover and quote Mercator API workflows. With explicit user approval, use mercator_pay for account-wallet paid jobs up to $0.05; reuse the exact quote plan, total and idempotency key.",
+    description: "Discover, quote and execute Mercator jobs through this default MCP server. Account wallets can settle its bounded payment challenge when funded; reuse the unchanged plan and idempotency key on retries.",
     parallelTools: Object.freeze(["get_suggested_queries", "get_connection_status", "search_services"]),
   }),
   cloudflare: Object.freeze({
