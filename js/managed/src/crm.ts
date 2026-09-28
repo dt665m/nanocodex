@@ -100,7 +100,7 @@ function record(row: EffectiveRecordRow) {
   const field_origins = { ...(website_origin ? { website: website_origin } : {}),
     ...(title_origin ? { title: title_origin } : {}),
     ...(company_id_origin ? { company_id: company_id_origin } : {}) };
-  return { ...fields, tags: JSON.parse(row.tags) as string[], ...(Object.keys(field_origins).length ? { field_origins } : {}) };
+  return { ...fields, graph_node_id: `legacy:crm_records:${JSON.stringify([row.id])}`, tags: JSON.parse(row.tags) as string[], ...(Object.keys(field_origins).length ? { field_origins } : {}) };
 }
 async function scope(parts: unknown[]): Promise<string> {
   const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(parts)));
@@ -187,15 +187,13 @@ export async function crmRequest(db: D1Database, ownerId: string, operation: Crm
         const row = results[0].results[0] as EffectiveRecordRow | undefined;
         if (!row) notFound();
         const notes = page(results[1].results as NoteRow[], size, queryScope);
-        const timeline = row.kind === "person"
-          ? await (await import("./crm-timeline")).crmTimelineRequest(db, ownerId, {
-            person_id: recordId,
-            ...(has(args, "timeline_limit") ? { limit: args.timeline_limit } : {}),
-            ...(has(args, "timeline_cursor") ? { cursor: args.timeline_cursor } : {}),
-          }) : null;
-        if (row.kind !== "person" && (has(args, "timeline_limit") || has(args, "timeline_cursor"))) invalid("Timeline requires a person.");
+        const timeline = await (await import("./crm-timeline")).crmTimelineRequest(db, ownerId, {
+          record_id: recordId,
+          ...(has(args, "timeline_limit") ? { limit: args.timeline_limit } : {}),
+          ...(has(args, "timeline_cursor") ? { cursor: args.timeline_cursor } : {}),
+        });
         return { record: record(row), notes: notes.items, next_cursor: notes.next_cursor,
-          ...(timeline ? { timeline: timeline.entries, timeline_next_cursor: timeline.next_cursor } : {}) };
+          timeline: timeline.entries, timeline_next_cursor: timeline.next_cursor };
       }
       case "save": {
         const args = object(input, ["id", ...recordFields]);
