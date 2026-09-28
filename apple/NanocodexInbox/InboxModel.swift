@@ -561,6 +561,21 @@ final class InboxModel: ObservableObject {
         return url
     }
     func downloadOutput(_ link: PublishedOutputLink, agentID: String) async throws -> URL {
+        #if DEBUG
+        // Simulator-only fixture: exercise the real Quick Look and share sheet
+        // without publishing private output bytes or requiring an account.
+        if isDemo, ProcessInfo.processInfo.environment["NANOCODEX_DEMO_OUTPUT_LINKS"] == "1",
+           let encoded = ProcessInfo.processInfo.environment["NANOCODEX_DEMO_VIDEO_BASE64"],
+           let bytes = Data(base64Encoded: encoded), link.isVideo {
+            let folder = FileManager.default.temporaryDirectory
+                .appendingPathComponent("NanocodexOutput-" + UUID().uuidString, isDirectory: true)
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            let file = folder.appendingPathComponent(link.filename)
+            do { try bytes.write(to: file, options: .atomic) }
+            catch { try? FileManager.default.removeItem(at: folder); throw error }
+            return file
+        }
+        #endif
         guard let client else { throw APIError.invalidCredential }
         let epoch = generation
         let url = try await client.downloadOutput(agentID: agentID, path: link.path)

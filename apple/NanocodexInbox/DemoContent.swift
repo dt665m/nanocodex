@@ -279,8 +279,8 @@ enum DemoContent {
         if ProcessInfo.processInfo.environment["NANOCODEX_DEMO_OUTPUT_LINKS"] == "1" {
             return [.init(id: "user-" + id, role: "You", text: "Show the videos"),
                     .init(id: "agent-" + id, role: "Agent", text: """
-                    [Main launch video](sandbox:/brain/outputs/frontiers-next/launch.mp4)
-                    [Complete bundle](sandbox:/brain/outputs/frontiers-next/videos.zip)
+                    [Main launch video](sandbox:/brain/outputs/frontiers-next/frontiers-merch-launch-actual-character.mp4)
+                    [Complete bundle](sandbox:/brain/outputs/frontiers-next/frontiers-launch-and-drops.zip)
                     [Web reference](https://example.com)
                     [Not an output](sandbox:/brain/tmp/secret.mp4)
                     """)]
