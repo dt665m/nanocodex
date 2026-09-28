@@ -743,21 +743,55 @@ type StreamMessage = Extract<ServerMessage,
   | { type: "stream_failed" }
 >;
 
-/** Explicit guest allowlist: never serialize a raw agent event or its payload. */
-type SharedEvent =
-  | { cursor: string; created_at: number; turn_id: string | null; type: "turn_accepted"; id: string; input: string }
-  | { cursor: string; created_at: number; turn_id: string | null; type: "assistant_delta"; delta: string }
-  | { cursor: string; created_at: number; turn_id: string | null; type: "turn_completed"; id: string; final_message: string };
+/** Shared chat is an allowlist, not a filtered copy of the owner's event stream.
+ * Tool output and reasoning can contain credentials in ordinary text values. */
+type SharedEvent = { cursor: string; created_at: number; turn_id: string | null; type: string; [key: string]: unknown };
+
+/** Only the event types consumed by the standard Chat transcript are projected.
+ * Never copy transport metadata, opaque provider envelopes, or whole payloads. */
+function sharedChatEvent(event: AgentEvent): AgentEvent | null {
+  const fields: Record<string, readonly string[]> = {
+    "assistant.delta": ["text", "phase", "turn_id", "item_id", "managed_agent_id", "model_call_index"],
+    "assistant.message": ["text", "phase", "turn_id", "item_id", "managed_agent_id", "model_call_index"],
+    "reasoning.summary.delta": ["text", "turn_id", "item_id", "managed_agent_id", "model_call_index"],
+    "tool.call": ["tool", "call_id", "arguments", "turn_id", "item_id", "managed_agent_id", "model_call_index"],
+    "tool.result": ["tool", "call_id", "result", "structured_result", "content", "status", "is_error", "turn_id", "item_id", "managed_agent_id", "model_call_index"],
+    "run.started": ["turn_id", "managed_agent_id"],
+    "run.completed": ["turn_id", "status", "disposition", "managed_agent_id"],
+    "run.failed": ["turn_id", "message", "managed_agent_id"],
+    "run.error": ["turn_id", "message", "managed_agent_id"],
+    "model.warmup.started": [], "model.warmup.completed": [], "model.warmup.failed": [],
+    "model.connection.started": [], "model.call.started": [], "model.call.completed": [],
+    "model.attempt.retrying": [], "run.steered": [],
+  };
+  const allowed = fields[event.type];
+  if (!allowed) return null;
+  const source = event.payload as Record<string, unknown> | undefined;
+  const payload = Object.fromEntries(allowed.flatMap(key => source?.[key] === undefined ? [] : [[key, source[key]]]));
+  return { protocol_version: event.protocol_version, request_id: event.request_id, seq: event.seq,
+    type: event.type, payload };
+}
 
 function projectSharedEvent({ cursor, created_at, turn_id, message }: DurableEvent<StreamMessage>): SharedEvent | null {
-  if (message.type === "turn_accepted" && typeof message.id === "string")
-    return { cursor, created_at, turn_id, type: "turn_accepted", id: message.id, input: promptInputText(message.input) };
-  if (message.type === "turn_completed" && typeof message.id === "string")
-    return { cursor, created_at, turn_id, type: "turn_completed", id: message.id, final_message: message.final_message };
-  if (message.type === "event" && message.agent_id === undefined
-    && message.event.type === "assistant.delta" && message.event.payload.phase === "final_answer"
-    && typeof message.event.payload.text === "string" && message.event.payload.text.length > 0)
-    return { cursor, created_at, turn_id, type: "assistant_delta", delta: message.event.payload.text };
+  if (message.type === "turn_accepted") {
+    const provenance = message as typeof message & { author?: "guest"; share_link_id?: string };
+    return { cursor, created_at, turn_id, type: "turn_accepted", id: message.id,
+      input: promptInputText(message.input), ...(provenance.author === "guest"
+        ? { author: "guest", share_link_id: provenance.share_link_id } : {}) };
+  }
+  if (message.type === "event") {
+    const event = sharedChatEvent(message.event);
+    return event ? { cursor, created_at, turn_id, type: "event", event,
+      ...(message.agent_id === undefined ? {} : { agent_id: message.agent_id }) } : null;
+  }
+  if (message.type === "turn_completed") return { cursor, created_at, turn_id, type: "turn_completed",
+    id: message.id, final_message: message.final_message };
+  if (message.type === "turn_cancelling" || message.type === "turn_cancelled")
+    return { cursor, created_at, turn_id, type: message.type, id: message.id };
+  if (message.type === "turn_retryable" || message.type === "turn_failed")
+    return { cursor, created_at, turn_id, type: message.type, id: message.id, error: "Turn unavailable" };
+  if (message.type === "stream_failed")
+    return { cursor, created_at, turn_id, type: "stream_failed", error: "Stream unavailable" };
   return null;
 }
 
@@ -800,6 +834,7 @@ type ManagedRealtimeRouteResult = Readonly<{
 type TurnAuthorization = Readonly<{
   capabilities: readonly OrganizationCapability[];
   connectGrant?: ConnectGrantSlice;
+  guestShareLinkId?: string;
 }>;
 
 type ManagedSubagentDescriptor = Readonly<{
@@ -1078,17 +1113,22 @@ function forwardedPrincipal(headers: Headers): Readonly<{
 function parseTurnAuthorization(encoded: string): TurnAuthorization {
   const value = JSON.parse(encoded) as unknown;
   if (!value || typeof value !== "object" || Array.isArray(value)
-    || Object.keys(value).some((key) => key !== "capabilities" && key !== "connectGrant")
+    || Object.keys(value).some((key) => key !== "capabilities" && key !== "connectGrant" && key !== "guestShareLinkId")
     || !isOrganizationCapabilities((value as { capabilities?: unknown }).capabilities)) {
     throw new Error("invalid turn authorization");
   }
   const parsed = value as {
     capabilities: OrganizationCapability[];
     connectGrant?: unknown;
+    guestShareLinkId?: unknown;
   };
+  if (parsed.guestShareLinkId !== undefined && (typeof parsed.guestShareLinkId !== "string"
+    || !/^[0-9a-f-]{36}$/.test(parsed.guestShareLinkId) || parsed.connectGrant === undefined))
+    throw new Error("invalid guest turn authorization");
   if (parsed.connectGrant === undefined) return { capabilities: parsed.capabilities };
   if (!isConnectGrantSlice(parsed.connectGrant)) throw new Error("invalid turn authorization");
-  return { capabilities: parsed.capabilities, connectGrant: parsed.connectGrant };
+  return { capabilities: parsed.capabilities, connectGrant: parsed.connectGrant,
+    ...(parsed.guestShareLinkId === undefined ? {} : { guestShareLinkId: parsed.guestShareLinkId }) };
 }
 
 function managedSubagentDescriptor(value: unknown): ManagedSubagentDescriptor {
@@ -2424,9 +2464,9 @@ async function managedFetchRoute(
     }
     const shared = url.pathname.match(/^\/v1\/shared\/([^/]+)(?:\/(.*))?$/);
     if (shared) {
-      if (!SESSION_ID.test(shared[1] ?? "") || !["", "events/history", "events", "comments"].includes(shared[2] ?? ""))
+      if (!SESSION_ID.test(shared[1] ?? "") || !["", "events/history", "events", "turns"].includes(shared[2] ?? ""))
         return json({ error: "not_found" }, { status: 404 });
-      if (request.method !== "GET" && !(request.method === "POST" && shared[2] === "comments"))
+      if (request.method !== "GET" && !(request.method === "POST" && shared[2] === "turns"))
         return json({ error: "forbidden" }, { status: 403 });
       if (request.method === "POST" && request.headers.get("origin") !== url.origin)
         return json({ error: "forbidden_origin" }, { status: 403 });
@@ -2435,6 +2475,7 @@ async function managedFetchRoute(
       const path = shared[2] ? `/share/${shared[2]}` : "/share";
       const headers = new Headers({ authorization: request.headers.get("authorization")! });
       if (request.headers.get("content-type")) headers.set("content-type", request.headers.get("content-type")!);
+      if (request.headers.get("idempotency-key")) headers.set("idempotency-key", request.headers.get("idempotency-key")!);
       if (request.headers.get("origin")) {
         headers.set("origin", request.headers.get("origin")!);
         headers.set("x-nanocodex-verified-share-origin", url.origin);
@@ -2461,8 +2502,8 @@ async function managedFetchRoute(
       ...(routedTurnId === undefined ? {} : { turn_id: routedTurnId }),
     });
     const stub = env.NANOCODEX_SESSIONS.getByName(agentId, durablePlacementOptions(clientIngressColo));
-    if (resource === "share-comments" || resource === "share-links" || /^share-links\/[^/]+$/.test(resource)) {
-      if (url.search && (resource !== "share-comments" || [...url.searchParams.keys()].some(key => key !== "before")))
+    if (resource === "share-links" || /^share-links\/[^/]+$/.test(resource)) {
+      if (url.search)
         return json({ error: "invalid_request" }, { status: 400 });
       if ((principal.kind !== "account_session" && principal.kind !== "api_key") || principal.connectGrant
         || !principal.capabilities.includes("agents:read")
@@ -2472,14 +2513,14 @@ async function managedFetchRoute(
         const failure = requireSameOriginMutation(request, url, principal);
         if (failure) return failure;
       }
-      if (request.method === "GET" && resource !== "share-links" && resource !== "share-comments"
+      if (request.method === "GET" && resource !== "share-links"
         || request.method === "POST" && resource !== "share-links"
         || request.method === "DELETE" && !/^share-links\/[0-9a-f-]{36}$/.test(resource)
         || !["GET", "POST", "DELETE"].includes(request.method))
         return json({ error: "method_not_allowed" }, { status: 405 });
       const headers = new Headers();
       forwardPrincipalAssertions(headers, principal);
-      return stub.fetch(`https://session.internal/${resource}?public_origin=${encodeURIComponent(url.origin)}${resource === "share-comments" && url.search ? `&${url.search.slice(1)}` : ""}`, {
+      return stub.fetch(`https://session.internal/${resource}?public_origin=${encodeURIComponent(url.origin)}`, {
         method: request.method, headers, body: request.body, signal: request.signal,
       });
     }
@@ -4161,7 +4202,7 @@ export class DurableAgentSession extends DurableComputerObject {
       }
       turnAuthorization = asserted.authorization;
     }
-    if (url.pathname === "/share" || url.pathname === "/share/events/history" || url.pathname === "/share/events" || url.pathname === "/share/comments") {
+    if (url.pathname === "/share" || url.pathname === "/share/events/history" || url.pathname === "/share/events" || url.pathname === "/share/turns") {
       const headers = { "cache-control": "no-store" };
       if (ownerAssertion || this.#deleting || this.#deleted || this.#durabilityExported
         || this.#session()?.runtime_profile !== "managed")
@@ -4198,28 +4239,28 @@ export class DurableAgentSession extends DurableComputerObject {
             },
           });
       }
-      if (url.pathname === "/share/comments") {
-        const before = url.searchParams.get("before");
-        if ([...url.searchParams.keys()].some(key => key !== "before")
-          || url.searchParams.getAll("before").length > 1 || before !== null && (!/^[1-9]\d*$/.test(before)
-            || !Number.isSafeInteger(Number(before))))
-          return json({ error: "invalid_request" }, { status: 400, headers });
-        if (request.method === "GET") return json(this.#shareLinks.comments(before === null ? undefined : Number(before)), { headers });
-        if (url.search) return json({ error: "invalid_request" }, { status: 400, headers });
+      if (url.pathname === "/share/turns") {
+        if (request.method !== "POST" || url.search) return json({ error: "forbidden" }, { status: 403, headers });
         if (!request.headers.get("origin")
           || request.headers.get("origin") !== request.headers.get("x-nanocodex-verified-share-origin"))
           return json({ error: "forbidden_origin" }, { status: 403, headers });
-        if (request.method !== "POST") return json({ error: "forbidden" }, { status: 403, headers });
+        if (link.permission !== "write" || !link.authorization_json)
+          return json({ error: "forbidden" }, { status: 403, headers });
         if (request.headers.get("content-type")?.split(";")[0] !== "application/json")
           return json({ error: "invalid_request" }, { status: 400, headers });
-        const encoded = await request.text();
-        if (encoded.length > 5000) return json({ error: "invalid_request" }, { status: 400, headers });
-        let candidate: unknown;
-        try { candidate = JSON.parse(encoded); }
-        catch { return json({ error: "invalid_request" }, { status: 400, headers }); }
-        const result = this.#shareLinks.comment(bearer, candidate);
-        return result.value ? json(result.value, { status: result.status, headers })
-          : json({ error: result.status === 404 ? "not_found" : "comment_rejected" }, { status: result.status, headers });
+        let pinned: TurnAuthorization;
+        try { pinned = parseTurnAuthorization(link.authorization_json); }
+        catch { return json({ error: "forbidden" }, { status: 403, headers }); }
+        if (pinned.connectGrant || !pinned.capabilities.includes("agents:write"))
+          return json({ error: "forbidden" }, { status: 403, headers });
+        const authorization: TurnAuthorization = { capabilities: ["agents:read", "agents:write"],
+          connectGrant: { grantId: `0x${createHash("sha256").update(`share:${link.id}`).digest("hex")}`,
+            connectors: ["chatgpt"], mcpIds: [] }, guestShareLinkId: link.id };
+        return this.#submitHttpTurn(request, authorization, (turnId, newTurn) => {
+          const result = this.#shareLinks.admit(bearer, link.id, turnId, newTurn);
+          if (result === "revoked") throw new ManagedRequestError(404, "not_found", "share link revoked");
+          if (result === "rate_limited") throw new ManagedRequestError(429, "share_turn_rate_limit", "share link turn admission limit reached");
+        });
       }
       if (request.method !== "GET") return json({ error: "forbidden" }, { status: 403, headers });
       const beforeParam = url.searchParams.get("before");
@@ -4231,11 +4272,10 @@ export class DurableAgentSession extends DurableComputerObject {
         return json({ error: "invalid_history_page" }, { status: 400, headers });
       try {
         const page = await this.#eventArchive.history(this.#eventLog, beforeParam ?? undefined, Number(limitParam));
-        // Never spread the raw event: tool events, reasoning, usage and arbitrary fields
-        // are intentionally absent from this separate public projection.
+        // Only normal Chat transcript events are projected; private transport fields remain owner-only.
         const data = page.data.flatMap(event => {
           const projected = projectSharedEvent(event);
-          return projected && projected.type !== "assistant_delta" ? [projected] : [];
+          return projected ? [projected] : [];
         });
         // Revocation during an archived R2 read must not disclose the decoded page.
         if (!this.#shareLinks.validate(bearer)) return json({ error: "not_found" }, { status: 404, headers });
@@ -4243,7 +4283,7 @@ export class DurableAgentSession extends DurableComputerObject {
           next_cursor: page.has_more ? page.data[0]?.cursor ?? null : null }, { headers });
       } catch { return json({ error: "event_archive_unavailable" }, { status: 503, headers }); }
     }
-    if (url.pathname === "/share-comments" || url.pathname === "/share-links" || /^\/share-links\/[^/]+$/.test(url.pathname)) {
+    if (url.pathname === "/share-links" || /^\/share-links\/[^/]+$/.test(url.pathname)) {
       const headers = { "cache-control": "no-store" };
       if (!ownerAssertion || turnAuthorization.connectGrant
         || !turnAuthorization.capabilities.includes("agents:read")
@@ -4252,14 +4292,6 @@ export class DurableAgentSession extends DurableComputerObject {
       const session = this.#session();
       if (!session || session.runtime_profile !== "managed" || this.#deleting || this.#deleted || this.#durabilityExported)
         return json({ error: "not_found" }, { status: 404, headers });
-      if (request.method === "GET" && url.pathname === "/share-comments") {
-        const before = url.searchParams.get("before");
-        if ([...url.searchParams.keys()].some(key => key !== "before" && key !== "public_origin")
-          || url.searchParams.getAll("before").length > 1 || before !== null && (!/^[1-9]\d*$/.test(before)
-            || !Number.isSafeInteger(Number(before))))
-          return json({ error: "invalid_request" }, { status: 400, headers });
-        return json(this.#shareLinks.comments(before === null ? undefined : Number(before)), { headers });
-      }
       if (request.method === "GET" && url.pathname === "/share-links")
         return json({ data: this.#shareLinks.list() }, { headers });
       if (request.method === "DELETE") {
@@ -4279,7 +4311,7 @@ export class DurableAgentSession extends DurableComputerObject {
         || !["read", "write"].includes((parsed as { permission?: string }).permission ?? ""))
         return json({ error: "invalid_request" }, { status: 400, headers });
       const permission = (parsed as { permission: SharePermission }).permission;
-      const created = this.#shareLinks.create(permission);
+      const created = this.#shareLinks.create(permission, JSON.stringify(turnAuthorization));
       if (!created) return json({ error: "share_link_limit" }, { status: 429, headers });
       const { token, revoked_at: _revoked, ...link } = created;
       const publicOrigin = url.searchParams.get("public_origin") ?? session.public_origin;
@@ -6557,6 +6589,7 @@ export class DurableAgentSession extends DurableComputerObject {
   async #submitHttpTurn(
     request: Request,
     authorization: TurnAuthorization,
+    beforeAdmission?: (turnId: string, newTurn: boolean) => void,
   ): Promise<Response> {
     if (this.#deleting) return json({ error: "agent_deleting" }, { status: 409 });
     if (authorization.connectGrant
@@ -6565,7 +6598,29 @@ export class DurableAgentSession extends DurableComputerObject {
     }
     let value: unknown;
     try {
-      value = await request.json();
+      if (authorization.guestShareLinkId) {
+        // Public bearer writes are deliberately smaller than the owner API's input envelope.
+        const reader = request.body?.getReader();
+        if (!reader) return json({ error: "invalid_json" }, { status: 400 });
+        let size = 0;
+        const chunks: Uint8Array[] = [];
+        try {
+          for (;;) {
+            const { done, value: chunk } = await reader.read();
+            if (done) break;
+            size += chunk.byteLength;
+            if (size > 32_768) {
+              void reader.cancel().catch(() => {});
+              return json({ error: "request_too_large" }, { status: 413 });
+            }
+            chunks.push(chunk);
+          }
+        } finally { reader.releaseLock(); }
+        const bytes = new Uint8Array(size);
+        let offset = 0;
+        for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+        value = JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes));
+      } else value = await request.json();
     } catch {
       return json({ error: "invalid_json" }, { status: 400 });
     }
@@ -6630,14 +6685,16 @@ export class DurableAgentSession extends DurableComputerObject {
       const input = body.input;
       const id = typeof body.id === "string" ? body.id : uuidV7();
       const requestHash = await hashManagedInput(input);
+      beforeAdmission?.(id, false);
       const submission = await this.#submitManagedTurn(
         id,
         input,
         requestHash,
-        requestKey,
+        requestKey === null || !authorization.guestShareLinkId ? requestKey : `share:${authorization.guestShareLinkId}:${requestKey}`,
         body.id !== undefined,
         authorization,
-        undefined, undefined, "http", callerContext(request.headers),
+        beforeAdmission === undefined ? undefined : () => beforeAdmission(id, true), undefined, "http", authorization.guestShareLinkId ? {} : callerContext(request.headers),
+        true, beforeAdmission === undefined ? undefined : () => beforeAdmission(id, false),
       );
       const view = managedTurnView(submission.row);
       const summary = submission.created
@@ -7536,6 +7593,7 @@ export class DurableAgentSession extends DurableComputerObject {
     transport: import("./startup-context").StartupTransport = "unknown",
     caller: CallerContext = {},
     userInitiated = true,
+    beforeReplay?: () => void,
   ): Promise<ManagedTurnSubmission> {
     await this.#settingsMutationTail;
     if (this.#deleting || this.#deleted) {
@@ -7570,6 +7628,7 @@ export class DurableAgentSession extends DurableComputerObject {
     }
     const existing = keyed ?? identified;
     if (existing) {
+      beforeReplay?.();
       const retained = this.#managedTurn(existing.id);
       const owner = retained ? parseTurnAuthorization(retained.authorization_json).connectGrant?.grantId ?? null
         : this.#operations.turnOwner(existing.id);
@@ -7615,7 +7674,8 @@ export class DurableAgentSession extends DurableComputerObject {
     let goalCommandResult: { text: string; continue: boolean } | undefined;
     let controlledGoalId: string | undefined;
     const now = Date.now();
-    const accepted: StreamMessage = { type: "turn_accepted", id, input, replayed: false };
+    const accepted: StreamMessage = { type: "turn_accepted", id, input, replayed: false,
+      ...(authorization.guestShareLinkId ? { author: "guest", share_link_id: authorization.guestShareLinkId } : {}) };
     const firstPrompt = conversationTitle(promptInputText(input));
     let event: DurableEvent<StreamMessage> | undefined;
     let cancellingEvent: DurableEvent<StreamMessage> | undefined;
