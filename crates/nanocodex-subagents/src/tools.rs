@@ -1155,6 +1155,33 @@ mod strict_spawn_tests {
     }
 
     #[test]
+    fn malformed_contracts_and_legacy_schema_fail_before_child_reservation() {
+        for output_contract in [
+            json!("array"),
+            json!([]),
+            json!({ "kind": "array", "items": [] }),
+            json!({ "kind": "object", "fields": [{
+                "name": "value", "schema": { "kind": "string" },
+                "required": true, "unexpected": true
+            }] }),
+        ] {
+            assert!(
+                serde_json::from_value::<SpawnAgentTask>(json!({
+                    "role": "auditor", "task": "check", "model": null,
+                    "thinking": null, "output_contract": output_contract
+                }))
+                .is_err()
+            );
+        }
+        let legacy: SpawnAgentTask = serde_json::from_value(json!({
+            "role": "auditor", "task": "check", "output_schema": "array"
+        }))
+        .unwrap();
+        let (task, _) = legacy.into_parts().unwrap();
+        assert!(prepare_batch(vec![task]).is_err());
+    }
+
+    #[test]
     fn legacy_in_flight_schema_remains_accepted_but_not_advertised() {
         let parsed: SpawnAgentTask = serde_json::from_value(json!({
             "role": "old", "task": "already started", "output_schema": { "type": "string" }
