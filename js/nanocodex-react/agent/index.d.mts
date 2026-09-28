@@ -114,6 +114,8 @@ export type AgentControllerSnapshot = Readonly<{
   running: boolean;
   status: string;
   pendingTurns: number;
+  /** Locally retained root submissions that have not started yet. */
+  pendingPrompts: readonly Readonly<{ id: number; text: string; turnId?: string; state: "queued" | "cancelling" }>[];
   isLoadingOlder: boolean;
   canLoadOlder: boolean;
   hasOlder: boolean | undefined;
@@ -121,6 +123,8 @@ export type AgentControllerSnapshot = Readonly<{
   submit(input: string, options?: SubmitOptions): Promise<AgentTurn | undefined>;
   steer(input: string, options?: Omit<SubmitOptions, "intent">): Promise<AgentTurn | undefined>;
   cancel(): Promise<boolean>;
+  /** Withdraw a specific queued root; never substitute a different active turn. */
+  cancelPrompt(id: number): Promise<boolean>;
   clear(): void;
   loadOlder(): Promise<boolean>;
   /** Permanently releases this mounted controller. Normal React unmount cleanup is automatic. */

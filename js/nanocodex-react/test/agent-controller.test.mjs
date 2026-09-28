@@ -160,6 +160,37 @@ test("prompt controls steer active work, queue roots, cancel the latest turn, an
   }
 });
 
+test("queued message controls withdraw only the selected root", async () => {
+  const frames = fakeAnimationFrames();
+  const source = fakeAgent();
+  let controller, root;
+  function Consumer() { controller = useAgentController(source.agent); return null; }
+  try {
+    await act(async () => { root = create(createElement(Consumer)); });
+    await act(async () => { await controller.submit("first"); });
+    source.emit(event(1, "run.started", { turn_id: "turn-1" }));
+    await act(async () => {
+      await controller.submit("second", { intent: "queue" });
+      await controller.submit("third", { intent: "queue" });
+    });
+    await flushFrames(frames);
+    assert.deepEqual(controller.pendingPrompts.map(({ text }) => text), ["second", "third"]);
+    const [second, third] = controller.pendingPrompts;
+    await act(async () => { assert.equal(await controller.cancelPrompt(second.id), true); });
+    assert.equal(source.turns[1].cancelled, true);
+    assert.equal(source.turns[2].cancelled, false);
+    assert.equal((await controller.cancelPrompt(9000)), false);
+    await flushFrames(frames);
+    assert.equal(controller.pendingPrompts[0].state, "cancelling");
+    await act(async () => source.turns[1].fail(Object.assign(new Error("cancelled"), { code: "turn_cancelled" })));
+    await flushFrames(frames);
+    assert.deepEqual(controller.pendingPrompts.map(({ id }) => id), [third.id]);
+  } finally {
+    if (root) await act(async () => root.unmount());
+    frames.restore();
+  }
+});
+
 for (const completion of ["cancelled", "completed"]) {
   test(`Stop fences a pending correction even when the old turn ${completion}`, async () => {
     const frames = fakeAnimationFrames();
