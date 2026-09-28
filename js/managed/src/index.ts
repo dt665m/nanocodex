@@ -9400,7 +9400,16 @@ export class DurableAgentSession extends DurableComputerObject {
       this.#processSessions,
     );
     const cloudTools: NamedTool[] = [
-      ...(browserRuntime?.tools ?? []),
+      ...(browserRuntime?.tools.map(tool => ({
+        ...tool,
+        handler: (input, context) => {
+          // The retained browser belongs to the account thread. A public link
+          // never inherits existing authenticated tabs or private login state.
+          if (this.#authorizationForToolContext(context)?.guestShareLinkId)
+            throw new ManagedRequestError(403, "browser_forbidden", "shared guests cannot use the owner's browser");
+          return tool.handler(input, context);
+        },
+      } satisfies NamedTool)) ?? []),
       ...(multiplayer ? [computer.tool] : []),
       ...(multiplayer ? [] : [managedMountTool(async (request, context) => {
         if (!turnCanProvisionExecutionProvider(this.#authorizationForToolContext(context), request.provider)) {
