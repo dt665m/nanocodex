@@ -37,7 +37,15 @@ final class InboxUITests: XCTestCase {
         let field = app.secureTextFields["secure-input-password"]
         if !field.isHittable { app.scrollViews["secure-input-review"].swipeDown() }
         field.tap(); field.typeText("synthetic-native-secret")
-        app.buttons["secure-input-submit"].tap()
+        let run = app.buttons["secure-input-submit"]
+        XCTAssertEqual(run.label, "Authenticate & run as root")
+        XCTAssertFalse(run.isEnabled)
+        let confirmation = app.switches["native-secure-command-confirm"]
+        if !confirmation.isHittable { app.scrollViews["secure-input-review"].swipeUp() }
+        XCTAssertTrue(confirmation.waitForExistence(timeout: 5))
+        confirmation.tap()
+        XCTAssertTrue(run.isEnabled)
+        run.tap()
         XCTAssertTrue(app.staticTexts["Authentication denied"].waitForExistence(timeout: 5))
         XCTAssertTrue(app.staticTexts["Submission attempts: 0"].exists)
         XCTAssertFalse(app.staticTexts["synthetic-native-secret"].exists)
@@ -62,6 +70,7 @@ final class InboxUITests: XCTestCase {
         XCTAssertTrue(field.waitForExistence(timeout: 5), "Password input must use native secure text entry")
         field.tap(); field.typeText("synthetic-password")
         XCTAssertNotEqual(field.value as? String, "synthetic-password")
+        XCTAssertEqual(app.buttons["secure-input-submit"].label, "Send password to website")
         app.buttons["secure-input-submit"].tap()
         XCTAssertTrue(app.staticTexts["Sensitive fields filled in browser."].waitForExistence(timeout: 5))
         XCTAssertFalse(app.staticTexts["synthetic-password"].exists)
@@ -82,6 +91,7 @@ final class InboxUITests: XCTestCase {
         sheet.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.02))
             .press(forDuration: 0.1, thenDragTo: app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.08)))
         let submit = app.buttons["secure-input-submit"]
+        XCTAssertEqual(submit.label, "Fill fields only")
         XCTAssertFalse(submit.isEnabled)
         let samples = [("card", "4242424242424242"), ("expiry", "1230"), ("cvc", "123")]
         for (id, sample) in samples {
