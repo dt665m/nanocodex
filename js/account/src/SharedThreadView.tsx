@@ -1,22 +1,21 @@
 import { ArrowLeft, LockKeyhole, MessageCircle, RefreshCw } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { AgentEntry } from "nanocodex-react/agent";
+import type { Agent, AgentEvent } from "nanocodex-react/agent";
 import { TerminalComposer } from "nanocodex-terminal/composer";
-import { TerminalTranscriptSurface } from "nanocodex-terminal/transcript";
+import { AgentTerminalView } from "nanocodex-terminal";
 import "nanocodex-terminal/styles.css";
 import "./AgentTerminal.css";
 import "./Home.css";
 import "./ThreadSharing.css";
 
 type SharedMetadata = { agent_id?: string; title?: string; permission: "read" | "write"; latest_event_cursor?: string };
-type SharedEvent = { cursor: string; type: "turn_accepted" | "turn_completed"; turn_id?: string | null; id?: string; input?: string; final_message?: string };
-type LiveDelta = { cursor: string; turn_id: string | null; text: string };
-type Comment = { id: string; input: string; createdAt?: string | number; created_at?: string | number };
+type SharedEvent = { cursor: string; type: "turn_accepted" | "turn_completed" | "event" | "assistant_delta"; turn_id?: string | null; id?: string; input?: string; final_message?: string; delta?: string; author?: string; event?: AgentEvent };
+type PendingTurn = { id: string; input: string };
 const revokedMessage = "This link is invalid or has been revoked.";
 const after = (a: string, b: string) => BigInt(a) > BigInt(b);
 const byCursor = (a: { cursor: string }, b: { cursor: string }) => BigInt(a.cursor) < BigInt(b.cursor) ? -1 : BigInt(a.cursor) > BigInt(b.cursor) ? 1 : 0;
 
-// Guest access is intentionally isolated from account cookies, owner sessions and the agent SDK.
+// Guest access is isolated from account cookies and owner sessions.
 // The fragment bearer never enters a URL request, browser storage, telemetry or a tool call.
 export function SharedThreadView({ agentId }: { agentId: string }) {
   const [token] = useState(() => {
@@ -26,19 +25,19 @@ export function SharedThreadView({ agentId }: { agentId: string }) {
   const base = `/v1/shared/${encodeURIComponent(agentId)}`;
   const [meta, setMeta] = useState<SharedMetadata | null>(null);
   const [events, setEvents] = useState<SharedEvent[]>([]);
-  const [live, setLive] = useState<LiveDelta[]>([]);
-  const [comments, setComments] = useState<Comment[]>([]);
+  const [optimistic, setOptimistic] = useState<PendingTurn[]>([]);
+  const eventListeners = useRef(new Set<(event: AgentEvent) => void>());
+  const historyListeners = useRef(new Set<(events: readonly AgentEvent[]) => void>());
+  const historySnapshot = useRef<readonly AgentEvent[]>([]);
+  const loadOlderRef = useRef<() => Promise<boolean>>(async () => false);
   const [olderCursor, setOlderCursor] = useState<string | null>(null);
   const [olderPending, setOlderPending] = useState(false);
   const historyExhausted = useRef(false);
-  const [olderCommentsCursor, setOlderCommentsCursor] = useState<string | null>(null);
-  const [olderCommentsPending, setOlderCommentsPending] = useState(false);
-  const commentsExhausted = useRef(false);
   const streamCursor = useRef<string | null>(null);
   const accessEpoch = useRef(0);
   const [draft, setDraft] = useState("");
   const [pending, setPending] = useState(false);
-  const pendingComment = useRef<{ id: string; input: string } | null>(null);
+  const pendingTurn = useRef<PendingTurn | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const read = useCallback(async (path: string, signal?: AbortSignal) => {
@@ -47,10 +46,10 @@ export function SharedThreadView({ agentId }: { agentId: string }) {
     return response.json() as Promise<unknown>;
   }, [base, token]);
   const invalidate = useCallback((message = revokedMessage) => {
-    // Ignore any earlier history/comment requests that complete after a revoke.
+    // Ignore any earlier history requests that complete after a revoke.
     accessEpoch.current++;
-    setLoading(false); setPending(false); setOlderPending(false); setOlderCommentsPending(false);
-    setMeta(null); setEvents([]); setLive([]); setComments([]); setOlderCursor(null); setOlderCommentsCursor(null); setError(message);
+    setLoading(false); setPending(false); setOlderPending(false);
+    setMeta(null); setEvents([]); setOptimistic([]); setOlderCursor(null); pendingTurn.current = null; setError(message);
   }, []);
   const refresh = useCallback(async (signal?: AbortSignal) => {
     const epoch = accessEpoch.current;
@@ -58,17 +57,12 @@ export function SharedThreadView({ agentId }: { agentId: string }) {
     setLoading(true); setError("");
     try {
       const metadata = await read("", signal) as SharedMetadata;
-      const [history, annotations] = await Promise.all([read("/events/history", signal), read("/comments", signal)]) as [
-        { data: SharedEvent[]; has_more: boolean; next_cursor?: string },
-        { data: Comment[]; has_more?: boolean; next_cursor?: string },
-      ];
+      const history = await read("/events/history", signal) as { data: SharedEvent[]; has_more: boolean; next_cursor?: string };
       if (signal?.aborted || epoch !== accessEpoch.current) return;
       streamCursor.current ??= metadata.latest_event_cursor ?? "0";
       setMeta(metadata);
       setEvents((previous) => mergeEvents(previous, Array.isArray(history.data) ? history.data : []));
       setOlderCursor((current) => current ?? (!historyExhausted.current && history.has_more ? history.next_cursor ?? null : null));
-      setComments((previous) => mergeComments(previous, annotations.data ?? []));
-      setOlderCommentsCursor((current) => current ?? (!commentsExhausted.current && annotations.has_more ? annotations.next_cursor ?? null : null));
     } catch (cause) {
       if (!signal?.aborted && epoch === accessEpoch.current) {
         if (cause instanceof Error && cause.message === revokedMessage) invalidate();
@@ -117,20 +111,13 @@ export function SharedThreadView({ agentId }: { agentId: string }) {
               buffer = buffer.slice(boundary + 2);
               const data = frame.split("\n").filter((line) => line.startsWith("data: ")).map((line) => line.slice(6)).join("\n");
               if (!data) continue;
-              const event = JSON.parse(data) as SharedEvent | { cursor: string; type: "assistant_delta"; turn_id: string | null; delta: string };
+              const event = JSON.parse(data) as SharedEvent;
               if (typeof event.cursor !== "string" || !/^\d+$/.test(event.cursor) || !after(event.cursor, streamCursor.current ?? "0")) continue;
               streamCursor.current = event.cursor;
-              if (event.type === "assistant_delta") {
-                if (typeof event.delta !== "string") continue;
-                setLive((current) => {
-                  const prior = current.find((row) => row.turn_id === event.turn_id);
-                  return prior ? current.map((row) => row === prior ? { ...row, cursor: event.cursor, text: row.text + event.delta } : row)
-                    : [...current, { cursor: event.cursor, turn_id: event.turn_id, text: event.delta }];
-                });
-              } else if (event.type === "turn_accepted" || event.type === "turn_completed") {
+              const sdk = projectEvent(event, agentId);
+              if (sdk) for (const listener of eventListeners.current) listener(sdk);
+              if (event.type === "turn_accepted" || event.type === "turn_completed" || event.type === "event")
                 setEvents((current) => mergeEvents(current, [event]));
-                if (event.type === "turn_completed") setLive((current) => current.filter((row) => row.turn_id !== (event.turn_id ?? event.id)));
-              }
             }
           }
           if (active && !controller.signal.aborted && epoch === accessEpoch.current) {
@@ -148,11 +135,11 @@ export function SharedThreadView({ agentId }: { agentId: string }) {
     };
     void connect();
     return () => { active = false; controller.abort(); };
-  }, [base, token, Boolean(meta), read, invalidate]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [base, token, Boolean(meta), read, invalidate, agentId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   function showGuestError(cause: unknown, fallback: string) {
     const message = cause instanceof Error ? cause.message : fallback;
-    if (message === revokedMessage || message === "Comment access is no longer available.") invalidate(message);
+    if (message === revokedMessage) invalidate(message);
     else setError(message);
   }
   async function loadOlder(): Promise<boolean> {
@@ -169,85 +156,66 @@ export function SharedThreadView({ agentId }: { agentId: string }) {
     } catch (cause) { if (epoch === accessEpoch.current) showGuestError(cause, "Couldn’t load earlier messages."); return false; }
     finally { setOlderPending(false); }
   }
-  async function loadOlderComments() {
-    if (!olderCommentsCursor || olderCommentsPending) return;
-    const epoch = accessEpoch.current;
-    setOlderCommentsPending(true); setError("");
-    try {
-      const page = await read(`/comments?before=${encodeURIComponent(olderCommentsCursor)}`) as { data: Comment[]; has_more: boolean; next_cursor?: string };
-      if (epoch !== accessEpoch.current) return;
-      setComments((current) => mergeComments(current, page.data));
-      if (!page.has_more) commentsExhausted.current = true;
-      setOlderCommentsCursor(page.has_more ? page.next_cursor ?? null : null);
-    } catch (cause) { if (epoch === accessEpoch.current) showGuestError(cause, "Couldn’t load earlier comments."); }
-    finally { setOlderCommentsPending(false); }
-  }
+  loadOlderRef.current = loadOlder;
+  const history = useMemo(() => projectHistory(events, optimistic, agentId), [events, optimistic, agentId]);
+  useEffect(() => {
+    historySnapshot.current = history;
+    for (const listener of historyListeners.current) listener(history);
+  }, [history]);
+  const agent = useMemo<Agent>(() => ({
+    sessionId: agentId,
+    events: { watch: () => ({
+      onEvent(listener) { eventListeners.current.add(listener); return () => eventListeners.current.delete(listener); },
+      onHistory(listener) { historyListeners.current.add(listener); listener(historySnapshot.current); return () => historyListeners.current.delete(listener); },
+      loadOlder: () => loadOlderRef.current(),
+      off() {},
+    }) },
+    turn: { prompt: ({ input, id: providedId }: { input: string; id?: string }) => {
+      const id = providedId ?? crypto.randomUUID();
+      const response = fetch(`${base}/turns`, { method: "POST", credentials: "omit", cache: "no-store",
+        headers: { Authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify({ id, input }) });
+      return { historyEntryId: `managed-user-${id}`, steer: async () => { throw Error("Steering is unavailable on shared links."); },
+        cancel: async () => { throw Error("Cancellation is unavailable on shared links."); },
+        result: async () => { const result = await response; if (!result.ok) throw Error(result.status === 403 || result.status === 404 ? revokedMessage : "Couldn’t confirm your message. Send again to retry."); return { finalMessage: "", dispose() {} }; },
+        dispose() {}, };
+    } },
+  }), [agentId, base, token]);
   async function submit(value: string) {
     const input = value.trim();
     if (!input || pending || meta?.permission !== "write") return;
-    // Preserve the exact intended write and ID after an uncertain response.
-    const candidate = pendingComment.current?.input === input ? pendingComment.current : { id: crypto.randomUUID(), input };
-    pendingComment.current = candidate;
+    const candidate = pendingTurn.current?.input === input ? pendingTurn.current : { id: crypto.randomUUID(), input };
+    pendingTurn.current = candidate;
+    setOptimistic((current) => current.some((turn) => turn.id === candidate.id) ? current : [...current, candidate]);
     const epoch = accessEpoch.current;
     setPending(true); setError("");
-    const accept = (comment: Comment) => {
-      if (epoch !== accessEpoch.current) return;
-      setComments((current) => mergeComments(current, [comment]));
-      pendingComment.current = null;
-      setDraft("");
-    };
     try {
-      const response = await fetch(`${base}/comments`, { method: "POST", credentials: "omit", headers: { Authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify(candidate) });
-      if (!response.ok) throw new Error(response.status === 403 || response.status === 404 ? "Comment access is no longer available." : "Couldn’t confirm your comment. Try again.");
-      accept(await response.json() as Comment);
+      // The guest adapter uses the same turn.prompt contract as the owned terminal.
+      const turn = agent.turn.prompt({ input, id: candidate.id } as { input: string; id: string });
+      await turn.result();
+      if (epoch !== accessEpoch.current) return;
+      pendingTurn.current = null;
+      setDraft("");
+      void refresh();
     } catch (cause) {
-      try {
-        const page = await read("/comments") as { data: Comment[] };
-        const confirmed = page.data.find((item) => item.id === candidate.id && item.input === candidate.input);
-        if (confirmed) { accept(confirmed); return; }
-      } catch { /* The original error is more useful than a second read error. */ }
-      if (epoch === accessEpoch.current) showGuestError(cause, "Couldn’t confirm your comment. Try again.");
-    } finally { setPending(false); }
+      if (epoch === accessEpoch.current) showGuestError(cause, "Couldn’t confirm your message. Send again to retry.");
+    } finally { if (epoch === accessEpoch.current) setPending(false); }
   }
-  const transcript = useMemo((): AgentEntry[] => {
-    const completed = new Set(events.filter((event) => event.type === "turn_completed").map((event) => event.turn_id ?? event.id));
-    const rows: Array<AgentEntry & { cursor: string }> = [];
-    for (const event of events) {
-      if (event.type === "turn_accepted" && typeof event.input === "string")
-        rows.push({ id: `user-${event.cursor}`, cursor: event.cursor, kind: "user", text: event.input });
-      if (event.type === "turn_completed" && typeof event.final_message === "string")
-        rows.push({ id: `answer-${event.cursor}`, cursor: event.cursor, kind: "assistant", text: event.final_message, streaming: false });
-    }
-    for (const row of live) if (!completed.has(row.turn_id ?? undefined) && row.text)
-      rows.push({ id: `live-${row.turn_id ?? "latest"}`, cursor: row.cursor, kind: "assistant", text: row.text, streaming: true });
-    return rows.sort(byCursor).map(({ cursor: _cursor, ...entry }) => entry);
-  }, [events, live]);
-  const commentComposer = meta?.permission === "write"
-    ? <div className="shared-chat-dock">
-      <details className="shared-chat-comments"><summary><MessageCircle aria-hidden="true" /> Comments ({comments.length})</summary>
-        <div className="shared-chat-comments-body" aria-label="Comments">
-          {olderCommentsCursor ? <button type="button" className="shared-thread-older" disabled={olderCommentsPending} onClick={() => { void loadOlderComments(); }}>{olderCommentsPending ? "Loading…" : "Load earlier comments"}</button> : null}
-          {comments.length ? comments.map((comment) => <p key={comment.id}><strong>Guest comment</strong><span>{comment.input}</span></p>) : <p>No comments yet.</p>}
-        </div>
-      </details>
-      <TerminalComposer formLabel="Guest comment composer" inputLabel="Comment on this thread" sendLabel="Post comment"
-        draft={draft} onChange={setDraft} onSubmit={(value) => { void submit(value); }}
-        onCancel={() => {}} pending={pending} running={false} status="ready" placeholder="Leave a comment for the thread owner…" />
-      <span className="shared-chat-comment-note">Comments won’t be sent to the AI.</span>
-    </div>
-    : <div className="shared-chat-dock"><details className="shared-chat-comments"><summary><MessageCircle aria-hidden="true" /> Comments ({comments.length})</summary>
-      <div className="shared-chat-comments-body" aria-label="Comments">{comments.map((comment) => <p key={comment.id}><strong>Guest comment</strong><span>{comment.input}</span></p>)}</div>
-    </details><p className="shared-thread-readonly"><LockKeyhole aria-hidden="true" /> This link is view only.</p></div>;
+  const guestTurns = new Set(events.filter((row) => row.type === "turn_accepted" && row.author === "guest").map((row) => row.turn_id ?? row.id));
+  for (const turn of optimistic) guestTurns.add(turn.id);
+  const composer = meta?.permission === "write"
+    ? <TerminalComposer draft={draft} onChange={setDraft} onSubmit={(value) => { void submit(value); }}
+        onCancel={() => {}} pending={pending} running={false} status="ready" placeholder="Message Nanocodex…" />
+    : <p className="shared-thread-readonly"><LockKeyhole aria-hidden="true" /> This link is view only.</p>;
 
   return <main className="nanocodex-demo chat-workspace is-full shared-chat-workspace">
     <div className="conversation-workspace">
       <aside className="shared-chat-sidebar" aria-label="Shared conversation"><a href="/" className="shared-thread-brand"><span className="paradigm-mark" aria-hidden="true" /> Nanocodex</a>
         <div className="shared-chat-sidebar-thread"><MessageCircle aria-hidden="true" /><span>{meta?.title || "Shared thread"}</span></div>
-        <p><LockKeyhole aria-hidden="true" /> {meta?.permission === "write" ? "Comments enabled" : "View only"}</p>
+        <p><LockKeyhole aria-hidden="true" /> {meta?.permission === "write" ? "Can send messages" : "View only"}</p>
       </aside>
       <div className="conversation-main">
         <header className="agent-chat-header"><a href="/" aria-label="Nanocodex home" className="shared-chat-back"><ArrowLeft aria-hidden="true" /></a>
-          <div className="agent-chat-heading"><strong>{meta?.title || "Shared thread"}</strong><span>Shared conversation · {meta?.permission === "write" ? "comments enabled" : "view only"}</span></div>
+          <div className="agent-chat-heading"><strong>{meta?.title || "Shared thread"}</strong><span>Shared conversation · {meta?.permission === "write" ? "can send messages" : "view only"}</span></div>
           <div className="agent-chat-header-actions">
             {olderCursor ? <button type="button" className="shared-thread-older" disabled={olderPending} aria-label="Load earlier messages" onClick={() => { void loadOlder(); }}><span className="shared-chat-older-wide">Load earlier messages</span><span className="shared-chat-older-short">Earlier</span></button> : null}
             <button type="button" className="chat-icon-button" onClick={() => { void refresh(); }} disabled={loading} aria-label="Refresh shared thread" title="Refresh shared thread"><RefreshCw aria-hidden="true" /></button>
@@ -255,25 +223,44 @@ export function SharedThreadView({ agentId }: { agentId: string }) {
         </header>
         {loading && !meta ? <p role="status" className="shared-thread-state">Opening shared thread…</p> : null}
         {error && !meta ? <div role="alert" className="shared-thread-state"><h1>Can’t open this thread</h1><p>{error}</p><button type="button" onClick={() => { void refresh(); }}>Try again</button></div> : null}
-        {meta ? <><div className="shared-chat-boundary"><LockKeyhole aria-hidden="true" /> A view of this conversation. Comments are visible to the owner but never start an AI turn.</div>
+        {meta ? <><div className="shared-chat-boundary"><LockKeyhole aria-hidden="true" /> You’re in a shared conversation. Messages you send start a real AI turn.</div>
           {error ? <p className="shared-thread-error" role="alert">{error}</p> : null}
-          <div className="agent-terminal-workspace"><TerminalTranscriptSurface entries={transcript} composer={commentComposer}
-            canLoadOlder={Boolean(olderCursor)} isLoadingOlder={olderPending} mode="full" status="ready" inactiveMessage=""
-            welcome={loading ? "Opening shared thread…" : "No messages have been shared yet."} onLoadOlder={loadOlder} /></div>
+          <AgentTerminalView agent={agent} agentError={undefined} mode="full" voice={false}
+            onConversationActivity={() => {}} onStateChange={() => {}} retryAgent={() => { void refresh(); }}
+            composer={composer} userLabel={(entry) => entry.turnId && guestTurns.has(entry.turnId) ? "Guest" : "Owner"} welcome={loading ? "Opening shared thread…" : "No messages have been shared yet."} />
         </> : null}
       </div>
     </div>
   </main>;
 }
 
+function projectEvent(row: SharedEvent, sessionId: string): AgentEvent | null {
+  const turnId = row.turn_id ?? row.id;
+  const seq = Number(row.cursor);
+  if (!Number.isSafeInteger(seq)) return null;
+  if (row.type === "event" && row.event && typeof row.event.type === "string")
+    return { ...row.event, request_id: sessionId, seq, payload: row.event.payload ?? {} };
+  const payload = turnId ? { turn_id: turnId } : {};
+  if (row.type === "turn_accepted" && typeof row.input === "string")
+    return { request_id: sessionId, seq, type: "managed.prompt", payload: { ...payload, text: row.input, author: row.author } };
+  if (row.type === "assistant_delta" && typeof row.delta === "string")
+    return { request_id: sessionId, seq, type: "assistant.delta", payload: { ...payload, text: row.delta } };
+  if (row.type === "turn_completed" && typeof row.final_message === "string")
+    return { request_id: sessionId, seq, type: "assistant.message", payload: { ...payload, text: row.final_message } };
+  return null;
+}
+function projectHistory(rows: SharedEvent[], optimistic: PendingTurn[], sessionId: string): readonly AgentEvent[] {
+  const accepted = new Set(rows.filter((row) => row.type === "turn_accepted").map((row) => row.turn_id ?? row.id));
+  const projected = rows.map((row) => projectEvent(row, sessionId)).filter((row): row is AgentEvent => Boolean(row));
+  for (const turn of optimistic) if (!accepted.has(turn.id)) projected.push({
+    request_id: sessionId, seq: Number.MAX_SAFE_INTEGER - optimistic.length + optimistic.indexOf(turn),
+    type: "managed.prompt", payload: { turn_id: turn.id, text: turn.input, author: "guest" },
+  });
+  return projected;
+}
 function mergeEvents(previous: SharedEvent[], incoming: SharedEvent[]) {
   const unique = new Map(previous.map((item) => [item.cursor, item]));
   for (const event of incoming) if (event && typeof event.cursor === "string" && /^\d+$/.test(event.cursor)
-    && (event.type === "turn_accepted" || event.type === "turn_completed")) unique.set(event.cursor, event);
+    && (event.type === "turn_accepted" || event.type === "turn_completed" || event.type === "event")) unique.set(event.cursor, event);
   return [...unique.values()].sort(byCursor);
-}
-function mergeComments(previous: Comment[], incoming: Comment[]) {
-  const unique = new Map(previous.map((item) => [item.id, item]));
-  for (const item of incoming) if (item?.id) unique.set(item.id, item);
-  return [...unique.values()].sort((a, b) => Number(a.created_at ?? a.createdAt ?? 0) - Number(b.created_at ?? b.createdAt ?? 0));
 }

@@ -1,4 +1,4 @@
-// Behavioral browser journey: owner creates/revokes a link, guest reads and contributes without cookies.
+// Behavioral browser journey: owner creates/revokes a link, guest sends an actual AI turn without cookies.
 // Repro: SIDEBAR_BROWSER_CHANNEL=chrome node js/account/scripts/thread-share-smoke.mjs
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
@@ -17,7 +17,7 @@ const events = [{cursor:'1',created_at:Date.now(),type:'turn_accepted',id:'initi
 let revoked = false;
 const streams=new Set();
 const emit=(event)=>{if(event.type!=='assistant_delta')events.push(event);const frame=`id: ${event.cursor}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;for(const stream of streams)stream.write(frame);};
-const comments = []; let ambiguousWrite=true; let staleRead=false; const writeIds=[];
+const turns = []; let ambiguousWrite=true; const writeIds=[];
 const server = createServer(async(req,res) => {
   requests.push({url:req.url, authorization:req.headers.authorization, cookie:req.headers.cookie});
   res.setHeader('Content-Type','application/json');
@@ -25,7 +25,6 @@ const server = createServer(async(req,res) => {
   const json = body ? JSON.parse(body) : {};
   const owner = `/v1/agents/${agentId}/share-links`;
   const shared = `/v1/shared/${agentId}`;
-  if (req.url===`/v1/agents/${agentId}/share-comments` && req.method==='GET') return res.end(JSON.stringify({data:comments}));
   if (req.url===owner && req.method==='GET') return res.end(JSON.stringify({data:links}));
   if (req.url===owner && req.method==='POST') {
     const item={id:'link-1',permission:json.permission,created_at:Date.now()};
@@ -44,11 +43,22 @@ const server = createServer(async(req,res) => {
     if (req.url===shared) return res.end(JSON.stringify({agent_id:agentId,permission:links[0]?.permission??'read',title:'Project handoff',latest_event_cursor:'2'}));
     if (req.url.startsWith(`${shared}/events/history`)) {
       const before=new URL(req.url,'http://localhost').searchParams.get('before');
-      const page=before==='3' ? {data:[],has_more:true,next_cursor:'2'} : before==='2' ? {data:[events[0]],has_more:false,next_cursor:null} : {data:[events[1]],has_more:true,next_cursor:'3'};
+      const page=before==='3' ? {data:[],has_more:true,next_cursor:'2'} : before==='2' ? {data:[events[0]],has_more:false,next_cursor:null} : {data:events.slice(1),has_more:true,next_cursor:'3'};
       return res.end(JSON.stringify({...page,latest_cursor:'3'}));
     }
-    if (req.url===`${shared}/comments` && req.method==='GET') {const data=staleRead ? [] : comments;staleRead=false;return res.end(JSON.stringify({data}));}
-    if (req.url===`${shared}/comments` && req.method==='POST' && links[0]?.permission==='write') {writeIds.push(json.id);let comment=comments.find(c=>c.id===json.id);if (comment) return res.end(JSON.stringify(comment));comment={id:json.id,input:json.input,created_at:Date.now(),author:'guest'};comments.push(comment);if (ambiguousWrite){ambiguousWrite=false;staleRead=true;res.statusCode=503;return res.end(JSON.stringify({error:'unknown_outcome'}));}res.statusCode=201;return res.end(JSON.stringify(comment));}
+    if (req.url===`${shared}/turns` && req.method==='POST' && links[0]?.permission==='write') {
+      writeIds.push(json.id);
+      let turn=turns.find(t=>t.id===json.id);
+      if (!turn) {
+        turn={id:json.id,input:json.input};turns.push(turn);
+        emit({cursor:String(7+turns.length*4),type:'turn_accepted',id:turn.id,turn_id:turn.id,input:turn.input,author:'guest'});
+        emit({cursor:String(8+turns.length*4),type:'event',turn_id:turn.id,event:{request_id:'synthetic',seq:8+turns.length*4,type:'reasoning.summary.delta',payload:{turn_id:turn.id,text:'Checking the answer…'}}});
+        emit({cursor:String(9+turns.length*4),type:'event',turn_id:turn.id,event:{request_id:'synthetic',seq:9+turns.length*4,type:'tool.call',payload:{turn_id:turn.id,tool:'search',call_id:'tool-1',arguments:{query:'status'}}}});
+        emit({cursor:String(10+turns.length*4),type:'event',turn_id:turn.id,event:{request_id:'synthetic',seq:10+turns.length*4,type:'tool.result',payload:{turn_id:turn.id,call_id:'tool-1',result:{text:'complete'}}}});
+      }
+      if (ambiguousWrite) {ambiguousWrite=false;res.statusCode=503;return res.end(JSON.stringify({error:'unknown_outcome'}));}
+      res.statusCode=202;return res.end(JSON.stringify(turn));
+    }
   }
   res.statusCode=404;res.end(JSON.stringify({error:'not_found'}));
 });
@@ -103,21 +113,24 @@ try {
  await visitor.waitForTimeout(150);
  assert.equal(await visitor.getByText('The release is ready.').count(),0,'stale history cannot repopulate a revoked transcript');
  await visitor.reload();await visitor.getByRole('alert').waitFor();
- // A new link with write access exercises contribution using the same guest UI and bearer boundary.
+ // A new link with write access sends a real AI turn through the same guest chat surface.
  revoked=false;links.push({id:'link-2',permission:'write',created_at:new Date().toISOString()});
  const writer=await browser.newPage();await writer.goto(link);
- await writer.getByRole('textbox',{name:'Comment on this thread'}).fill('Can you follow up?');
- await writer.getByRole('button',{name:'Post comment'}).click();
- await writer.getByRole('alert').getByText(/Couldn’t confirm your comment/).waitFor();
- await writer.getByRole('button',{name:'Post comment'}).click();
- await writer.getByText(/Comments \(1\)/).click();
+ await writer.getByRole('textbox',{name:'Message Nanocodex'}).fill('Can you follow up?');
+ await writer.getByRole('button',{name:'Send message'}).click();
  await writer.getByText('Can you follow up?').waitFor();
- assert.deepEqual(writeIds,[writeIds[0],writeIds[0]],'retry must retain the same comment ID');
- assert.equal(comments.length,1,'uncertain outcome must not duplicate a comment');
- await owner.getByRole('button',{name:'Refresh'}).click();
- await owner.getByText('Can you follow up?').waitFor();
- assert.equal(requests.some(r=>r.url.includes('/turns')),false,'sharing must never start an owner AI turn');
+ await writer.getByRole('alert').getByText(/Couldn’t confirm your message/).waitFor();
+ await writer.getByRole('button',{name:'Send message'}).click();
+ await writer.getByText('Checking the answer…').waitFor();
+ assert.deepEqual(writeIds,[writeIds[0],writeIds[0]],'retry must retain the same turn ID');
+ assert.equal(turns.length,1,'uncertain outcome must not duplicate a turn');
+ assert.equal(await writer.getByText('Can you follow up?').count(),1,'optimistic prompt reconciles with accepted event');
+ assert.equal(await writer.getByText('Guest').count(),1,'shared turn is attributed to transferable Guest');
+ const reader=await browser.newPage();await reader.goto(link);
+ await reader.getByText('Can you follow up?').waitFor();
+ assert.equal(await reader.getByRole('textbox',{name:'Message Nanocodex'}).count(),0,'read link has no composer');
  assert.ok(requests.filter(r=>r.url.startsWith('/v1/shared/')).every(r=>r.authorization===`Bearer ${token}` && !r.cookie && !r.url.includes(token)));
+ assert.equal(requests.some(r=>r.url?.includes('/comments')),false,'no comment endpoints');
  await writer.screenshot({path:new URL('write.png',output).pathname});
  const mobile=await browser.newPage({viewport:{width:390,height:844},isMobile:true,hasTouch:true});
  await mobile.goto(link);
@@ -126,5 +139,5 @@ try {
  await mobile.screenshot({path:new URL('mobile.png',output).pathname});
  await mobile.close();
  console.log('Share-link journey passed; screenshots: output/thread-share/{owner,read,write,mobile}.png');
- await owner.close();await visitor.close();await writer.close();
+ await owner.close();await visitor.close();await writer.close();await reader.close();
 } finally {await browser.close();server.close();}

@@ -57,6 +57,7 @@ export function AgentTerminalView({
   promptIntent,
   retryAgent,
   renderTool,
+  userLabel,
   showToolCalls = true,
   voice = false,
   voiceOptions,
@@ -84,6 +85,7 @@ export function AgentTerminalView({
   promptIntent?: "queue" | "steer";
   retryAgent(): void;
   renderTool?(tool: ToolActivity, controls: AgentTerminalAccessory): ReactNode;
+  userLabel?(entry: Extract<import("nanocodex-react/agent").AgentEntry, { kind: "user" }>): string | undefined;
   showToolCalls?: boolean;
   /** Enables the package-owned microphone control. */
   voice?: boolean;
@@ -265,6 +267,7 @@ export function AgentTerminalView({
       mode={mode}
       renderTool={renderTool ? (tool) => renderTool(tool, { agentReady: agentStatus === "ready", submit: submitAccessoryPrompt }) : undefined}
       showToolCalls={showToolCalls}
+      userLabel={userLabel}
       status={agentStatus}
       voiceEntries={voiceEntries}
       welcome={welcome}
