@@ -3091,12 +3091,17 @@ final class InboxUITests: XCTestCase {
         if loading.exists {
             var visibleAnchor: XCUIElement?
             let materialized = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
-                visibleAnchor = conversation.staticTexts.allElementsBoundByIndex.first {
-                    $0.isHittable && $0.label.hasPrefix("Progress note ") && $0.frame.minY >= conversation.frame.minY
+                // Filter in the accessibility query before resolving per-element
+                // attributes. Slow CI snapshots can otherwise exhaust the wait
+                // while pagination changes the unfiltered element indices.
+                visibleAnchor = conversation.staticTexts.matching(
+                    NSPredicate(format: "label BEGINSWITH %@", "Progress note ")
+                ).allElementsBoundByIndex.first {
+                    $0.frame.minY >= conversation.frame.minY && $0.isHittable
                 }
                 return visibleAnchor != nil
             }, object: nil)
-            guard XCTWaiter.wait(for: [materialized], timeout: 3) == .completed,
+            guard XCTWaiter.wait(for: [materialized], timeout: 10) == .completed,
                   let first = visibleAnchor else {
                 capture(app, "history-loading-missing-anchor")
                 return XCTFail("Existing messages must remain readable while older history loads: "
