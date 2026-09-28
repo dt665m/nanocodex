@@ -18,6 +18,9 @@ describe("broker Mercator execution", () => {
     const invalid = await SELF.fetch(`${base}/mercator`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...input, idempotency_key: "other-operation", approved_total: "0.06" }) });
     expect(invalid.status).toBe(400);
     expect(await invalid.json()).toMatchObject({ error: "invalid_mercator_payment_request" });
+    const malformed = await SELF.fetch(`${base}/mercator`, { method: "POST", headers: { "content-type": "application/json" }, body: "{" });
+    expect(malformed.status).toBe(400);
+    expect(await malformed.json()).toMatchObject({ error: "invalid_mercator_payment_request" });
     expect(JSON.stringify(result)).not.toMatch(/signature|privateKey|authorization/);
   });
 

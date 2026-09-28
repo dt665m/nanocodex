@@ -682,8 +682,11 @@ export class UserCredentialBroker extends DurableObject<BrokerEnv> {
         if (!isJsonContentType(request.headers.get("content-type"))) return jsonError(415, "invalid_content_type");
         const wallet = this.#credentials.wallet;
         if (!wallet) return jsonError(404, "wallet_not_configured");
+        let paymentRequest: unknown;
+        try { paymentRequest = await readJson(request, 64 * 1024); }
+        catch { return jsonError(400, "invalid_mercator_payment_request"); }
         try {
-          return json(await executeMercatorPayment(await readJson(request, 64 * 1024), {
+          return json(await executeMercatorPayment(paymentRequest, {
             store: this.#state.storage, wallet: rootWalletProvider(wallet), signal: request.signal,
           }), 200);
         } catch (error) {

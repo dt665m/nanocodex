@@ -28,7 +28,8 @@ export class MercatorPaymentInputError extends Error {
 
 /** Caller must serialize operations per account (the credential DO does so).
  * This endpoint is only reachable through the trusted owner service binding.
- * Explicit user authorization is enforced by the managed tool authority model.
+ * The managed layer enforces owner tool authority. Per-job user consent is
+ * enforced by the agent's explicit-authorization policy, not by this broker.
  */
 export async function executeMercatorPayment(value: unknown, { store, wallet, fetcher = fetch, signal: callerSignal }: Options): Promise<Result> {
   if (!record(value) || Object.keys(value).some(k => !["plan", "approved_total", "idempotency_key", "id"].includes(k))
