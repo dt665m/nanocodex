@@ -9225,7 +9225,10 @@ export class DurableAgentSession extends DurableComputerObject {
           // routing must not opt the root into classification or extra authority.
           if (this.#threadRoute()) {
             assertRoutingOwned();
-            assertRoutingAuthority(this.#activeTurnAuthorization());
+            // A write-link guest may use an existing pinned root inference route,
+            // but cannot classify a new route or route a child session.
+            if (!this.#activeTurnAuthorization()?.guestShareLinkId)
+              assertRoutingAuthority(this.#activeTurnAuthorization());
           }
         } else {
           const binding = readChildRoute(sessionId);
@@ -11682,12 +11685,12 @@ export class DurableAgentSession extends DurableComputerObject {
     if (this.env.NANOCODEX_THREAD_ROUTING !== "true" || !this.env.AI) {
       throw new ManagedRequestError(503, "routing_unavailable", "thread routing requires enabled Workers AI binding");
     }
+    // An existing route is immutable; write-link guests can send ordinary
+    // messages on it, but never classify or replace the opening route.
+    if (this.#threadRoute()) return;
     if (!this.#hasFullAccountAuthority(parseTurnAuthorization(row.authorization_json))) {
       throw new ManagedRequestError(403, "routing_forbidden", "thread routing PoC requires full account authority");
     }
-    // The opening route owns this conversation. New probe measurements,
-    // reconnects and restarts must never select another provider or model.
-    if (this.#threadRoute()) return;
     const session = this.#session()!;
     if (session.runtime_profile !== "managed" || session.completed_turns > 0 || this.#sessionStatus()?.has_snapshot) {
       throw new ManagedRequestError(409, "routing_requires_new_thread", "routing can only initialize a new managed thread");
