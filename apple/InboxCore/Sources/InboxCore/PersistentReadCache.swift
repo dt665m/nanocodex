@@ -9,6 +9,7 @@ final class PersistentReadCache: @unchecked Sendable {
     private let lock = NSLock()
     private let directory: URL
     private var generation: UInt64 = 0
+    private var lastClearGeneration: UInt64 = 0
 
     static func scoped(to credential: AccountCredential) -> PersistentReadCache {
         let key = digest(credential.origin + "\n" + credential.apiKey)
@@ -80,6 +81,43 @@ final class PersistentReadCache: @unchecked Sendable {
             try? FileManager.default.removeItem(at: file)
         }
     }
+    /// Apply acknowledged Todo writes to the saved projection before returning
+    /// to the UI. The lock also excludes stale GET admission during the update.
+    @discardableResult
+    func applyTodoMutation(path: String, method: String, response: JSON, ticket: UInt64) -> Bool {
+        guard method == "POST" else { return false }
+        let parts = path.split(separator: "/")
+        let capture = path == "/v1/todo"
+        let decision = parts.count == 5 && parts[0] == "v1" && parts[1] == "todo"
+            && parts[2] == "decisions" && parts[4] == "respond"
+        guard capture || decision else { return false }
+        // Invalid capture replies cannot form a valid projection.
+        guard !capture || (try? TodoCapture(response["item"])) != nil else { return true }
+        lock.lock(); defer { lock.unlock() }
+        guard ticket >= lastClearGeneration else { return true }
+        generation &+= 1
+        let saved = (try? Data(contentsOf: file("/v1/todo"))).flatMap { try? JSONDecoder().decode(JSON.self, from: $0) }
+        var snapshot: [String: JSON]
+        if let saved, case .object(let value) = saved, (try? TodoSnapshot(saved)) != nil {
+            snapshot = value
+        } else if capture {
+            snapshot = ["items": .array([]), "decisions": .array([]), "traces": .array([])]
+        } else { return true }
+        if capture {
+            let item = response["item"], id = response["item"]["id"].string
+            var items = snapshot["items"]?.array ?? []
+            if let index = items.firstIndex(where: { $0["id"].string == id }) { items[index] = item }
+            else { items.insert(item, at: 0) }
+            snapshot["items"] = .array(items)
+        } else {
+            let id = String(parts[3]).removingPercentEncoding ?? String(parts[3])
+            snapshot["decisions"] = .array((snapshot["decisions"]?.array ?? []).filter { $0["id"].string != id })
+        }
+        if let data = try? JSONEncoder().encode(JSON.object(snapshot)), data.count <= 32 * 1024 * 1024 {
+            writeLocked(data, path: "/v1/todo")
+        }
+        return true
+    }
     func ticket() -> UInt64 { lock.lock(); defer { lock.unlock() }; return generation }
     func read(path: String) -> Data? {
         guard Self.allows(path) else { return nil }
@@ -96,6 +134,10 @@ final class PersistentReadCache: @unchecked Sendable {
            let next = try? JSONDecoder().decode(JSON.self, from: data),
            let previousCursor = Cursor(rawValue: previous["latest_cursor"].string),
            let nextCursor = Cursor(rawValue: next["latest_cursor"].string), previousCursor > nextCursor { return }
+        writeLocked(data, path: path)
+    }
+    /// Caller holds lock; shared admission keeps mutation writes bounded too.
+    private func writeLocked(_ data: Data, path: String) {
         do {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             var excluded = URLResourceValues(); excluded.isExcludedFromBackup = true
@@ -121,6 +163,7 @@ final class PersistentReadCache: @unchecked Sendable {
     func clear() {
         lock.lock(); defer { lock.unlock() }
         generation &+= 1
+        lastClearGeneration = generation
         try? FileManager.default.removeItem(at: directory)
     }
 }

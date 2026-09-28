@@ -235,7 +235,13 @@ public final class ManagedClient: @unchecked Sendable {
         let decoded = data.isEmpty ? JSON.null : try JSONDecoder().decode(JSON.self, from: data)
         if method != "GET", method != "HEAD" {
             let store = snapshots
-            await Task.detached(priority: .utility) { store.invalidate(path: path, method: method) }.value
+            await Task.detached(priority: .utility) {
+                if let snapshotTicket,
+                   store.applyTodoMutation(path: path, method: method, response: decoded, ticket: snapshotTicket) { return }
+                // A retired client must not recreate a Todo projection.
+                if snapshotTicket == nil, path == "/v1/todo" || path.hasPrefix("/v1/todo/") { return }
+                store.invalidate(path: path, method: method)
+            }.value
         }
         if method == "GET", body == nil, let snapshotTicket {
             try Task.checkCancellation()
