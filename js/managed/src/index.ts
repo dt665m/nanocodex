@@ -9593,7 +9593,16 @@ export class DurableAgentSession extends DurableComputerObject {
     let cloudflareAgentMs = 0;
     try {
       phaseStartedAt = performance.now();
-      const selectedTools = restrictedEnvironment ? [computer.tool, brainViewImage, updatePlan()] : cloudTools;
+      const guestUnsafeTools = new Set(["view_image", "image_gen__imagegen", "account_connectors"]);
+      const selectedTools = (restrictedEnvironment ? [computer.tool, brainViewImage, updatePlan()] : cloudTools)
+        .map(tool => guestUnsafeTools.has(tool.name) ? ({
+          ...tool,
+          handler: (input: unknown, context: ToolContext) => {
+            if (this.#authorizationForToolContext(context)?.guestShareLinkId)
+              throw new ManagedRequestError(403, "guest_tool_forbidden", "shared guests cannot access account resources");
+            return tool.handler(input, context);
+          },
+        } satisfies NamedTool) : tool);
       const configuredNames = configuredMemoryToolNames(configuration.tools);
       const configuredTools = configuredNames === undefined ? selectedTools : selectedTools.filter(tool => configuredNames.includes(tool.name));
       if (configuredNames?.some(name => !selectedTools.some(tool => tool.name === name))) throw new Error("configuration names an unavailable tool");
