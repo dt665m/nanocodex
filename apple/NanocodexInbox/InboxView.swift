@@ -1806,6 +1806,7 @@ private struct ConversationMessageView: View {
 private struct ConversationMessageContent: View, Equatable {
     @State private var openedOutput: URL?
     @State private var openedFiles: [URL] = []
+    @State private var outputLease = OutputFileLease()
     @State private var outputError: String?
     @State private var outputTask: Task<Void, Never>?
     let row: TranscriptRow
@@ -1903,6 +1904,7 @@ private struct ConversationMessageContent: View, Equatable {
                 if value == nil {
                     for file in openedFiles { removeDownloadedOutput(file) }
                     openedFiles = []
+                    outputLease.files = []
                 }
             }
             .onDisappear {
@@ -1910,6 +1912,7 @@ private struct ConversationMessageContent: View, Equatable {
                 if openedOutput == nil {
                     for file in openedFiles { removeDownloadedOutput(file) }
                     openedFiles = []
+                    outputLease.files = []
                 }
             }
     }
@@ -1923,6 +1926,7 @@ private struct ConversationMessageContent: View, Equatable {
                 guard !Task.isCancelled else { removeDownloadedOutput(file); return }
                 for previous in openedFiles { removeDownloadedOutput(previous) }
                 openedFiles = [file]
+                outputLease.files = [file]
                 openedOutput = file
             } catch {
                 if !Task.isCancelled { outputError = "Couldn’t open file. Tap to retry." }
@@ -1963,6 +1967,7 @@ private struct PublishedOutputCard: View {
     let agentID: String
     @State private var sharing = false
     @State private var shareFile: URL?
+    @State private var shareLease = OutputFileLease()
     @State private var sharePresented = false
     @State private var failure: String?
 
@@ -2006,18 +2011,19 @@ private struct PublishedOutputCard: View {
             do {
                 let file = try await model.downloadOutput(link, agentID: agentID)
                 guard !Task.isCancelled else { removeDownloadedOutput(file); return }
-                shareFile = file; sharePresented = true
+                shareLease.files = [file]; shareFile = file; sharePresented = true
             } catch { if !Task.isCancelled { failure = "Couldn’t download file. Tap to retry." } }
             sharing = false
         }
         .sheet(isPresented: $sharePresented, onDismiss: {
             if let shareFile { removeDownloadedOutput(shareFile) }
             shareFile = nil
+            shareLease.files = []
         }) {
             if let shareFile { OutputActivitySheet(file: shareFile) { sharePresented = false } }
         }
         .onDisappear {
-            if !sharePresented, let shareFile { removeDownloadedOutput(shareFile); self.shareFile = nil }
+            if !sharePresented, let shareFile { removeDownloadedOutput(shareFile); self.shareFile = nil; shareLease.files = [] }
         }
     }
 }
@@ -2028,6 +2034,12 @@ private func removeDownloadedOutput(_ file: URL) {
        parent.deletingLastPathComponent().standardizedFileURL == FileManager.default.temporaryDirectory.standardizedFileURL {
         try? FileManager.default.removeItem(at: parent)
     } else { try? FileManager.default.removeItem(at: file) }
+}
+
+/// Cleans up even when SwiftUI tears down a whole row with a presented sheet.
+private final class OutputFileLease {
+    var files: [URL] = []
+    deinit { for file in files { removeDownloadedOutput(file) } }
 }
 
 private struct OutputActivitySheet: UIViewControllerRepresentable {

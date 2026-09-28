@@ -17,7 +17,7 @@ final class PublishedOutputDownloadTests: XCTestCase {
         let client = ManagedClient(credential: try .init(origin: fixture.origin, apiKey: fixtureKey), configuration: fixture.configuration)
         defer { client.close() }
         let file = try await client.downloadOutput(agentID: "agent-1", path: path)
-        defer { try? FileManager.default.removeItem(at: file) }
+        defer { try? FileManager.default.removeItem(at: file.deletingLastPathComponent()) }
         XCTAssertEqual(file.pathExtension, "mp4")
         XCTAssertEqual(try String(contentsOf: file, encoding: .utf8), payload)
     }

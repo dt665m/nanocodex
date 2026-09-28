@@ -28,18 +28,18 @@ public struct PublishedOutputLink: Identifiable, Equatable, Hashable, Sendable {
             && path.split(separator: "/", omittingEmptySubsequences: false).dropFirst().allSatisfy { !$0.isEmpty && $0 != "." && $0 != ".." }
     }
 
-    /// Only assistant-authored Markdown links become cards. Plain text, quoted
-    /// paths, user messages and untrusted tool output do not trigger downloads.
+    /// Parse the same Markdown semantics shown to the user: a link-like string
+    /// inside a code span/fence must not become a downloadable file card.
     public static func parse(_ markdown: String) -> [Self] {
-        guard let regex = try? NSRegularExpression(pattern: #"\[([^\]\n]{1,160})\]\((?:<(sandbox:/brain/outputs/[^>\n]+)>|(sandbox:/brain/outputs/[^\s)<>]+))\)"#) else { return [] }
-        let source = markdown as NSString
+        guard let styled = try? AttributedString(markdown: markdown,
+            options: .init(failurePolicy: .returnPartiallyParsedIfPossible)) else { return [] }
         var result: [Self] = [], seen = Set<String>()
-        for match in regex.matches(in: markdown, range: NSRange(location: 0, length: source.length)).prefix(64) {
-            let range = match.range(at: match.range(at: 2).location == NSNotFound ? 3 : 2)
-            guard let url = URL(string: source.substring(with: range)),
-                  let link = Self(url: url, title: source.substring(with: match.range(at: 1))),
+        for run in styled.runs {
+            guard let url = run.link,
+                  let link = Self(url: url, title: String(styled[run.range].characters)),
                   seen.insert(link.path).inserted else { continue }
             result.append(link)
+            if result.count == 64 { break }
         }
         return result
     }

@@ -17,6 +17,17 @@ final class PublishedOutputLinkTests: XCTestCase {
         XCTAssertFalse(links[1].isVideo)
     }
 
+    func testLinkLookingTextInCodeDoesNotBecomeAFileCard() {
+        let source = """
+        `[inline](sandbox:/brain/outputs/inline.mp4)`
+        ```md
+        [fenced](sandbox:/brain/outputs/fenced.mp4)
+        ```
+        [real](sandbox:/brain/outputs/real.mp4)
+        """
+        XCTAssertEqual(PublishedOutputLink.parse(source).map(\.filename), ["real.mp4"])
+    }
+
     func testRejectsOtherHandsAndPathTraversal() {
         for source in ["sandbox:/etc/passwd", "sandbox:/brain/tmp/private.mp4", "sandbox:/brain/outputs/../secret.mp4",
                        "sandbox:/brain/outputs/%2e%2e/secret.mp4", "sandbox:/brain/outputs//x.mp4",
