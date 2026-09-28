@@ -28,7 +28,9 @@ export function mercatorMcpPayment(
         }
         // The quote is a free call to the same default MCP, not another model
         // tool or a separate REST payment integration. Fail closed on drift.
-        const quote = await client.callTool({ name: "quote_plan", arguments: { plan: input.plan } }, undefined,
+        const quote = await client.callTool({ name: "quote_plan", arguments: {
+          plan: input.plan, ...(typeof input.id === "string" ? { id: input.id } : {}),
+        } }, undefined,
           { signal: call?.signal, timeout: 30_000 });
         const data = quote.structuredContent ?? quote.content?.find(block => block.type === "text")?.text;
         let parsed: unknown;
