@@ -1825,7 +1825,10 @@ impl AgentWorker {
             }));
             return;
         }
+        let chatgpt_voice = realtime.auth_mode() == nanocodex::oai::auth::OpenAiAuthMode::ChatGpt;
         let mut builder = VoiceSessionBuilder::new(realtime, self.main.agent.clone())
+            .client_managed_handoffs(chatgpt_voice)
+            .include_startup_context(!chatgpt_voice)
             .session_id(Arc::clone(&self.main.request_id))
             .agent_control(self.voice_agent_control.clone());
         if let Some(voice) = voice {
@@ -3702,6 +3705,11 @@ fn classify_submission(input: impl Into<SubmittedPrompt>) -> Submission {
     if trimmed.starts_with("/split ") {
         return Submission::InvalidCommand("Usage: /split".to_owned());
     }
+    if trimmed == "/share" || trimmed.starts_with("/share ") {
+        return Submission::InvalidCommand(
+            "Sharing requires a hosted nanocodex2 thread.".to_owned(),
+        );
+    }
     if trimmed == "/cancel" {
         return Submission::Cancel;
     }
@@ -4263,6 +4271,31 @@ mod tests {
             classify_submission("/autorouter"),
             Submission::Prompt("/autorouter".into())
         );
+    }
+
+    #[test]
+    fn local_tui_share_reports_hosted_thread_requirement_without_sending_prompt() {
+        for command in [
+            "/share",
+            "/share read",
+            "/share write",
+            "/share list",
+            "/share revoke link-id",
+        ] {
+            assert_eq!(
+                classify_submission(command),
+                Submission::InvalidCommand(
+                    "Sharing requires a hosted nanocodex2 thread.".to_owned()
+                )
+            );
+        }
+        let (commands, mut worker) = mpsc::unbounded_channel();
+        let mut app = App::new("/workspace".into());
+        app.input = "/share read".to_owned();
+        app.cursor = app.input.len();
+        submit(&mut app, "local-thread", &commands, SubmitIntent::Immediate).unwrap();
+        assert!(worker.try_recv().is_err());
+        assert_eq!(app.main.pending_turns, 0);
     }
 
     #[test]

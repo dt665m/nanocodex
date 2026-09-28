@@ -2,6 +2,127 @@ import XCTest
 import UIKit
 
 final class InboxUITests: XCTestCase {
+    func testNativeCommandReviewAndDeniedAuthentication() throws {
+        let app = XCUIApplication()
+        app.launchArguments = ["--native-secure-input-ui-fixture"]
+        app.launch()
+        let open = app.buttons["secure-input-open"]
+        XCTAssertTrue(open.waitForExistence(timeout: 5))
+        XCTAssertFalse(app.secureTextFields["secure-input-password"].exists)
+        let conversation = XCTAttachment(screenshot: app.screenshot())
+        conversation.name = "native-password-conversation"; conversation.lifetime = .keepAlways
+        add(conversation)
+        open.tap()
+        XCTAssertTrue(app.staticTexts["Machine: fixture-machine"].waitForExistence(timeout: 5))
+        let sheet = app.descendants(matching: .any)["secure-input-sheet"].firstMatch
+        XCTAssertTrue(sheet.exists)
+        let presentation = XCTAttachment(screenshot: app.screenshot())
+        presentation.name = "native-password-conversation-sheet"; presentation.lifetime = .keepAlways
+        add(presentation)
+        // Expand the native sheet before reviewing all command details.
+        sheet.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.02))
+            .press(forDuration: 0.1, thenDragTo: app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.08)))
+        let executable = app.descendants(matching: .any)["native-secure-command-executable"].firstMatch
+        XCTAssertTrue(executable.waitForExistence(timeout: 5))
+        XCTAssertTrue(executable.label.contains("\"/usr/bin/id\""), executable.label)
+        let cwd = app.descendants(matching: .any)["native-secure-command-cwd"].firstMatch
+        XCTAssertTrue(cwd.exists)
+        XCTAssertTrue(cwd.label.contains("\"/\""), cwd.label)
+        XCTAssertTrue(app.staticTexts["Local user ID: 501"].exists)
+        let arguments = app.descendants(matching: .any)["native-secure-command-arguments"].firstMatch
+        if !arguments.isHittable { app.scrollViews["secure-input-review"].swipeUp() }
+        XCTAssertTrue(arguments.exists)
+        XCTAssertTrue(arguments.label.contains("\\u202e"))
+        XCTAssertFalse(arguments.label.contains("\u{202e}"))
+        let run = app.buttons["secure-input-submit"]
+        XCTAssertEqual(run.label, "Authenticate & run as root")
+        XCTAssertFalse(run.isEnabled)
+        let confirmation = app.switches["native-secure-command-confirm"]
+        if !confirmation.isHittable { app.scrollViews["secure-input-review"].swipeUp() }
+        XCTAssertTrue(confirmation.waitForExistence(timeout: 5))
+        confirmation.tap()
+        XCTAssertFalse(run.isEnabled, "Explicit review alone must not enable a root command")
+        let field = app.secureTextFields["secure-input-password"]
+        if !field.isHittable { app.scrollViews["secure-input-review"].swipeUp() }
+        field.tap(); field.typeText("synthetic-native-secret")
+        XCTAssertTrue(run.isEnabled)
+        run.tap()
+        XCTAssertTrue(app.staticTexts["Authentication denied"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["Submission attempts: 0"].exists)
+        XCTAssertFalse(app.staticTexts["synthetic-native-secret"].exists)
+        let attachment = XCTAttachment(screenshot: app.screenshot())
+        attachment.name = "native-command-auth-denied"; attachment.lifetime = .keepAlways
+        add(attachment)
+        app.buttons["Cancel"].tap()
+        XCTAssertTrue(open.waitForExistence(timeout: 5))
+        XCTAssertTrue(open.isHittable)
+        XCTAssertFalse(field.exists)
+        let dismissed = XCTAttachment(screenshot: app.screenshot())
+        dismissed.name = "native-password-back-to-conversation"; dismissed.lifetime = .keepAlways
+        add(dismissed)
+    }
+
+    func testPrivatePasswordFieldAndSafeReceipt() throws {
+        let app = XCUIApplication()
+        app.launchArguments = ["--secure-input-ui-fixture"]
+        app.launch()
+        app.buttons["secure-input-open"].tap()
+        let field = app.secureTextFields["secure-input-field:password"]
+        XCTAssertTrue(field.waitForExistence(timeout: 5), "Password input must use native secure text entry")
+        field.tap(); field.typeText("synthetic-password")
+        XCTAssertNotEqual(field.value as? String, "synthetic-password")
+        XCTAssertEqual(app.buttons["secure-input-submit"].label, "Send password to website")
+        app.buttons["secure-input-submit"].tap()
+        XCTAssertTrue(app.staticTexts["Sensitive fields filled in browser."].waitForExistence(timeout: 5))
+        XCTAssertFalse(app.staticTexts["synthetic-password"].exists)
+        let attachment = XCTAttachment(screenshot: app.screenshot())
+        attachment.name = "secure-input-safe-receipt"; attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
+    func testPrivateCardFormFillsOnlyBoundFields() throws {
+        let app = XCUIApplication()
+        app.launchArguments = ["--card-secure-input-ui-fixture"]
+        app.launch()
+        let open = app.buttons["secure-input-open"]
+        XCTAssertTrue(open.waitForExistence(timeout: 5))
+        open.tap()
+        let sheet = app.descendants(matching: .any)["secure-input-sheet"].firstMatch
+        XCTAssertTrue(sheet.waitForExistence(timeout: 5))
+        sheet.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.02))
+            .press(forDuration: 0.1, thenDragTo: app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.08)))
+        let submit = app.buttons["secure-input-submit"]
+        XCTAssertEqual(submit.label, "Fill fields only")
+        XCTAssertFalse(submit.isEnabled)
+        let samples = [("card", "4242424242424242"), ("expiry", "12/30"), ("cvc", "123")]
+        for (id, sample) in samples {
+            let field = app.secureTextFields["secure-input-field:" + id]
+            XCTAssertTrue(field.exists)
+            if !field.isHittable { app.scrollViews["secure-input-review"].swipeUp() }
+            field.tap(); field.typeText(sample)
+            XCTAssertNotEqual(field.value as? String, sample)
+            XCTAssertFalse(app.staticTexts[sample].exists)
+        }
+        XCTAssertTrue(submit.isEnabled)
+        submit.tap()
+        XCTAssertTrue(app.staticTexts["Sensitive fields filled in browser."].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["Fixture: 3 bound fields filled; form submissions: 0"].exists)
+        XCTAssertFalse(submit.isEnabled)
+        XCTAssertFalse(app.keyboards.firstMatch.exists)
+        for (id, sample) in samples {
+            let field = app.secureTextFields["secure-input-field:" + id]
+            let remaining = field.value as? String ?? ""
+            XCTAssertTrue(remaining.isEmpty || remaining == field.placeholderValue, "Private field must be cleared")
+            XCTAssertFalse(app.staticTexts[sample].exists)
+        }
+        let attachment = XCTAttachment(screenshot: app.screenshot())
+        attachment.name = "private-card-fields-filled-only"; attachment.lifetime = .keepAlways
+        add(attachment)
+        app.buttons["Cancel"].tap()
+        XCTAssertTrue(open.waitForExistence(timeout: 5))
+        XCTAssertFalse(app.secureTextFields["secure-input-field:card"].exists)
+    }
+
     // CRM failure scenarios: failed fetch must be retryable; filters must not retain
     // old rows; profile facts/notes must render; relationships must open their target.
     func testCRMBrowseAndRelationshipNavigation() {
@@ -443,6 +564,40 @@ final class InboxUITests: XCTestCase {
         app.launch()
         return app
     }
+    // A process restart must recover persisted roster, transcript, directory,
+    // and visited profile even when every network request fails immediately.
+    func testOfflineColdRelaunchRestoresConversationsAndCRM() {
+        let app = startupFixture(warmTabs: true)
+        XCTAssertTrue(app.buttons["main-tab-chat"].waitForExistence(timeout: 10))
+        app.buttons["main-tab-chat"].tap()
+        XCTAssertTrue(app.staticTexts["Loaded saved conversation."].waitForExistence(timeout: 10))
+        switchConversation(app, id: "other")
+        XCTAssertTrue(app.staticTexts["Loaded other conversation."].waitForExistence(timeout: 10))
+        app.buttons["main-tab-crm"].tap()
+        XCTAssertTrue(app.buttons["crm-record-alex"].waitForExistence(timeout: 5))
+        app.buttons["crm-record-alex"].tap()
+        XCTAssertTrue(app.staticTexts["Example University"].waitForExistence(timeout: 5))
+        capture(app, "offline-cache-populated")
+
+        app.terminate()
+        app.launchEnvironment["NANOCODEX_STARTUP_OFFLINE"] = "1"
+        app.launch()
+        XCTAssertTrue(app.buttons["main-tab-chat"].waitForExistence(timeout: 5))
+        app.buttons["main-tab-chat"].tap()
+        XCTAssertTrue(app.buttons["conversation-title:other"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["conversation-title:other"].isSelected)
+        XCTAssertTrue(app.staticTexts["Loaded other conversation."].waitForExistence(timeout: 5))
+        XCTAssertFalse(app.textFields["phone-number"].exists)
+        switchConversation(app, id: "saved")
+        XCTAssertTrue(app.staticTexts["Loaded saved conversation."].waitForExistence(timeout: 5))
+        capture(app, "offline-cold-restored-conversation")
+        app.buttons["main-tab-crm"].tap()
+        XCTAssertTrue(app.buttons["crm-record-alex"].waitForExistence(timeout: 5))
+        app.buttons["crm-record-alex"].tap()
+        XCTAssertTrue(app.staticTexts["Example University"].waitForExistence(timeout: 5))
+        capture(app, "offline-cold-restored-crm-profile")
+    }
+
     func testStartupSpinnerAndLastTabRestoration() {
         let app = startupFixture()
         XCTAssertTrue(app.activityIndicators["account-restoration"].waitForExistence(timeout: 5))
@@ -2416,6 +2571,34 @@ final class InboxUITests: XCTestCase {
 
 
 
+
+    func testPrivateOutputLinksRenderNativePreviewAndSaveCards() throws {
+        let clip = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "FrontiersMerchSample", withExtension: "mp4"))
+        let app = launch(["NANOCODEX_DEMO_OUTPUT_LINKS": "1",
+                          "NANOCODEX_DEMO_VIDEO_BASE64": try Data(contentsOf: clip).base64EncodedString()])
+        let conversation = app.descendants(matching: .any)["conversation"].firstMatch
+        XCTAssertTrue(conversation.waitForExistence(timeout: 10))
+        XCTAssertFalse(conversation.buttons["View Not an output"].exists,
+                       "Only canonical /brain/outputs links become file cards")
+        XCTAssertEqual(conversation.buttons.matching(identifier: "published-output-open").count, 2)
+        XCTAssertEqual(conversation.buttons.matching(identifier: "published-output-save").count, 2)
+        XCTAssertTrue(conversation.links["sandbox:/brain/outputs/frontiers-next/frontiers-merch-launch-actual-character.mp4"].exists)
+        XCTAssertTrue(conversation.links["sandbox:/brain/outputs/frontiers-next/frontiers-launch-and-drops.zip"].exists)
+        capture(app, "private-output-links")
+        let launchVideo = conversation.buttons["View Main launch video"]
+        XCTAssertTrue(launchVideo.isHittable)
+        launchVideo.tap()
+        let done = app.buttons["Done"]
+        XCTAssertTrue(done.waitForExistence(timeout: 10), "The video should open in native Quick Look")
+        capture(app, "private-output-video-preview")
+        done.tap()
+        let saveVideo = conversation.buttons["Save or share Main launch video"]
+        XCTAssertTrue(saveVideo.isHittable)
+        saveVideo.tap()
+        XCTAssertTrue(app.otherElements["ShareSheet.RemoteContainerView"].waitForExistence(timeout: 10),
+                      "The iOS share sheet should open for a local video file")
+        capture(app, "private-output-save-share")
+    }
 
     func testNativeMediaPreviewZoomPlaybackAndDraftRestoration() throws {
         let clip = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "VideoAudioCheck", withExtension: "mp4"))

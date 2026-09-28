@@ -276,6 +276,15 @@ enum DemoContent {
         #if DEBUG
         if ProcessInfo.processInfo.environment["NANOCODEX_DEMO_LOCAL_PHOTOS"] == "1" { return localPhotoRows() }
         #endif
+        if ProcessInfo.processInfo.environment["NANOCODEX_DEMO_OUTPUT_LINKS"] == "1" {
+            return [.init(id: "user-" + id, role: "You", text: "Show the videos"),
+                    .init(id: "agent-" + id, role: "Agent", text: """
+                    [Main launch video](sandbox:/brain/outputs/frontiers-next/frontiers-merch-launch-actual-character.mp4)
+                    [Complete bundle](sandbox:/brain/outputs/frontiers-next/frontiers-launch-and-drops.zip)
+                    [Web reference](https://example.com)
+                    [Not an output](sandbox:/brain/tmp/secret.mp4)
+                    """)]
+        }
         if ProcessInfo.processInfo.environment["NANOCODEX_DEMO_GENERATED_OUTPUTS"] == "1" { return generatedOutputRows() }
         if ProcessInfo.processInfo.environment["NANOCODEX_DEMO_RENDER_PROFILE"] == "1" {
             // Keep the default fixture stable; allow deterministic long-session
@@ -406,6 +415,13 @@ private final class StartupFixtureProtocol: URLProtocol, @unchecked Sendable {
         Self.queue.async { [self] in
             guard !stopped else { return }
             record("start")
+            // A second process launch reuses the on-disk account cache while
+            // every transport operation fails, including roster and history.
+            if ProcessInfo.processInfo.environment["NANOCODEX_STARTUP_OFFLINE"] == "1" {
+                record("offline")
+                client?.urlProtocol(self, didFailWithError: URLError(.notConnectedToInternet))
+                return
+            }
             let path = request.url!.path
             let id = request.url!.pathComponents.dropFirst(3).first ?? "saved"
             let isStream = path.hasSuffix("/events")
