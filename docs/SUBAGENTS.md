@@ -32,7 +32,7 @@ An enabled runtime installs seven tools for root and child agents:
 
 | Tool | Contract |
 | --- | --- |
-| `spawn_agent` | Create a clean child session with a role, focused task, required output schema, and optional model/thinking overrides. |
+| `spawn_agent` | Create a clean child session with a role, focused task, strict typed output contract, and nullable model/thinking overrides. |
 | `submit_result` | Submit `{output}` against the child’s schema and the runtime’s trusted instruction revision. |
 | `send_agent_message` | Send a bounded directed message within the current task tree. |
 | `list_agents` | List visible agents, status, topology, and caller authority. |
@@ -50,9 +50,11 @@ If steering superseded that request, the tool returns
 Incorporate the updated instructions and submit again. Only an accepted result
 satisfies the child’s completion contract.
 
-Model and thinking overrides apply only to the new child. When either is
-omitted, the child inherits the invoking agent’s current value at the spawn
-boundary.
+Model and thinking overrides apply only to the new child. In the strict
+model-facing tool, pass `null` for either value to inherit the invoking agent’s
+setting. Its `output_contract` uses closed object/array/scalar nodes, compiled
+into a JSON Schema before launch. Trusted programmatic APIs still accept raw
+JSON Schema; legacy in-flight tool calls may complete with `output_schema`.
 
 ## Tree authority and messaging
 
