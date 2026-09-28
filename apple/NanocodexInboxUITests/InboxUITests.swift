@@ -3750,6 +3750,68 @@ final class InboxUITests: XCTestCase {
                        "A submitted message must invalidate the render projection")
     }
 
+    // Synthetic, opt-in measurements. XCTest interaction time includes driver
+    // waits; these are simulator diagnostics, not physical-device FPS claims.
+    func testPerformanceChatTimelineScrolling() throws {
+        guard ProcessInfo.processInfo.environment["NANOCODEX_INBOX_PERFORMANCE"] == "1" else {
+            throw XCTSkip("Opt-in synthetic chat profiling")
+        }
+        let app = launch(["NANOCODEX_DEMO_RENDER_PROFILE": "1",
+                          "NANOCODEX_DEMO_RENDER_ROWS": "500",
+                          "NANOCODEX_RENDER_COUNTER": "1"])
+        let conversation = app.descendants(matching: .any)["conversation"].firstMatch
+        XCTAssertTrue(conversation.waitForExistence(timeout: 10))
+        let options = XCTMeasureOptions()
+        options.iterationCount = 3
+        var metrics: [XCTMetric] = [XCTClockMetric(), XCTCPUMetric(application: app), XCTMemoryMetric(application: app)]
+        if #available(iOS 26.0, *) { metrics.append(XCTHitchMetric(application: app)) }
+        measure(metrics: metrics, options: options) {
+            for _ in 0..<6 { conversation.swipeDown() }
+            let latest = app.buttons["latest-messages"]
+            XCTAssertTrue(latest.isHittable)
+            latest.tap()
+            gone(latest)
+            let counter = app.staticTexts["conversation-native-mounted-count"]
+            XCTAssertEqual(counter.value as? String, "500")
+            let mounted = Int(counter.label) ?? 0
+            XCTAssertGreaterThan(mounted, 0)
+            XCTAssertLessThanOrEqual(mounted, 64)
+            print("PROFILE_CHAT_MOUNTED \(mounted)/500")
+        }
+        capture(app, "profile-500-message-scroll")
+    }
+
+    func testPerformanceStreamingMarkdownAndTools() throws {
+        guard ProcessInfo.processInfo.environment["NANOCODEX_INBOX_PERFORMANCE"] == "1" else {
+            throw XCTSkip("Opt-in synthetic chat profiling")
+        }
+        let app = launch(["NANOCODEX_DEMO_RICH_STREAM": "1",
+                          "NANOCODEX_DEMO_STREAMING_GROWTH": "1",
+                          "NANOCODEX_DEMO_STREAM_INTERVAL_MS": "1000"])
+        selectInbox(app)
+        let conversation = app.descendants(matching: .any)["conversation"].firstMatch
+        let tool = conversation.buttons["tool-disclosure-demo-rich-tool"]
+        XCTAssertTrue(tool.waitForExistence(timeout: 10))
+        let options = XCTMeasureOptions()
+        options.iterationCount = 3
+        var metrics: [XCTMetric] = [XCTClockMetric(), XCTCPUMetric(application: app), XCTMemoryMetric(application: app)]
+        if #available(iOS 26.0, *) { metrics.append(XCTHitchMetric(application: app)) }
+        // Sequential windows over a growing document, not identical replays.
+        // Keep one process alive so XCTest can harvest its CPU counters.
+        measure(metrics: metrics, options: options) {
+            for _ in 0..<8 { if tool.isHittable { break }; conversation.swipeDown() }
+            XCTAssertTrue(tool.isHittable)
+            tool.tap()
+            let latest = app.buttons["latest-messages"]
+            if latest.isHittable { latest.tap() }
+            Thread.sleep(forTimeInterval: 5)
+        }
+        for _ in 0..<8 { if tool.isHittable { break }; conversation.swipeDown() }
+        XCTAssertTrue(tool.isHittable)
+        XCTAssertTrue(tool.label.contains("Completed"))
+        capture(app, "profile-streaming-markdown-and-tools")
+    }
+
     func testPerformanceDemoConversationRendering() throws {
         guard ProcessInfo.processInfo.environment["NANOCODEX_INBOX_PERFORMANCE"] == "1" else {
             throw XCTSkip("Opt-in deterministic rendering profile; does not use a saved account.")

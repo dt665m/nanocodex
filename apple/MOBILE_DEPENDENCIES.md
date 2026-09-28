@@ -50,3 +50,24 @@ scripts/xcodebuild-guard.sh -resolvePackageDependencies \
 ```
 
 Keep the committed resolution files with dependency updates so transitive versions remain reproducible. These libraries do not require license keys or paid accounts.
+
+## Chat performance profiling
+
+Run `CHAT_PROFILE_DEVICE=<existing-simulator-UDID> apple/scripts/profile-chat.sh`.
+The guarded build and opt-in XCTest profiles use synthetic data and retain three
+samples each after XCTest warm-up for 500-message scrolling, typing with a Markdown transcript, and
+streaming Markdown with expanded tool progress. CPU and memory metrics measure the
+app process; scrolling/streaming also record clock and hitch metrics. The streaming
+profile measures sequential windows in one process as the document grows, while
+toggling the tool disclosure and returning to the tail; samples are not identical
+replays. The fixture streams for 60 seconds; later navigation windows can include
+the completed response. Launch is excluded. The scrolling
+profile checks that native mounted hosts remain bounded independently of 500 rows.
+
+The script exports raw metric CSVs, videos, and XCTest results under ignored
+`output/`; publish these as artifacts and summarize measurements in the PR.
+Clock measurements include XCTest driver waits and the fixture's streaming delays.
+Simulator results depend on host load and are not real-device FPS, memory limits,
+or proof of improvement over a baseline. Debug instrumentation and recording add
+cost. Some simulator runtimes omit hitch measurements; missing output is not zero
+hitches. Use identical hardware/build/workloads for any before/after comparison.
