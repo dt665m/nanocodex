@@ -79,7 +79,7 @@ func enroll(_ publicKey: String) throws {
 }
 func readRequest(_ fd: Int32) throws -> Data {
     var bytes = Data(); var byte: UInt8 = 0
-    let deadline = ProcessInfo.processInfo.systemUptime + 5
+    let deadline = ProcessInfo.processInfo.systemUptime + 1
     while bytes.count < 32768 {
         let remaining = deadline - ProcessInfo.processInfo.systemUptime
         guard remaining > 0 else { throw BoundaryError.invalid }
@@ -148,10 +148,12 @@ do {
     let listener = nc_secure_listen(socketPath, 0o666)
     guard listener >= 0 else { throw BoundaryError.unavailable }
     defer { close(listener); unlink(socketPath) }
+    var admission = AdmissionLimiter()
     while true {
         var uid: UInt32 = 0
         let peer = nc_secure_accept(listener, &uid)
         if peer < 0 { continue }
+        guard admission.admit(uid: uid, now: ProcessInfo.processInfo.systemUptime) else { close(peer); continue }
         let response: Data
         do { response = try run(broker, bytes: readRequest(peer), uid: uid) }
         catch { response = Data("{\"status\":\"rejected\"}".utf8) }

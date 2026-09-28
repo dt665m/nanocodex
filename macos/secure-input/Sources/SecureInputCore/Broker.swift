@@ -34,6 +34,21 @@ public struct Receipt: Codable {
     public let exit_code: Int32?
 }
 /// Serialized by the daemon. No ticket or decrypted material survives process restart.
+/// Bound local socket work per peer UID. A slow or malformed user cannot hold the
+/// single-threaded helper indefinitely or exhaust another user's allowance.
+public struct AdmissionLimiter {
+    private var windows: [UInt32: (until: TimeInterval, count: Int)] = [:]
+    public init() {}
+    public mutating func admit(uid: UInt32, now: TimeInterval) -> Bool {
+        windows = windows.filter { $0.value.until > now }
+        var window = windows[uid] ?? (until: now + 60, count: 0)
+        guard window.count < 24 else { return false }
+        window.count += 1
+        windows[uid] = window
+        return true
+    }
+}
+
 public final class Broker {
     private struct Pending { let ticket: Ticket; let key: P256.KeyAgreement.PrivateKey }
     private var pending: [String: Pending] = [:]

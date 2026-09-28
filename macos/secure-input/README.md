@@ -61,7 +61,7 @@ See [PROTOCOL.md](PROTOCOL.md) for the adapter and encryption contract. Binding 
 to exact argv/cwd/uid, not the contents of mutable scripts or executable files.
 A user approving a command must trust those files. An approval is consumed before
 decryption/execution; cancel and five-minute expiry invalidate pending tickets.
-A daemon restart discards all pending tickets and their ephemeral keys. Command
+A daemon restart discards all pending tickets and their ephemeral keys. The public local socket admits at most 24 requests per peer UID per minute and requires a complete frame within one second; a same-user process can still deny its own availability. Command
 execution has a 120-second bound; timeout or uncertain delivery yields
 `outcome_unknown` and must never be retried automatically. Cancellation before
 submission removes the pending request; it cannot undo an already-started command.

@@ -3,6 +3,14 @@ import CryptoKit
 @testable import SecureInputCore
 
 final class BoundaryTests: XCTestCase {
+    func testLocalAdmissionIsBoundedPerUIDAndResetsAfterWindow() {
+        var limiter = AdmissionLimiter()
+        for _ in 0..<24 { XCTAssertTrue(limiter.admit(uid: 501, now: 100)) }
+        XCTAssertFalse(limiter.admit(uid: 501, now: 159.9))
+        XCTAssertTrue(limiter.admit(uid: 502, now: 159.9), "An unrelated local user keeps their own allowance")
+        XCTAssertTrue(limiter.admit(uid: 501, now: 160), "The sixty-second window resets")
+    }
+
     func testApprovedEnvelopeIsBoundAndOneUse() throws {
         let authority = P256.Signing.PrivateKey()
         let broker = Broker(approvalKey: authority.publicKey, identity: .init())
