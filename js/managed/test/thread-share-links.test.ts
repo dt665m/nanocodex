@@ -187,7 +187,21 @@ it("streams only safe guest transcript events and closes the feed when its link 
   expect(transcript).toContain('event: assistant_delta');
   expect(transcript).toContain('"delta":"safe live token"');
   expect(transcript).not.toMatch(/SECRET_TOOL_OUTPUT|SECRET_USAGE|SECRET_ACCEPTED_METADATA|SECRET_DELTA_METADATA|SECRET_REASONING|nsl_/);
+  // Anonymous guests are capped below the owner's stream capacity.
+  const otherStreams: Response[] = [];
+  for (let index = 0; index < 15; index++) {
+    const next = await api(`/v1/shared/${id}/events?after=5`, "GET", undefined, undefined, token);
+    expect(next.status).toBe(200);
+    otherStreams.push(next);
+  }
+  const overLimit = await api(`/v1/shared/${id}/events?after=5`, "GET", undefined, undefined, token);
+  expect(overLimit.status).toBe(429);
+  expect(await overLimit.json()).toMatchObject({ error: "event_stream_limit", limit: 16 });
+  const ownerFeed = await api(`/v1/agents/${id}/events?after=5`, "GET", owner);
+  expect(ownerFeed.status).toBe(200);
+  await ownerFeed.body?.cancel();
   expect((await api(`${path}/${link.id}`, "DELETE", owner, undefined, undefined, "https://nanocodex.example")).status).toBe(204);
+  for (const feed of otherStreams) await feed.body?.cancel().catch(() => {});
   const closed = await reader.read().catch(() => ({ done: true }));
   expect(closed.done).toBe(true);
   expect((await api(`/v1/shared/${id}/events?after=0`, "GET", undefined, undefined, token)).status).toBe(404);

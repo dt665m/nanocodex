@@ -3,6 +3,8 @@ export const MAX_HISTORY_PAGE_SIZE = 256;
 export const MAX_HISTORY_PAGE_BYTES = 4 * 1024 * 1024;
 const KEEPALIVE_MS = 15_000;
 const MAX_SUBSCRIBERS = 32;
+// Link holders must not consume all owner event-stream slots.
+const MAX_SHARED_SUBSCRIBERS = 16;
 const MAX_CURSOR = 9_223_372_036_854_775_807n;
 const DIRECT_EVENT_BYTES = 1_000_000;
 const EVENT_CHUNK_CODE_UNITS = 256_000;
@@ -312,9 +314,11 @@ export class DurableEventLog<Message extends { type: string }> {
     if (options?.authorize && !options.authorize()) {
       return Response.json({ error: "not_found" }, { status: 404, headers: { "cache-control": "no-store" } });
     }
-    if (this.#subscribers.size >= MAX_SUBSCRIBERS) {
+    const sharedLimitReached = options?.tag
+      && [...this.#subscribers].filter((subscriber) => subscriber.tag).length >= MAX_SHARED_SUBSCRIBERS;
+    if (this.#subscribers.size >= MAX_SUBSCRIBERS || sharedLimitReached) {
       return Response.json(
-        { error: "event_stream_limit", limit: MAX_SUBSCRIBERS },
+        { error: "event_stream_limit", limit: sharedLimitReached ? MAX_SHARED_SUBSCRIBERS : MAX_SUBSCRIBERS },
         {
           status: 429,
           headers: { "cache-control": "no-store", "retry-after": "1" },
