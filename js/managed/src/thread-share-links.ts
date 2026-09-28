@@ -90,6 +90,10 @@ export class ThreadShareLinks {
 
   clear(): void {
     this.storage.sql.exec("DELETE FROM managed_share_turn_admissions");
+    // Legacy annotation rows must be removed before their link FK on old DOs.
+    if (this.storage.sql.exec<{ name: string }>(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name='managed_share_comments'",
+    ).toArray().length > 0) this.storage.sql.exec("DELETE FROM managed_share_comments");
     this.storage.sql.exec("DELETE FROM managed_share_links");
   }
 }
