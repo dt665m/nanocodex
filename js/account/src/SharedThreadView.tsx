@@ -229,7 +229,7 @@ export function SharedThreadView({ agentId }: { agentId: string }) {
         </header>
         {loading && !meta ? <p role="status" className="shared-thread-state">Opening shared thread…</p> : null}
         {error && !meta ? <div role="alert" className="shared-thread-state"><h1>Can’t open this thread</h1><p>{error}</p><button type="button" onClick={() => { void refresh(); }}>Try again</button></div> : null}
-        {meta ? <><div className="shared-chat-boundary"><LockKeyhole aria-hidden="true" /> You’re in a shared conversation. Messages you send start a real AI turn.</div>
+        {meta ? <><div className="shared-chat-boundary"><LockKeyhole aria-hidden="true" /> {meta.permission === "write" ? "You’re in a shared conversation. Messages you send start a real AI turn." : "You’re viewing this shared conversation."}</div>
           {error ? <p className="shared-thread-error" role="alert">{error}</p> : null}
           <AgentTerminalView agent={agent} agentError={undefined} mode="full" voice={false}
             onConversationActivity={() => {}} onStateChange={() => {}} retryAgent={() => { void refresh(); }}
