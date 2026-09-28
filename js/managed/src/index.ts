@@ -6696,6 +6696,9 @@ export class DurableAgentSession extends DurableComputerObject {
         beforeAdmission === undefined ? undefined : () => beforeAdmission(id, true), undefined, "http", authorization.guestShareLinkId ? {} : callerContext(request.headers),
         true, beforeAdmission === undefined ? undefined : () => beforeAdmission(id, false),
       );
+      // An archived replay may await I/O after the first check; a revoke wins
+      // before the response leaves this Durable Object.
+      beforeAdmission?.(id, false);
       const view = managedTurnView(submission.row);
       const summary = submission.created
         ? this.#conversationSummary()

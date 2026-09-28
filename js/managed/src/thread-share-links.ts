@@ -79,7 +79,10 @@ export class ThreadShareLinks {
       "SELECT COUNT(*) AS count FROM managed_share_turn_admissions WHERE link_id=? AND admitted_at>=?",
       link.id, now - 3_600_000,
     ).one().count;
-    if (minute >= 20 || hour >= 120) return "rate_limited";
+    const allLinksHour = this.storage.sql.exec<{ count: number }>(
+      "SELECT COUNT(*) AS count FROM managed_share_turn_admissions WHERE admitted_at>=?", now - 3_600_000,
+    ).one().count;
+    if (minute >= 20 || hour >= 120 || allLinksHour >= 200) return "rate_limited";
     this.storage.sql.exec("INSERT INTO managed_share_turn_admissions(turn_id,link_id,admitted_at) VALUES(?,?,?)",
       turnId, link.id, now);
     return "ok";
