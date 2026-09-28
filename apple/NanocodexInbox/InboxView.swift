@@ -2035,7 +2035,7 @@ private struct OutputActivitySheet: UIViewControllerRepresentable {
     let complete: () -> Void
     func makeUIViewController(context: Context) -> UIActivityViewController {
         let controller = UIActivityViewController(activityItems: [file], applicationActivities: nil)
-        controller.completionWithItemsHandler = { _, _, _, _ in complete() }
+        controller.completionWithItemsHandler = { _, _, _, _ in DispatchQueue.main.async(execute: complete) }
         return controller
     }
     func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
