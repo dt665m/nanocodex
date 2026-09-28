@@ -85,6 +85,7 @@ final class InboxModel: ObservableObject {
     private var overviewVisible = Set<String>()
     private var overviewTasks: [String: Task<Void, Never>] = [:]
     private var overviewTokens: [String: UUID] = [:]
+    private var overviewRowsRevisions: [String: UUID] = [:]
     private var overviewEvents: [String: [AgentEvent]] = [:]
     private var overviewBytes: [String: [Int]] = [:]
     private var overviewByteCounts: [String: Int] = [:]
@@ -2214,6 +2215,7 @@ final class InboxModel: ObservableObject {
         overviewTasks.removeValue(forKey: id)?.cancel(); overviewTokens[id] = nil
         overviewProjections.removeValue(forKey: id)?.cancel()
         overviewProjectors[id] = nil
+        overviewRowsRevisions[id] = nil
         overviewEvents[id] = nil; overviewBytes[id] = nil; overviewByteCounts[id] = nil
     }
     private func resumeOverview() {
@@ -2225,6 +2227,7 @@ final class InboxModel: ObservableObject {
               cards.contains(where: { $0.id == id }), let client else { return }
         let epoch = generation, token = UUID()
         overviewTokens[id] = token
+        overviewRowsRevisions[id] = UUID()
         overviewProjectors[id] = TranscriptStreamProjection()
         overviewTasks[id] = Task { [weak self] in
             // A fast fling should not open a network stream for every card it passes.
@@ -2298,14 +2301,39 @@ final class InboxModel: ObservableObject {
             let history = overviewEvents[id] ?? []
             guard let projected = try? await projector.rows(history),
                   generation == epoch, overviewTokens[id] == token, !Task.isCancelled else { return }
-            if overviewTranscripts[id] != projected { overviewTranscripts[id] = projected }
-            if let index = cards.firstIndex(where: { $0.id == id }) {
-                var card = cards[index]
-                card.apply(events: history, transcriptRows: projected); card.error = nil
-                if cards[index] != card { cards[index] = card }
-                reconcilePending(id: id, events: history, state: card)
-                historyCursors[id] = max(historyCursors[id] ?? .zero, card.appliedHistoryCursor)
-                await reconcileInBackground()
+            // Overview streams can carry the same large tool payloads as the
+            // focused conversation. Compare rows and prepare card previews on a
+            // worker, retaining the main actor only for validated publication.
+            guard let revision = overviewRowsRevisions[id] else { return }
+            let previousRows = overviewTranscripts[id] ?? []
+            let previousCard = cards.first(where: { $0.id == id })
+            let worker = Task.detached(priority: .userInitiated) {
+                TranscriptPublicationPreparation(events: history, rows: projected,
+                    previousRows: previousRows, card: previousCard, rowsRevision: revision)
+            }
+            let prepared = await withTaskCancellationHandler(
+                operation: { await worker.value }, onCancel: { worker.cancel() })
+            guard generation == epoch, overviewTokens[id] == token, !Task.isCancelled else { return }
+            // A refresh, another publication, or retention trimming may have
+            // changed the base while suspended. New tail deltas alone are safe:
+            // publish this prefix, then catch up without starving a live stream.
+            if let currentRevision = overviewRowsRevisions[id],
+               prepared.isCurrent(rowsRevision: currentRevision, card: cards.first(where: { $0.id == id })),
+               history.first?.cursor == overviewEvents[id]?.first?.cursor {
+                if prepared.rowsChanged {
+                    overviewRowsRevisions[id] = UUID()
+                    overviewTranscripts[id] = projected
+                }
+                if var card = prepared.card, let index = cards.firstIndex(where: { $0.id == id }) {
+                    card.error = nil
+                    if cards[index] != card { cards[index] = card }
+                    reconcilePending(id: id, events: history, state: card)
+                    historyCursors[id] = max(historyCursors[id] ?? .zero, card.appliedHistoryCursor)
+                    await reconcileInBackground()
+                }
+            } else {
+                try? await Task.sleep(for: .milliseconds(100))
+                continue
             }
             if overviewEvents[id]?.last?.cursor == history.last?.cursor { return }
             do { try await Task.sleep(for: .milliseconds(100)) } catch { return }
