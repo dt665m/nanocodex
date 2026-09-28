@@ -15,6 +15,8 @@ const links = [];
 const requests = [];
 const events = [{cursor:'1',created_at:Date.now(),type:'turn_accepted',id:'initial',input:'What changed?'}, {cursor:'3',created_at:Date.now(),type:'turn_completed',id:'initial',final_message:'The release is ready.'}];
 let revoked = false;
+const streams=new Set();
+const emit=(event)=>{if(event.type!=='assistant_delta')events.push(event);const frame=`id: ${event.cursor}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;for(const stream of streams)stream.write(frame);};
 const comments = []; let ambiguousWrite=true; let staleRead=false; const writeIds=[];
 const server = createServer(async(req,res) => {
   requests.push({url:req.url, authorization:req.headers.authorization, cookie:req.headers.cookie});
@@ -29,9 +31,16 @@ const server = createServer(async(req,res) => {
     const item={id:'link-1',permission:json.permission,created_at:Date.now()};
     links.push(item); return res.end(JSON.stringify({...item,url:`http://127.0.0.1:${server.address().port}/share/${agentId}#token=${token}`}));
   }
-  if (req.url===`${owner}/link-1` && req.method==='DELETE') {revoked=true;links.splice(0);res.statusCode=204;return res.end();}
+  if (req.url===`${owner}/link-1` && req.method==='DELETE') {revoked=true;links.splice(0);for(const stream of streams)stream.end();streams.clear();res.statusCode=204;return res.end();}
   if (req.url?.startsWith(shared)) {
     if (req.headers.authorization!==`Bearer ${token}` || revoked) {res.statusCode=403;return res.end(JSON.stringify({error:'invalid_share_link'}));}
+    if (req.url?.startsWith(`${shared}/events?`)) {
+      res.setHeader('Content-Type','text/event-stream');res.setHeader('Cache-Control','no-store');
+      const cursor=BigInt(new URL(req.url,'http://localhost').searchParams.get('after')??'0');
+      res.write('retry: 1000\n\n');streams.add(res);req.on('close',()=>streams.delete(res));
+      for(const event of events)if(BigInt(event.cursor)>cursor)res.write(`id: ${event.cursor}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+      return;
+    }
     if (req.url===shared) return res.end(JSON.stringify({agent_id:agentId,permission:links[0]?.permission??'read',title:'Project handoff',latest_event_cursor:'2'}));
     if (req.url.startsWith(`${shared}/events/history`)) {
       const before=new URL(req.url,'http://localhost').searchParams.get('before');
@@ -50,7 +59,7 @@ import {ThreadShareDialog} from './src/ThreadShareDialog'; import {SharedThreadV
 import './src/ThreadSharing.css';
 createRoot(document.getElementById('root')).render(location.pathname.startsWith('/share/')
  ? <SharedThreadView agentId="synthetic-agent" /> : <ThreadShareDialog agentId="synthetic-agent" onClose={()=>{}} />);
-`,resolveDir:new URL('..',import.meta.url).pathname,loader:'tsx'},bundle:true,write:false,outfile:'app.js',jsx:'automatic' });
+`,resolveDir:new URL('..',import.meta.url).pathname,loader:'tsx'},bundle:true,write:false,outfile:'app.js',jsx:'automatic',plugins:[{name:'guest-agent-projection',setup(build){build.onResolve({filter:/^nanocodex-react\/agent$/},()=>({path:'safe-agent-output',namespace:'guest'}));build.onLoad({filter:/.*/,namespace:'guest'},()=>({contents:'export function projectToolOutput(){return []}; export function generatedOutputUrl(){return undefined}',loader:'js'}));}}] });
 const html=`<meta name="viewport" content="width=device-width,initial-scale=1"><div id="root"></div><style>html,body,#root{min-height:100%;margin:0} ${bundle.outputFiles.find(f=>f.path.endsWith('.css')).text}</style><script>${bundle.outputFiles.find(f=>f.path.endsWith('.js')).text}</script>`;
 server.on('request',(req,res)=>{});
 // Wrap the API server's request listener with an HTML response for SPA routes.
@@ -68,6 +77,12 @@ try {
  await owner.screenshot({path:new URL('owner.png',output).pathname});
  const visitor=await browser.newPage();await visitor.goto(link);
  await visitor.getByText('The release is ready.').waitFor();
+ emit({cursor:'4',type:'turn_accepted',id:'live-turn',turn_id:'live-turn',input:'Any updates?'});
+ emit({cursor:'5',type:'assistant_delta',turn_id:'live-turn',delta:'Working on it…'});
+ await visitor.getByText('Working on it…').waitFor();
+ emit({cursor:'6',type:'turn_completed',id:'live-turn',turn_id:'live-turn',final_message:'All updates complete.'});
+ await visitor.getByText('All updates complete.').waitFor();
+ assert.equal(await visitor.getByText('Working on it…').count(),0,'final answer replaces its streamed delta');
  await visitor.getByRole('button',{name:'Load earlier messages'}).click();
  await visitor.getByRole('button',{name:'Load earlier messages'}).click();
  await visitor.getByText('What changed?').waitFor();
@@ -83,6 +98,7 @@ try {
  await writer.getByRole('button',{name:'Post comment'}).click();
  await writer.getByRole('alert').getByText(/Couldn’t confirm your comment/).waitFor();
  await writer.getByRole('button',{name:'Post comment'}).click();
+ await writer.getByText(/Comments \(1\)/).click();
  await writer.getByText('Can you follow up?').waitFor();
  assert.deepEqual(writeIds,[writeIds[0],writeIds[0]],'retry must retain the same comment ID');
  assert.equal(comments.length,1,'uncertain outcome must not duplicate a comment');

@@ -80,3 +80,36 @@
 .thread-share-comments li p { margin: 6px 0 0; overflow-wrap: anywhere; white-space: pre-wrap; line-height: 1.5; font-size: 13px; }
 .shared-thread-older { justify-self: center; }
 .thread-share-older { margin-top: 12px; padding: 8px 10px; border: 1px solid var(--chat-line, var(--border-soft, #ddd)); border-radius: 8px; color: inherit; background: transparent; font-size: 12px; cursor: pointer; }
+/* Shared links use the same chat shell, transcript rendering and composer as an
+   owned agent. The only difference is the guest's deliberately limited authority. */
+.shared-chat-workspace { width: 100%; height: 100dvh; min-height: 0; display: flex; }
+.shared-chat-workspace .conversation-workspace { display: grid; width: 100%; height: 100%; min-height: 0; grid-template-columns: 260px minmax(0, 1fr); }
+.shared-chat-workspace .conversation-main { display: flex; min-height: 0; min-width: 0; flex-direction: column; grid-column: 2; }
+.shared-chat-workspace .agent-terminal-workspace { flex: 1 1 auto; min-height: 0; }
+.shared-chat-sidebar { grid-column: 1; display: flex; min-height: 0; flex-direction: column; gap: 20px; padding: 22px 14px; border-right: 1px solid var(--chat-line); background: var(--chat-sidebar); }
+.shared-chat-sidebar .shared-thread-brand { padding: 4px 10px; }
+.shared-chat-sidebar-thread { display: flex; align-items: center; gap: 10px; padding: 12px; border-radius: 10px; background: var(--chat-selected); font-weight: 600; }
+.shared-chat-sidebar-thread span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.shared-chat-sidebar p { display: flex; align-items: center; gap: 8px; margin: auto 12px 0; color: var(--chat-muted); font-size: 12px; }
+.shared-chat-sidebar svg { flex: none; width: 16px; height: 16px; }
+.shared-chat-back { display: none; width: 38px; height: 38px; align-items: center; justify-content: center; border-radius: 8px; color: inherit; }
+.shared-chat-boundary { display: flex; align-items: center; gap: 8px; margin: 0 auto; padding: 5px 20px 10px; color: var(--chat-muted); font-size: 12px; }
+.shared-chat-boundary svg { width: 14px; height: 14px; flex: none; }
+.shared-chat-workspace .shared-thread-state { margin: auto; padding: 16px; }
+.shared-chat-workspace .shared-thread-state button { color: var(--chat-text); }
+.shared-chat-workspace .shared-thread-error { width: min(100% - 32px, 680px); margin: 0 auto; }
+.shared-chat-dock { width: 100%; }
+.shared-chat-comments { width: min(100% - 32px, 680px); margin: 0 auto 8px; border-top: 1px solid var(--chat-line); color: var(--chat-muted); }
+.shared-chat-comments summary { display: flex; gap: 8px; align-items: center; padding: 5px; cursor: pointer; list-style: none; font-size: 12px; }
+.shared-chat-comments summary::-webkit-details-marker { display: none; }
+.shared-chat-comments svg { width: 15px; height: 15px; }
+.shared-chat-comments-body { max-height: min(180px, 28dvh); overflow-y: auto; padding: 0 8px; }
+.shared-chat-comments-body p { margin: 8px 0; overflow-wrap: anywhere; }
+.shared-chat-comments-body strong { display: block; font-size: 11px; }
+.shared-chat-comments-body span { color: var(--chat-text); white-space: pre-wrap; }
+.shared-chat-workspace .shared-thread-readonly { width: min(100% - 32px, 680px); margin: 4px auto 12px; }
+.shared-chat-comment-note { display: block; width: min(100% - 32px, 680px); margin: 0 auto 4px; color: var(--chat-muted); font-size: 11px; }
+@media (max-width: 760px) { .shared-chat-workspace .conversation-workspace { grid-template-columns: minmax(0, 1fr); } .shared-chat-workspace .conversation-main { grid-column: 1; } .shared-chat-sidebar { display: none; } .shared-chat-back { display: inline-flex; } .shared-chat-boundary { padding: 4px 16px 8px; } .shared-chat-workspace .agent-chat-header { padding-inline: 10px; } .shared-chat-workspace .agent-chat-heading strong { font-size: 15px; } }
+
+.shared-chat-older-short { display: none; }
+@media (max-width: 760px) { .shared-chat-older-wide { display: none; } .shared-chat-older-short { display: inline; } .shared-chat-workspace .agent-chat-header .shared-thread-older { padding: 6px; white-space: nowrap; } }
