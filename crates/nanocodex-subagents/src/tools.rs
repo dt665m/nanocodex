@@ -597,10 +597,7 @@ fn spawn_agent_parameters() -> Value {
                 "enum": ["none", "low", "medium", "high", "xhigh", "max", null],
                 "description": "Reasoning override; null inherits the parent's level."
             },
-            "output_contract": {
-                "$ref": "#/$defs/node",
-                "description": "Typed shape of submit_result.output. Use kind=object with fields for a report; use kind=string for plain text. Each field has name, schema, and required. Arrays use kind=array and items. No raw JSON Schema keywords belong in this argument."
-            }
+            "output_contract": { "$ref": "#/$defs/node" }
         },
         "required": ["role", "task", "model", "thinking", "output_contract"],
         "additionalProperties": false,
@@ -672,7 +669,7 @@ impl Tool for SubmitResult {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition::function(
             SUBMIT_RESULT_TOOL,
-            "Submits the current child subagent turn's final JSON output. This tool is unavailable to the root agent; root agents return final output as assistant text. Supply only output matching the task schema. Finish after acceptance. If superseded, incorporate pending instructions and submit the updated result. Invalid values can be corrected and retried.",
+            "Submits the current child subagent turn's final JSON output. This tool is unavailable to the root agent; root agents return final output as assistant text. Supply only output matching the task schema. After an accepted receipt, send a brief final assistant message with no further tool calls; do not finish with an empty response. If superseded, incorporate pending instructions and submit the updated result. Invalid values can be corrected and retried.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1086,6 +1083,26 @@ mod strict_spawn_tests {
         let serialized = serde_json::to_value(definition).unwrap();
         assert_eq!(serialized["strict"], true);
         let parameters = &serialized["parameters"];
+        // The live provider rejects even descriptive siblings of a $ref.
+        fn assert_bare_refs(value: &Value) {
+            match value {
+                Value::Object(object) => {
+                    if object.contains_key("$ref") {
+                        assert_eq!(object.len(), 1, "$ref must have no sibling keywords");
+                    }
+                    for child in object.values() {
+                        assert_bare_refs(child);
+                    }
+                }
+                Value::Array(items) => {
+                    for item in items {
+                        assert_bare_refs(item);
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_bare_refs(parameters);
         assert_eq!(parameters["additionalProperties"], false);
         assert_eq!(
             parameters["required"],
@@ -1152,6 +1169,14 @@ mod strict_spawn_tests {
         assert!(validator.is_valid(&json!({ "status": "ok" })));
         assert!(!validator.is_valid(&json!({ "status": 1 })));
         assert!(!validator.is_valid(&json!({ "status": "other" })));
+    }
+
+    #[test]
+    fn child_prompt_requires_final_message_after_accepted_submission() {
+        let prompt = agent_prompt(AgentId::new(1), "Return the result");
+        assert!(prompt.contains("call submit_result({output})"));
+        assert!(prompt.contains("When its receipt says accepted, send a brief final"));
+        assert!(prompt.contains("do not end with an empty model"));
     }
 
     #[test]
