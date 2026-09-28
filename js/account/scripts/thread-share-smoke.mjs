@@ -89,7 +89,19 @@ try {
  assert.equal(await visitor.getByRole('textbox',{name:'Comment on this thread'}).count(),0);
  await visitor.screenshot({path:new URL('read.png',output).pathname});
  await visitor.reload(); await visitor.getByText('The release is ready.').waitFor();
+ // A slow authorized history response must never resurrect the transcript after
+ // an active stream is closed by revocation.
+ let resolveBlocked; const blocked=new Promise(resolve=>{resolveBlocked=resolve;});
+ let historyStarted; const started=new Promise(resolve=>{historyStarted=resolve;});
+ await visitor.route('**/events/history',async route=>{
+   historyStarted(); await blocked;
+   await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({data:[events[1]],has_more:false})});
+ });
+ await visitor.getByRole('button',{name:'Refresh shared thread'}).click(); await started;
  await owner.getByRole('button',{name:'Revoke link'}).click();assert.equal(revoked,true);
+ await visitor.getByRole('alert').waitFor(); resolveBlocked();
+ await visitor.waitForTimeout(150);
+ assert.equal(await visitor.getByText('The release is ready.').count(),0,'stale history cannot repopulate a revoked transcript');
  await visitor.reload();await visitor.getByRole('alert').waitFor();
  // A new link with write access exercises contribution using the same guest UI and bearer boundary.
  revoked=false;links.push({id:'link-2',permission:'write',created_at:new Date().toISOString()});

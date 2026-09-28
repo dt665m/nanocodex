@@ -35,6 +35,7 @@ export function SharedThreadView({ agentId }: { agentId: string }) {
   const [olderCommentsPending, setOlderCommentsPending] = useState(false);
   const commentsExhausted = useRef(false);
   const streamCursor = useRef<string | null>(null);
+  const accessEpoch = useRef(0);
   const [draft, setDraft] = useState("");
   const [pending, setPending] = useState(false);
   const pendingComment = useRef<{ id: string; input: string } | null>(null);
@@ -46,9 +47,13 @@ export function SharedThreadView({ agentId }: { agentId: string }) {
     return response.json() as Promise<unknown>;
   }, [base, token]);
   const invalidate = useCallback((message = revokedMessage) => {
+    // Ignore any earlier history/comment requests that complete after a revoke.
+    accessEpoch.current++;
+    setLoading(false); setPending(false); setOlderPending(false); setOlderCommentsPending(false);
     setMeta(null); setEvents([]); setLive([]); setComments([]); setOlderCursor(null); setOlderCommentsCursor(null); setError(message);
   }, []);
   const refresh = useCallback(async (signal?: AbortSignal) => {
+    const epoch = accessEpoch.current;
     if (!token) { invalidate("This link is missing its access token."); setLoading(false); return; }
     setLoading(true); setError("");
     try {
@@ -57,7 +62,7 @@ export function SharedThreadView({ agentId }: { agentId: string }) {
         { data: SharedEvent[]; has_more: boolean; next_cursor?: string },
         { data: Comment[]; has_more?: boolean; next_cursor?: string },
       ];
-      if (signal?.aborted) return;
+      if (signal?.aborted || epoch !== accessEpoch.current) return;
       streamCursor.current ??= metadata.latest_event_cursor ?? "0";
       setMeta(metadata);
       setEvents((previous) => mergeEvents(previous, Array.isArray(history.data) ? history.data : []));
@@ -65,11 +70,11 @@ export function SharedThreadView({ agentId }: { agentId: string }) {
       setComments((previous) => mergeComments(previous, annotations.data ?? []));
       setOlderCommentsCursor((current) => current ?? (!commentsExhausted.current && annotations.has_more ? annotations.next_cursor ?? null : null));
     } catch (cause) {
-      if (!signal?.aborted) {
+      if (!signal?.aborted && epoch === accessEpoch.current) {
         if (cause instanceof Error && cause.message === revokedMessage) invalidate();
         else setError(cause instanceof Error ? cause.message : "Couldn’t open this thread.");
       }
-    } finally { if (!signal?.aborted) setLoading(false); }
+    } finally { if (!signal?.aborted && epoch === accessEpoch.current) setLoading(false); }
   }, [read, token, invalidate]);
   useEffect(() => {
     const controller = new AbortController();
@@ -83,10 +88,11 @@ export function SharedThreadView({ agentId }: { agentId: string }) {
   useEffect(() => {
     if (!meta || !token) return;
     const controller = new AbortController();
+    const epoch = accessEpoch.current;
     let active = true;
     const connect = async () => {
       let delay = 500;
-      while (active && !controller.signal.aborted) {
+      while (active && !controller.signal.aborted && epoch === accessEpoch.current) {
         try {
           const cursor = streamCursor.current ?? meta.latest_event_cursor ?? "0";
           const response = await fetch(`${base}/events?after=${encodeURIComponent(cursor)}`, {
@@ -99,14 +105,14 @@ export function SharedThreadView({ agentId }: { agentId: string }) {
           const reader = response.body.getReader();
           const decoder = new TextDecoder();
           let buffer = "";
-          while (active) {
+          while (active && epoch === accessEpoch.current) {
             const chunk = await reader.read();
-            if (chunk.done) break;
+            if (chunk.done || epoch !== accessEpoch.current) break;
             buffer += decoder.decode(chunk.value, { stream: true });
             // Keep a malformed or unbounded SSE frame from accumulating forever.
             if (buffer.length > 1_000_000) throw new Error("The live feed frame was too large.");
             let boundary: number;
-            while ((boundary = buffer.indexOf("\n\n")) !== -1) {
+            while (epoch === accessEpoch.current && (boundary = buffer.indexOf("\n\n")) !== -1) {
               const frame = buffer.slice(0, boundary).replaceAll("\r", "");
               buffer = buffer.slice(boundary + 2);
               const data = frame.split("\n").filter((line) => line.startsWith("data: ")).map((line) => line.slice(6)).join("\n");
@@ -127,13 +133,13 @@ export function SharedThreadView({ agentId }: { agentId: string }) {
               }
             }
           }
-          if (active && !controller.signal.aborted) {
+          if (active && !controller.signal.aborted && epoch === accessEpoch.current) {
             // A revoked link actively closes its stream. Recheck before retrying,
             // rather than leaving the last private transcript visible indefinitely.
             await read("", controller.signal);
           }
         } catch (cause) {
-          if (!active || controller.signal.aborted) return;
+          if (!active || controller.signal.aborted || epoch !== accessEpoch.current) return;
           if (cause instanceof Error && cause.message === revokedMessage) { invalidate(); return; }
           await new Promise((resolve) => window.setTimeout(resolve, delay));
           delay = Math.min(delay * 2, 10_000);
@@ -151,25 +157,29 @@ export function SharedThreadView({ agentId }: { agentId: string }) {
   }
   async function loadOlder(): Promise<boolean> {
     if (!olderCursor || olderPending) return false;
+    const epoch = accessEpoch.current;
     setOlderPending(true); setError("");
     try {
       const page = await read(`/events/history?before=${encodeURIComponent(olderCursor)}`) as { data: SharedEvent[]; has_more: boolean; next_cursor?: string };
+      if (epoch !== accessEpoch.current) return false;
       setEvents((current) => mergeEvents(current, page.data));
       if (!page.has_more) historyExhausted.current = true;
       setOlderCursor(page.has_more ? page.next_cursor ?? null : null);
       return true;
-    } catch (cause) { showGuestError(cause, "Couldn’t load earlier messages."); return false; }
+    } catch (cause) { if (epoch === accessEpoch.current) showGuestError(cause, "Couldn’t load earlier messages."); return false; }
     finally { setOlderPending(false); }
   }
   async function loadOlderComments() {
     if (!olderCommentsCursor || olderCommentsPending) return;
+    const epoch = accessEpoch.current;
     setOlderCommentsPending(true); setError("");
     try {
       const page = await read(`/comments?before=${encodeURIComponent(olderCommentsCursor)}`) as { data: Comment[]; has_more: boolean; next_cursor?: string };
+      if (epoch !== accessEpoch.current) return;
       setComments((current) => mergeComments(current, page.data));
       if (!page.has_more) commentsExhausted.current = true;
       setOlderCommentsCursor(page.has_more ? page.next_cursor ?? null : null);
-    } catch (cause) { showGuestError(cause, "Couldn’t load earlier comments."); }
+    } catch (cause) { if (epoch === accessEpoch.current) showGuestError(cause, "Couldn’t load earlier comments."); }
     finally { setOlderCommentsPending(false); }
   }
   async function submit(value: string) {
@@ -178,8 +188,10 @@ export function SharedThreadView({ agentId }: { agentId: string }) {
     // Preserve the exact intended write and ID after an uncertain response.
     const candidate = pendingComment.current?.input === input ? pendingComment.current : { id: crypto.randomUUID(), input };
     pendingComment.current = candidate;
+    const epoch = accessEpoch.current;
     setPending(true); setError("");
     const accept = (comment: Comment) => {
+      if (epoch !== accessEpoch.current) return;
       setComments((current) => mergeComments(current, [comment]));
       pendingComment.current = null;
       setDraft("");
@@ -194,7 +206,7 @@ export function SharedThreadView({ agentId }: { agentId: string }) {
         const confirmed = page.data.find((item) => item.id === candidate.id && item.input === candidate.input);
         if (confirmed) { accept(confirmed); return; }
       } catch { /* The original error is more useful than a second read error. */ }
-      showGuestError(cause, "Couldn’t confirm your comment. Try again.");
+      if (epoch === accessEpoch.current) showGuestError(cause, "Couldn’t confirm your comment. Try again.");
     } finally { setPending(false); }
   }
   const transcript = useMemo((): AgentEntry[] => {
