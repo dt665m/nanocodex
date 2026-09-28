@@ -446,6 +446,37 @@ public final class ManagedClient: @unchecked Sendable {
         guard response.statusCode == 200 else { throw APIError.http(response.statusCode) }
     }
 
+    /// Download a private /brain/outputs link with this account's credentials.
+    /// The sandbox URI itself is never passed to URLSession or an external app.
+    public func downloadOutput(agentID: String, path: String) async throws -> URL {
+        guard PublishedOutputLink.validPath(path) else { throw APIError.invalidResponse }
+        var query = URLComponents()
+        query.queryItems = [URLQueryItem(name: "path", value: path)]
+        guard let encoded = query.percentEncodedQuery else { throw APIError.invalidResponse }
+        var request = try request(path: Self.agentPath(agentID) + "/files?" + encoded)
+        request.timeoutInterval = 300
+        request.setValue("application/octet-stream", forHTTPHeaderField: "Accept")
+        let (download, response) = try await session.download(for: request)
+        defer { try? FileManager.default.removeItem(at: download) }
+        guard let response = response as? HTTPURLResponse else { throw APIError.invalidResponse }
+        guard response.statusCode == 200 else { throw APIError.http(response.statusCode) }
+        guard response.mimeType == "application/octet-stream" else { throw APIError.invalidResponse }
+        let size = try download.resourceValues(forKeys: [.fileSizeKey]).fileSize
+        guard size != nil, size! >= 0, response.expectedContentLength < 0 || Int64(size!) == response.expectedContentLength else {
+            throw APIError.invalidResponse
+        }
+        // An isolated folder keeps the original filename in Quick Look and
+        // Save to Files without colliding with another download of that name.
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("NanocodexOutput-" + UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let local = directory.appendingPathComponent((path as NSString).lastPathComponent)
+        do { try FileManager.default.moveItem(at: download, to: local) }
+        catch { try? FileManager.default.removeItem(at: directory); throw error }
+        if Task.isCancelled { try? FileManager.default.removeItem(at: directory); throw CancellationError() }
+        return local
+    }
+
     /// Account-scoped URLCache retains immutable previews; original bytes never
     /// enter a scrolling transcript or the in-memory history projection.
     public func attachmentPreview(agentID: String, attachmentID: String) async throws -> Data {

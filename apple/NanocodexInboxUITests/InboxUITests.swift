@@ -2388,6 +2388,19 @@ final class InboxUITests: XCTestCase {
 
 
 
+    func testPrivateOutputLinksRenderNativePreviewAndSaveCards() {
+        let app = launch(["NANOCODEX_DEMO_OUTPUT_LINKS": "1"])
+        let conversation = app.descendants(matching: .any)["conversation"].firstMatch
+        XCTAssertTrue(conversation.waitForExistence(timeout: 10))
+        XCTAssertFalse(conversation.buttons["View Not an output"].exists,
+                       "Only canonical /brain/outputs links become file cards")
+        XCTAssertEqual(conversation.buttons.matching(identifier: "published-output-open").count, 2)
+        XCTAssertEqual(conversation.buttons.matching(identifier: "published-output-save").count, 2)
+        XCTAssertTrue(conversation.links["sandbox:/brain/outputs/frontiers-next/launch.mp4"].exists)
+        XCTAssertTrue(conversation.links["sandbox:/brain/outputs/frontiers-next/videos.zip"].exists)
+        capture(app, "private-output-links")
+    }
+
     func testNativeMediaPreviewZoomPlaybackAndDraftRestoration() throws {
         let clip = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "VideoAudioCheck", withExtension: "mp4"))
         let app = launch(["NANOCODEX_DEMO_GENERATED_OUTPUTS": "1", "NANOCODEX_DEMO_VIDEO_BASE64": try Data(contentsOf: clip).base64EncodedString()])

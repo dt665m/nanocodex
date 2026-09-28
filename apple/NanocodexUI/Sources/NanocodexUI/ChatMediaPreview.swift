@@ -39,7 +39,13 @@ public struct ChatMediaPreview<Label: View>: View {
         .onDisappear { if selection == nil { Self.remove(files); files = [] } }
     }
     private static func remove(_ urls: [URL]) {
-        for url in urls where url.isFileURL { try? FileManager.default.removeItem(at: url) }
+        for url in urls where url.isFileURL {
+            let parent = url.deletingLastPathComponent()
+            if parent.lastPathComponent.hasPrefix("NanocodexOutput-"),
+               parent.deletingLastPathComponent().standardizedFileURL == FileManager.default.temporaryDirectory.standardizedFileURL {
+                try? FileManager.default.removeItem(at: parent)
+            } else { try? FileManager.default.removeItem(at: url) }
+        }
     }
 }
 

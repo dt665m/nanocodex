@@ -560,6 +560,16 @@ final class InboxModel: ObservableObject {
         }
         return url
     }
+    func downloadOutput(_ link: PublishedOutputLink, agentID: String) async throws -> URL {
+        guard let client else { throw APIError.invalidCredential }
+        let epoch = generation
+        let url = try await client.downloadOutput(agentID: agentID, path: link.path)
+        guard epoch == generation, !Task.isCancelled else {
+            try? FileManager.default.removeItem(at: url.deletingLastPathComponent())
+            throw CancellationError()
+        }
+        return url
+    }
     func attachmentPreview(_ attachment: MessageAttachment, agentID: String) async throws -> Data {
         if let local = attachmentURL(attachment) {
             let epoch = generation
