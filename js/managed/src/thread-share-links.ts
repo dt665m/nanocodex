@@ -71,6 +71,7 @@ export class ThreadShareLinks {
     if (link.permission !== "write" || !link.authorization_json) return "revoked";
     if (!newTurn) return "ok";
     const now = Date.now();
+    this.storage.sql.exec("DELETE FROM managed_share_turn_admissions WHERE admitted_at<?", now - 86_400_000);
     const minute = this.storage.sql.exec<{ count: number }>(
       "SELECT COUNT(*) AS count FROM managed_share_turn_admissions WHERE link_id=? AND admitted_at>=?",
       link.id, now - 60_000,
