@@ -1,4 +1,4 @@
-import { executeMercatorPayment } from "./mercator-payment";
+import { executeMercatorPayment, MercatorPaymentInputError } from "./mercator-payment";
 import type { CloudflareAccountVaultResult } from "nanocodex/cloudflare/egress";
 import { createSshKeyPair, sshPublicKey } from "nanocodex/tools/ssh";
 import { DurableObject } from "cloudflare:workers";
@@ -686,7 +686,11 @@ export class UserCredentialBroker extends DurableObject<BrokerEnv> {
           return json(await executeMercatorPayment(await readJson(request, 64 * 1024), {
             store: this.#state.storage, wallet: rootWalletProvider(wallet), signal: request.signal,
           }), 200);
-        } catch { return jsonError(503, "mercator_outcome_unknown"); }
+        } catch (error) {
+          return error instanceof MercatorPaymentInputError
+            ? jsonError(error.status, error.code)
+            : jsonError(503, "mercator_outcome_unknown");
+        }
       }
       if (url.pathname === "/v1/wallet/connect") {
         if (request.method !== "POST") return jsonError(405, "method_not_allowed");

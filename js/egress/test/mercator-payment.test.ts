@@ -12,6 +12,12 @@ describe("broker Mercator execution", () => {
     expect(result.result?.payer.toLowerCase()).toBe(`did:pkh:eip155:4217:${metadata.address}`);
     expect(result).toMatchObject({ status: "submitted", result: { id: "broker-synthetic-job", payer: expect.any(String), paidSubmissions: 1 } });
     expect(await replay.json()).toEqual(result);
+    const conflict = await SELF.fetch(`${base}/mercator`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...input, approved_total: "0.04" }) });
+    expect(conflict.status).toBe(409);
+    expect(await conflict.json()).toMatchObject({ error: "mercator_idempotency_conflict" });
+    const invalid = await SELF.fetch(`${base}/mercator`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...input, idempotency_key: "other-operation", approved_total: "0.06" }) });
+    expect(invalid.status).toBe(400);
+    expect(await invalid.json()).toMatchObject({ error: "invalid_mercator_payment_request" });
     expect(JSON.stringify(result)).not.toMatch(/signature|privateKey|authorization/);
   });
 

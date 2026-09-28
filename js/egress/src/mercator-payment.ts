@@ -15,6 +15,17 @@ interface Options { store: Store; wallet: ReturnType<typeof Provider.create>; fe
 type Result = { status: "submitted" | "rejected" | "unknown"; operation_id: string; result?: unknown; reason?: string };
 type RecordState = { fingerprint: string; result: Result };
 
+/** Validation is definitely pre-payment; do not describe it as an unknown charge. */
+export class MercatorPaymentInputError extends Error {
+  readonly code: "invalid_mercator_payment_request" | "mercator_idempotency_conflict";
+  readonly status: 400 | 409;
+  constructor(code: "invalid_mercator_payment_request" | "mercator_idempotency_conflict", status: 400 | 409) {
+    super(code);
+    this.code = code;
+    this.status = status;
+  }
+}
+
 /** Caller must serialize operations per account (the credential DO does so).
  * This endpoint is only reachable through the trusted owner service binding.
  * Explicit user authorization is enforced by the managed tool authority model.
@@ -24,26 +35,28 @@ export async function executeMercatorPayment(value: unknown, { store, wallet, fe
     || !record(value.plan) || !Array.isArray(value.plan.nodes) || value.plan.nodes.length < 1 || value.plan.nodes.length > 10
     || typeof value.idempotency_key !== "string" || !/^[A-Za-z0-9_-]{8,200}$/.test(value.idempotency_key)
     || typeof value.approved_total !== "string" || !/^\d{1,2}(?:\.\d{1,6})?$/.test(value.approved_total)
-    || (value.id !== undefined && (typeof value.id !== "string" || !/^[0-9a-f-]{36}$/i.test(value.id)))) throw new Error("Invalid Mercator payment request");
+    || (value.id !== undefined && (typeof value.id !== "string" || !/^[0-9a-f-]{36}$/i.test(value.id)))) throw new MercatorPaymentInputError("invalid_mercator_payment_request", 400);
   const [whole, fraction = ""] = value.approved_total.split(".");
   const maximum = BigInt(whole!) * 1_000_000n + BigInt(fraction.padEnd(6, "0"));
-  if (maximum <= 0n || maximum > 50_000n) throw new Error("Mercator approval must be positive and at most $0.05 per operation");
+  if (maximum <= 0n || maximum > 50_000n) throw new MercatorPaymentInputError("invalid_mercator_payment_request", 400);
   const fingerprintBody = canonical(value);
   const body = canonical({ idempotencyKey: value.idempotency_key, plan: value.plan, ...(value.id === undefined ? {} : { id: value.id }) });
-  if (new TextEncoder().encode(body).length > 64 * 1024) throw new Error("Mercator request exceeds 64 KiB");
+  if (new TextEncoder().encode(body).length > 64 * 1024) throw new MercatorPaymentInputError("invalid_mercator_payment_request", 400);
+  const signal = AbortSignal.any([AbortSignal.timeout(60_000), ...(callerSignal ? [callerSignal] : [])]);
+  signal.throwIfAborted(); // A canceled queued request must not reserve a payment key.
   const fingerprint = await digest(fingerprintBody);
   const key = `mercator-payment:${value.idempotency_key}`;
   const previous = await store.get<RecordState>(key);
   if (previous) {
-    if (previous.fingerprint !== fingerprint) throw new Error("Mercator idempotency key conflict");
+    if (previous.fingerprint !== fingerprint) throw new MercatorPaymentInputError("mercator_idempotency_conflict", 409);
     return previous.result;
   }
   const operation_id = value.idempotency_key;
   const unknown: Result = { status: "unknown", operation_id, reason: "Do not repay. This stored outcome requires manual merchant reconciliation using the idempotency key." };
+  signal.throwIfAborted();
   // Durable before any network activity: eviction, timeout and lost replies cannot
   // cause a second signature. Unknown outcomes intentionally require reconciliation.
   await store.put(key, { fingerprint, result: unknown });
-  const signal = AbortSignal.any([AbortSignal.timeout(60_000), ...(callerSignal ? [callerSignal] : [])]);
   let paymentSubmitted = false;
   let result: Result;
   try {

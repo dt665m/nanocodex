@@ -5,7 +5,7 @@ import { custom, decodeFunctionData, parseAbi } from "viem";
 import { Transaction, Abis } from "viem/tempo";
 import { tempo } from "viem/tempo/chains";
 import { Challenge, Credential } from "mppx";
-import { executeMercatorPayment } from "../src/mercator-payment.ts";
+import { executeMercatorPayment, MercatorPaymentInputError } from "../src/mercator-payment.ts";
 // Protocol failures: quote drift, token/chain/recipient escalation, redirects,
 // duplicate/concurrent submission, and lost response after signing. The positive
 // scenario uses the actual Accounts signer; only merchant/RPC transport is fake.
@@ -97,6 +97,13 @@ describe("bounded account Mercator payments", () => {
         assert.equal(result.status, "rejected");
         assert.equal(f.submissions(), 0);
     });
+    it("does not reserve a key when an already-canceled queued request begins", async () => {
+        const f = fixture();
+        const controller = new AbortController(); controller.abort();
+        await assert.rejects(executeMercatorPayment(input, { ...f, signal: controller.signal }));
+        assert.equal(await f.store.get(`mercator-payment:${input.idempotency_key}`), undefined);
+        assert.equal(f.submissions(), 0);
+    });
     it("retains the reservation if result persistence fails after merchant acceptance", async () => {
         const f = fixture();
         const put = f.store.put;
@@ -146,6 +153,7 @@ describe("bounded account Mercator payments", () => {
             assert.equal((await executeMercatorPayment(input, f)).status, "rejected");
             assert.equal(f.submissions(), 0);
         }
-        await assert.rejects(executeMercatorPayment({ ...input, approved_total: "0.050001" }, fixture()), /0.05/);
+        await assert.rejects(executeMercatorPayment({ ...input, approved_total: "0.050001" }, fixture()),
+            error => error instanceof MercatorPaymentInputError && error.status === 400);
     });
 });

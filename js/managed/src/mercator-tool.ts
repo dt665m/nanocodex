@@ -27,7 +27,13 @@ export function mercatorPaymentTools(options: { owner: string; broker: Pick<Fetc
           method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(input),
           signal,
         });
-        if (!response.ok) return { status: response.status === 404 ? "rejected" : "unknown", reason: response.status === 404 ? "Account wallet is not configured" : "Broker outcome unknown; keep the same key, do not create a replacement payment" };
+        if (!response.ok) {
+          void response.body?.cancel().catch(() => {});
+          if (response.status === 400) return { status: "invalid", reason: "Invalid plan, approved total or operation key; no payment request started." };
+          if (response.status === 409) return { status: "conflict", reason: "This key is already bound to a different plan or amount. Reuse the exact original arguments; do not create a replacement payment without reconciling the original." };
+          if (response.status === 404) return { status: "rejected", reason: "Account wallet is not configured" };
+          return { status: "unknown", reason: "Broker outcome unknown; keep the same key, do not create a replacement payment" };
+        }
         return await response.json();
         })();
         return await Promise.race([pending, interrupted]);
