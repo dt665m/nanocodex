@@ -370,7 +370,7 @@ const TerminalEntryView = memo(function TerminalEntryView({
     </details>
   );
   if (entry.kind === "user") return <pre className="agent-terminal-user" data-source={voice ? "voice" : undefined}>
-    {voice ? <span className="agent-terminal-entry-label">voice</span> : userLabel && !voice ? <span className="agent-terminal-entry-label">{userLabel(entry)}</span> : null}{entry.text}
+    {voice ? <span className="agent-terminal-entry-label">voice</span> : !voice && (userLabel?.(entry) || entry.author === "guest") ? <span className="agent-terminal-entry-label">{userLabel?.(entry) || "Guest"}</span> : null}{entry.text}
   </pre>;
   if (entry.kind === "assistant" || entry.kind === "reasoning") return (
     <article className={`agent-terminal-markdown is-${entry.kind}`} data-source={voice ? "voice" : undefined}>

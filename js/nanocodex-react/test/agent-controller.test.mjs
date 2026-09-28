@@ -774,3 +774,20 @@ test("root terminal polling cannot attach to a child session with the same ID", 
   assert.equal(JSON.parse(state.entries[0].tool.output).output, "root done");
   assert.equal(JSON.parse(state.entries[1].tool.output).output, "child");
 });
+
+test("shared guest prompts retain author in the standard Chat transcript", async () => {
+  const frames = fakeAnimationFrames();
+  const source = fakeAgent();
+  source.history = [event(1, "managed.prompt", { text: "Guest message", turn_id: "guest-turn", author: "guest" })];
+  let controller;
+  function Consumer() { controller = useAgentController(source.agent); return null; }
+  let root;
+  try {
+    await act(async () => { root = create(createElement(Consumer)); });
+    await flushFrames(frames);
+    assert.equal(controller.entries.find(entry => entry.turnId === "guest-turn")?.author, "guest");
+  } finally {
+    if (root) await act(async () => root.unmount());
+    frames.restore();
+  }
+});

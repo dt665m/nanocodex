@@ -68,7 +68,7 @@ export function ThreadShareDialog({ agentId, onClose }: { agentId: string; onClo
         <div className="thread-share-create"><select id="thread-share-permission" value={permission} onChange={(event) => setPermission(event.target.value as "read" | "write")}>
           <option value="read">Can view</option><option value="write">Can view and message</option>
         </select><button type="submit" disabled={busy}>Create {permission === "read" ? "view" : "message"} link</button></div>
-        <p className="thread-share-help">Anyone with this link can {permission === "read" ? "read the shared messages" : "send messages to Nanocodex"}.</p>
+        <p className="thread-share-help">Anyone with this link can {permission === "read" ? "read this thread, including future messages and tool output" : "read this thread and send real AI turns billed to you"}. Share only with people you trust; revoke the link at any time.</p>
       </form>
       {created ? <div className="thread-share-created"><label htmlFor="thread-share-new-link">New share link · copy it now</label>
         <div><input id="thread-share-new-link" aria-label="New share link" readOnly value={created.url} onFocus={(event) => event.target.select()} />

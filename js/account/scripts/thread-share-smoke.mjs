@@ -55,6 +55,7 @@ const server = createServer(async(req,res) => {
         emit({cursor:String(8+turns.length*4),type:'event',turn_id:turn.id,event:{request_id:'synthetic',seq:8+turns.length*4,type:'reasoning.summary.delta',payload:{turn_id:turn.id,text:'Checking the answer…'}}});
         emit({cursor:String(9+turns.length*4),type:'event',turn_id:turn.id,event:{request_id:'synthetic',seq:9+turns.length*4,type:'tool.call',payload:{turn_id:turn.id,tool:'search',call_id:'tool-1',arguments:{query:'status'}}}});
         emit({cursor:String(10+turns.length*4),type:'event',turn_id:turn.id,event:{request_id:'synthetic',seq:10+turns.length*4,type:'tool.result',payload:{turn_id:turn.id,call_id:'tool-1',result:{text:'complete'}}}});
+        setTimeout(()=>{emit({cursor:String(11+turns.length*4),type:'event',turn_id:turn.id,event:{request_id:'synthetic',seq:11+turns.length*4,type:'assistant.delta',payload:{turn_id:turn.id,phase:'final_answer',text:'Follow-up '}}});emit({cursor:String(12+turns.length*4),type:'turn_completed',id:turn.id,turn_id:turn.id,final_message:'Follow-up complete.'});},180);
       }
       if (ambiguousWrite) {ambiguousWrite=false;res.statusCode=503;return res.end(JSON.stringify({error:'unknown_outcome'}));}
       res.statusCode=202;return res.end(JSON.stringify(turn));
@@ -69,7 +70,12 @@ import {ThreadShareDialog} from './src/ThreadShareDialog'; import {SharedThreadV
 import './src/ThreadSharing.css';
 createRoot(document.getElementById('root')).render(location.pathname.startsWith('/share/')
  ? <SharedThreadView agentId="synthetic-agent" /> : <ThreadShareDialog agentId="synthetic-agent" onClose={()=>{}} />);
-`,resolveDir:new URL('..',import.meta.url).pathname,loader:'tsx'},bundle:true,write:false,outfile:'app.js',jsx:'automatic',plugins:[{name:'guest-agent-projection',setup(build){build.onResolve({filter:/^nanocodex-react\/agent$/},()=>({path:'safe-agent-output',namespace:'guest'}));build.onLoad({filter:/.*/,namespace:'guest'},()=>({contents:'export function projectToolOutput(){return []}; export function generatedOutputUrl(){return undefined}',loader:'js'}));}}] });
+`,resolveDir:new URL('..',import.meta.url).pathname,loader:'tsx'},bundle:true,write:false,outfile:'app.js',jsx:'automatic',plugins:[{name:'single-react-for-browser-fixture',setup(build){build.onResolve({filter:/^react(?:\/jsx(?:-dev)?-runtime)?$/},args=>({path:require.resolve(args.path)}));}},{name:'disabled-voice-for-browser-fixture',setup(build){
+  build.onResolve({filter:/^nanocodex-react$/},()=>({path:'disabled-voice',namespace:'fixture'}));
+  build.onLoad({filter:/.*/,namespace:'fixture'},()=>({contents:`export const Voice={defaultVoice:'alloy',voices:['alloy']};
+    export const createElevenLabsManager=()=>({});
+    export const useVoice=()=>({transcripts:[],isActive:false,isConnecting:false,voice:undefined,status:'idle',statusText:'',start:async()=>{},stop:async()=>{},speak:async()=>{},error:undefined});`,loader:'js'}));
+}}] });
 const html=`<meta name="viewport" content="width=device-width,initial-scale=1"><div id="root"></div><style>html,body,#root{min-height:100%;margin:0} ${bundle.outputFiles.find(f=>f.path.endsWith('.css')).text}</style><script>${bundle.outputFiles.find(f=>f.path.endsWith('.js')).text}</script>`;
 server.on('request',(req,res)=>{});
 // Wrap the API server's request listener with an HTML response for SPA routes.
@@ -118,14 +124,16 @@ try {
  const writer=await browser.newPage();await writer.goto(link);
  await writer.getByRole('textbox',{name:'Message Nanocodex'}).fill('Can you follow up?');
  await writer.getByRole('button',{name:'Send message'}).click();
- await writer.getByText('Can you follow up?').waitFor();
+ await writer.locator('.agent-terminal-user').filter({hasText:'Can you follow up?'}).waitFor();
  await writer.getByRole('alert').getByText(/Couldn’t confirm your message/).waitFor();
  await writer.getByRole('button',{name:'Send message'}).click();
  await writer.getByText('Checking the answer…').waitFor();
+ await writer.getByText('Follow-up complete.').waitFor();
  assert.deepEqual(writeIds,[writeIds[0],writeIds[0]],'retry must retain the same turn ID');
  assert.equal(turns.length,1,'uncertain outcome must not duplicate a turn');
- assert.equal(await writer.getByText('Can you follow up?').count(),1,'optimistic prompt reconciles with accepted event');
+ assert.equal(await writer.locator('.agent-terminal-user').filter({hasText:'Can you follow up?'}).count(),1,'optimistic prompt reconciles with accepted event');
  assert.equal(await writer.getByText('Guest').count(),1,'shared turn is attributed to transferable Guest');
+ links[0].permission='read';
  const reader=await browser.newPage();await reader.goto(link);
  await reader.getByText('Can you follow up?').waitFor();
  assert.equal(await reader.getByRole('textbox',{name:'Message Nanocodex'}).count(),0,'read link has no composer');

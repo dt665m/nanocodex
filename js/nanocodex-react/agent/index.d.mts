@@ -90,7 +90,7 @@ export type PlanUpdate = Readonly<{
 }>;
 
 export type AgentEntry = Readonly<(
-  | { id: string; kind: "user"; text: string; promptId?: number | undefined }
+  | { id: string; kind: "user"; text: string; author?: "guest" | undefined; promptId?: number | undefined }
   | { id: string; kind: "reasoning"; text: string; streaming: boolean }
   | { id: string; kind: "assistant"; text: string; streaming: boolean }
   | { id: string; kind: "tool"; tool: ToolActivity }

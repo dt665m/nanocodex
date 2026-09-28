@@ -9,7 +9,7 @@ import "./Home.css";
 import "./ThreadSharing.css";
 
 type SharedMetadata = { agent_id?: string; title?: string; permission: "read" | "write"; latest_event_cursor?: string };
-type SharedEvent = { cursor: string; type: "turn_accepted" | "turn_completed" | "event" | "assistant_delta"; turn_id?: string | null; id?: string; input?: string; final_message?: string; delta?: string; author?: string; event?: AgentEvent };
+type SharedEvent = { cursor: string; type: "turn_accepted" | "turn_completed" | "event" | "assistant_delta" | "turn_failed" | "turn_cancelled"; turn_id?: string | null; id?: string; input?: string; final_message?: string; delta?: string; author?: string; event?: AgentEvent; agent_id?: number };
 type PendingTurn = { id: string; input: string };
 const revokedMessage = "This link is invalid or has been revoked.";
 const after = (a: string, b: string) => BigInt(a) > BigInt(b);
@@ -29,6 +29,8 @@ export function SharedThreadView({ agentId }: { agentId: string }) {
   const eventListeners = useRef(new Set<(event: AgentEvent) => void>());
   const historyListeners = useRef(new Set<(events: readonly AgentEvent[]) => void>());
   const historySnapshot = useRef<readonly AgentEvent[]>([]);
+  const rawAssistantTurns = useRef(new Set<string>());
+  const optimisticIds = useRef(new Set<string>());
   const loadOlderRef = useRef<() => Promise<boolean>>(async () => false);
   const [olderCursor, setOlderCursor] = useState<string | null>(null);
   const [olderPending, setOlderPending] = useState(false);
@@ -49,7 +51,7 @@ export function SharedThreadView({ agentId }: { agentId: string }) {
     // Ignore any earlier history requests that complete after a revoke.
     accessEpoch.current++;
     setLoading(false); setPending(false); setOlderPending(false);
-    setMeta(null); setEvents([]); setOptimistic([]); setOlderCursor(null); pendingTurn.current = null; setError(message);
+    setMeta(null); setEvents([]); setOptimistic([]); optimisticIds.current.clear(); setOlderCursor(null); pendingTurn.current = null; setError(message);
   }, []);
   const refresh = useCallback(async (signal?: AbortSignal) => {
     const epoch = accessEpoch.current;
@@ -114,9 +116,14 @@ export function SharedThreadView({ agentId }: { agentId: string }) {
               const event = JSON.parse(data) as SharedEvent;
               if (typeof event.cursor !== "string" || !/^\d+$/.test(event.cursor) || !after(event.cursor, streamCursor.current ?? "0")) continue;
               streamCursor.current = event.cursor;
-              const sdk = projectEvent(event, agentId);
-              if (sdk) for (const listener of eventListeners.current) listener(sdk);
-              if (event.type === "turn_accepted" || event.type === "turn_completed" || event.type === "event")
+              if (event.type === "event" && event.event?.type === "assistant.message" && event.turn_id)
+                rawAssistantTurns.current.add(event.turn_id);
+              // History reconciliation replaces an optimistic prompt with the
+              // durable event; streaming it too would briefly display two rows.
+              if (!(event.type === "turn_accepted" && event.id && optimisticIds.current.has(event.id)))
+                for (const sdk of projectEvents(event, agentId, rawAssistantTurns.current))
+                  for (const listener of eventListeners.current) listener(sdk);
+              if (event.type === "turn_accepted" || event.type === "turn_completed" || event.type === "event" || event.type === "turn_failed" || event.type === "turn_cancelled")
                 setEvents((current) => mergeEvents(current, [event]));
             }
           }
@@ -185,6 +192,7 @@ export function SharedThreadView({ agentId }: { agentId: string }) {
     if (!input || pending || meta?.permission !== "write") return;
     const candidate = pendingTurn.current?.input === input ? pendingTurn.current : { id: crypto.randomUUID(), input };
     pendingTurn.current = candidate;
+    optimisticIds.current.add(candidate.id);
     setOptimistic((current) => current.some((turn) => turn.id === candidate.id) ? current : [...current, candidate]);
     const epoch = accessEpoch.current;
     setPending(true); setError("");
@@ -200,8 +208,6 @@ export function SharedThreadView({ agentId }: { agentId: string }) {
       if (epoch === accessEpoch.current) showGuestError(cause, "Couldn’t confirm your message. Send again to retry.");
     } finally { if (epoch === accessEpoch.current) setPending(false); }
   }
-  const guestTurns = new Set(events.filter((row) => row.type === "turn_accepted" && row.author === "guest").map((row) => row.turn_id ?? row.id));
-  for (const turn of optimistic) guestTurns.add(turn.id);
   const composer = meta?.permission === "write"
     ? <TerminalComposer draft={draft} onChange={setDraft} onSubmit={(value) => { void submit(value); }}
         onCancel={() => {}} pending={pending} running={false} status="ready" placeholder="Message Nanocodex…" />
@@ -227,31 +233,42 @@ export function SharedThreadView({ agentId }: { agentId: string }) {
           {error ? <p className="shared-thread-error" role="alert">{error}</p> : null}
           <AgentTerminalView agent={agent} agentError={undefined} mode="full" voice={false}
             onConversationActivity={() => {}} onStateChange={() => {}} retryAgent={() => { void refresh(); }}
-            composer={composer} userLabel={(entry) => entry.turnId && guestTurns.has(entry.turnId) ? "Guest" : "Owner"} welcome={loading ? "Opening shared thread…" : "No messages have been shared yet."} />
+            composer={composer} welcome={loading ? "Opening shared thread…" : "No messages have been shared yet."} />
         </> : null}
       </div>
     </div>
   </main>;
 }
 
-function projectEvent(row: SharedEvent, sessionId: string): AgentEvent | null {
+function projectEvents(row: SharedEvent, sessionId: string, rawAssistantTurns: Set<string>): AgentEvent[] {
   const turnId = row.turn_id ?? row.id;
-  const seq = Number(row.cursor);
-  if (!Number.isSafeInteger(seq)) return null;
-  if (row.type === "event" && row.event && typeof row.event.type === "string")
-    return { ...row.event, request_id: sessionId, seq, payload: row.event.payload ?? {} };
+  const cursor = Number(row.cursor);
+  if (!Number.isSafeInteger(cursor) || cursor > Math.floor(Number.MAX_SAFE_INTEGER / 4)) return [];
+  const seq = cursor * 4;
   const payload = turnId ? { turn_id: turnId } : {};
+  if (row.type === "event" && row.event && typeof row.event.type === "string")
+    return [{ ...row.event, request_id: sessionId, seq, payload: { ...row.event.payload, ...payload,
+      ...(row.agent_id === undefined ? {} : { managed_agent_id: row.agent_id }) } }];
   if (row.type === "turn_accepted" && typeof row.input === "string")
-    return { request_id: sessionId, seq, type: "managed.prompt", payload: { ...payload, text: row.input, author: row.author } };
+    return [{ request_id: sessionId, seq, type: "managed.prompt", payload: { ...payload, text: row.input,
+      ...(row.author === "guest" ? { author: "guest" } : {}) } }];
   if (row.type === "assistant_delta" && typeof row.delta === "string")
-    return { request_id: sessionId, seq, type: "assistant.delta", payload: { ...payload, text: row.delta } };
-  if (row.type === "turn_completed" && typeof row.final_message === "string")
-    return { request_id: sessionId, seq, type: "assistant.message", payload: { ...payload, text: row.final_message } };
-  return null;
+    return [{ request_id: sessionId, seq, type: "assistant.delta", payload: { ...payload, text: row.delta } }];
+  if (row.type === "turn_completed" && typeof row.final_message === "string") {
+    const completion: AgentEvent = { request_id: sessionId, seq: seq + 1, type: "run.completed", payload: { ...payload, status: "completed", disposition: "completed" } };
+    return rawAssistantTurns.has(turnId ?? "") ? [completion] : [
+      { request_id: sessionId, seq, type: "assistant.message", payload: { ...payload, text: row.final_message } }, completion,
+    ];
+  }
+  if (row.type === "turn_failed" || row.type === "turn_cancelled")
+    return [{ request_id: sessionId, seq, type: "run.failed", payload: { ...payload, message: "Turn unavailable" } }];
+  return [];
 }
 function projectHistory(rows: SharedEvent[], optimistic: PendingTurn[], sessionId: string): readonly AgentEvent[] {
   const accepted = new Set(rows.filter((row) => row.type === "turn_accepted").map((row) => row.turn_id ?? row.id));
-  const projected = rows.map((row) => projectEvent(row, sessionId)).filter((row): row is AgentEvent => Boolean(row));
+  const rawAssistantTurns = new Set(rows.filter((row) => row.type === "event" && row.event?.type === "assistant.message")
+    .map((row) => row.turn_id).filter((id): id is string => typeof id === "string"));
+  const projected = rows.flatMap((row) => projectEvents(row, sessionId, rawAssistantTurns));
   for (const turn of optimistic) if (!accepted.has(turn.id)) projected.push({
     request_id: sessionId, seq: Number.MAX_SAFE_INTEGER - optimistic.length + optimistic.indexOf(turn),
     type: "managed.prompt", payload: { turn_id: turn.id, text: turn.input, author: "guest" },
@@ -261,6 +278,6 @@ function projectHistory(rows: SharedEvent[], optimistic: PendingTurn[], sessionI
 function mergeEvents(previous: SharedEvent[], incoming: SharedEvent[]) {
   const unique = new Map(previous.map((item) => [item.cursor, item]));
   for (const event of incoming) if (event && typeof event.cursor === "string" && /^\d+$/.test(event.cursor)
-    && (event.type === "turn_accepted" || event.type === "turn_completed" || event.type === "event")) unique.set(event.cursor, event);
+    && (event.type === "turn_accepted" || event.type === "turn_completed" || event.type === "event" || event.type === "turn_failed" || event.type === "turn_cancelled")) unique.set(event.cursor, event);
   return [...unique.values()].sort(byCursor);
 }
