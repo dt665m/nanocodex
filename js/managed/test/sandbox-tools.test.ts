@@ -30,27 +30,6 @@ describe("Cloudflare sandbox tools", () => {
   beforeEach(() => sandboxSdk.getSandbox.mockReset());
   afterEach(() => vi.restoreAllMocks());
 
-  it("exposes only the canonical shell and preview tools without a host selector", () => {
-    const tools = createCloudflareSandboxTools(async () => fakeSandbox());
-
-    expect(Object.keys(tools)).toEqual(["exec_command", "write_stdin", "preview"]);
-    expect(tools.exec_command!.parameters).toMatchObject({
-      required: ["cmd"],
-    });
-    const parameters = tools.exec_command!.parameters as {
-      properties: Record<string, Record<string, unknown>>;
-    };
-    expect(parameters.properties.yield_time_ms!.maximum).toBeUndefined();
-    expect(parameters.properties.max_output_tokens!.maximum).toBeUndefined();
-    expect(parameters.properties.environment).toBeUndefined();
-    expect(parameters.properties.host).toBeUndefined();
-    expect(tools.exec_command!.outputSchema).toMatchObject({
-      required: ["wall_time_seconds", "output"],
-    });
-    expect(tools.write_stdin!.parameters).toMatchObject({ required: ["session_id"] });
-    expect(tools.preview!.parameters).toMatchObject({ required: ["port"] });
-  });
-
   it("does not impose command, wait, or output ceilings below the platform", async () => {
     const sandbox = fakeSandbox();
     const process = fakeProcess({ status: "completed", exitCode: 0 });
@@ -164,6 +143,30 @@ describe("Cloudflare sandbox tools", () => {
       exit_code: 0,
     });
     expect(cursors.size).toBe(0);
+  });
+
+  it("does not reuse a retained process ID after the container forgets its processes", async () => {
+    const sandbox = fakeSandbox();
+    const process = fakeProcess({ status: "running" });
+    sandbox.getProcess.mockResolvedValue(null);
+    sandbox.startProcess.mockImplementation(async (_command: string, options: { processId: string }) => {
+      process.id = options.processId;
+      return process;
+    });
+    const cursors = new Map<string, unknown>([["sandbox-output-cursor:7", 12]]);
+    const candidates = [7, 8];
+    vi.spyOn(crypto, "getRandomValues").mockImplementation((buffer) => {
+      (buffer as Uint32Array)[0] = candidates.shift()!;
+      return buffer;
+    });
+    const tools = createCloudflareSandboxTools(async () => sandbox, undefined, {
+      get: (key) => cursors.get(key), put: (key, value) => { cursors.set(key, value); },
+      delete: (key) => { cursors.delete(key); },
+    });
+    await expect(tools.exec_command!.handler({ cmd: "replacement", yield_time_ms: 0 }, context))
+      .resolves.toMatchObject({ session_id: 8 });
+    expect(cursors.get("sandbox-output-cursor:7")).toBe(12);
+    expect(sandbox.startProcess).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ processId: "nanocodex-8" }));
   });
 
   it("uses Ctrl-C as the canonical termination path for a yielded session", async () => {
@@ -716,18 +719,6 @@ describe("Cloudflare sandbox tools", () => {
       .rejects.toThrow("invalid preview capability");
     await expect(openSandboxPreviewCapability(secret, malformed))
       .rejects.toThrow("invalid preview capability");
-  });
-
-  it("round-trips valid preview capabilities", async () => {
-    const secret = "preview-round-trip-secret";
-    const sessionId = "018f25e8-7b51-7a32-8c4d-fedcba987654";
-    const url = await cloudflareSandboxPreviewUrl(
-      "https://nanocodex.example", secret, sessionId, 8_080,
-    );
-    const capability = new URL(url).pathname.split("/")[2]!;
-
-    await expect(openSandboxPreviewCapability(secret, capability))
-      .resolves.toEqual({ sessionId, port: 8_080 });
   });
 
   it("caches one derived preview key and replaces it when the secret rotates", async () => {

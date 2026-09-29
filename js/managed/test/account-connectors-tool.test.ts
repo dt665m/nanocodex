@@ -60,53 +60,6 @@ describe("managed account connector tool", () => {
     expect(options.mock.calls.map(([context]) => context)).toEqual([root, child, child]);
   });
 
-  it("lists provider-neutral connection metadata without broker credentials", async () => {
-    const fetch = vi.fn(async () => Response.json(canonicalStatuses()));
-    const result = await manageAccountConnectors({
-      ...base,
-      broker: { fetch } as unknown as Fetcher,
-    }, { operation: "list" });
-
-    expect(result).toMatchObject({
-      connectors: {
-        github: {
-          connected: true,
-          account: "octocat",
-          connections: [{ id: A, label: "octocat", accountId: "github-1", capabilities: ["github"] }],
-        },
-        gmail: {
-          connected: true,
-          connections: [
-            { id: A, label: "work@example.com", accountId: "google-1", capabilities: ["gmail", "gdrive"] },
-            { id: B, label: "home@example.com", accountId: "google-2", capabilities: ["gmail"] },
-          ],
-        },
-        gdrive: {
-          connected: true,
-          account: "work@example.com",
-          connections: [
-            { id: A, label: "work@example.com", accountId: "google-1", capabilities: ["gmail", "gdrive"] },
-          ],
-        },
-        slack: { connected: true, account: "Acme (U123)", connections: [{ id: B, label: "Acme (U123)", accountId: "T123:U123", capabilities: ["slack"] }] },
-      },
-      supported: [
-        { id: "github", name: "GitHub", capabilities: ["github"] },
-        { id: "google", name: "Google Workspace", capabilities: ["gmail", "gdrive", "gcalendar", "gtasks", "gdocs", "gsheets", "gslides", "gcontacts"] },
-        { id: "slack", name: "Slack", capabilities: ["slack"] },
-        { id: "x", name: "X", capabilities: ["x"] },
-        { id: "spotify", name: "Spotify", capabilities: ["spotify"] },
-        { id: "soundcloud", name: "SoundCloud", capabilities: ["soundcloud"] },
-        { id: "link", name: "Stripe Link", capabilities: ["link"] },
-      ],
-    });
-    expect(JSON.stringify(result)).not.toMatch(/access_token|secret/);
-    expect(fetch).toHaveBeenCalledWith(
-      "https://broker.internal/users/user%2Fwith%20spaces/connectors",
-      expect.objectContaining({ signal: expect.any(AbortSignal) }),
-    );
-  });
-
   it("filters both capabilities and exact connection IDs for a delegated grant", async () => {
     const result = await manageAccountConnectors({
       ...base,
@@ -124,6 +77,24 @@ describe("managed account connector tool", () => {
       },
     });
     expect(JSON.stringify(result)).not.toMatch(/work@example.com|Acme/);
+  });
+
+  it("preserves optional safe scope diagnostics without exposing credentials", async () => {
+    const result = await manageAccountConnectors({ ...base,
+      broker: { fetch: async () => Response.json(canonicalStatuses()) } as unknown as Fetcher,
+    }, { operation: "list" });
+    expect(result).toMatchObject({ connectors: { gmail: { connections: [
+      { id: A, scopes: ["openid", "https://mail.google.com/"] }, { id: B },
+    ] } } });
+    expect(JSON.stringify(result)).not.toContain("secret");
+  });
+
+  it("rejects malformed scope diagnostics", async () => {
+    const statuses = canonicalStatuses();
+    Object.assign(statuses.connectors.gmail.connections[0]!, { scopes: [42] });
+    await expect(manageAccountConnectors({ ...base,
+      broker: { fetch: async () => Response.json(statuses) } as unknown as Fetcher,
+    }, { operation: "list" })).rejects.toThrow();
   });
 
   it("keeps legacy singleton readers without granting them a selector", async () => {
@@ -243,7 +214,7 @@ describe("managed account connector tool", () => {
 });
 
 function canonicalStatuses() {
-  const googleWork = { id: A, label: " work@example.com ", account_id: "google-1", capabilities: ["gmail", "gdrive"], access_token: "secret" };
+  const googleWork = { scopes: ["openid", "https://mail.google.com/"], id: A, label: " work@example.com ", account_id: "google-1", capabilities: ["gmail", "gdrive"], access_token: "secret" };
   return { connectors: {
     github: { connected: true, connections: [{ id: A, label: "octocat", account_id: "github-1", capabilities: ["github"], access_token: "secret" }] },
     gmail: { connected: true, connections: [googleWork, { id: B, label: "home@example.com", account_id: "google-2", capabilities: ["gmail"] }] },

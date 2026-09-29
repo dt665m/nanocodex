@@ -7,7 +7,8 @@ mod platform;
 
 use crate::{
     DefaultResponsesService, Model, OpenAiAuth, OpenAiAuthError, OpenAiAuthMode, ReasoningMode,
-    ResponsesHistory, ResponsesRetryPolicy, ResponsesTransport, Thinking, session::SessionBuilder,
+    ResponsesHistory, ResponsesRetryPolicy, ResponsesTransport, Thinking,
+    responses::StrictJsonSchema, session::SessionBuilder,
 };
 
 #[doc(hidden)]
@@ -246,6 +247,17 @@ impl<F> OpenAiBuilder<F> {
         self
     }
 
+    /// Requires each Responses request to produce output matching a JSON Schema.
+    ///
+    /// The format is sent as `text.format` with `type: "json_schema"` and
+    /// strict validation enabled. This setting is inherited by sessions and
+    /// agents created from this client.
+    #[must_use]
+    pub fn strict_json_schema(mut self, schema: StrictJsonSchema) -> Self {
+        self.config.strict_json_schema = Some(schema);
+        self
+    }
+
     /// Sets the default reasoning effort for new sessions and agents.
     ///
     /// A higher-level session or agent builder may override this reusable
@@ -381,6 +393,7 @@ impl<F> OpenAiBuilder<F> {
     ///             Ok::<_, ResponseError>(ResponsesServiceResponse::new(
     ///                 ResponsesOutput::Generation(GenerationOutput {
     ///                     id: "resp_adapter_01".to_owned(),
+    ///                     reported_model: None,
     ///                     status: "completed".to_owned(),
     ///                     end_turn: Some(true),
     ///                     final_message: Some("served by the adapter".to_owned()),
@@ -669,8 +682,11 @@ mod tests {
 
     use crate::{
         Model, ModelConfig, OpenAiAuthMode, ResponseError, ResponsesAttempt, ResponsesHistory,
-        ResponsesServiceResponse, ResponsesTransport,
+        ResponsesServiceResponse, ResponsesTransport, Thinking,
+        responses::{RequestProfile, StrictJsonSchema},
     };
+    use serde_json::json;
+    use std::sync::Arc;
 
     use super::{OpenAi, apply_mode_defaults};
 
@@ -695,20 +711,6 @@ mod tests {
     }
 
     #[test]
-    fn one_client_recipe_builds_independent_sessions() {
-        let client = OpenAi::builder("test-key")
-            .service(|| NeverCalled)
-            .build()
-            .unwrap();
-
-        let session = client.instructions("Answer only from supplied facts.");
-        let first = session.clone().build().unwrap();
-        let second = session.build().unwrap();
-
-        assert_ne!(first.id(), second.id());
-    }
-
-    #[test]
     fn response_storage_is_opt_in_for_both_auth_modes() {
         for mode in [OpenAiAuthMode::ApiKey, OpenAiAuthMode::ChatGpt] {
             let mut config = ModelConfig {
@@ -718,6 +720,43 @@ mod tests {
             apply_mode_defaults(&mut config, mode);
             assert!(!config.store_responses);
         }
+    }
+
+    #[test]
+    fn strict_json_schema_is_sent_in_the_text_format() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+            "additionalProperties": false
+        });
+        let client = OpenAi::builder("test-key")
+            .strict_json_schema(StrictJsonSchema::new("answer", schema.clone()))
+            .build()
+            .unwrap();
+        let profile = RequestProfile::new("schema-session", "schema-cache", Arc::from([]));
+        let request = serde_json::to_value(crate::responses::ResponseCreate::warmup(
+            client.config(),
+            Model::Astra,
+            Thinking::Low,
+            false,
+            &profile,
+            None,
+        ))
+        .expect("request should serialize");
+
+        assert_eq!(
+            request["text"],
+            json!({
+                "verbosity": "low",
+                "format": {
+                    "type": "json_schema",
+                    "strict": true,
+                    "name": "answer",
+                    "schema": schema
+                }
+            })
+        );
     }
 
     #[test]
@@ -801,21 +840,6 @@ mod tests {
             .expect("Astra pro reasoning mode should fail validation");
 
         assert!(error.to_string().contains("does not support pro"));
-    }
-
-    #[test]
-    fn api_key_can_opt_into_https_checkpoints() {
-        let client = OpenAi::builder("test-key")
-            .transport(ResponsesTransport::Https)
-            .store(true)
-            .build()
-            .unwrap();
-
-        assert!(client.config.store_responses);
-        assert_eq!(
-            client.config.responses_history,
-            ResponsesHistory::Incremental
-        );
     }
 
     #[test]

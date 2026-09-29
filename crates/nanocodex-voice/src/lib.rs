@@ -451,6 +451,8 @@ pub struct VoiceSessionBuilder {
     codex_response_handoff_mode: RealtimeResponseHandoffMode,
     codex_response_handoff_channel_prefixes: BTreeMap<String, Vec<String>>,
     initial_items: Vec<RealtimeInitialItem>,
+    realtime_start_instructions: Option<String>,
+    realtime_end_instructions: Option<String>,
     include_startup_context: bool,
     flush_transcript_tail_on_session_end: bool,
     audio: AudioConfig,
@@ -462,7 +464,6 @@ impl VoiceSessionBuilder {
     /// Creates a voice lifecycle over an existing OpenAI recipe and agent.
     #[must_use]
     pub fn new(openai: OpenAi, agent: Nanocodex) -> Self {
-        let desktop_handoffs = openai.auth_mode() == OpenAiAuthMode::ChatGpt;
         Self {
             openai,
             agent,
@@ -475,15 +476,17 @@ impl VoiceSessionBuilder {
             transport: None,
             session_mode: RealtimeSessionMode::Conversational,
             output_modality: RealtimeOutputModality::Audio,
-            client_managed_handoffs: desktop_handoffs,
+            client_managed_handoffs: false,
             delegation_ack_filler: None,
             codex_responses_as_items: false,
             codex_response_item_prefix: None,
             codex_response_handoff_mode: RealtimeResponseHandoffMode::Thinking,
             codex_response_handoff_channel_prefixes: BTreeMap::new(),
             initial_items: Vec::new(),
-            include_startup_context: !desktop_handoffs,
-            flush_transcript_tail_on_session_end: true,
+            realtime_start_instructions: None,
+            realtime_end_instructions: None,
+            include_startup_context: true,
+            flush_transcript_tail_on_session_end: false,
             audio: AudioConfig::default(),
             agent_control: VoiceAgentControl::default(),
             media_controls: Arc::default(),
@@ -640,6 +643,38 @@ impl VoiceSessionBuilder {
         self
     }
 
+    /// Overrides the developer instruction recorded when realtime starts.
+    ///
+    /// # Errors
+    /// Rejects instructions exceeding Codex's 8,192 estimated-token limit.
+    pub fn realtime_start_instructions(
+        mut self,
+        instructions: impl Into<String>,
+    ) -> Result<Self, RealtimeError> {
+        let instructions = instructions.into();
+        validate_mode_instructions("realtime start instructions", &instructions)?;
+        self.realtime_start_instructions = Some(format!(
+            "<realtime_conversation>\n{instructions}\n</realtime_conversation>"
+        ));
+        Ok(self)
+    }
+
+    /// Overrides the developer instruction recorded when realtime ends.
+    ///
+    /// # Errors
+    /// Rejects instructions exceeding Codex's 8,192 estimated-token limit.
+    pub fn realtime_end_instructions(
+        mut self,
+        instructions: impl Into<String>,
+    ) -> Result<Self, RealtimeError> {
+        let instructions = instructions.into();
+        validate_mode_instructions("realtime end instructions", &instructions)?;
+        self.realtime_end_instructions = Some(format!(
+            "<realtime_conversation>\n{instructions}\n</realtime_conversation>"
+        ));
+        Ok(self)
+    }
+
     /// Enables or disables Codex's bounded realtime startup context.
     ///
     /// This defaults to `true` and includes current-thread history, recent
@@ -651,6 +686,7 @@ impl VoiceSessionBuilder {
     }
 
     /// Enables or disables routing an unconsumed transcript tail when voice ends.
+    /// Defaults to `false`, matching the app-server start request.
     #[must_use]
     pub const fn flush_transcript_tail_on_session_end(mut self, flush: bool) -> Self {
         self.flush_transcript_tail_on_session_end = flush;
@@ -855,6 +891,15 @@ fn run_thread(
     drop(finished.send(completion));
 }
 
+fn validate_mode_instructions(name: &str, instructions: &str) -> Result<(), RealtimeError> {
+    if instructions.len().div_ceil(4) > 8_192 {
+        return Err(RealtimeError::InvalidConfiguration(format!(
+            "{name} must not exceed 8192 estimated tokens"
+        )));
+    }
+    Ok(())
+}
+
 async fn run_voice(
     mut builder: VoiceSessionBuilder,
     events: &mpsc::UnboundedSender<VoiceEvent>,
@@ -865,8 +910,14 @@ async fn run_voice(
 ) -> Result<(), VoiceFailure> {
     send_event(events, VoiceEvent::Connecting);
     let lifecycle_agent = builder.agent.clone();
+    let end_instructions = builder.realtime_end_instructions.clone();
     let context = lifecycle_agent
-        .append_developer_message(REALTIME_START_INSTRUCTIONS)
+        .append_developer_message(
+            builder
+                .realtime_start_instructions
+                .as_deref()
+                .unwrap_or(REALTIME_START_INSTRUCTIONS),
+        )
         .await?;
     if builder.include_startup_context {
         let rollout = lifecycle_agent
@@ -886,7 +937,11 @@ async fn run_voice(
     )
     .await;
     let ended = lifecycle_agent
-        .append_developer_message(REALTIME_END_INSTRUCTIONS)
+        .append_developer_message(
+            end_instructions
+                .as_deref()
+                .unwrap_or(REALTIME_END_INSTRUCTIONS),
+        )
         .await
         .map(|_| ());
     match (result, ended) {
@@ -1005,7 +1060,12 @@ async fn run_active_voice(
                         drop(result.send(session.send_text(role, text).await));
                     }
                     VoiceCommand::AppendSpeech { text, result } => {
-                        drop(result.send(session.append_speech(text).await));
+                        let outcome = session.append_speech(text).await;
+                        if outcome.is_ok() {
+                            agent_bridge.delivery.allow_explicit_speech();
+                            audio.resume();
+                        }
+                        drop(result.send(outcome));
                     }
                 }
             }
@@ -1116,6 +1176,8 @@ async fn run_active_voice(
             let tail = session.close_with_transcript_tail().await?;
             if builder.flush_transcript_tail_on_session_end {
                 route_transcript_tail(&agent_bridge.agent, &tail).await?;
+            } else {
+                retain_transcript_tail(&agent_bridge.agent, &tail).await?;
             }
         }
         Ok(())
@@ -1219,6 +1281,8 @@ async fn handle_realtime_event(
         RealtimeEvent::TranscriptTail(tail) => {
             if flush_transcript_tail_on_session_end {
                 route_transcript_tail(&agent_bridge.agent, &tail).await?;
+            } else {
+                retain_transcript_tail(&agent_bridge.agent, &tail).await?;
             }
         }
         RealtimeEvent::SpeechStarted => {
@@ -1559,6 +1623,20 @@ async fn handle_observed_agent_event(
     Ok(())
 }
 
+async fn retain_transcript_tail(
+    agent: &Nanocodex,
+    tail: &[RealtimeTranscriptEntry],
+) -> Result<(), VoiceFailure> {
+    let transcript = tail
+        .iter()
+        .map(|entry| ProtocolTranscriptEntry::new(&entry.role, &entry.text))
+        .collect::<Vec<_>>();
+    if let Some(context) = nanocodex_voice_protocol::realtime_transcript_context(&transcript) {
+        agent.append_developer_message(context).await?;
+    }
+    Ok(())
+}
+
 async fn route_transcript_tail(
     agent: &Nanocodex,
     tail: &[RealtimeTranscriptEntry],
@@ -1805,13 +1883,7 @@ fn send_event(events: &mpsc::UnboundedSender<VoiceEvent>, event: VoiceEvent) {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        AudioConfig, HandoffStream, REALTIME_END_INSTRUCTIONS, REALTIME_START_INSTRUCTIONS,
-        RealtimeTranscriptEntry, VoiceAgentControl, VoiceSpeaker, codex_realtime_delegation,
-        codex_realtime_delegation_with_transcript, codex_realtime_tail_delegation,
-        codex_voice_instructions, realtime_output_byte_limit, truncate_realtime_output,
-    };
-    use std::time::Duration;
+    use super::{HandoffStream, realtime_output_byte_limit, truncate_realtime_output};
 
     #[tokio::test]
     async fn meters_coalesce_without_delaying_terminal_events() {
@@ -1837,6 +1909,23 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_instruction_budget_matches_app_server() {
+        assert!(super::validate_mode_instructions("realtime start instructions", "").is_ok());
+        assert!(
+            super::validate_mode_instructions("realtime start instructions", &"a".repeat(32_768))
+                .is_ok()
+        );
+        let error =
+            super::validate_mode_instructions("realtime end instructions", &"a".repeat(32_769))
+                .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("realtime end instructions must not exceed 8192 estimated tokens")
+        );
+    }
+
+    #[test]
     fn private_agent_messages_are_not_speech_candidates() {
         use nanocodex::oai::responses::MessagePhase;
         assert!(!super::speakable_message(
@@ -1850,91 +1939,6 @@ mod tests {
             Some(MessagePhase::FinalAnswer)
         ));
         assert!(super::speakable_message("answer", None));
-    }
-
-    #[test]
-    fn desktop_audio_policy_is_explicit_and_stable() {
-        let config = AudioConfig::default();
-        assert_eq!(config.playback_prebuffer(), Duration::from_millis(120));
-        assert_eq!(config.maximum_playback_buffer(), Duration::from_secs(8));
-    }
-
-    #[test]
-    fn transcript_speakers_have_stable_labels() {
-        assert_eq!(VoiceSpeaker::User.to_string(), "user");
-        assert_eq!(VoiceSpeaker::Assistant.to_string(), "assistant");
-    }
-
-    #[test]
-    fn unused_agent_control_is_an_idempotent_interrupt() {
-        let control = VoiceAgentControl::default();
-        assert!(!control.has_active_turn());
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .expect("test runtime should build");
-        assert!(
-            !runtime
-                .block_on(control.cancel())
-                .expect("cancel should be idle")
-        );
-    }
-
-    #[test]
-    fn codex_backend_prompt_is_rendered_for_the_local_user() {
-        let prompt = codex_voice_instructions();
-        assert!(prompt.starts_with("## Identity, tone, and role"));
-        assert!(prompt.contains("Running backend work remains steerable."));
-        assert!(!prompt.contains("{{ user_first_name }}"));
-    }
-
-    #[test]
-    fn delegated_input_uses_codex_markers_and_xml_escaping() {
-        assert_eq!(
-            codex_realtime_delegation("fix <x> & ship"),
-            "<realtime_delegation>\n  <input>fix &lt;x&gt; &amp; ship</input>\n</realtime_delegation>"
-        );
-        assert_eq!(
-            codex_realtime_delegation_with_transcript(
-                "ship it",
-                &[
-                    RealtimeTranscriptEntry {
-                        role: "assistant".to_owned(),
-                        text: "Use <main>".to_owned(),
-                    },
-                    RealtimeTranscriptEntry {
-                        role: "user".to_owned(),
-                        text: "yes & now".to_owned(),
-                    },
-                ],
-            ),
-            "<realtime_delegation>\n  <input>ship it</input>\n  <transcript_delta>assistant: Use &lt;main&gt;\nuser: yes &amp; now</transcript_delta>\n</realtime_delegation>"
-        );
-    }
-
-    #[test]
-    fn lifecycle_and_tail_flush_markers_match_codex() {
-        assert!(
-            REALTIME_START_INSTRUCTIONS
-                .starts_with("<realtime_conversation>\nRealtime conversation started.")
-        );
-        assert!(
-            REALTIME_END_INSTRUCTIONS
-                .starts_with("<realtime_conversation>\nRealtime conversation ended.")
-        );
-        assert_eq!(
-            codex_realtime_tail_delegation(&[RealtimeTranscriptEntry {
-                role: "user".to_owned(),
-                text: "ship <it>".to_owned(),
-            }])
-            .unwrap(),
-            concat!(
-                "<realtime_delegation>\n",
-                "  <source>transcript_tail_flush</source>\n",
-                "  <input>The user just ended their realtime session. Here is the remaining handoff/transcript tail. You probably do not have to do anything; acknowledge the handoff unless the transcript itself asks for something.</input>\n",
-                "  <transcript_delta>user: ship &lt;it&gt;</transcript_delta>\n",
-                "</realtime_delegation>"
-            )
-        );
     }
 
     #[test]

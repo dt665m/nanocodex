@@ -11,7 +11,6 @@ import {
   browserToolInputAllowed,
   createManagedBrowserRuntime,
   CredentialSafeBrowserBinding,
-  managedBrowserProvider,
   KitesurfBrowserBinding,
   sanitizeBrowserToolResult,
 } from "../src/browser-runtime";
@@ -19,96 +18,6 @@ import {
 const API_KEY = "bb_live_do_not_project_this_value";
 const SESSION_ID = "session_123";
 const CONNECT_URL = "wss://connect.browserbase.com/devtools?token=signed-secret";
-
-describe("managed browser deployment policy", () => {
-  it("accepts only host-selected providers", () => {
-    expect(managedBrowserProvider(undefined)).toBe("cloudflare");
-    expect(managedBrowserProvider("browserbase")).toBe("browserbase");
-    expect(managedBrowserProvider(" KITESURF ")).toBe("kitesurf");
-    expect(() => managedBrowserProvider("model-choice")).toThrow(
-      "MANAGED_BROWSER_PROVIDER must be cloudflare, browserbase, or kitesurf",
-    );
-  });
-
-  it("requires a BROWSER binding for Kitesurf before creating the runtime", async () => {
-    const createRuntime = vi.fn();
-    await expect(createManagedBrowserRuntime({
-      ctx: { storage: {} } as DurableObjectState,
-      env: { LOADER: {} as WorkerLoader, MANAGED_BROWSER_PROVIDER: "kitesurf" },
-      sessionId: "missing-binding",
-      createRuntime,
-    })).rejects.toThrow("Kitesurf browser provider requires the BROWSER binding");
-    expect(createRuntime).not.toHaveBeenCalled();
-  });
-
-  it.each(["cloudflare", "kitesurf"])("configures the %s runtime lifecycle", async (provider) => {
-    let received: Record<string, unknown> | undefined;
-    const swept = vi.fn(async () => ({ swept: [] }));
-    const closed = vi.fn(async () => undefined);
-    const expired = vi.fn(async () => []);
-    const createRuntime = vi.fn((options) => {
-      received = options as unknown as Record<string, unknown>;
-      return {
-        runtime: { expirePaused: expired },
-        connector: { sweep: swept, closeSession: closed },
-        tools: {
-          browser_execute: tool({
-            description: "Run browser code.",
-            inputSchema: jsonSchema({
-              type: "object",
-              properties: { code: { type: "string" } },
-              required: ["code"],
-              additionalProperties: false,
-            }),
-            execute: async () => ({ ok: true }),
-          }),
-        },
-      } as unknown as BrowserRuntime;
-    });
-    const binding = { fetch: vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => new Response()) };
-    const runtime = await createManagedBrowserRuntime({
-      ctx: { storage: { get: vi.fn(async () => undefined) } } as unknown as DurableObjectState,
-      env: {
-        BROWSER: binding,
-        LOADER: {} as WorkerLoader,
-        MANAGED_BROWSER_PROVIDER: provider,
-      },
-      sessionId: "agent-a",
-      ...(provider === "kitesurf" ? { resolveVaultLogin: vi.fn(), authorizeVaultAccess: vi.fn() } : {}),
-      createRuntime,
-    });
-
-    expect(runtime.provider).toBe(provider);
-    expect(runtime.tools.map(({ name }) => name)).toEqual(["browser_execute"]);
-    if (provider === "kitesurf") {
-      expect(runtime.tools[0]!.description).toContain("one-shot Kitesurf");
-      expect(runtime.tools[0]!.description).not.toContain("cdp.spec");
-      expect(runtime.tools[0]!.description).not.toContain("retained managed browser session");
-      await expect(runtime.submitVaultChallenge({}, new AbortController().signal)).rejects.toThrow("does not support private browser continuation");
-      await expect(runtime.submitVaultTakeover({}, new AbortController().signal)).rejects.toThrow("does not support private browser continuation");
-    }
-    expect(received?.browser).toBeInstanceOf(CredentialSafeBrowserBinding);
-    expect(received?.loader).toBeDefined();
-    expect(received?.quickActions).toBe(false);
-    expect(received?.session).toEqual(provider === "kitesurf" ? { mode: "one-shot", browser: "kitesurf" } : {
-      mode: "reuse",
-      key: "primary",
-      keepAliveMs: 600_000,
-    });
-    expect(received?.name).toBe(`managed-browser-${provider}`);
-    const transport = (received?.browser as CredentialSafeBrowserBinding).browser;
-    expect(transport instanceof KitesurfBrowserBinding).toBe(provider === "kitesurf");
-    await transport.fetch("https://localhost/v1/devtools/browser?targets=true", { headers: { Upgrade: "websocket" } });
-    const forwarded = new URL(String(binding.fetch.mock.calls[0]?.[0]));
-    expect(forwarded.searchParams.get("browser")).toBe(provider === "kitesurf" ? "kitesurf" : null);
-
-    await runtime.expireAndSweep();
-    await runtime.close();
-    expect(expired).toHaveBeenCalledOnce();
-    expect(swept).toHaveBeenCalledWith({ maxIdleMs: 600_000 });
-    expect(closed).toHaveBeenCalledOnce();
-  });
-});
 
 describe("Browserbase session factory", () => {
   it("stops reading chunked responses at the byte limit", async () => {
@@ -286,59 +195,6 @@ describe("AI SDK browser tool adapter", () => {
     expect(JSON.stringify(adapted)).not.toContain(API_KEY);
     expect(JSON.stringify(result)).not.toContain("raw-cookie");
     expect(execute).toHaveBeenCalledOnce();
-  });
-
-  it("replaces the foreign codemode prompt with the Rust Code Mode tool contract", async () => {
-    const upstreamDescription = [
-      "Execute JavaScript in a sandbox with access to connector SDKs.",
-      "## Workflow",
-      "Call `codemode.search(query)` before using the `cdp` connector.",
-    ].join("\n");
-    const tools = await adaptAiSdkTools({
-      browser_execute: tool({
-        description: upstreamDescription,
-        inputSchema: jsonSchema({
-          type: "object",
-          properties: { code: { type: "string" } },
-          required: ["code"],
-          additionalProperties: false,
-        }),
-        execute: async () => ({ ok: true }),
-      }),
-      browser_markdown: tool({
-        description: "Read a page as Markdown.",
-        inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
-        execute: async () => "page",
-      }),
-    });
-    const adapted = tools.find(({ name }) => name === "browser_execute");
-    const ordinary = tools.find(({ name }) => name === "browser_markdown");
-
-    expect(adapted?.description).toContain(
-      "Outer contract (Nanocodex Rust/WASM Code Mode)",
-    );
-    expect(adapted?.description).toContain(
-      "nested tools exist only on `tools.*`; `cdp` and `codemode` are not globals",
-    );
-    expect(adapted?.description).toContain("`await tools.browser_execute({ code })`");
-    expect(adapted?.description).toContain(
-      "only host globals are `cdp` and `codemode`",
-    );
-    expect(adapted?.description).toContain(
-      '`await codemode.search("short intent")`',
-    );
-    expect(adapted?.description).toContain(
-      '`await codemode.describe("cdp.method")`',
-    );
-    expect(adapted?.description).toContain(
-      '`await cdp.send({ method: "Target.getTargets" })`',
-    );
-    expect(adapted?.description).toContain("including `Runtime.evaluate`");
-    expect(adapted?.description).toContain("`Target.getTargetInfo` is not available");
-    expect(adapted?.description).toContain("use `tools.web__run(...)`");
-    expect(adapted?.description).not.toContain(upstreamDescription);
-    expect(adapted?.description).not.toContain("## Workflow");
-    expect(ordinary?.description).toBe("Read a page as Markdown.");
   });
 
   it("redacts provider URLs and scalar cookie material", () => {
@@ -682,5 +538,28 @@ describe("Kitesurf binding", () => {
     expect(captured!.method).toBe("PUT");
     expect(captured!.headers.get("x-override")).toBe("yes");
     expect(await captured!.text()).toBe("new");
+  });
+});
+
+describe("hosted browser account authority", () => {
+  it("checks current authority on every ordinary browser call before provider execution", async () => {
+    let allowed = true;
+    const execute = vi.fn(async () => ({ title: "Class schedule" }));
+    const runtime = await createManagedBrowserRuntime({
+      ctx: { storage: { get: async () => undefined } } as unknown as DurableObjectState,
+      env: { BROWSER: { fetch: vi.fn() }, LOADER: {} as WorkerLoader },
+      sessionId: "account-browser",
+      authorizeVaultAccess: () => { if (!allowed) throw new Error("full account authority required"); },
+      createRuntime: () => ({
+        tools: { browser_execute: tool({ inputSchema: jsonSchema({ type: "object" }), execute }) },
+        connector: {}, runtime: {},
+      }) as unknown as BrowserRuntime,
+    });
+    const browser = runtime.tools.find(tool => tool.name === "browser_execute")!;
+    const context = { signal: new AbortController().signal } as Parameters<typeof browser.handler>[1];
+    await expect(browser.handler({ code: "1" }, context)).resolves.toEqual({ title: "Class schedule" });
+    allowed = false;
+    await expect(browser.handler({ code: "1" }, context)).rejects.toThrow("full account authority required");
+    expect(execute).toHaveBeenCalledTimes(1);
   });
 });

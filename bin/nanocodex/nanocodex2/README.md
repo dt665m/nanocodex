@@ -6,11 +6,53 @@ with an SMS code. `NANOCODEX_MANAGED_URL` selects another cluster.
 Running `nanocodex2` opens a new interactive session;
 `nanocodex2 attach AGENT_URL_OR_ID` resumes an existing one with local workspace
 tools.
+The local tool runtime also includes Mercator discovery through
+`https://mercator.sh/mcp` by default. Use `tool_search` to find its free
+read-only discovery tools. For paid jobs, add the protected
+`https://mercator.sh/mcp/auth` connection in **Account → Connections**,
+select **Authorize**, and approve the Tempo Wallet capability with explicit
+limits and expiry. Check `get_connection_status` for payment readiness; a
+connected OAuth account or the public default alone is not proof of funding.
 
 Image rendering uses terminal geometry and known terminal hints without reading
 keyboard input for capability probes. Recognized Kitty, Ghostty, iTerm2, and
 WezTerm environments use native images where supported; other terminals use
 half-block images.
+
+## Managed2 preview (explicit opt-in)
+
+`nanocodex2 --managed2` opens the familiar terminal UI against the separate
+Managed2 API. `nanocodex2 --managed2 run "Say hello"` prints one prompt's
+answer without opening the UI; `nanocodex2 --managed2 attach AGENT_UUID`
+resumes an existing Managed2 agent in the same terminal UI.
+The original managed service remains the default. Managed2 has its own
+`ncx2_` credential: supply `NANOCODEX_MANAGED2_API_KEY` or a private local
+`~/.config/nanocodex/managed2-api-key` file. The ordinary `nanocodex2 login`
+account key cannot authenticate to Managed2. Set `NANOCODEX_MANAGED2_URL`
+for an alternate HTTPS origin (loopback HTTP is permitted for local tests).
+
+This preview keeps the standard terminal presentation and supports sequential
+text turns and streamed answers. Managed2 does not yet support workspace tools,
+voice, agent listing, model changes, or steering; unavailable actions are gated
+rather than sent to the legacy API. Legacy commands with `--managed2` fail explicitly rather than
+silently contacting the original service. If submission fails with uncertain
+admission, preserve the printed request ID before retrying.
+
+## Side exploration
+
+`/btw [question]` opens one independent side pane; enter a question after opening
+with bare `/btw`, or ask it immediately. Tab switches between main and side;
+`/close` in the side pane closes it without stopping the main conversation.
+The hosted service creates a separate managed agent from the parent's latest
+committed model boundary. No transcript is copied into a new prompt; the side
+question is submitted only to the child, never the parent. Uncommitted work
+beyond that safe boundary is excluded; before the first committed boundary,
+forking returns an error. Accepted side turns remain durable in their own agent
+after you close the pane; use `/id` there if you want its agent ID before closing.
+Side follow-ups run sequentially; queue them with Tab while a reply is active.
+The side agent runs through hosted tools; the main thread's local tool-host connection
+is not cloned into it. Conversations are separate, but account tools and hosted
+workspace effects are not isolated. The Managed2 text-only preview does not support `/btw` yet.
 
 ## Hand screens
 
@@ -646,6 +688,6 @@ closes the factory's parent pipe so it drains and stops its VMs, including acros
 WSL. See [Microsoft's WSL configuration reference](https://learn.microsoft.com/en-us/windows/wsl/wsl-config)
 for `nestedVirtualization` and supported Windows configurations.
 
-Linux servers installed with `nanocodex hand setup` keep their existing systemd
-services and retained identities. The installer links the native computer to its
-factory using `hand --vm-provider NAME`; re-run setup to update existing units.
+Linux servers installed with `nanocodex hand install` keep their systemd service,
+private workspace, and machine identity across idempotent repairs. VM factories
+remain a separate `nanocodex2 host` capability and are not installed implicitly.

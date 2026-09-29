@@ -34,7 +34,7 @@ test('Worker inputs isolate services and follow dependencies, assets, config and
   await put('js/email/build.mjs', 'const asset = new URL("../../assets/", import.meta.url);');
   await put('assets/template.html', 'hello');
   let previous = await fingerprintWorkers(root);
-  assert.equal(Object.keys(previous).length, 10);
+  assert.equal(Object.keys(previous).length, 11);
   assert.deepEqual(await fingerprintWorkers(root), previous);
   const change = async (path, text, expected) => {
     await put(path, text);
@@ -42,6 +42,8 @@ test('Worker inputs isolate services and follow dependencies, assets, config and
     assert.deepEqual(Object.keys(next).filter(name => next[name] !== previous[name]).sort(), expected.sort(), path);
     previous = next;
   };
+  await change('js/media/src/index.ts', 'export const value = 2;', ['media']);
+  await change('js/media/src/media/generated/ffmpeg.wasm.bin', 'fixture binary', ['media']);
   await change('js/managed/src/index.ts', 'export const value = 2;', ['managed']);
   await change('js/fixture-protocol/index.ts', 'export const version = 2;', ['x']);
   await change('js/shared-inner.mjs', 'export const value = 2;', ['egress']);
@@ -51,6 +53,8 @@ test('Worker inputs isolate services and follow dependencies, assets, config and
   await change('scripts/cloudflare/released-account-image.mjs', '// release policy', ['account']);
   await change('scripts/cloudflare/account-relay-image.mjs', '// publication policy', []);
   await change('js/account/container/relay.mjs', '// container runtime', []);
+  await change('scripts/cloudflare/managed-crm.mjs', '// migration deployment policy', ['managed']);
+  await change('js/managed/migrations/0001_crm.sql', 'CREATE TABLE crm_test(id TEXT);', ['managed']);
   await change('js/managed/Dockerfile', 'FROM alpine', []);
   await change('crates/nanocodex-remote/src/runtime.rs', '// native runtime', []);
   await change('js/nanocodex/src/lib.rs', 'pub fn changed() {}', Object.keys(workerSpecs).filter(name => workerSpecs[name].needsWasm));

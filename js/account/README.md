@@ -12,6 +12,9 @@ or a second agent backend.
   agents include native `browseX` public X browsing, listed in `accountInfo.apis`
   without an X connection. **Durable Agent** retains a
   thread only after the user connects their own ChatGPT or OpenAI credential.
+- **Thread sharing** creates revocable view or write links for a durable
+  agent conversation. Guests see the normal Chat transcript; write links admit
+  real AI turns with attenuated account-tool permissions. See [thread sharing](../../docs/THREAD_SHARING.md).
 - **Attached Tools**, **Multiplayer**, and **World** demonstrate browser-hosted
   tools, a shared managed-agent room, and an agent-populated world.
 - **Account** and **Connect** handle SMS OTP account login, connection, device,
@@ -40,21 +43,6 @@ Hiding the tab pauses the connection. Losing focus, control, or the connection
 discards unsent input; resuming requires taking control again. Disconnected
 video is cleared and hidden. Screen availability still depends on the host
 publisher; this viewer does not provision a Cloudflare desktop.
-
-The viewer tests cover recovery deadlines, server publication changes, stale
-callbacks, control release, and authorization expiry. Chromium checks exercised
-real video/data channels, actual tab hide/show, discarded drafts, a 12-second
-publisher outage, and reopening the viewer. That lifecycle test uses a synthetic
-publisher. Separate live VM checks received 1600×900 video, renewed the viewer
-lease for three minutes, and used browser pointer/text/keyboard input to create
-and list a marker file in the VM terminal. A live factory restart with a
-12-second shutdown gap cleared the old frame and resumed decoded video with
-the new publication in about 18 seconds, retaining selection without acquiring
-control.
-The frame-transport Chromium fixture also exercised real JPEG decoding,
-pointer/text/keyboard input, actual tab hide/show, and a 12-second publisher
-outage with zero WebRTC peers or ICE requests. The host and broker remain
-responsible for provisioning and publishing Cloudflare desktops.
 
 ## Boundaries
 
@@ -116,7 +104,8 @@ history expires after ten minutes; account changes remove it. Live turn events
 invalidate the list and selected thread state. Streaming transport and
 OAuth/device lifecycles retain their existing protocol ownership.
 
-Use the checkout-level operator interface in [AGENTS.md](../../AGENTS.md) for
-local development, checks, deployment, and verification. This package exposes
+Use the root [README.md](../../README.md) for checkout setup and the root
+[package scripts](../../package.json) for repository commands. Follow
+[AGENTS.md](../../AGENTS.md) for deployment order and verification guidance. This package exposes
 the supporting `dev`, `build`, `test`, `typecheck`, `check:docs`, and `deploy`
 scripts, but the repository instructions own how they are run.

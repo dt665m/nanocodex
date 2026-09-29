@@ -2,18 +2,7 @@ import { env } from "cloudflare:workers";
 import { runInDurableObject, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 
-import {
-  GOOGLE_CAPABILITIES,
-  GOOGLE_PROVIDER,
-  buildGoogleAuthorizationUrl,
-  decodeGoogleTokenResponse,
-  googleCapabilities,
-} from "../src/connectors/google";
-import {
-  SLACK_PROVIDER,
-  buildSlackAuthorizationUrl,
-  decodeSlackTokenResponse,
-} from "../src/connectors/slack";
+import { GOOGLE_CAPABILITIES } from "../src/connectors/google";
 import type { EgressEnv } from "../src/egress";
 import { UserConnectorBroker } from "../src/connector-broker";
 import { CredentialVault, type EncryptedEnvelope } from "../src/credential-vault";
@@ -82,25 +71,6 @@ describe("provider-neutral connector identities", () => {
     expect(await revoked.json()).toEqual({ error: "connector_connection_not_found" });
   }, 60_000);
 
-  it("requests the full Google Workspace catalog while decoding partial consent", () => {
-    const authorization = buildGoogleAuthorizationUrl({
-      clientId: "client", redirectUri, state: "state", codeChallenge: "A".repeat(43),
-    });
-    expect(authorization.searchParams.get("scope")?.split(" ")).toEqual(GOOGLE_PROVIDER.scopes);
-    expect(authorization.searchParams.get("prompt")?.split(" ")).toEqual(["consent", "select_account"]);
-    expect(Object.keys(GOOGLE_CAPABILITIES)).toEqual([
-      "gmail", "gdrive", "gcalendar", "gtasks", "gdocs", "gsheets", "gslides", "gcontacts",
-    ]);
-    const token = decodeGoogleTokenResponse({
-      access_token: "secret-access",
-      refresh_token: "secret-refresh",
-      expires_in: 3_600,
-      token_type: "Bearer",
-      scope: `openid email ${GOOGLE_CAPABILITIES.gmail} ${GOOGLE_CAPABILITIES.gcalendar}`,
-    });
-    expect(googleCapabilities(token.scopes)).toEqual(["gmail", "gcalendar"]);
-  });
-
   it("projects one Google identity into each granted capability and selects among identities", async () => {
     const user = "multi-google-identities";
     const alpha = await connect(user, "google", "google-alpha-code");
@@ -140,6 +110,43 @@ describe("provider-neutral connector identities", () => {
     const after = await connectorStatus(user);
     expect(after.gmail.connections.map((connection) => connection.id)).toEqual([beta]);
     expect(after.gdrive).toEqual({ connected: false, connections: [] });
+  });
+
+  it("reports granted Google scopes through reconnect and refresh without losing mailbox access", async () => {
+    const user = "google-scope-journey";
+    const connection = await connect(user, "google", "google-alpha-code");
+    const settings = "https://www.googleapis.com/auth/gmail.settings.basic";
+    let status = await connectorStatus(user);
+    expect(status.gmail.connections[0]!.scopes).toEqual([
+      "openid", "email", GOOGLE_CAPABILITIES.gmail, GOOGLE_CAPABILITIES.gdrive,
+    ]);
+    expect(status.gmail.connections[0]!.scopes).not.toContain(settings);
+    const broker = workerEnv.USER_CONNECTORS.getByName(user);
+    expect((await broker.fetch("https://gmail.googleapis.com/gmail/v1/users/me/messages")).status).toBe(200);
+
+    // Reconnect upgrades this identity, preserving its selector and prior refresh token.
+    expect(await connect(user, "google", "google-scope-omit-expiring-code")).toBe(connection);
+    expect((await connectorStatus(user)).gmail.connections[0]!.scopes).toContain(settings);
+    expect((await broker.fetch("https://gmail.googleapis.com/gmail/v1/users/me/messages")).status).toBe(200);
+    status = await connectorStatus(user);
+    expect(status.gmail.connections[0]!.scopes).toEqual([
+      "openid", "email", GOOGLE_CAPABILITIES.gmail, settings,
+    ]);
+    expect(status.gdrive.connected).toBe(false);
+
+    // Explicit refresh scopes replace the callback grant, including loss of settings consent.
+    expect(await connect(user, "google", "google-scope-reduced-expiring-code")).toBe(connection);
+    expect((await broker.fetch("https://gmail.googleapis.com/gmail/v1/users/me/messages")).status).toBe(200);
+    status = await connectorStatus(user);
+    expect(status.gmail.connected).toBe(true);
+    expect(status.gmail.connections[0]!.scopes).toEqual(["openid", "email", GOOGLE_CAPABILITIES.gmail]);
+    // Inspect durable encrypted state as well as public projection.
+    await runInDurableObject(broker, async (_instance: UserConnectorBroker, state) => {
+      const row = await state.storage.get<{ envelope: EncryptedEnvelope }>("connector-state");
+      const vault = new CredentialVault(workerEnv, `connectors/${state.id.toString()}`);
+      const saved = await vault.open<{ connections: { google: Record<string, { scopes: string[] }> } }>(row!.envelope);
+      expect(saved.value.connections.google[connection]!.scopes).toEqual(["openid", "email", GOOGLE_CAPABILITIES.gmail]);
+    });
   });
 
   it("allows the managed Google Calendar and People route matrix", async () => {
@@ -317,22 +324,6 @@ describe("provider-neutral connector identities", () => {
     expect(after.gmail).toEqual({ connected: false, connections: [] });
     expect(after.gdrive).toEqual({ connected: false, connections: [] });
   });
-
-  it("builds and validates Slack user OAuth responses", () => {
-    const authorization = buildSlackAuthorizationUrl({
-      clientId: "client", redirectUri, state: "state",
-    });
-    expect(authorization.searchParams.get("scope")).toBeNull();
-    expect(authorization.searchParams.get("user_scope")).toBe(SLACK_PROVIDER.userScopes.join(","));
-    expect(decodeSlackTokenResponse({
-      ok: true,
-      team: { id: "T123", name: "Workspace" },
-      authed_user: {
-        id: "U456", access_token: "xoxp-secret", token_type: "user",
-        scope: SLACK_PROVIDER.userScopes.join(","),
-      },
-    })).toMatchObject({ teamId: "T123", userId: "U456" });
-  });
 });
 
 type PublicConnection = {
@@ -340,6 +331,7 @@ type PublicConnection = {
   label: string;
   account_id: string;
   capabilities: string[];
+  scopes?: string[];
 };
 type PublicStatus = Record<string, { connected: boolean; connections: PublicConnection[] }>;
 

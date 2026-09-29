@@ -15,15 +15,17 @@ export function projectEnvironment(info, { runtime, default_cwd }) {
       ...(hand.vm_provider === undefined ? {} : { vm_provider: hand.vm_provider }),
     }])),
     accounts: Object.fromEntries([...services].map((service) => [service, {
-      connections: (info.connectorAccounts?.[service] ?? []).map(({ id, label, accountId, capabilities }) => ({
+      connections: (info.connectorAccounts?.[service] ?? []).map(({ id, label, accountId, capabilities, scopes }) => ({
         id, label, ...(accountId === undefined ? {} : { accountId }),
         ...(capabilities === undefined ? {} : { capabilities: [...capabilities] }),
+        ...(scopes === undefined ? {} : { scopes: [...scopes] }),
       })),
       ...(info.accounts?.[service] === undefined ? {} : { label: info.accounts[service] }),
       ...(info.connectorTools?.[service] === undefined ? {} : { ...info.connectorTools[service] }),
     }])),
     apis: info.apis, identity: info.identity, stablecoins: info.stablecoins,
     authorizations: info.authorizations, vault: info.vault,
+    ...(info.wallet === undefined ? {} : { wallet: projectWallet(info.wallet) }),
   };
 }
 
@@ -70,4 +72,15 @@ export function requestOriginLocation(value, now = Date.now()) {
     || timestamp_ms < now - 300_000 || timestamp_ms > now + 30_000
     || typeof approximate !== "boolean") return undefined;
   return { latitude, longitude, accuracy_meters, timestamp_ms, approximate };
+}
+
+/** Keep wallet metadata separate from payment authority. Never spread signer data. */
+function projectWallet(wallet) {
+  if (wallet.status !== "ready") return { status: wallet.status };
+  const balance = wallet.balance.status === "ready" ? {
+    status: "ready", amount: wallet.balance.amount, decimals: wallet.balance.decimals,
+    symbol: wallet.balance.symbol, token: wallet.balance.token,
+  } : { status: "unavailable" };
+  return { status: "ready", address: wallet.address, created_at: wallet.created_at,
+    chain: wallet.chain, chain_id: wallet.chain_id, balance };
 }

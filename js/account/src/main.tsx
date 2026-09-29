@@ -1,18 +1,15 @@
 import { QueryClientProvider } from "@tanstack/react-query";
 import { appQueryClient } from "./queryClient";
-import { Suspense, useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { BrowserRouter } from "react-router";
 import { AccountSessionProvider } from "./AccountSession";
 import { NanocodexApp } from "./NanocodexApp";
 import { ArtifactRuntime } from "./artifactRuntime";
-import {
-  prepareRepositorySurface,
-  preloadDirectSurface,
-  type PreparedDirectRoute,
-} from "./routeLoaders";
+import type { PreparedDirectRoute } from "./routeLoaders";
 import { surfaceFromUrl } from "./navigation";
 
+const SharedThreadView = lazy(() => import("./SharedThreadView").then((module) => ({ default: module.SharedThreadView })));
 const directUrl = new URL(window.location.href);
 const directPath = directUrl.pathname === "/"
   ? "/"
@@ -23,6 +20,8 @@ const directSurface = surfaceFromUrl(directUrl);
 const directRepositorySurface = directSurface === "code" || directSurface === "commits"
   ? directSurface
   : undefined;
+const needsDirectData = directSurface === "changelog" || directSurface === "docs"
+  || (directSurface === "evals" && directPath === "/evals");
 if (directRepositorySurface) {
   const commit = directUrl.searchParams.get("commit")?.toLowerCase();
   const requestedCommit = directRepositorySurface === "commits"
@@ -30,24 +29,28 @@ if (directRepositorySurface) {
     && /^[0-9a-f]{40}$/.test(commit)
     ? commit
     : undefined;
-  void prepareRepositorySurface(directRepositorySurface, requestedCommit).catch(() => undefined);
+  void import("./routeLoaders")
+    .then(({ prepareRepositorySurface }) => prepareRepositorySurface(directRepositorySurface, requestedCommit))
+    .catch(() => undefined);
 }
 
 createRoot(container).render(
   directPath === "/artifact-runtime"
     ? <ArtifactRuntime />
-    : <BrowserApplication url={directUrl} />,
+    : /^\/share\/[^/]+$/.test(directPath)
+      ? <Suspense fallback={<p role="status">Opening shared thread…</p>}><SharedThreadView key={directPath} agentId={decodeURIComponent(directPath.slice(7))} /></Suspense>
+      : <BrowserApplication url={directUrl} />,
 );
 
 function BrowserApplication({ url }: { url: URL }) {
   const [preparedRoute, setPreparedRoute] = useState<PreparedDirectRoute | null>(
-    directRepositorySurface || directSurface === "home" || directSurface === "agent" ? {} : null,
+    needsDirectData ? null : {},
   );
 
   useEffect(() => {
-    if (directRepositorySurface) return;
+    if (!needsDirectData) return;
     let active = true;
-    void preloadDirectSurface(url).then(
+    void import("./routeLoaders").then(({ preloadDirectSurface }) => preloadDirectSurface(url)).then(
       (prepared) => {
         if (active) setPreparedRoute(prepared);
       },

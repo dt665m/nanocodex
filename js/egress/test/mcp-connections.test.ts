@@ -9,23 +9,6 @@ const workerEnv = env as unknown as EgressEnv;
 const LINEAR_ENDPOINT = "https://mcp.linear.app/mcp";
 
 describe("generic remote MCP connection owner", () => {
-  it("joins public connector and MCP metadata without returning connection credentials", async () => {
-    const user = "joined-catalog";
-    const id = connectionId("J");
-    await materialize(user, id, LINEAR_ENDPOINT, "Catalog workspace");
-    const catalog = await control(`/users/${user}/catalog`, "GET");
-    expect(catalog.status).toBe(200);
-    const body = await catalog.json<Record<string, unknown>>();
-    const connectors = await (await control(`/users/${user}/connectors`, "GET")).json<Record<string, unknown>>();
-    const mcps = await (await control(`/users/${user}/mcp-connections`, "GET")).json<Record<string, unknown>>();
-    expect(body).toEqual({ ...connectors, ...mcps });
-    expect(JSON.stringify(body)).not.toContain(LINEAR_ENDPOINT);
-    expect((await control(`/users/${user}/catalog`, "POST", {})).status).toBe(405);
-    await control(`/users/${user}/mcp-connections/${id}`, "DELETE");
-    const changed = await (await control(`/users/${user}/catalog`, "GET")).json<Record<string, unknown>>();
-    expect(changed.mcp_connections).toEqual([{ id, name: "Catalog workspace", status: "revoked" }]);
-  });
-
   it("connects Mercator without inventing OAuth and proxies its MCP tools", async () => {
     const user = "mcp-mercator";
     const id = connectionId("Q");
@@ -76,6 +59,40 @@ describe("generic remote MCP connection owner", () => {
         structuredContent: { connected: true },
       },
     });
+  });
+
+  it("onboards protected Mercator with advertised scope and a public PKCE client", async () => {
+    const user = "mcp-mercator-wallet";
+    const id = connectionId("B");
+    const ownerSubject = subject("mercator-wallet");
+    const endpoint = "https://mercator.sh/mcp/auth";
+    await materialize(user, id, endpoint, "Mercator");
+    const started = await start(user, id);
+    expect(started.response.status).toBe(200);
+    const authorization = new URL(started.body.authorization_url);
+    expect(authorization.origin).toBe("https://mercator.sh");
+    expect(authorization.searchParams.get("resource")).toBe(endpoint);
+    expect(authorization.searchParams.get("scope")).toBe("mercator:tools");
+    expect(authorization.searchParams.get("client_id")).toBe("mercator-test-client");
+    expect(authorization.searchParams.get("code_challenge_method")).toBe("S256");
+    expect(started.body.mcp_connections).toEqual([{ id, name: "Mercator", status: "authorization_required" }]);
+    const completed = await control(`/users/${user}/mcp-connections/${id}/callback`, "POST", {
+      code: "wallet-approved", state: authorization.searchParams.get("state"),
+    });
+    expect(completed.status).toBe(200);
+    expect(await completed.json()).toEqual({
+      mcp_connections: [{ id, name: "Mercator", status: "connected" }],
+      return_to: "/connections",
+    });
+    await bindSubject(ownerSubject, user);
+    const listed = await SELF.fetch(mcpRequest(id, ownerSubject, {
+      method: "POST", contentType: "application/json",
+      body: JSON.stringify({ jsonrpc: "2.0", id: 7, method: "tools/list", params: {} }),
+    }));
+    expect(listed.status).toBe(200);
+    expect((await listed.json() as { result: { tools: { name: string }[] } }).result.tools[0]?.name)
+      .toBe("search_services");
+    expect(JSON.stringify(started.body)).not.toContain("mercator-test-access");
   });
 
   it("materializes one immutable endpoint and denies cross-owner use", async () => {

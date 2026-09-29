@@ -2891,8 +2891,30 @@ async function proxyManagedAgent(
   const slash = resource.indexOf("/");
   const requestedAgentId = slash === -1 ? resource : resource.slice(0, slash);
   const suffix = slash === -1 ? "" : resource.slice(slash);
+  if (grant.status !== "active" || grant.expiresAt <= Math.floor(Date.now() / 1000)) {
+    throw new ApiFailure(401, "grant_inactive", "This connection has expired or was revoked.");
+  }
   if (requestedAgentId !== grant.agentId || request.method === "DELETE") {
     throw new ApiFailure(403, "agent_not_granted", "This durable agent is outside the signed Connect authorization.");
+  }
+  if (/^\/checkpoints(?:\/|$)/.test(suffix)) {
+    if (suffix !== "/checkpoints" || request.method !== "GET") throw new ApiFailure(405, "method_not_allowed", "Only checkpoint reads are supported.");
+    if (!grant.capabilities.includes("agent.output.final") || !(grant.capabilities.includes("agent.output.actions") || grant.capabilities.includes("agent.trace.read")))
+      throw new ApiFailure(403, "agent_output_not_granted", "Checkpoints require final output and actions or trace access.");
+  }
+  if (/^\/artifacts(?:\/|$)/.test(suffix)) {
+    const url = new URL(request.url);
+    const list = suffix === "/artifacts"
+      && url.searchParams.size === 1
+      && url.searchParams.has("turn_id")
+      && Boolean(url.searchParams.get("turn_id"));
+    const content = /^\/artifacts\/[^/]+\/content$/.test(suffix) && url.search === "";
+    if (request.method !== "GET" || (!list && !content)) {
+      throw new ApiFailure(405, "method_not_allowed", "Only exact artifact list and content reads are supported.");
+    }
+    if (!grant.capabilities.includes("agent.output.final")) {
+      throw new ApiFailure(403, "agent_output_not_granted", "Artifacts require access to final agent replies.");
+    }
   }
   if (/^\/durability(?:\/|$)/.test(suffix)) {
     if (suffix !== "/durability" || request.method !== "POST" || new URL(request.url).search !== "") {
@@ -2939,11 +2961,16 @@ async function projectManagedResponse(
   resource: string,
 ): Promise<Response> {
   const responseHeaders = new Headers();
-  for (const name of ["content-type", "retry-after", "x-nanocodex-realtime-location"]) {
+  // Downloaded JSON and event-stream files are opaque artifacts, not agent
+  // protocol messages. Rewriting either would corrupt the bytes and digest.
+  const artifactContent = /^\/artifacts\/[^/]+\/content$/.test(resource) || resource === "/checkpoints";
+  const headerNames = ["content-type", "retry-after", "x-nanocodex-realtime-location"];
+  if (artifactContent) headerNames.push("content-length", "etag", "cache-control", "x-content-type-options", "content-disposition");
+  for (const name of headerNames) {
     const value = upstream.headers.get(name);
     if (value) responseHeaders.set(name, value);
   }
-  if (!upstream.ok || !upstream.body) {
+  if (artifactContent || !upstream.ok || !upstream.body) {
     return new Response(upstream.body, {
       status: upstream.status,
       statusText: upstream.statusText,
@@ -5852,6 +5879,7 @@ function resourceValues(resources: readonly string[], prefix: string): string[] 
 
 function approvedAgentCapabilities(resources: readonly string[]): string[] {
   const approved = new Set(resources);
+  const sandbox = approved.has("urn:nanocodex:agent:execution:sandbox") ? ["agent.execution.sandbox"] : [];
   const portability = approved.has(agentPortabilityResource)
     ? ["agent.durability.portability"]
     : [];
@@ -5859,7 +5887,7 @@ function approvedAgentCapabilities(resources: readonly string[]): string[] {
     .filter((resource) => resource.startsWith(AGENT_VISIBILITY_RESOURCE_PREFIX))
     .flatMap((resource) => resource.slice(AGENT_VISIBILITY_RESOURCE_PREFIX.length).split(",")));
   if (approved.has("urn:nanocodex:agent:trace:read") || compact.has("traces")) {
-    return [...new Set([...Object.values(AGENT_VISIBILITY_RESOURCES), ...portability])];
+    return [...new Set([...Object.values(AGENT_VISIBILITY_RESOURCES), ...portability, ...sandbox])];
   }
   const legacy = Object.entries(AGENT_VISIBILITY_RESOURCES)
     .filter(([resource]) => approved.has(resource))
@@ -5867,7 +5895,7 @@ function approvedAgentCapabilities(resources: readonly string[]): string[] {
   const combined = Object.entries(AGENT_VISIBILITY_NAMES)
     .filter(([name]) => compact.has(name))
     .map(([, capability]) => capability);
-  return [...new Set([...legacy, ...combined, ...portability])];
+  return [...new Set([...legacy, ...combined, ...portability, ...sandbox])];
 }
 
 function approvedAgentConversationId(resources: readonly string[]): string | undefined {
@@ -6150,7 +6178,7 @@ function cors(response: Response, request: Request) {
     response.headers.set("access-control-max-age", "86400");
     response.headers.set(
       "access-control-expose-headers",
-      "mcp-session-id, payment-receipt, payment-response, payment-session, payment-session-snapshot, retry-after, link, x-ratelimit-limit, x-ratelimit-remaining, x-ratelimit-reset, x-ratelimit-resource, www-authenticate, x-nanocodex-realtime-location",
+      "content-disposition, content-length, etag, mcp-session-id, payment-receipt, payment-response, payment-session, payment-session-snapshot, retry-after, link, x-ratelimit-limit, x-ratelimit-remaining, x-ratelimit-reset, x-ratelimit-resource, www-authenticate, x-nanocodex-realtime-location",
     );
     response.headers.set("vary", "Origin");
   }

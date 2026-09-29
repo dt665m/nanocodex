@@ -4,9 +4,22 @@ import type { ToolContext } from "nanocodex";
 interface Env extends ManagedBrowserEnv { SMOKE: DurableObjectNamespace<KitesurfSmoke> }
 export class KitesurfSmoke extends DurableObject<Env> {
   async fetch(): Promise<Response> {
-    const runtime = await createManagedBrowserRuntime({ ctx: this.ctx, env: this.env, sessionId: "public-smoke" });
+    let loginLookups = 0;
+    const runtime = await createManagedBrowserRuntime({
+      ctx: this.ctx, env: this.env, sessionId: "public-smoke",
+      authorizeVaultAccess: () => {},
+      resolveVaultLogin: async () => { loginLookups++; throw new Error("Unexpected login lookup"); },
+    });
     try {
-      const tool = runtime.tools.find(tool => tool.name === "browser_execute")!;
+      const privateToolsSuppressed = runtime.tools.length === 1 && runtime.tools[0]?.name === "browser_execute";
+      if (!privateToolsSuppressed) throw new Error("Kitesurf exposed unexpected private tools");
+      let secureInputBlocked = false;
+      try { await runtime.submitSecureInput({}, new AbortController().signal); }
+      catch (error) {
+        secureInputBlocked = error instanceof Error && error.message.includes("Kitesurf does not support private browser continuation");
+      }
+      if (!secureInputBlocked || loginLookups !== 0) throw new Error("Kitesurf secure input guard failed");
+      const tool = runtime.tools[0]!;
       const context = { callId: "kitesurf-public-smoke", signal: AbortSignal.timeout(90_000) } as ToolContext;
       const result = await tool.handler({ code: `
         const created = await cdp.send({ method: "Target.createTarget", params: { url: "https://example.com" } });
@@ -34,7 +47,8 @@ export class KitesurfSmoke extends DurableObject<Env> {
         || execution.result.containsExampleDomain !== true || !(Number(execution.result.htmlLength) > 0)
         || !credentialPolicyBlocked) throw new Error("Kitesurf smoke assertion failed");
       return Response.json({ provider: "kitesurf", status: "completed", title: "Example Domain",
-        containsExampleDomain: true, htmlLength: execution.result.htmlLength, credentialPolicyBlocked: true });
+        containsExampleDomain: true, htmlLength: execution.result.htmlLength, credentialPolicyBlocked: true,
+        privateToolsSuppressed, secureInputBlocked, loginLookups });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Smoke failed";
       return Response.json({ error: message.replace(/(?:https?|wss?):\/\/[^\s"'<>]+/g, "[URL redacted]") }, { status: 500 });

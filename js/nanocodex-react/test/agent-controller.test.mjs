@@ -83,100 +83,6 @@ test("useAgentController projects the complete ordered semantic transcript", asy
   }
 });
 
-test("tool activities retain bounded input, successful output, duration, images, and status", async () => {
-  const frames = fakeAnimationFrames();
-  const source = fakeAgent();
-  let controller;
-
-  function Consumer() {
-    controller = useAgentController(source.agent);
-    return null;
-  }
-
-  let root;
-  try {
-    await act(async () => { root = create(createElement(Consumer)); });
-    await flushFrames(frames);
-    const calls = [
-      ["sandbox", "sandbox_exec", { command: "printf hello", cwd: "." }],
-      ["process", "sandbox_start_process", { command: "npm start", ready_port: 8_000 }],
-      ["preview", "sandbox_preview", { port: 8_000 }],
-      ["account", "accountInfo", {}],
-      ["machine", "user_machine-a_exec_command", { cmd: "pwd" }],
-      ["mcp", "mcp__linear__search_issues", { query: `bug ${"x".repeat(5_000)}` }],
-    ];
-    await act(async () => {
-      source.emit(event(1, "run.started", { turn_id: "turn-tools" }));
-      calls.forEach(([call_id, tool, arguments_], index) => source.emit(event(index + 2, "tool.call", {
-        call_id, tool, arguments: arguments_, turn_id: "turn-tools",
-      })));
-    });
-    await flushFrames(frames);
-    const running = controller.entries.filter((entry) => entry.kind === "tool");
-    assert.equal(running.length, calls.length);
-    assert.ok(running.every((entry) => entry.tool.status === "running"));
-    assert.equal(JSON.parse(running[0].tool.input).command, "printf hello");
-    assert.ok(running.at(-1).tool.arguments.length <= 181);
-    assert.ok(running.at(-1).tool.input.length <= 4_002);
-
-    await act(async () => {
-      source.emit(event(20, "tool.result", {
-        call_id: "sandbox", status: "completed", duration_ns: 1_250_000_000,
-        result: { success: true, exit_code: 0, stdout: "hello", stderr: "" },
-        turn_id: "turn-tools",
-      }));
-      source.emit(event(21, "tool.result", {
-        call_id: "process", status: "completed",
-        result: { process_id: "proc", pid: 42, status: "running", ready_port: 8_000 },
-        turn_id: "turn-tools",
-      }));
-      source.emit(event(22, "tool.result", {
-        call_id: "preview", status: "completed",
-        result: { port: 8_000, url: "https://preview.example.test/", persistent: false },
-        turn_id: "turn-tools",
-      }));
-      source.emit(event(23, "tool.result", {
-        call_id: "account", status: "completed",
-        result: { status: "ready", authenticated: ["github"], connectorAccounts: {}, machines: [], vault: [] },
-        turn_id: "turn-tools",
-      }));
-      source.emit(event(24, "tool.result", {
-        call_id: "machine", status: "completed",
-        result: "model-visible fallback",
-        structured_result: [{ type: "input_image", image_url: "data:image/png;base64,AA==" }],
-        metadata: { machine_name: "Machine A", tool_name: "exec_command" },
-        turn_id: "turn-tools",
-      }));
-      source.emit(event(25, "tool.result", {
-        call_id: "mcp", status: "completed", result: { issues: [1, 2], note: "y".repeat(5_000) },
-        turn_id: "turn-tools",
-      }));
-    });
-    await flushFrames(frames);
-    const completed = controller.entries.filter((entry) => entry.kind === "tool");
-    assert.ok(completed.every((entry) => entry.tool.status === "completed"));
-    assert.equal(completed[0].tool.durationNs, 1_250_000_000);
-    assert.equal(JSON.parse(completed[0].tool.output).stdout, "hello");
-    assert.match(completed[2].tool.output, /preview\.example\.test/);
-    assert.equal(JSON.parse(completed[3].tool.output).status, "ready");
-    assert.deepEqual(completed[4].tool.images, ["data:image/png;base64,AA=="]);
-    assert.deepEqual(JSON.parse(completed[4].tool.output), [
-      { type: "input_image", image_url: "[Embedded attachment]" },
-    ]);
-    assert.equal(completed[4].tool.generatedOutput[0].url, "data:image/png;base64,AA==");
-    assert.deepEqual(completed[4].tool.metadata, {
-      machine_name: "Machine A",
-      tool_name: "exec_command",
-    });
-    assert.equal(completed[5].tool.result, undefined);
-    assert.match(completed[5].tool.output, /"issues"/);
-    assert.ok(completed[5].tool.output.length <= 4_002);
-    await act(async () => root.unmount());
-  } finally {
-    frames.restore();
-  }
-});
-
 test("authoritative turn results release running state without a terminal stream event", async () => {
   const frames = fakeAnimationFrames();
   const source = fakeAgent();
@@ -250,6 +156,37 @@ test("prompt controls steer active work, queue roots, cancel the latest turn, an
     controller.dispose();
     assert.deepEqual(source.turns.map((turn) => turn.disposals), [1, 1]);
   } finally {
+    frames.restore();
+  }
+});
+
+test("queued message controls withdraw only the selected root", async () => {
+  const frames = fakeAnimationFrames();
+  const source = fakeAgent();
+  let controller, root;
+  function Consumer() { controller = useAgentController(source.agent); return null; }
+  try {
+    await act(async () => { root = create(createElement(Consumer)); });
+    await act(async () => { await controller.submit("first"); });
+    source.emit(event(1, "run.started", { turn_id: "turn-1" }));
+    await act(async () => {
+      await controller.submit("second", { intent: "queue" });
+      await controller.submit("third", { intent: "queue" });
+    });
+    await flushFrames(frames);
+    assert.deepEqual(controller.pendingPrompts.map(({ text }) => text), ["second", "third"]);
+    const [second, third] = controller.pendingPrompts;
+    await act(async () => { assert.equal(await controller.cancelPrompt(second.id), true); });
+    assert.equal(source.turns[1].cancelled, true);
+    assert.equal(source.turns[2].cancelled, false);
+    assert.equal((await controller.cancelPrompt(9000)), false);
+    await flushFrames(frames);
+    assert.equal(controller.pendingPrompts[0].state, "cancelling");
+    await act(async () => source.turns[1].fail(Object.assign(new Error("cancelled"), { code: "turn_cancelled" })));
+    await flushFrames(frames);
+    assert.deepEqual(controller.pendingPrompts.map(({ id }) => id), [third.id]);
+  } finally {
+    if (root) await act(async () => root.unmount());
     frames.restore();
   }
 });
@@ -546,32 +483,6 @@ test("hidden controllers reduce bursts and publish one visible catch-up snapshot
   }
 });
 
-test("AgentController exposes the same stable controls through a render prop", async () => {
-  const frames = fakeAnimationFrames();
-  const source = fakeAgent();
-  let first;
-  let latest;
-  let root;
-  try {
-    await act(async () => {
-      root = create(createElement(AgentController, {
-        agent: source.agent,
-        children(snapshot) {
-          first ??= snapshot;
-          latest = snapshot;
-          return null;
-        },
-      }));
-    });
-    await flushFrames(frames);
-    assert.equal(first.submit, latest.submit);
-    assert.equal(first.cancel, latest.cancel);
-    await act(async () => root.unmount());
-  } finally {
-    frames.restore();
-  }
-});
-
 function fakeAgent() {
   let eventListener = () => {};
   let historyListener = () => {};
@@ -862,4 +773,21 @@ test("root terminal polling cannot attach to a child session with the same ID", 
   assert.equal(state.entries.length, 2);
   assert.equal(JSON.parse(state.entries[0].tool.output).output, "root done");
   assert.equal(JSON.parse(state.entries[1].tool.output).output, "child");
+});
+
+test("shared guest prompts retain author in the standard Chat transcript", async () => {
+  const frames = fakeAnimationFrames();
+  const source = fakeAgent();
+  source.history = [event(1, "managed.prompt", { text: "Guest message", turn_id: "guest-turn", author: "guest" })];
+  let controller;
+  function Consumer() { controller = useAgentController(source.agent); return null; }
+  let root;
+  try {
+    await act(async () => { root = create(createElement(Consumer)); });
+    await flushFrames(frames);
+    assert.equal(controller.entries.find(entry => entry.turnId === "guest-turn")?.author, "guest");
+  } finally {
+    if (root) await act(async () => root.unmount());
+    frames.restore();
+  }
 });

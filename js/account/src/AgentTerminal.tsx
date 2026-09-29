@@ -25,6 +25,7 @@ import {
   type ModelSessionStatus,
   type CredentialSource,
 } from "./modelSession";
+import { SecureInputCard } from "./SecureInputCard";
 import { VaultIntakeCard } from "./VaultIntakeCard";
 import { ArtifactDock } from "./ArtifactDock";
 import { PhoneCallsPanel } from "./PhoneCallsPanel";
@@ -230,6 +231,7 @@ const BrowserAgentTerminal = memo(function BrowserAgentTerminal({
 export const ManagedAgentTerminal = memo(function ManagedAgentTerminal({
   agentId,
   authStatus,
+  initialDraft,
   mode,
   onConversationActivity,
   onStateChange,
@@ -238,6 +240,7 @@ export const ManagedAgentTerminal = memo(function ManagedAgentTerminal({
 }: {
   agentId: string;
   authStatus: ModelSessionStatus | undefined;
+  initialDraft?: string;
   mode: AgentTerminalMode;
   onConversationActivity(input: string): void;
   onStateChange(state: AgentTerminalState): void;
@@ -329,6 +332,7 @@ export const ManagedAgentTerminal = memo(function ManagedAgentTerminal({
     <PhoneCallsPanel key={`${accountId}:${agentId}`} parentAgentId={agentId} enabled={Boolean(accountId) && mode !== "hidden"} />
     <AgentTerminalView
       agent={startupReady ? agent : undefined}
+      initialDraft={initialDraft}
       agentError={stateQuery.error?.message}
       inactiveMessage={({ agentError, agentStatus }) => inactiveTerminalMessage({
         agentError,
@@ -342,7 +346,7 @@ export const ManagedAgentTerminal = memo(function ManagedAgentTerminal({
       onConversationActivity={recordConversationActivity}
       onStateChange={onStateChange}
       retryAgent={retryAgent}
-      renderTool={(tool, { submit }) => <VaultIntakeCard key={tool.callId} tool={tool} onReceipt={submit} />}
+      renderTool={(tool, { submit }) => <><SecureInputCard key={`secure:${tool.callId}`} tool={tool} agentId={agentId} onReceipt={submit} /><VaultIntakeCard key={tool.callId} tool={tool} onReceipt={submit} /></>}
       voice={voiceEnabled}
       welcome={settingsReady && !conversationStarted ? "# What should we work on?" : undefined}
       composerPlaceholder="Ask Nanocodex"

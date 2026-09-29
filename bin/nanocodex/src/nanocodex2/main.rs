@@ -23,7 +23,12 @@ mod host;
 mod installation;
 #[path = "../launcher.rs"]
 mod launcher;
+#[cfg(any(target_os = "linux", test))]
+mod linux_hand_install;
+mod managed2;
 mod native_hand;
+#[cfg(target_os = "macos")]
+mod native_secure_input;
 mod observation_providers;
 mod reload;
 mod screen_audio;
@@ -91,12 +96,14 @@ use nanocodex_managed::{
 use nanocodex_tools::{
     Tools, WorkspaceTools,
     attachment::{Attachment, AttachmentMetadata, AttachmentTarget},
+    mcp::{Mcp, McpServer},
 };
 use percent_encoding::percent_decode_str;
 use tracing::Instrument as _;
 use url::Url;
 
 const SYSTEM_HOST_TOKEN_ENV: &str = "NANOCODEX_SYSTEM_HOST_TOKEN";
+const MERCATOR_MCP_URL: &str = "https://mercator.sh/mcp";
 
 #[derive(Parser)]
 #[command(
@@ -106,6 +113,9 @@ const SYSTEM_HOST_TOKEN_ENV: &str = "NANOCODEX_SYSTEM_HOST_TOKEN";
     about = "Small managed Nanocodex client with local workspace tools"
 )]
 struct Cli {
+    /// Opt in to the separate Managed2 API (limited text sessions in the standard TUI).
+    #[arg(long, global = true)]
+    managed2: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -137,6 +147,10 @@ enum Command {
     #[cfg(target_os = "linux")]
     #[command(name = "__hand-desktop", hide = true)]
     HandDesktop(screen_native::DesktopCommand),
+    /// Install this binary as a native Linux Hand from a private stdin request.
+    #[cfg(any(target_os = "linux", test))]
+    #[command(name = "__install-hand", hide = true)]
+    InstallHand,
     /// Share an existing Wayland session through the shared Rust publisher.
     #[cfg(target_os = "linux")]
     #[command(name = "wayland-host", hide = true)]
@@ -157,6 +171,8 @@ enum Command {
     Cron(control::Cron),
     /// List account-owned managed agents as JSON.
     List,
+    /// Read owner-only rolling 24-hour Hand tool statistics as JSON.
+    HandStats,
     /// Read one managed agent's durable state as JSON.
     State(AgentId),
     /// Read one managed turn's durable state as JSON.
@@ -622,6 +638,20 @@ fn run_with_runtime(
 }
 
 async fn run(cli: Cli) -> Result<(), ManagedError> {
+    if cli.managed2 {
+        return match cli.command {
+            None => tui::run_managed2(None).await,
+            Some(Command::Attach(Attach { agent: Some(agent) })) if agent.managed_origin.is_none() => {
+                tui::run_managed2(Some(agent.agent_id)).await
+            }
+            Some(Command::Run(command)) if !command.settings.is_explicit() => {
+                managed2::run(command.agent, Some(command.prompt), command.idempotency_key).await
+            }
+            _ => Err(ManagedError::Configuration(
+                "--managed2 supports interactive sessions, attach ID, and run [--agent ID] PROMPT only; legacy commands/settings are unavailable".into(),
+            )),
+        };
+    }
     let command = match cli.command {
         Some(Command::Tui(command)) => {
             return command
@@ -661,6 +691,8 @@ async fn run(cli: Cli) -> Result<(), ManagedError> {
         }
         #[cfg(target_os = "linux")]
         Some(Command::HandDesktop(command)) => return screen_native::serve_desktop(command).await,
+        #[cfg(any(target_os = "linux", test))]
+        Some(Command::InstallHand) => return linux_hand_install::run().await,
         Some(Command::Hand(command)) if command.rootfs.is_none() && command.docker.is_none() => {
             return native_hand::serve_hand(command).await;
         }
@@ -728,6 +760,8 @@ async fn run(cli: Cli) -> Result<(), ManagedError> {
         Some(Command::HandScreen(command)) => screen_native::serve(&client, command).await,
         #[cfg(target_os = "linux")]
         Some(Command::HandDesktop(_)) => unreachable!("handled before managed client setup"),
+        #[cfg(any(target_os = "linux", test))]
+        Some(Command::InstallHand) => unreachable!("handled before managed client setup"),
         Some(Command::Host(_)) => unreachable!("handled before managed client setup"),
         Some(Command::New(settings)) => {
             let account = settings.chatgpt_account.clone();
@@ -745,6 +779,7 @@ async fn run(cli: Cli) -> Result<(), ManagedError> {
         Some(Command::Settings(command)) => command.run(&client).await,
         Some(Command::Cron(command)) => command.run(&client).await,
         Some(Command::List) => write_json(&client.list().await?),
+        Some(Command::HandStats) => write_json(&client.hosted_tool_stats().await?),
         Some(Command::State(command)) => write_json(&client.state(&command.agent_id).await?),
         Some(Command::Turn(command)) => write_json(
             &client
@@ -1137,7 +1172,10 @@ async fn open_workspace_agent_with_settings(
             tools = tools.add(tool);
         }
     }
+    // The terminal owns its local tool runtime. Cloudflare managed-agent MCP
+    // defaults are not inherited by nanocodex2's workspace-backed driver.
     let tools = tools
+        .add(default_mercator_mcp()?)
         .build()
         .map_err(|error| ManagedError::Configuration(error.to_string()))?;
     let backend = match (agent_id, state) {
@@ -1165,6 +1203,18 @@ async fn open_workspace_agent_with_settings(
     };
     let agent_id = agent.agent_id().to_owned();
     Ok((agent, events, agent_id, workspace))
+}
+
+fn default_mercator_mcp() -> Result<Mcp, ManagedError> {
+    Mcp::builder()
+        .server(
+            "mercator",
+            McpServer::http(MERCATOR_MCP_URL)
+                .description("Discover and quote Mercator services. Paid jobs require separate authorization.")
+                .parallel_tools(["get_suggested_queries", "get_connection_status", "search_services"]),
+        )
+        .build()
+        .map_err(|error| ManagedError::Configuration(error.to_string()))
 }
 
 async fn await_turn(
@@ -1328,6 +1378,13 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[test]
+    fn hand_stats_is_a_read_only_standard_managed_command() {
+        let cli = Cli::try_parse_from(["nanocodex2", "hand-stats"]).unwrap();
+        assert!(!cli.managed2);
+        assert!(matches!(cli.command, Some(Command::HandStats)));
     }
 
     #[test]

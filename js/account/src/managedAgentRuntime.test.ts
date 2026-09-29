@@ -1,12 +1,13 @@
 import type { AgentEvent } from "nanocodex-react/agent";
 import type { ManagedEvent } from "nanocodex/managed";
-import { appQueryClient, clearOtherAccountQueries } from "./queryClient.ts";
+import { appQueryClient, clearOtherAccountQueries, sessionQueryKey } from "./queryClient.ts";
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  beginManagedConversationCreation,
+  reconcileManagedCreateSelection,
   listManagedConversations,
   loadManagedConversationSelection,
-  terminalEvent,
   managedTerminalAgent,
   type ManagedTerminalSource,
 } from "./managedAgentRuntime.ts";
@@ -17,20 +18,6 @@ appQueryClient.setDefaultOptions({ ...appQueryClient.getDefaultOptions(), querie
 const FIRST_AGENT_ID = "018f0000-0000-7000-8000-000000000001";
 const SECOND_AGENT_ID = "018f0000-0000-7000-8000-000000000002";
 const FORBIDDEN_AGENT_ID = "018f0000-0000-7000-8000-000000000003";
-
-test("terminal projection preserves the persisted event time for command elapsed duration", () => {
-  const projected = terminalEvent({
-    cursor: "26", createdAt: 1788766853390, turnId: "cargo-turn", type: "event",
-    data: {
-      type: "event", cursor: "26", created_at: 1788766853390, turn_id: "cargo-turn",
-      event: { protocol_version: 1, request_id: "internal", seq: 1, type: "tool.call",
-        payload: { call_id: "cargo", tool: "exec_command", arguments: { cmd: "cargo test" } } },
-    },
-  }, "public-session", undefined, 26);
-  assert.equal(projected?.payload.managed_event_created_at, 1788766853390);
-  assert.equal(projected?.payload.managed_event_cursor, "26");
-  assert.equal(projected?.payload.turn_id, "cargo-turn");
-});
 
 test("an exact agent route survives a successful list cached before another client created it", async (t) => {
   t.after(() => appQueryClient.clear());
@@ -111,6 +98,88 @@ test("an exact agent route survives a successful list cached before another clie
     /That exact agent is not available to this account/,
   );
   assert.deepEqual(exactCalls, [SECOND_AGENT_ID, FORBIDDEN_AGENT_ID]);
+});
+
+test("an exact route selects without waiting for a slow list, then survives its stale response", async (t) => {
+  t.after(() => appQueryClient.clear());
+  const originalLocation = Object.getOwnPropertyDescriptor(globalThis, "location");
+  const originalFetch = globalThis.fetch;
+  Object.defineProperty(globalThis, "location", { configurable: true, value: new URL("https://account.example") });
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalLocation) Object.defineProperty(globalThis, "location", originalLocation);
+    else Reflect.deleteProperty(globalThis, "location");
+  });
+  let completeList!: (response: Response) => void;
+  globalThis.fetch = async (input, init) => {
+    const request = new Request(input, init);
+    const path = new URL(request.url).pathname;
+    if (path === "/v1/agents") return new Promise<Response>(resolve => { completeList = resolve; });
+    if (path === `/v1/agents/${SECOND_AGENT_ID}`) return Response.json({});
+    throw new Error(`Unexpected ${request.method} ${path}`);
+  };
+  const selection = await loadManagedConversationSelection({
+    accountId: "slow-list-client", routeAgentId: SECOND_AGENT_ID, hasCredential: true,
+  });
+  assert.equal(selection.selectedId, SECOND_AGENT_ID, "exact route does not await listing");
+  assert.deepEqual(selection.conversations.map(({ id }) => id), [SECOND_AGENT_ID]);
+  completeList(Response.json({ data: [FIRST_AGENT_ID], summaries: {} }));
+  await listManagedConversations("slow-list-client");
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.deepEqual((await listManagedConversations("slow-list-client")).map(({ id }) => id),
+    [SECOND_AGENT_ID, FIRST_AGENT_ID], "the late stale list cannot remove the exact route");
+});
+
+test("new managed conversation has an immediate local placeholder and reconciles its receipt", async (t) => {
+  t.after(() => appQueryClient.clear());
+  const originalLocation = Object.getOwnPropertyDescriptor(globalThis, "location");
+  const originalFetch = globalThis.fetch;
+  Object.defineProperty(globalThis, "location", { configurable: true, value: new URL("https://account.example") });
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalLocation) Object.defineProperty(globalThis, "location", originalLocation);
+    else Reflect.deleteProperty(globalThis, "location");
+  });
+  let complete!: (response: Response) => void;
+  let requests = 0;
+  globalThis.fetch = async (input, init) => {
+    const request = new Request(input, init);
+    if (request.method === "POST" && new URL(request.url).pathname === "/v1/agents") {
+      requests++;
+      return new Promise<Response>(resolve => { complete = resolve; });
+    }
+    if (request.method === "GET") return Response.json({ data: [FIRST_AGENT_ID], summaries: {} });
+    throw new Error(`Unexpected ${request.method} ${request.url}`);
+  };
+  appQueryClient.setQueryData(sessionQueryKey, { account: { id: "optimistic-test" } });
+  const { provisional, receipt } = beginManagedConversationCreation("optimistic-test");
+  assert.match(provisional.id, /^pending:/);
+  assert.equal(provisional.title, "New agent");
+  assert.notEqual(provisional.id, FIRST_AGENT_ID);
+  assert.equal(requests, 1, "creation begins immediately, before the receipt resolves");
+  assert.equal(reconcileManagedCreateSelection(provisional.id, provisional.id, FIRST_AGENT_ID), FIRST_AGENT_ID);
+  assert.equal(reconcileManagedCreateSelection(SECOND_AGENT_ID, provisional.id, FIRST_AGENT_ID), SECOND_AGENT_ID,
+    "a later tab selection is not stolen by a slow create receipt");
+  complete(Response.json({ agent_id: FIRST_AGENT_ID }));
+  assert.equal((await receipt).id, FIRST_AGENT_ID);
+  assert.deepEqual((await listManagedConversations("optimistic-test")).map(({ id }) => id), [FIRST_AGENT_ID]);
+});
+
+test("failed managed create rejects without publishing a provisional agent", async (t) => {
+  t.after(() => appQueryClient.clear());
+  const originalLocation = Object.getOwnPropertyDescriptor(globalThis, "location");
+  const originalFetch = globalThis.fetch;
+  Object.defineProperty(globalThis, "location", { configurable: true, value: new URL("https://account.example") });
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalLocation) Object.defineProperty(globalThis, "location", originalLocation);
+    else Reflect.deleteProperty(globalThis, "location");
+  });
+  globalThis.fetch = async () => Response.json({ error: "unavailable", message: "Creation failed" }, { status: 503 });
+  const { provisional, receipt } = beginManagedConversationCreation("failure-test");
+  assert.match(provisional.id, /^pending:/);
+  await assert.rejects(receipt, /Creation failed/);
+  assert.equal(appQueryClient.getQueryData(["account", "failure-test", "conversations"]), undefined);
 });
 
 function historyFixture(id: string) {
@@ -378,4 +447,16 @@ test("streaming work grows linearly instead of rescanning the incomplete transcr
   assert.equal(history.length, count);
   assert.equal(history.map(event => event.payload.text).join(""), "x".repeat(count));
   assert.ok(Object.isFrozen(history));
+});
+
+test("managed shared guest turn retains Guest attribution for the owner's Chat projection", async () => {
+  const { managedHistoryEvents } = await import("./managedAgentRuntime.ts");
+  const accepted: ManagedEvent = { cursor: "1", createdAt: 1, turnId: "guest-turn", type: "turn_accepted",
+    data: { cursor: "1", created_at: 1, turn_id: "guest-turn", type: "turn_accepted",
+      id: "guest-turn", input: "Can you follow up?", replayed: false, author: "guest", share_link_id: "share-id" } };
+  const projected = managedHistoryEvents([accepted], FIRST_AGENT_ID, undefined);
+  assert.equal(projected[0]?.type, "managed.prompt");
+  assert.equal(projected[0]?.payload.author, "guest");
+  assert.equal(projected[0]?.payload.text, "Can you follow up?");
+  assert.equal(projected[0]?.payload.share_link_id, undefined);
 });

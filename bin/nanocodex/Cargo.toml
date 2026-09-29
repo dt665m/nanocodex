@@ -26,7 +26,7 @@ tempo = [
 ]
 
 [dependencies]
-nanocodex-tui-control = { path = "tui-control", version = "0.6.4" }
+nanocodex-tui-control = { path = "tui-control", version = "0.6.5" }
 nanocodex-computer.workspace = true
 arboard.workspace = true
 async-trait.workspace = true
@@ -70,6 +70,7 @@ semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 syntect.workspace = true
+sysinfo.workspace = true
 two-face.workspace = true
 sha2.workspace = true
 shlex.workspace = true
@@ -93,7 +94,6 @@ nanocodex-eval.workspace = true
 nanocodex-eval-adapters.workspace = true
 nanocodex-vm.workspace = true
 regex.workspace = true
-sysinfo.workspace = true
 
 [build-dependencies]
 chrono.workspace = true

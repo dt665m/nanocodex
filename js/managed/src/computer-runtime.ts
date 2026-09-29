@@ -1,6 +1,5 @@
 import { networkAllows, type NetworkPolicy } from "./agent-configuration";
 import {
-  createComputerRuntime,
   createMediaCommands,
   createWorkspaceFilesystem,
   type ComputerRuntime,
@@ -8,6 +7,9 @@ import {
   type Workspace,
   type WorkspaceStorageClient,
 } from "nanocodex-tools";
+import { createComputerRuntimeWithoutPdf } from "nanocodex-tools/computer-runtime-core";
+import { createPdfTextCommandWithExtractor } from "nanocodex-tools/pdf-command";
+import { extractPdfTextFromMediaService } from "./pdf-runtime";
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { ToolContext } from "nanocodex";
 
@@ -39,7 +41,7 @@ export async function createManagedComputerRuntime(options: Readonly<{
     context?: ToolContext,
   ) => ManagedEgressConnectorAccess;
   egress: Fetcher;
-  mediaLoader?: WorkerLoader;
+  mediaService?: Fetcher;
   sshIdentityAllowed?: (reference: string, context?: ToolContext) => boolean;
   vaultAllowed?: (context?: ToolContext) => boolean;
   subject?: string;
@@ -65,17 +67,23 @@ export async function createManagedComputerRuntime(options: Readonly<{
       () => options.vaultAllowed?.(calls.getStore()) ?? true,
       options.networkPolicy,
     );
-    const runtime = await createComputerRuntime({
+    const runtime = await createComputerRuntimeWithoutPdf({
       filesystem,
       refreshFilesystemBeforeExec: options.filesystem !== undefined,
+      lazyInitialize: true,
+      // Wrangler uploads this prebundled ES module independently; only shell
+      // calls evaluate it, not chat-only Durable Object activations.
+      loadInterpreter: () => import("./just-bash-lazy.mjs"),
       fetch,
       networkMode: options.subject === undefined
         ? "public-http-only"
         : "connector-http-gateway",
       commands: ({ filesystem: mountedFilesystem }) => [
-        ...(options.mediaLoader ? createMediaCommands({
+        ...(options.mediaService ? [createPdfTextCommandWithExtractor(mountedFilesystem, (data, pdfOptions, signal) =>
+          extractPdfTextFromMediaService(options.mediaService!, data, pdfOptions, signal))] : []),
+        ...(options.mediaService ? createMediaCommands({
           filesystem: mountedFilesystem,
-          execute: createMediaExecutor(options.mediaLoader),
+          execute: createMediaExecutor(options.mediaService),
         }) : []),
         ...(options.networkPolicy && options.networkPolicy.access !== "enabled" ? [] : [{
           name: "ssh",

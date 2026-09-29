@@ -20,8 +20,9 @@ use nanocodex_tools::{
     runtime::ToolsBuildError,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use std::{
+    collections::BTreeMap,
     sync::{Arc, Weak},
     time::Duration,
 };
@@ -43,6 +44,69 @@ pub struct AgentTask {
     pub output_schema: Value,
 }
 
+/// A closed, recursively typed model-facing language for child result shapes.
+/// No caller-authored JSON Schema object is exposed to strict function calling.
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum OutputContractNode {
+    Object { fields: Vec<OutputContractField> },
+    Array { items: Box<Self> },
+    String,
+    StringEnum { values: Vec<String> },
+    Integer,
+    Number,
+    Boolean,
+    Null,
+    Any,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OutputContractField {
+    name: String,
+    schema: OutputContractNode,
+    required: bool,
+}
+
+impl OutputContractNode {
+    fn into_schema(self) -> Value {
+        match self {
+            Self::Object { fields } => {
+                // Last declaration wins on duplicate names, including whether
+                // it is required, so every strict-valid input yields one schema.
+                let mut deduplicated = BTreeMap::new();
+                for field in fields {
+                    deduplicated.insert(field.name, (field.schema, field.required));
+                }
+                let mut properties = Map::new();
+                let mut required = Vec::new();
+                for (name, (schema, is_required)) in deduplicated {
+                    if is_required {
+                        required.push(name.clone());
+                    }
+                    properties.insert(name, schema.into_schema());
+                }
+                json!({ "type": "object", "properties": properties,
+                    "required": required, "additionalProperties": false })
+            }
+            Self::Array { items } => json!({ "type": "array", "items": items.into_schema() }),
+            Self::String => json!({ "type": "string" }),
+            Self::StringEnum { values } => {
+                if values.is_empty() {
+                    json!({ "type": "string" })
+                } else {
+                    json!({ "type": "string", "enum": values })
+                }
+            }
+            Self::Integer => json!({ "type": "integer" }),
+            Self::Number => json!({ "type": "number" }),
+            Self::Boolean => json!({ "type": "boolean" }),
+            Self::Null => json!({ "type": "null" }),
+            Self::Any => Value::Bool(true),
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SpawnAgentTask {
@@ -52,11 +116,26 @@ struct SpawnAgentTask {
     model: Option<Model>,
     #[serde(default)]
     thinking: Option<Thinking>,
-    output_schema: Value,
+    // Old in-flight calls can finish after deployment. New model declarations
+    // expose only the typed contract, while trusted Rust/JS APIs retain raw
+    // schemas through `start_agent` rather than this tool.
+    #[serde(default)]
+    output_schema: Option<Value>,
+    #[serde(default)]
+    output_contract: Option<OutputContractNode>,
 }
 
 impl SpawnAgentTask {
-    fn into_parts(self) -> (AgentTask, SpawnOptions) {
+    fn into_parts(self) -> std::io::Result<(AgentTask, SpawnOptions)> {
+        let output_schema = match (self.output_contract, self.output_schema) {
+            (Some(contract), None) => contract.into_schema(),
+            (None, Some(schema)) => schema,
+            _ => {
+                return Err(std::io::Error::other(
+                    "provide exactly one of output_contract or legacy output_schema",
+                ));
+            }
+        };
         let mut options = SpawnOptions::new();
         if let Some(model) = self.model {
             options = options.model(model);
@@ -64,14 +143,14 @@ impl SpawnAgentTask {
         if let Some(thinking) = self.thinking {
             options = options.thinking(thinking);
         }
-        (
+        Ok((
             AgentTask {
                 role: self.role,
                 task: self.task,
-                output_schema: self.output_schema,
+                output_schema,
             },
             options,
-        )
+        ))
     }
 }
 
@@ -454,11 +533,12 @@ impl Tool for SpawnAgent {
             "Starts an ephemeral, reusable clean-room subagent without inherited conversation history and immediately returns its ID. Children and in-memory idle snapshots are dropped when the parent runtime restarts; historical IDs do not identify recovered agents.",
             spawn_agent_parameters(),
         )
+        .with_strict_parameters()
         .with_output_schema(spawn_agent_output_schema())
     }
 
     async fn execute(&self, input: ToolInput, context: ToolContext<'_>) -> ToolResult {
-        let (task, options) = input.decode_json::<SpawnAgentTask>()?.into_parts();
+        let (task, options) = input.decode_json::<SpawnAgentTask>()?.into_parts()?;
         let host_context = context.host_context().map(Arc::<str>::from);
         let registry = self
             .registry
@@ -505,31 +585,72 @@ fn spawn_agent_parameters() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "role": {
-                "type": "string",
-                "description": "A short role describing the subagent's specialty."
-            },
-            "task": {
-                "type": "string",
-                "description": "A complete, focused task for the subagent."
-            },
+            "role": { "type": "string", "description": "A short role describing the subagent's specialty." },
+            "task": { "type": "string", "description": "A complete, focused task for the subagent." },
             "model": {
-                "type": "string",
-                "enum": ["astra", "sol", "luna", "glm-5.3", "kimi", "mimo"],
-                "description": "Model override for the new agent. Omit to inherit the parent's current model."
+                "type": ["string", "null"],
+                "enum": ["astra", "sol", "luna", "glm-5.3", "kimi", "mimo", null],
+                "description": "Model override; null inherits the parent's model."
             },
             "thinking": {
-                "type": "string",
-                "enum": ["none", "low", "medium", "high", "xhigh", "max"],
-                "description": "Reasoning effort override for the new agent. Omit to inherit the parent's current thinking level."
+                "type": ["string", "null"],
+                "enum": ["none", "low", "medium", "high", "xhigh", "max", null],
+                "description": "Reasoning override; null inherits the parent's level."
             },
-            "output_schema": {
-                "anyOf": [{ "type": "object" }, { "type": "boolean" }],
-                "description": "The JSON Schema that every successful result from this agent must satisfy. Pass a schema object (not a JSON-encoded string), or a boolean schema. For a free-form report, use an object schema with one string property."
-            }
+            "output_contract": { "$ref": "#/$defs/node" }
         },
-        "required": ["role", "task", "output_schema"],
-        "additionalProperties": false
+        "required": ["role", "task", "model", "thinking", "output_contract"],
+        "additionalProperties": false,
+        "$defs": {
+            "node": { "anyOf": [
+                { "$ref": "#/$defs/object" },
+                { "$ref": "#/$defs/array" },
+                { "$ref": "#/$defs/string_enum" },
+                { "$ref": "#/$defs/scalar" }
+            ] },
+            "object": {
+                "type": "object",
+                "properties": {
+                    "kind": { "type": "string", "const": "object" },
+                    "fields": { "type": "array", "items": { "$ref": "#/$defs/field" } }
+                },
+                "required": ["kind", "fields"], "additionalProperties": false
+            },
+            "array": {
+                "type": "object",
+                "properties": {
+                    "kind": { "type": "string", "const": "array" },
+                    "items": { "$ref": "#/$defs/node" }
+                },
+                "required": ["kind", "items"], "additionalProperties": false
+            },
+            "string_enum": {
+                "type": "object",
+                "properties": {
+                    "kind": { "type": "string", "const": "string_enum" },
+                    "values": { "type": "array", "items": { "type": "string" } }
+                },
+                "required": ["kind", "values"], "additionalProperties": false
+            },
+            "scalar": {
+                "type": "object",
+                "properties": {
+                    "kind": { "type": "string", "enum": [
+                        "string", "integer", "number", "boolean", "null", "any"
+                    ] }
+                },
+                "required": ["kind"], "additionalProperties": false
+            },
+            "field": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "schema": { "$ref": "#/$defs/node" },
+                    "required": { "type": "boolean" }
+                },
+                "required": ["name", "schema", "required"], "additionalProperties": false
+            }
+        }
     })
 }
 
@@ -548,7 +669,7 @@ impl Tool for SubmitResult {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition::function(
             SUBMIT_RESULT_TOOL,
-            "Submits the current child subagent turn's final JSON output. This tool is unavailable to the root agent; root agents return final output as assistant text. Supply only output matching the task schema. Finish after acceptance. If superseded, incorporate pending instructions and submit the updated result. Invalid values can be corrected and retried.",
+            "Submits the current child subagent turn's final JSON output. This tool is unavailable to the root agent; root agents return final output as assistant text. Supply only output matching the task schema. After an accepted receipt, send a brief final assistant message with no further tool calls; do not finish with an empty response. If superseded, incorporate pending instructions and submit the updated result. Invalid values can be corrected and retried.",
             json!({
                 "type": "object",
                 "properties": {
@@ -951,212 +1072,152 @@ fn agent_status_schema() -> Value {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        AgentTask, SendAgentMessage, SpawnAgentTask, SubmitResult, WaitAgent, prepare_batch,
-        spawn_agent_parameters,
-    };
-    use crate::runtime::Registry;
-    use nanocodex_agent::{Model, SpawnOptions, Thinking};
-    use nanocodex_tools::Tool;
-    use serde_json::json;
-    use std::sync::Weak;
+mod strict_spawn_tests {
+    use super::*;
 
     #[test]
-    fn batch_preparation_validates_every_schema_before_reservation() {
-        let error = prepare_batch(vec![
-            AgentTask {
-                role: "planner".to_owned(),
-                task: "plan".to_owned(),
-                output_schema: json!({ "type": "object" }),
-            },
-            AgentTask {
-                role: "reviewer".to_owned(),
-                task: "review".to_owned(),
-                output_schema: json!({ "type": 42 }),
-            },
-        ]);
-        let error = match error {
-            Ok(_) => panic!("invalid batch schema was accepted"),
-            Err(error) => error,
-        };
-
-        assert!(error.to_string().contains("invalid output_schema"));
-    }
-
-    #[test]
-    fn spawn_agent_advertises_schema_values_instead_of_encoded_json() {
-        let validator = jsonschema::validator_for(&spawn_agent_parameters()).unwrap();
-        for schema in [json!({ "type": "object" }), json!(true), json!(false)] {
-            assert!(validator.is_valid(&json!({
-                "role": "reader", "task": "read the fixture", "output_schema": schema,
-            })));
+    fn model_facing_spawn_is_strict_and_closed_at_every_object() {
+        let definition =
+            ToolDefinition::function("spawn_agent", "start child", spawn_agent_parameters())
+                .with_strict_parameters();
+        let serialized = serde_json::to_value(definition).unwrap();
+        assert_eq!(serialized["strict"], true);
+        let parameters = &serialized["parameters"];
+        // The live provider rejects even descriptive siblings of a $ref.
+        fn assert_bare_refs(value: &Value) {
+            match value {
+                Value::Object(object) => {
+                    if object.contains_key("$ref") {
+                        assert_eq!(object.len(), 1, "$ref must have no sibling keywords");
+                    }
+                    for child in object.values() {
+                        assert_bare_refs(child);
+                    }
+                }
+                Value::Array(items) => {
+                    for item in items {
+                        assert_bare_refs(item);
+                    }
+                }
+                _ => {}
+            }
         }
-        for schema in [
-            json!("{\"type\":\"object\"}"),
-            json!(null),
-            json!(42),
-            json!([]),
-        ] {
-            assert!(!validator.is_valid(&json!({
-                "role": "reader", "task": "read the fixture", "output_schema": schema,
-            })));
-        }
-    }
-
-    #[test]
-    fn spawn_agent_exposes_optional_model_and_thinking_overrides() {
-        let parameters = spawn_agent_parameters();
-
-        assert_eq!(
-            parameters["properties"]["model"]["enum"],
-            json!(["astra", "sol", "luna", "glm-5.3", "kimi", "mimo"])
-        );
-        assert_eq!(
-            parameters["properties"]["thinking"]["enum"],
-            json!(["none", "low", "medium", "high", "xhigh", "max"])
-        );
+        assert_bare_refs(parameters);
+        assert_eq!(parameters["additionalProperties"], false);
         assert_eq!(
             parameters["required"],
-            json!(["role", "task", "output_schema"])
+            json!(["role", "task", "model", "thinking", "output_contract"])
         );
-
-        let overridden: SpawnAgentTask = serde_json::from_value(json!({
-            "role": "researcher",
-            "task": "inspect the implementation",
-            "model": "luna",
-            "thinking": "medium",
-            "output_schema": { "type": "object" }
-        }))
-        .unwrap();
-        assert_eq!(overridden.model, Some(Model::Luna));
-        assert_eq!(overridden.thinking, Some(Thinking::Medium));
-        let (_, options) = overridden.into_parts();
-        assert_eq!(
-            options,
-            SpawnOptions::new()
-                .model(Model::Luna)
-                .thinking(Thinking::Medium)
-        );
-
-        let inherited: SpawnAgentTask = serde_json::from_value(json!({
-            "role": "researcher",
-            "task": "inspect the implementation",
-            "output_schema": { "type": "object" }
-        }))
-        .unwrap();
-        assert_eq!(inherited.model, None);
-        assert_eq!(inherited.thinking, None);
-        let (_, options) = inherited.into_parts();
-        assert_eq!(options, SpawnOptions::new());
-
-        let astra: SpawnAgentTask = serde_json::from_value(json!({
-            "role": "researcher",
-            "task": "inspect the implementation",
-            "model": "astra",
-            "thinking": "max",
-            "output_schema": { "type": "object" }
-        }))
-        .unwrap();
-        assert_eq!(astra.model, Some(Model::Astra));
-        assert_eq!(astra.thinking, Some(Thinking::Max));
-    }
-
-    #[test]
-    fn every_advertised_spawn_model_deserializes() {
-        let parameters = spawn_agent_parameters();
-        for alias in parameters["properties"]["model"]["enum"]
-            .as_array()
-            .unwrap()
-        {
-            let task: SpawnAgentTask = serde_json::from_value(json!({
-                "role": "worker",
-                "task": "Inspect the fixture",
-                "model": alias,
-                "output_schema": { "type": "object" }
-            }))
-            .unwrap();
-            assert_eq!(task.model, Some(alias.as_str().unwrap().parse().unwrap()));
+        for shape in ["object", "array", "string_enum", "scalar", "field"] {
+            assert_eq!(parameters["$defs"][shape]["additionalProperties"], false);
+            let properties = parameters["$defs"][shape]["properties"]
+                .as_object()
+                .unwrap();
+            let required = parameters["$defs"][shape]["required"].as_array().unwrap();
+            assert_eq!(properties.len(), required.len());
         }
-    }
-
-    #[test]
-    fn send_message_definition_names_deferred_delivery_and_queued_waiting() {
-        let definition = SendAgentMessage {
-            registry: Weak::<Registry>::new(),
-        }
-        .definition();
-        let priority = &definition.parameters().unwrap().as_value()["properties"]["priority"];
-
-        assert_eq!(priority["enum"], json!(["deferred", "urgent"]));
-        assert_eq!(priority["default"], json!("deferred"));
-        assert!(definition.description().contains("do not wait"));
-        assert!(definition.description().contains("finish the turn"));
-    }
-
-    #[test]
-    fn submit_result_requires_only_output_and_no_model_chosen_revision() {
-        let definition = SubmitResult {
-            registry: Weak::<Registry>::new(),
-        }
-        .definition();
-        let parameters = definition.parameters().unwrap().as_value();
-
         let validator = jsonschema::validator_for(parameters).unwrap();
-        for output in [
-            json!({ "report": "done" }),
-            json!([1, "two"]),
-            json!("text"),
-            json!(2.5),
-            json!(true),
-            json!(null),
-        ] {
-            assert!(validator.is_valid(&json!({ "output": output })));
-        }
-        assert_eq!(
-            parameters["properties"]["output"]["anyOf"]
-                .as_array()
-                .unwrap()
-                .len(),
-            6
-        );
-        assert_eq!(parameters["required"], json!(["output"]));
-        assert_eq!(parameters["additionalProperties"], json!(false));
-        assert_eq!(parameters["properties"].as_object().unwrap().len(), 1);
-        for key in ["turn_token", "instruction_revision"] {
-            let mut arguments = json!({ "output": {"report": "done"} });
-            arguments[key] = json!(1);
-            assert!(serde_json::from_value::<super::SubmitResultArgs>(arguments).is_err());
-        }
+        let valid = json!({
+            "role": "audit", "task": "check", "model": null, "thinking": null,
+            "output_contract": { "kind": "object", "fields": [
+                { "name": "summary", "schema": { "kind": "string" }, "required": true },
+                { "name": "items", "schema": { "kind": "array", "items": { "kind": "integer" } }, "required": false }
+            ] }
+        });
+        assert!(validator.is_valid(&valid));
         assert!(
-            definition
-                .description()
-                .contains("unavailable to the root agent")
+            !validator.is_valid(&json!({ "role": "audit", "task": "check", "model": null,
+            "thinking": null, "output_contract": [] }))
         );
+        let mut misplaced = valid;
+        misplaced["required"] = json!(["summary"]);
+        assert!(!validator.is_valid(&misplaced));
     }
 
     #[test]
-    fn wait_agent_only_refers_to_clean_spawns() {
-        let definition = WaitAgent {
-            registry: Weak::<Registry>::new(),
-        }
-        .definition();
-        let description =
-            &definition.parameters().unwrap().as_value()["properties"]["agent_ids"]["description"];
-
-        assert!(description.as_str().unwrap().contains("spawn_agent"));
-        assert!(!description.as_str().unwrap().contains("fork_agent"));
+    fn typed_contract_compiles_nested_and_optional_results() {
+        let parsed: SpawnAgentTask = serde_json::from_value(json!({
+            "role": "audit", "task": "check", "model": null, "thinking": null,
+            "output_contract": { "kind": "object", "fields": [
+                { "name": "summary", "schema": { "kind": "string" }, "required": true },
+                { "name": "items", "schema": { "kind": "array", "items": { "kind": "integer" } }, "required": false }
+            ] }
+        })).unwrap();
+        let (task, _) = parsed.into_parts().unwrap();
+        OutputContract::compile(&task.output_schema).unwrap();
+        let validator = jsonschema::validator_for(&task.output_schema).unwrap();
+        assert!(validator.is_valid(&json!({ "summary": "done" })));
+        assert!(validator.is_valid(&json!({ "summary": "done", "items": [1, 2] })));
+        assert!(!validator.is_valid(&json!({ "items": [1] })));
+        assert!(!validator.is_valid(&json!({ "summary": "done", "items": ["bad"] })));
+        assert!(!validator.is_valid(&json!({ "summary": "done", "unexpected": true })));
     }
 
     #[test]
-    fn wait_agent_definition_requires_callers_to_preserve_nonterminal_agents() {
-        let definition = WaitAgent {
-            registry: Weak::<Registry>::new(),
-        }
-        .definition();
+    fn typed_contract_enums_and_duplicate_fields_remain_valid_schemas() {
+        let parsed: SpawnAgentTask = serde_json::from_value(json!({
+            "role": "audit", "task": "check", "model": null, "thinking": null,
+            "output_contract": { "kind": "object", "fields": [
+                { "name": "status", "schema": { "kind": "integer" }, "required": true },
+                { "name": "status", "schema": { "kind": "string_enum", "values": ["ok", "fail"] }, "required": false }
+            ] }
+        })).unwrap();
+        let (task, _) = parsed.into_parts().unwrap();
+        OutputContract::compile(&task.output_schema).unwrap();
+        let validator = jsonschema::validator_for(&task.output_schema).unwrap();
+        assert!(validator.is_valid(&json!({})));
+        assert!(validator.is_valid(&json!({ "status": "ok" })));
+        assert!(!validator.is_valid(&json!({ "status": 1 })));
+        assert!(!validator.is_valid(&json!({ "status": "other" })));
+    }
 
-        assert!(definition.description().contains("every requested agent"));
-        assert!(definition.description().contains("preserve"));
-        assert!(definition.description().contains("nonterminal"));
+    #[test]
+    fn child_prompt_requires_final_message_after_accepted_submission() {
+        let prompt = agent_prompt(AgentId::new(1), "Return the result");
+        assert!(prompt.contains("call submit_result({output})"));
+        assert!(prompt.contains("When its receipt says accepted, send a brief final"));
+        assert!(prompt.contains("do not end with an empty model"));
+    }
+
+    #[test]
+    fn malformed_contracts_and_legacy_schema_fail_before_child_reservation() {
+        for output_contract in [
+            json!("array"),
+            json!([]),
+            json!({ "kind": "array", "items": [] }),
+            json!({ "kind": "object", "fields": [{
+                "name": "value", "schema": { "kind": "string" },
+                "required": true, "unexpected": true
+            }] }),
+        ] {
+            assert!(
+                serde_json::from_value::<SpawnAgentTask>(json!({
+                    "role": "auditor", "task": "check", "model": null,
+                    "thinking": null, "output_contract": output_contract
+                }))
+                .is_err()
+            );
+        }
+        let legacy: SpawnAgentTask = serde_json::from_value(json!({
+            "role": "auditor", "task": "check", "output_schema": "array"
+        }))
+        .unwrap();
+        let (task, _) = legacy.into_parts().unwrap();
+        assert!(prepare_batch(vec![task]).is_err());
+    }
+
+    #[test]
+    fn legacy_in_flight_schema_remains_accepted_but_not_advertised() {
+        let parsed: SpawnAgentTask = serde_json::from_value(json!({
+            "role": "old", "task": "already started", "output_schema": { "type": "string" }
+        }))
+        .unwrap();
+        let (task, _) = parsed.into_parts().unwrap();
+        assert_eq!(task.output_schema, json!({ "type": "string" }));
+        assert!(
+            spawn_agent_parameters()["properties"]
+                .get("output_schema")
+                .is_none()
+        );
     }
 }

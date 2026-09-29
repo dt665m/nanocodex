@@ -1,4 +1,8 @@
 import SwiftUI
+import LocalAuthentication
+#if DEBUG && targetEnvironment(simulator)
+import CryptoKit
+#endif
 import QuickLook
 import PhotosUI
 import UniformTypeIdentifiers
@@ -33,6 +37,101 @@ private extension EnvironmentValues {
     }
 }
 
+/// Layout limits belong to the chrome, never to a particular phone model.
+private enum InboxChrome {
+    static let gutter: CGFloat = 12
+    static let maximumWidth: CGFloat = 620
+    static let touchTarget: CGFloat = 44
+}
+
+/// Preserve a single mounted set of controls while switching between one and
+/// two rows. Measure their ideal text widths before offering any compression.
+private struct InboxNavigationLayout: Layout {
+    private let spacing: CGFloat = 6
+
+    private func measurements(width: CGFloat, subviews: Subviews) -> (tabs: CGSize, models: CGSize, wraps: Bool) {
+        let tabs = subviews[0].sizeThatFits(.unspecified)
+        guard subviews.count > 1 else { return (tabs, .zero, false) }
+        let wraps = tabs.width + spacing + subviews[1].sizeThatFits(.unspecified).width > width
+        let models = subviews[1].sizeThatFits(ProposedViewSize(width: wraps ? width : width - tabs.width - spacing, height: nil))
+        return (tabs, models, wraps)
+    }
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let width = proposal.width ?? subviews.reduce(0) { $0 + $1.sizeThatFits(.unspecified).width } + spacing
+        let sizes = measurements(width: width, subviews: subviews)
+        return CGSize(width: width, height: sizes.wraps
+            ? sizes.tabs.height + spacing + sizes.models.height : max(sizes.tabs.height, sizes.models.height))
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let sizes = measurements(width: bounds.width, subviews: subviews)
+        subviews[0].place(at: CGPoint(x: bounds.minX, y: sizes.wraps ? bounds.minY : bounds.midY - sizes.tabs.height / 2),
+                          proposal: ProposedViewSize(sizes.tabs))
+        guard subviews.count > 1 else { return }
+        subviews[1].place(at: CGPoint(x: sizes.wraps ? bounds.minX : bounds.minX + sizes.tabs.width + spacing,
+                                    y: sizes.wraps ? bounds.minY + sizes.tabs.height + spacing : bounds.midY - sizes.models.height / 2),
+                          proposal: ProposedViewSize(width: sizes.wraps ? bounds.width : bounds.width - sizes.tabs.width - spacing,
+                                                     height: sizes.models.height))
+    }
+}
+
+private struct InboxNavigationSurface: ViewModifier {
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+
+    func body(content: Content) -> some View {
+        // A fixed control-derived radius also works when the controls wrap into
+        // two rows; a tall Capsule would cut into the first and last controls.
+        let shape = RoundedRectangle(cornerRadius: InboxChrome.touchTarget / 2 + 3, style: .continuous)
+        if reduceTransparency {
+            content.background(Ink.card, in: shape)
+        } else if #available(iOS 26.0, *) {
+            content.glassEffect(.regular, in: shape)
+        } else {
+            content.background(.regularMaterial, in: shape)
+        }
+    }
+}
+
+private struct ConversationPanelShape: ViewModifier {
+    let revealed: Bool
+
+    func body(content: Content) -> some View {
+        if #available(iOS 26.0, *) {
+            content.clipShape(ConcentricRectangle(corners: revealed ? .concentric(minimum: 28) : .fixed(0)))
+        } else {
+            content.clipShape(RoundedRectangle(cornerRadius: revealed ? 28 : 0, style: .continuous))
+        }
+    }
+}
+
+/// Shared visual treatment for Chat and TODO, including identical outer spacing.
+struct InboxComposerShell: ViewModifier {
+    let focused: Bool
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+
+    func body(content: Content) -> some View {
+        surface(content)
+            .padding(.horizontal, InboxChrome.gutter).padding(.top, 2).padding(.bottom, 2)
+    }
+
+    @ViewBuilder
+    private func surface(_ content: Content) -> some View {
+        let shape = RoundedRectangle(cornerRadius: 28)
+        if reduceTransparency {
+            content
+                .background(ChatPalette.composer, in: shape)
+                .overlay(shape.strokeBorder(Color.primary.opacity(focused ? 0.18 : 0.1)))
+        } else if #available(iOS 26.0, *) {
+            // Keep the editor and controls opaque; only the surface is translucent.
+            content.glassEffect(.regular, in: shape)
+        } else {
+            content.background(.ultraThinMaterial, in: shape)
+                .overlay(shape.strokeBorder(Color.primary.opacity(focused ? 0.12 : 0.06)))
+        }
+    }
+}
+
 private enum Ink {
     static let background = Color(uiColor: .systemBackground)
     static let card = Color(uiColor: .secondarySystemGroupedBackground)
@@ -58,6 +157,10 @@ private enum Ink {
 
 struct InboxView: View {
     @ObservedObject var model: InboxModel
+    @State private var mainSurface: MainSurface = (ProcessInfo.processInfo.arguments.contains("--demo")
+        && !ProcessInfo.processInfo.arguments.contains("--todo-ui-fixture")) ? .chat : .todo
+    @State private var todoInputFocused = false
+    private enum MainSurface { case todo, chat, crm }
     @State private var showConversations = false
     @State private var showRunningAgents = false
     @State private var drawerTranslation: CGFloat = 0
@@ -67,6 +170,7 @@ struct InboxView: View {
     @State private var showScheduledJobs = false
     @State private var showConnectors = false
     @State private var showSettings = false
+    @State private var showMeeting = false
     @StateObject private var appUpdates = NativeAppUpdateModel()
     @Environment(\.scenePhase) private var updateScenePhase
     @State private var showScreens = false
@@ -76,11 +180,21 @@ struct InboxView: View {
     @State private var screenViewerRevision = UUID()
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var composerFocused = false
-    @State private var composerHeight: CGFloat = 80
+    @State private var bottomDockHeight: CGFloat = 0
 
     var body: some View {
         NavigationStack {
-            inbox
+            Group {
+                if model.connected && mainSurface == .todo {
+                    TodoBoardView(model: model)
+                        .id(model.todoAccountIdentity)
+                        .contentMargins(.bottom, bottomDockHeight, for: .scrollContent)
+                } else if model.connected && mainSurface == .crm {
+                    CRMView(model: model)
+                        .safeAreaInset(edge: .bottom, spacing: 0) { mainNavigation }
+                } else { inbox }
+            }
+                .environment(\.conversationComposerHeight, bottomDockHeight)
                 #if os(iOS)
                 .navigationTitle("Conversations")
                 .navigationBarTitleDisplayMode(.inline)
@@ -103,6 +217,11 @@ struct InboxView: View {
                         .navigationBarTitleDisplayMode(.inline)
                         #endif
                 }
+        }
+        // Account changes discard navigation destinations and their private state.
+        .id(model.screenScope)
+        .overlay(alignment: .bottom) {
+            if model.connected && mainSurface == .todo { bottomDock }
         }
         .safeAreaInset(edge: .top, spacing: 0) {
             if !model.isDemo, let update = appUpdates.update {
@@ -129,6 +248,9 @@ struct InboxView: View {
             }
         }
         .task(id: updateScenePhase) {
+            #if DEBUG
+            if StartupFixture.enabled { return }
+            #endif
             guard updateScenePhase == .active, !model.isDemo else { return }
             while !Task.isCancelled {
                 await appUpdates.check()
@@ -159,6 +281,8 @@ struct InboxView: View {
             }
         }
         .sheet(isPresented: $model.showContext) { ContextInboxView(model: model).tint(Ink.accent) }
+        .sheet(isPresented: $showMeeting) { MeetingView(model: model).tint(Ink.accent) }
+        .onAppear { MeetingLockedCoordinator.shared.recoverOutstanding() }
         .onChange(of: model.screenScope) { _, _ in
             screenThreads.removeAll(); screenExpanded = false; showScreens = false; controlsScreen = nil
         }
@@ -172,16 +296,99 @@ struct InboxView: View {
         }
         .onChange(of: model.focusedConversationIdentity, initial: true) { _, _ in
             composerFocused = false
-            if model.focused != nil { model.openThread() }
+            if mainSurface == .chat && model.focused != nil { model.openThread() }
+        }
+        .onChange(of: mainSurface) { _, surface in
+            if surface == .chat && model.focused != nil { model.openThread() }
         }
         .onChange(of: model.musicConnectorToOpen) { _, provider in
             if provider != nil && model.connected { showSettings = false; showConnectors = true }
         }
         .onChange(of: model.connected) { _, connected in
             if connected && model.musicConnectorToOpen != nil { showConnectors = true }
-            if !connected { screenThreads.removeAll(); screenExpanded = false; showConversations = false; showScreens = false; showScheduledJobs = false; showConnectors = false; showSettings = false; readingPositions.values.removeAll() }
+            if !connected { mainSurface = .todo; screenThreads.removeAll(); screenExpanded = false; showConversations = false; showScreens = false; showScheduledJobs = false; showConnectors = false; showSettings = false; readingPositions.values.removeAll() }
         }
 
+    }
+
+    @ViewBuilder
+    private var bottomDock: some View {
+        if !showScreens && !showScheduledJobs && !showConnectors {
+            VStack(spacing: 0) {
+                if mainSurface == .todo {
+                    TodoCaptureComposer(model: model, inputFocused: $todoInputFocused)
+                } else {
+                    conversationBottomControls
+                }
+                mainNavigation
+            }
+            .frame(maxWidth: InboxChrome.maximumWidth)
+            .frame(maxWidth: .infinity)
+            .background(Ink.background.ignoresSafeArea(edges: .bottom))
+            .overlay(alignment: .top) {
+                LinearGradient(colors: [Ink.background.opacity(0), Ink.background], startPoint: .top, endPoint: .bottom)
+                    .frame(height: 16).offset(y: -16).allowsHitTesting(false)
+            }
+            // Keep the idle dock near the home indicator, restoring keyboard clearance on focus.
+            .offset(y: composerFocused || todoInputFocused ? 0 : 14)
+            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { bottomDockHeight = $0 }
+        }
+    }
+
+    private var navigationTabs: some View {
+        HStack(spacing: 2) {
+            mainNavigationButton(.todo, title: "TODO", symbol: "checkmark.square", identifier: "main-tab-todo")
+            mainNavigationButton(.chat, title: "Chat", symbol: "bubble.left", identifier: "main-tab-chat")
+            mainNavigationButton(.crm, title: "CRM", symbol: "person.2", identifier: "main-tab-crm")
+        }
+    }
+
+    private var mainNavigation: some View {
+        InboxNavigationLayout {
+            navigationTabs
+            if model.focused != nil && mainSurface != .crm { MobileModelControls(model: model) }
+        }
+        .padding(.horizontal, 5).padding(.vertical, 3)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("main-selection-bar")
+        .modifier(InboxNavigationSurface())
+        // Keep the model picker readable without making its glass surface
+        // span the whole phone (or all 620 points on an iPad).
+        .frame(maxWidth: 380)
+        .frame(maxWidth: .infinity)
+        .padding(.horizontal, InboxChrome.gutter).padding(.top, 4).padding(.bottom, 2)
+    }
+
+    private func mainNavigationButton(_ surface: MainSurface, title: String, symbol: String, identifier: String) -> some View {
+        Button {
+            composerFocused = false
+            todoInputFocused = false
+            mainSurface = surface
+            if surface == .todo { Task { await model.refreshTodo() } }
+        } label: {
+            Image(systemName: symbol)
+                .font(.system(size: 19, weight: .medium))
+                .frame(width: InboxChrome.touchTarget, height: InboxChrome.touchTarget)
+                .background(mainSurface == surface ? Color.primary.opacity(0.09) : .clear, in: Capsule())
+                .overlay(alignment: .topTrailing) {
+                    if surface == .todo && model.pendingTodoDecisionCount > 0 {
+                        Text("\(model.pendingTodoDecisionCount)")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 4).frame(minWidth: 16, minHeight: 16)
+                            .background(.orange, in: Capsule())
+                            .offset(x: 3, y: -2)
+                            .accessibilityHidden(true)
+                    }
+                }
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(title)
+        .accessibilityValue(surface == .todo ? "\(model.pendingTodoDecisionCount) decisions need you" : "")
+        .accessibilityAddTraits(mainSurface == surface ? [.isSelected] : [])
+        .accessibilityRemoveTraits(mainSurface == surface ? [] : [.isSelected])
+        .accessibilityIdentifier(identifier)
     }
 
     private var inbox: some View {
@@ -195,83 +402,99 @@ struct InboxView: View {
         }
     }
     private var conversationWorkspace: some View {
-        GeometryReader { geometry in
-            let width = min(geometry.size.width - 24, 420)
-            let reveal = showConversations ? width + drawerTranslation : drawerTranslation
-            ZStack(alignment: .leading) {
-                if showConversations || drawerTranslation > 0 {
-                    ConversationDrawer(model: model, runningOnly: $showRunningAgents, select: { id in
-                        selectConversation(id)
-                        setConversationsVisible(false)
-                    }, close: { setConversationsVisible(false) }, create: createAgent,
-                    settings: { showSettings = true })
-                    .frame(width: width, height: geometry.size.height)
-                    // Slide the conversation above a stationary list. Moving
-                    // a newly inserted native scroll view can strand its rows
-                    // offscreen when the same drag dismisses the keyboard.
-                    .allowsHitTesting(showConversations)
-                    .accessibilityHidden(!showConversations)
-                    .transition(.opacity)
+        GeometryReader { safeGeometry in
+            GeometryReader { geometry in
+                // The surface fills the window, while controls use the safe viewport
+                // on either side of a landscape camera cutout.
+                let safeWidth = geometry.size.width - safeGeometry.safeAreaInsets.leading - safeGeometry.safeAreaInsets.trailing
+                let width = min(max(0, safeWidth - 2 * InboxChrome.gutter), 420) + safeGeometry.safeAreaInsets.leading
+                let reveal = showConversations ? width + drawerTranslation : drawerTranslation
+                ZStack(alignment: .leading) {
+                    if showConversations || drawerTranslation > 0 {
+                        ConversationDrawer(model: model, runningOnly: $showRunningAgents, select: { id in
+                            selectConversation(id)
+                            setConversationsVisible(false)
+                        }, close: { setConversationsVisible(false) }, create: createAgent,
+                        settings: { showSettings = true })
+                        .frame(width: width - safeGeometry.safeAreaInsets.leading, height: geometry.size.height)
+                        .padding(.leading, safeGeometry.safeAreaInsets.leading)
+                        .padding(.bottom, safeGeometry.safeAreaInsets.bottom)
+                        .background(ChatPalette.sidebar)
+                        // Slide the conversation above a stationary list. Moving
+                        // a newly inserted native scroll view can strand its rows
+                        // offscreen when the same drag dismisses the keyboard.
+                        .allowsHitTesting(showConversations)
+                        .accessibilityHidden(!showConversations)
+                        .transition(.opacity)
+                    }
+                    // Keep the transcript and editor mounted. Opening navigation must
+                    // not rebuild history, lose a draft, or start preview streams.
+                    inboxContent
+                        .environment(\.conversationNavigationActive, showConversations || drawerTranslation != 0)
+                        // Animate the outer drawer translation only. Inherited spring
+                        // transactions must not animate transcript layout or restoration.
+                        .transaction { $0.animation = nil }
+                        .frame(width: safeWidth, height: geometry.size.height, alignment: .top)
+                        .overlay(alignment: .bottom) { bottomDock }
+                        .padding(.leading, safeGeometry.safeAreaInsets.leading)
+                        .padding(.trailing, safeGeometry.safeAreaInsets.trailing)
+                        // The controls remain inside the keyboard-aware safe viewport;
+                        // the moving panel and its clip continue through the home area.
+                        .padding(.bottom, safeGeometry.safeAreaInsets.bottom)
+                        .background(Ink.background)
+                        .modifier(ConversationPanelShape(revealed: reveal > 0))
+                        .shadow(color: .black.opacity(reveal > 0 ? 0.12 : 0), radius: 16, x: -4)
+                        .overlay {
+                            if showConversations {
+                                Color.clear.contentShape(Rectangle())
+                                    .onTapGesture { setConversationsVisible(false) }
+                            }
+                        }
+                        .accessibilityHidden(showConversations)
+                        .offset(x: reveal)
                 }
-                // Keep the transcript and editor mounted. Opening navigation must
-                // not rebuild history, lose a draft, or start preview streams.
-                inboxContent
-                    .environment(\.conversationNavigationActive, showConversations || drawerTranslation != 0)
-                    // Animate the outer drawer translation only. Inherited spring
-                    // transactions must not animate transcript layout or restoration.
-                    .transaction { $0.animation = nil }
-                    .frame(width: geometry.size.width, height: geometry.size.height)
-                    .background(Ink.background)
-                    .clipShape(RoundedRectangle(cornerRadius: reveal > 0 ? 28 : 0))
-                    .shadow(color: .black.opacity(reveal > 0 ? 0.12 : 0), radius: 16, x: -4)
-                    .overlay {
+                .frame(height: geometry.size.height + safeGeometry.safeAreaInsets.bottom, alignment: .top)
+                .clipped()
+                .contentShape(Rectangle())
+                .simultaneousGesture(DragGesture(minimumDistance: 16)
+                    .updating($drawerGestureActive) { _, active, _ in active = true }
+                    .onChanged { value in
+                        // Keep the direction through onEnded: GestureState can reset
+                        // before that callback on iOS 18. Cancellation is handled below.
+                        if drawerDragIsHorizontal == nil {
+                            drawerDragIsHorizontal = (showConversations || value.startLocation.x <= safeGeometry.safeAreaInsets.leading + 28)
+                                && abs(value.translation.width) > abs(value.translation.height) * 1.5
+                                && (showConversations || value.translation.width > 0)
+                        }
+                        guard drawerDragIsHorizontal == true else { return }
                         if showConversations {
-                            Color.clear.contentShape(Rectangle())
-                                .onTapGesture { setConversationsVisible(false) }
+                            drawerTranslation = max(-width, min(0, value.translation.width))
+                        } else if value.translation.width > 0 {
+                            composerFocused = false
+                            drawerTranslation = min(width, value.translation.width)
                         }
                     }
-                    .accessibilityHidden(showConversations)
-                    .offset(x: reveal)
+                    .onEnded { value in
+                        let horizontal = drawerDragIsHorizontal == true
+                        drawerDragIsHorizontal = nil
+                        guard horizontal else { return }
+                        let visible: Bool
+                        if showConversations {
+                            visible = !(horizontal && (value.translation.width < -width * 0.25
+                                || value.predictedEndTranslation.width < -width * 0.5))
+                        } else {
+                            visible = horizontal && (value.translation.width > width * 0.25
+                                || value.predictedEndTranslation.width > width * 0.5)
+                        }
+                        setConversationsVisible(visible)
+                    })
+                    .onChange(of: drawerGestureActive) { _, active in
+                        guard !active else { return }
+                        drawerDragIsHorizontal = nil
+                        if drawerTranslation != 0 { setConversationsVisible(showConversations) }
+                    }
             }
-            .clipped()
-            .contentShape(Rectangle())
-            .simultaneousGesture(DragGesture(minimumDistance: 16)
-                .updating($drawerGestureActive) { _, active, _ in active = true }
-                .onChanged { value in
-                    // Keep the direction through onEnded: GestureState can reset
-                    // before that callback on iOS 18. Cancellation is handled below.
-                    if drawerDragIsHorizontal == nil {
-                        drawerDragIsHorizontal = (showConversations || value.startLocation.x <= 28)
-                            && abs(value.translation.width) > abs(value.translation.height) * 1.5
-                            && (showConversations || value.translation.width > 0)
-                    }
-                    guard drawerDragIsHorizontal == true else { return }
-                    if showConversations {
-                        drawerTranslation = max(-width, min(0, value.translation.width))
-                    } else if value.translation.width > 0 {
-                        composerFocused = false
-                        drawerTranslation = min(width, value.translation.width)
-                    }
-                }
-                .onEnded { value in
-                    let horizontal = drawerDragIsHorizontal == true
-                    drawerDragIsHorizontal = nil
-                    guard horizontal else { return }
-                    let visible: Bool
-                    if showConversations {
-                        visible = !(horizontal && (value.translation.width < -width * 0.25
-                            || value.predictedEndTranslation.width < -width * 0.5))
-                    } else {
-                        visible = horizontal && (value.translation.width > width * 0.25
-                            || value.predictedEndTranslation.width > width * 0.5)
-                    }
-                    setConversationsVisible(visible)
-                })
-                .onChange(of: drawerGestureActive) { _, active in
-                    guard !active else { return }
-                    drawerDragIsHorizontal = nil
-                    if drawerTranslation != 0 { setConversationsVisible(showConversations) }
-                }
+            .ignoresSafeArea(.container, edges: .horizontal)
         }
     }
     private func setConversationsVisible(_ visible: Bool) {
@@ -307,16 +530,18 @@ struct InboxView: View {
                     .id(model.screenScope + identity + screenViewerRevision.uuidString)
                     .frame(height: screenExpanded ? nil : 220)
                     .frame(maxHeight: screenExpanded ? .infinity : nil)
-                    .padding(.horizontal, 12).padding(.bottom, 8)
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, screenExpanded ? bottomDockHeight + 8 : 8)
                     .zIndex(1)
             }
             Group {
                     if let identity = model.focusedConversationIdentity {
                         ConversationView(model: model, identity: identity, readingPositions: readingPositions).id(identity)
-                            .environment(\.conversationComposerHeight, composerHeight)
                     } else { emptyState.frame(maxWidth: .infinity, maxHeight: .infinity) }
             }
-            .frame(maxHeight: screenExpanded && screenThreads.contains(model.focusedConversationIdentity ?? "") ? 0 : .infinity)
+            // Floating transcript controls must not push the header above the
+            // viewport when the landscape keyboard leaves very little height.
+            .frame(minHeight: 0, maxHeight: screenExpanded && screenThreads.contains(model.focusedConversationIdentity ?? "") ? 0 : .infinity)
             .clipped()
             .accessibilityHidden(screenExpanded && screenThreads.contains(model.focusedConversationIdentity ?? ""))
             .allowsHitTesting(!(screenExpanded && screenThreads.contains(model.focusedConversationIdentity ?? "")))
@@ -327,28 +552,28 @@ struct InboxView: View {
                     .padding(.horizontal, 16)
             }
         }
-        .overlay(alignment: .bottom) {
-            VStack(spacing: 0) {
-                if let error = model.error {
-                    HStack(alignment: .top) {
-                        Text(error).font(.caption).foregroundStyle(Ink.amber)
-                        Spacer(minLength: 4)
-                        Button { model.error = nil } label: { Image(systemName: "xmark") }
-                            .accessibilityLabel("Dismiss error")
-                    }
-                    .padding(12).background(Ink.card, in: RoundedRectangle(cornerRadius: 12)).padding(.horizontal, 12)
-                } else if let notice = model.notice, !composerFocused {
-                    Text(notice).font(.caption).foregroundStyle(Ink.muted).accessibilityIdentifier("notice")
+    }
+
+    private var conversationBottomControls: some View {
+        VStack(spacing: 0) {
+            if let error = model.error {
+                HStack(alignment: .top) {
+                    Text(error).font(.caption).foregroundStyle(Ink.amber)
+                    Spacer(minLength: 4)
+                    Button { model.error = nil } label: { Image(systemName: "xmark") }
+                        .accessibilityLabel("Dismiss error")
                 }
-                if model.focused != nil {
-                    AgentComposerView(model: model, focused: $composerFocused, onVoiceChat: {
-                        composerFocused = false
-                    }).frame(maxWidth: 620)
-                }
+                .padding(12).background(Ink.card, in: RoundedRectangle(cornerRadius: 12)).padding(.horizontal, 12)
+            } else if let notice = model.notice, !composerFocused {
+                Text(notice).font(.caption).foregroundStyle(Ink.muted).accessibilityIdentifier("notice")
             }
-            .padding(.bottom, 4)
-            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { composerHeight = $0 }
+            if model.focused != nil {
+                AgentComposerView(model: model, focused: $composerFocused, onVoiceChat: {
+                    composerFocused = false
+                }).frame(maxWidth: 620)
+            }
         }
+        .padding(.bottom, 0)
     }
 
     private var conversationHeader: some View {
@@ -410,6 +635,11 @@ struct InboxView: View {
             } label: {
                 Label(screenThreads.contains(model.focusedConversationIdentity ?? "") ? "Hide screen" : "Screen", systemImage: "display")
             }.disabled(model.remoteService == nil || model.focused == nil).accessibilityIdentifier("conversation-remote-screens")
+            if !model.isDemo {
+                Button { composerFocused = false; showMeeting = true } label: {
+                    Label("Listen to a meeting", systemImage: "waveform")
+                }.accessibilityIdentifier("inbox-meeting")
+            }
             Button { composerFocused = false; model.showContext = true } label: {
                 Label("Context from other apps", systemImage: "tray")
             }.accessibilityIdentifier("conversation-context")
@@ -494,6 +724,16 @@ struct InboxView: View {
                     Label("Device access", systemImage: "hand.raised")
                 }.accessibilityIdentifier("settings-device-access")
             }
+            Section {
+                NavigationLink("Open-source licenses") {
+                    ScrollView {
+                        Text(Self.mobileDependencyNotices)
+                            .font(.caption.monospaced()).textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading).padding()
+                    }
+                    .navigationTitle("Open-source licenses")
+                }.accessibilityIdentifier("settings-open-source")
+            }
             Section("Controls") {
                 Text("Open Conversations at the top to switch agents. The compose button creates a conversation. Back, Screens, and captured context are in the more menu.")
                 Text("The sidebar lists your conversations. Green identifies running agents. Drafts and reading positions stay with each conversation.").font(.caption)
@@ -504,6 +744,11 @@ struct InboxView: View {
         .navigationTitle("Settings")
         .accessibilityIdentifier("inbox-settings")
     }
+    private static let mobileDependencyNotices: String = {
+        guard let url = Bundle.main.url(forResource: "MOBILE_DEPENDENCY_NOTICES", withExtension: "md"),
+              let text = try? String(contentsOf: url, encoding: .utf8) else { return "License notices are unavailable." }
+        return text
+    }()
     private func createAgent() {
         composerFocused = false
         #if os(iOS)
@@ -787,7 +1032,6 @@ private struct AgentComposerView: View {
         let stopRequest = sendShowsStop ? card.flatMap { model.cancellation(agentID: $0.id, turnID: stopTarget) } : nil
         let canSend = model.canSend
         VStack(spacing: 0) {
-            MobileModelControls(model: model)
             if let error = model.creationError {
                 HStack {
                     Text(error).font(.caption).foregroundStyle(Ink.muted)
@@ -953,10 +1197,7 @@ private struct AgentComposerView: View {
                 }
                 .padding(.horizontal, 4).padding(.bottom, 4).padding(.top, visiblePending.isEmpty ? 4 : 0).accessibilityElement(children: .contain).accessibilityIdentifier("composer-input")
 
-        }.background(ChatPalette.composer, in: RoundedRectangle(cornerRadius: 28))
-            .overlay(RoundedRectangle(cornerRadius: 28).strokeBorder(Color.primary.opacity(focused ? 0.18 : 0.1)))
-            .shadow(color: .black.opacity(0.035), radius: 8, y: 2)
-            .padding(.horizontal, 12).padding(.top, 4).padding(.bottom, 6).background(Ink.background)
+        }.modifier(InboxComposerShell(focused: focused))
             .onChange(of: model.focusedConversationIdentity) { _, _ in
                 showExpandedEditor = false
                 focused = false
@@ -1362,6 +1603,7 @@ private struct AttachmentImageView: View {
     var contentMode: ContentMode = .fill
     var imageRatio: Binding<CGFloat>? = nil
     @State private var thumbnail: CGImage?
+    @State private var failed = false
 
     var body: some View {
         GeometryReader { geometry in
@@ -1372,6 +1614,15 @@ private struct AttachmentImageView: View {
                         .interpolation(.high).aspectRatio(contentMode: contentMode)
                         .frame(width: geometry.size.width, height: geometry.size.height)
                         .clipped()
+                } else if failed {
+                    VStack(spacing: 6) {
+                        Image(systemName: "photo.badge.exclamationmark").font(.title3)
+                        Text("Image unavailable").font(.caption).lineLimit(1).minimumScaleFactor(0.75)
+                    }
+                    .foregroundStyle(Ink.muted)
+                    .padding(8)
+                    .frame(maxWidth: geometry.size.width, maxHeight: geometry.size.height)
+                    .clipped()
                 } else {
                     ProgressView().controlSize(.small).tint(Ink.muted)
                 }
@@ -1381,57 +1632,36 @@ private struct AttachmentImageView: View {
         .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous).strokeBorder(.primary.opacity(0.06), lineWidth: 0.5))
         .contentShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
         .accessibilityElement(children: .ignore).accessibilityLabel("Attached image")
-        .accessibilityValue(thumbnail == nil ? "Loading image" : "Image loaded")
+        .accessibilityValue(failed ? "Image unavailable" : thumbnail == nil ? "Loading image" : "Image loaded")
         .task(id: visible ? source : nil) {
-            guard visible, let source else { thumbnail = nil; return }
-            if let cached = Self.cache.object(forKey: ThumbnailKey(source)) {
-                thumbnail = cached
-                imageRatio?.wrappedValue = CGFloat(cached.width) / CGFloat(cached.height)
-                return
+            thumbnail = nil
+            failed = false
+            guard visible, let source else { return }
+            do {
+                let decoded: CGImage
+                switch source {
+                case .file(let url): decoded = try await ChatImagePipeline.thumbnail(url: url, maxPixelSize: 960)
+                case .data(let data): decoded = try await ChatImagePipeline.thumbnail(data: data)
+                case .inline(let value):
+                    guard value.hasPrefix("data:image/"), let separator = value.firstIndex(of: ","),
+                          value[..<separator].hasSuffix(";base64"),
+                          let data = Data(base64Encoded: String(value[value.index(after: separator)...])) else {
+                        throw ChatImagePipeline.Failure.unavailable
+                    }
+                    decoded = try await ChatImagePipeline.thumbnail(data: data)
+                }
+                try Task.checkCancellation()
+                thumbnail = decoded
+                imageRatio?.wrappedValue = CGFloat(decoded.width) / CGFloat(decoded.height)
+            } catch is CancellationError {
+                // Cancellation from scrolling or source replacement is not a failure.
+            } catch {
+                guard !Task.isCancelled else { return }
+                failed = true
             }
-            let decoded = await Task.detached(priority: .userInitiated) { Self.decode(source) }.value
-            guard !Task.isCancelled else { return }
-            if let decoded { Self.cache.setObject(decoded, forKey: ThumbnailKey(source), cost: decoded.bytesPerRow * decoded.height) }
-            thumbnail = decoded
-            if let decoded { imageRatio?.wrappedValue = CGFloat(decoded.width) / CGFloat(decoded.height) }
         }
     }
 
-    private final class ThumbnailKey: NSObject {
-        let source: AttachmentImageSource
-        init(_ source: AttachmentImageSource) { self.source = source }
-        override var hash: Int { source.hashValue }
-        override func isEqual(_ other: Any?) -> Bool { (other as? ThumbnailKey)?.source == source }
-    }
-    private static let cache: NSCache<ThumbnailKey, CGImage> = {
-        let cache = NSCache<ThumbnailKey, CGImage>()
-        cache.totalCostLimit = 24 * 1024 * 1024
-        cache.countLimit = 32
-        return cache
-    }()
-
-    private nonisolated static func decode(_ source: AttachmentImageSource?) -> CGImage? {
-        let image: CGImageSource?
-        switch source {
-        case .file(let url):
-            guard url.isFileURL else { return nil }
-            image = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary)
-        case .inline(let value):
-            guard value.hasPrefix("data:image/"), let separator = value.firstIndex(of: ","),
-                  value[..<separator].hasSuffix(";base64"),
-                  let data = Data(base64Encoded: String(value[value.index(after: separator)...])) else { return nil }
-            image = CGImageSourceCreateWithData(data as CFData, nil)
-        case .data(let data): image = CGImageSourceCreateWithData(data as CFData, nil)
-        case nil: return nil
-        }
-        guard let image else { return nil }
-        return CGImageSourceCreateThumbnailAtIndex(image, 0, [
-            kCGImageSourceCreateThumbnailFromImageAlways: true,
-            kCGImageSourceCreateThumbnailWithTransform: true,
-            kCGImageSourceThumbnailMaxPixelSize: 960,
-            kCGImageSourceShouldCacheImmediately: true,
-        ] as CFDictionary)
-    }
 }
 
 private struct ConnectView: View {
@@ -1594,6 +1824,11 @@ private struct ConversationMessageView: View {
 }
 
 private struct ConversationMessageContent: View, Equatable {
+    @State private var openedOutput: URL?
+    @State private var openedFiles: [URL] = []
+    @State private var outputLease = OutputFileLease()
+    @State private var outputError: String?
+    @State private var outputTask: Task<Void, Never>?
     let row: TranscriptRow
     let model: InboxModel
     let agentID: String
@@ -1631,6 +1866,17 @@ private struct ConversationMessageContent: View, Equatable {
                             }.font(.caption).foregroundStyle(Ink.muted)
                         } else if row.role == "Agent", !row.text.isEmpty {
                             ChatMarkdown(text: row.text, compact: true)
+                                .environment(\.openURL, OpenURLAction { url in
+                                    guard let link = PublishedOutputLink(url: url) else { return .systemAction }
+                                    openOutput(link)
+                                    return .handled
+                                })
+                            if !row.running {
+                                ForEach(PublishedOutputLink.parse(row.text)) { link in
+                                    PublishedOutputCard(link: link, model: model, agentID: agentID)
+                                }
+                            }
+                            if let outputError { Text(outputError).font(.caption).foregroundStyle(.secondary) }
                         } else if !row.text.isEmpty {
                             Text(row.text).font(.system(size: row.role == "Status" ? 14 : 17))
                                 .lineSpacing(5).textSelection(.enabled)
@@ -1673,6 +1919,39 @@ private struct ConversationMessageContent: View, Equatable {
             }
             if row.role != "You" { Spacer(minLength: row.role == "Agent" ? 16 : 0) }
         }.frame(maxWidth: .infinity, alignment: row.role == "You" ? .trailing : .leading)
+            .nativeMediaPreview($openedOutput, in: openedFiles, title: "Generated file")
+            .onChange(of: openedOutput) { _, value in
+                if value == nil {
+                    for file in openedFiles { removeDownloadedOutput(file) }
+                    openedFiles = []
+                    outputLease.files = []
+                }
+            }
+            .onDisappear {
+                outputTask?.cancel()
+                if openedOutput == nil {
+                    for file in openedFiles { removeDownloadedOutput(file) }
+                    openedFiles = []
+                    outputLease.files = []
+                }
+            }
+    }
+
+    private func openOutput(_ link: PublishedOutputLink) {
+        outputTask?.cancel()
+        outputError = nil
+        outputTask = Task {
+            do {
+                let file = try await model.downloadOutput(link, agentID: agentID)
+                guard !Task.isCancelled else { removeDownloadedOutput(file); return }
+                for previous in openedFiles { removeDownloadedOutput(previous) }
+                openedFiles = [file]
+                outputLease.files = [file]
+                openedOutput = file
+            } catch {
+                if !Task.isCancelled { outputError = "Couldn’t open file. Tap to retry." }
+            }
+        }
     }
 
     @ViewBuilder private var media: some View {
@@ -1700,12 +1979,105 @@ private struct ConversationMessageContent: View, Equatable {
     }
 }
 
+/// A private Brain output is not a browser URL. Download only after a tap,
+/// then let the native previewer play, inspect, share or save the local copy.
+private struct PublishedOutputCard: View {
+    let link: PublishedOutputLink
+    let model: InboxModel
+    let agentID: String
+    @State private var sharing = false
+    @State private var shareFile: URL?
+    @State private var shareLease = OutputFileLease()
+    @State private var sharePresented = false
+    @State private var failure: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 0) {
+                ChatMediaPreview(title: link.title, load: { [try await model.downloadOutput(link, agentID: agentID)] }) {
+                    HStack(spacing: 12) {
+                        Image(systemName: link.isVideo ? "play.rectangle.fill" : link.isImage ? "photo" : "doc.zipper")
+                            .font(.title2).frame(width: 38)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(link.title).font(.subheadline.weight(.semibold)).lineLimit(2)
+                            Text(link.filename).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        }
+                        Spacer(minLength: 6)
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 68, alignment: .leading)
+                    .contentShape(Rectangle())
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("View " + link.title)
+                    .accessibilityIdentifier("published-output-open")
+                }
+                Button { sharing = true; failure = nil } label: {
+                    if sharing { ProgressView() }
+                    else { Image(systemName: "square.and.arrow.up").font(.body.weight(.medium)) }
+                }
+                .frame(width: 44, height: 52)
+                .buttonStyle(.plain)
+                .disabled(sharing)
+                .accessibilityLabel("Save or share " + link.title)
+                .accessibilityIdentifier("published-output-save")
+            }
+            .padding(.leading, 12).padding(.trailing, 4)
+            .background(Ink.surface, in: RoundedRectangle(cornerRadius: 12))
+            .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Ink.border, lineWidth: 0.5))
+            if let failure { Text(failure).font(.caption).foregroundStyle(.secondary) }
+        }
+        .frame(maxWidth: 440)
+        .task(id: sharing) {
+            guard sharing else { return }
+            do {
+                let file = try await model.downloadOutput(link, agentID: agentID)
+                guard !Task.isCancelled else { removeDownloadedOutput(file); return }
+                shareLease.files = [file]; shareFile = file; sharePresented = true
+            } catch { if !Task.isCancelled { failure = "Couldn’t download file. Tap to retry." } }
+            sharing = false
+        }
+        .sheet(isPresented: $sharePresented, onDismiss: {
+            if let shareFile { removeDownloadedOutput(shareFile) }
+            shareFile = nil
+            shareLease.files = []
+        }) {
+            if let shareFile { OutputActivitySheet(file: shareFile) { sharePresented = false } }
+        }
+        .onDisappear {
+            if !sharePresented, let shareFile { removeDownloadedOutput(shareFile); self.shareFile = nil; shareLease.files = [] }
+        }
+    }
+}
+
+private func removeDownloadedOutput(_ file: URL) {
+    let parent = file.deletingLastPathComponent()
+    if parent.lastPathComponent.hasPrefix("NanocodexOutput-"),
+       parent.deletingLastPathComponent().standardizedFileURL == FileManager.default.temporaryDirectory.standardizedFileURL {
+        try? FileManager.default.removeItem(at: parent)
+    } else { try? FileManager.default.removeItem(at: file) }
+}
+
+/// Cleans up even when SwiftUI tears down a whole row with a presented sheet.
+private final class OutputFileLease {
+    var files: [URL] = []
+    deinit { for file in files { removeDownloadedOutput(file) } }
+}
+
+private struct OutputActivitySheet: UIViewControllerRepresentable {
+    let file: URL
+    let complete: () -> Void
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        let controller = UIActivityViewController(activityItems: [file], applicationActivities: nil)
+        controller.completionWithItemsHandler = { _, _, _, _ in DispatchQueue.main.async(execute: complete) }
+        return controller
+    }
+    func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
+}
+
 private final class ConversationReadingPositions {
     struct Position {
         var atLatest: Bool
         var rowID: String? = nil
         var offsetY: CGFloat = 0
-        var childID: String? = nil
     }
     var values: [String: Position] = [:]
     var tools: [String: ConversationToolExpansion] = [:]
@@ -1948,9 +2320,11 @@ private struct ConversationContentView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.conversationNavigationActive) private var navigationActive
     @State private var followsLatest = true
-    @State private var isInteractingTranscript = false
-    @State private var isScrollGestureActive = false
-    @State private var scrollsTowardLatest = false
+    @State private var scrollPhase: ScrollPhase = .idle
+    private var isInteractingTranscript: Bool { scrollPhase == .interacting }
+    private var isScrollGestureActive: Bool {
+        scrollPhase == .tracking || scrollPhase == .interacting || scrollPhase == .decelerating
+    }
     @State private var hasInitialPosition = false
     @State private var pendingReadingRestore: ConversationReadingPositions.Position?
     @State private var rowGeometry = ConversationRowGeometry()
@@ -1959,10 +2333,6 @@ private struct ConversationContentView: View {
     #if DEBUG
     @State private var rowMeasurementCount: UInt64 = 0
     #endif
-    private var historyRestore: (id: String, offsetY: CGFloat, childID: String?)? {
-        get { rowGeometry.historyRestore }
-        nonmutating set { rowGeometry.historyRestore = newValue }
-    }
     @State private var historyContent = ConversationContentPosition()
     @State private var historyReady = false
     private enum HistoryDirection { case older, newer }
@@ -1973,8 +2343,6 @@ private struct ConversationContentView: View {
         let visible = rowGeometry.visibleFrames(height: viewport.size.height).filter { revision.itemsByID[rowGeometry.semanticID(for: $0.key)] != nil }
         let sourceRows = visible.keys.compactMap { rowGeometry.sourceRowIDs[$0] }
         model.protectHistoryRows(Set(visible.keys).union(sourceRows))
-        guard let first = visible.min(by: { $0.value.minY < $1.value.minY }) else { return }
-        historyRestore = (first.key, first.value.minY, nil)
     }
     private func loadHistory(_ direction: HistoryDirection, in viewport: GeometryProxy) {
         guard model.focusedConversationIdentity == identity, pendingReadingRestore == nil,
@@ -1988,21 +2356,7 @@ private struct ConversationContentView: View {
             if direction == .older { await model.loadOlder() }
             else { await model.loadNewer() }
             guard model.focusedConversationIdentity == identity else { return }
-            if model.historyMutationRevision == historyRequestRevision { historyRestore = nil }
             historyRequestInFlight = false
-        }
-    }
-    private func restoreHistoryPosition(using scroll: NativeConversationScrollProxy) {
-        guard !revision.preparing, !model.loadingOlder, !model.loadingNewer,
-              let target = historyRestore else { return }
-        var transaction = Transaction()
-        transaction.disablesAnimations = true
-        withTransaction(transaction) {
-            let position = ConversationReadingPositions.Position(atLatest: false, rowID: target.id, offsetY: target.offsetY, childID: target.childID)
-            readingPositions.values[identity] = position
-            pendingReadingRestore = position
-            scroll.scrollTo(target.id, anchor: .top)
-            historyRestore = nil
         }
     }
     private func updateHistoryPosition(in viewport: GeometryProxy) {
@@ -2049,11 +2403,9 @@ private struct ConversationContentView: View {
     private func followLatest(using scroll: NativeConversationScrollProxy) {
         guard followsLatest, pendingReadingRestore == nil,
               !model.needsLatestHistory, !isScrollGestureActive, !navigationActive else { return }
-        // Animate only the scroll offset, not the transcript's text or tool state.
-        // Initial positioning and accessibility Reduce Motion remain immediate.
-        withAnimation(hasInitialPosition && !reduceMotion ? .smooth(duration: 0.24) : nil) {
-            scroll.scrollTo("latest", anchor: .bottom, animated: hasInitialPosition && !reduceMotion)
-        }
+        // The native viewport follows measured height changes on its own.
+        // Only an explicit Latest tap animates; stream arrivals never restart it.
+        scroll.followLatest()
     }
     private func userTarget(_ direction: HistoryDirection) -> String? {
         let users = revision.userIndices
@@ -2079,7 +2431,6 @@ private struct ConversationContentView: View {
         model.setHistoryAtLatest(false)
         model.protectHistoryRows([id])
         historyDirection = nil
-        historyRestore = nil
         selectedUserMessage = id
         pendingUserDirection = nil
         pendingReadingRestore = .init(atLatest: false, rowID: id, offsetY: 0)
@@ -2087,7 +2438,7 @@ private struct ConversationContentView: View {
         // Measured restoration retains the target through streaming and layout changes.
         var transaction = Transaction(animation: nil)
         transaction.disablesAnimations = true
-        withTransaction(transaction) { scroll.scrollTo(id, anchor: .top) }
+        withTransaction(transaction) { scroll.scrollTo(id, topOffset: 0) }
     }
     private func navigateUser(_ direction: HistoryDirection, using scroll: NativeConversationScrollProxy) {
         // History insertion/restoration must finish before another explicit jump.
@@ -2099,7 +2450,6 @@ private struct ConversationContentView: View {
         navigationKnownIDs = Set(revision.items.map(\.id))
         pendingUserDirection = direction
         pendingReadingRestore = nil
-        historyRestore = nil
         historyDirection = nil
         followsLatest = false
         fetchUserHistory(direction)
@@ -2152,21 +2502,13 @@ private struct ConversationContentView: View {
                 next: revision.userIndices.indices.contains(next) ? revision.items[revision.userIndices[next]].id : nil)
             if userNavigationTargets != targets { userNavigationTargets = targets }
         }
-        if !navigationActive, !isInteractingTranscript, let target = pendingReadingRestore, let id = target.rowID, let parent = frames[id] {
-            let frame = target.childID.flatMap { frames[$0] } ?? parent
-            if abs(frame.minY - target.offsetY) < 1 {
-                // Retain the semantic position through keyboard/viewport
-                // changes. The next touch or explicit jump releases it.
-                historyReady = true
-            } else {
-                let available = viewport.size.height - composerHeight - 52 - parent.height
-                if abs(available) > 0.5 {
-                    // The timeline can grow while loading older steps.
-                    // Preserve the step's screen position within its parent.
-                    let origin = parent.minY + target.offsetY - frame.minY
-                    scroll.scrollTo(id, anchor: UnitPoint(x: 0, y: origin / available))
-                }
-            }
+        if !navigationActive, !isInteractingTranscript, let target = pendingReadingRestore,
+           let id = target.rowID, frames[id] != nil {
+            // The native viewport now owns this realized point. A target near
+            // the end may be clamped by content bounds and never align exactly;
+            // do not leave history loading blocked waiting for pixel equality.
+            historyReady = true
+            pendingReadingRestore = nil
         }
         saveReadingPosition(in: viewport)
         updateHistoryPosition(in: viewport)
@@ -2190,8 +2532,9 @@ private struct ConversationContentView: View {
             Button {
                 followsLatest = false
                 if let first = rowGeometry.firstFrame(where: { revision.itemsByID[$0] != nil }) {
-                    pendingReadingRestore = .init(atLatest: false, rowID: first.key,
-                        offsetY: revision.itemsByID[first.key]?.message == nil ? max(0, first.value.minY) : first.value.minY)
+                    let offset = revision.itemsByID[first.key]?.message == nil ? max(0, first.value.minY) : first.value.minY
+                    pendingReadingRestore = .init(atLatest: false, rowID: first.key, offsetY: offset)
+                    scroll.scrollTo(first.key, topOffset: offset)
                 }
                 tools.setAllExpanded(!hasExpandedTools)
             } label: { Image(systemName: hasExpandedTools ? "rectangle.compress.vertical" : "rectangle.expand.vertical").frame(width: 44, height: 44)
@@ -2252,9 +2595,9 @@ private struct ConversationContentView: View {
             pendingReadingRestore = rowGeometry[rowID].map {
                 .init(atLatest: false, rowID: rowID, offsetY: $0.minY)
             }
+            if let point = pendingReadingRestore { scroll.scrollTo(rowID, topOffset: point.offsetY) }
             if historyRequestInFlight { rememberHistoryPosition(in: viewport) }
         }
-        rowGeometry.onFollowLatest = { followLatest(using: scroll) }
         var rows: [NativeConversationTranscript.Row] = []
         var semanticIDs: [String: String] = [:]
         var sourceRowIDs: [String: String] = [:]
@@ -2324,6 +2667,14 @@ private struct ConversationContentView: View {
                         onToggle: { nativeToolToggle(item.id) }))
                 }))
             }
+            for activity in content.activity where activity.tool?.secureInput != nil {
+                if let intake = activity.tool?.secureInput {
+                    rows.append(.init(id: item.id + ":secure:" + activity.id, revision: cellRevision, content: {
+                        AnyView(SecureInputCard(model: model, intake: intake)
+                            .id("\(activity.id):\(model.vaultIntakeAccount)"))
+                    }))
+                }
+            }
             // Intake prompts remain reachable even when their group is collapsed.
             for activity in content.activity where activity.tool?.vaultIntake != nil {
                 if let intake = activity.tool?.vaultIntake {
@@ -2373,9 +2724,7 @@ private struct ConversationContentView: View {
                                                     role: transcript.speaker == "user" ? "You" : "Agent", text: transcript.text)
                             return AnyView(ConversationMessageView(row: row, model: model, agentID: agentID)
                                 .accessibilityIdentifier("voice-transcript-" + transcript.speaker))
-                        }) {
-                            rowGeometry.onFollowLatest?()
-                        }
+                        })
                     }
                     Color.clear.frame(height: 1)
             })
@@ -2387,22 +2736,21 @@ private struct ConversationContentView: View {
     var body: some View {
         Group {
             ZStack(alignment: .bottom) {
-            // The transcript fills the viewport and scrolls beneath the controls
-            // and composer. Content margins keep the final message reachable.
+            // Bound the native viewport above the dock. Occluded rows must not
+            // remain tappable or exposed as visible accessibility elements.
             GeometryReader { viewport in
             let boundaryItemID = historyBoundaryItemID
             ZStack(alignment: .top) {
             NativeConversationTranscript(
                 rows: nativeRows(in: viewport), proxy: scroll,
                 followsLatest: followsLatest && pendingReadingRestore == nil && !model.needsLatestHistory && !navigationActive,
-                bottomInset: composerHeight + 52,
+                bottomInset: 0,
                 onFrames: { frames in
                     // Native frames contain only realized cells in viewport coordinates.
                     var visible = frames
                     if let boundaryItemID, let boundary = frames.filter({ rowGeometry.semanticID(for: $0.key) == boundaryItemID }).values.max(by: { $0.maxY < $1.maxY }) {
                         visible["history-gap"] = CGRect(x: 0, y: boundary.maxY, width: 1, height: 1)
                     }
-                    rowGeometry.updateOffset(0)
                     rowGeometry.updateContentFrames(visible)
                     updateRowPositions(in: viewport, using: scroll)
                 },
@@ -2422,7 +2770,6 @@ private struct ConversationContentView: View {
                         if pendingUserDirection != nil { pendingUserDirection = nil }
                         if pendingReadingRestore != nil { pendingReadingRestore = nil }
                         let towardLatest = metrics.contentOffset.y > previous.contentOffset.y
-                        if scrollsTowardLatest != towardLatest { scrollsTowardLatest = towardLatest }
                         let direction: HistoryDirection = towardLatest ? .newer : .older
                         if historyDirection != direction { historyDirection = direction }
                         if hasInitialPosition && !historyReady { historyReady = true }
@@ -2431,9 +2778,7 @@ private struct ConversationContentView: View {
                     saveReadingPosition(in: viewport)
                 },
                 onPhase: { previous, phase in
-                if phase == .tracking { scrollsTowardLatest = false }
-                isInteractingTranscript = phase == .interacting
-                isScrollGestureActive = phase == .tracking || phase == .interacting || phase == .decelerating
+                scrollPhase = phase
                 // Horizontal drawer gestures can enter a scroll phase without
                 // moving the transcript. Only vertical input suspends following.
                 if phase == .idle, previous == .interacting || previous == .decelerating {
@@ -2447,10 +2792,10 @@ private struct ConversationContentView: View {
                     followLatest(using: scroll)
                 }
                 })
+            .padding(.bottom, composerHeight + 52)
             .contentShape(Rectangle())
             .onChange(of: revision.projectionRevision) { _, _ in
                 continueUserNavigation(using: scroll)
-                restoreHistoryPosition(using: scroll)
                 // Content-height observation follows after layout; issuing a second
                 // scroll here would retarget against the previous geometry.
                 updateHistoryPosition(in: viewport)
@@ -2463,6 +2808,7 @@ private struct ConversationContentView: View {
                 if let first = rowGeometry.visibleFrames(height: viewport.size.height).filter({ revision.itemsByID[rowGeometry.semanticID(for: $0.key)] != nil })
                     .min(by: { $0.value.minY < $1.value.minY }) {
                     pendingReadingRestore = .init(atLatest: false, rowID: first.key, offsetY: first.value.minY)
+                    scroll.scrollTo(first.key, topOffset: first.value.minY)
                 }
             }
             .onChange(of: hasInitialPosition) { _, _ in updateHistoryPosition(in: viewport) }
@@ -2474,7 +2820,6 @@ private struct ConversationContentView: View {
             .onChange(of: model.loadingOlder) { _, loading in
                 if !loading {
                     continueUserNavigation(using: scroll)
-                    restoreHistoryPosition(using: scroll)
                 }
                 updateHistoryPosition(in: viewport)
             }
@@ -2482,7 +2827,6 @@ private struct ConversationContentView: View {
             .onChange(of: model.loadingNewer) { _, loading in
                 if !loading {
                     continueUserNavigation(using: scroll)
-                    restoreHistoryPosition(using: scroll)
                 }
                 updateHistoryPosition(in: viewport)
             }
@@ -2500,15 +2844,21 @@ private struct ConversationContentView: View {
                         selectedUserMessage = nil
                         pendingUserDirection = nil
                         historyDirection = nil
-                        historyRestore = nil
                         pendingReadingRestore = nil
                         // Record the intent before fetching/projecting the live
                         // tail; every later publication continues following it.
                         followsLatest = true
-                        Task {
-                            if model.needsLatestHistory { await model.loadNewer(latest: true) }
-                            guard model.focusedConversationIdentity == identity, !model.needsLatestHistory else { return }
-                            followLatest(using: scroll)
+                        // This button is an explicit native intent, even if
+                        // the previous drag is still decelerating. Do not gate
+                        // it on a stale SwiftUI gesture phase.
+                        if model.needsLatestHistory {
+                            Task {
+                                await model.loadNewer(latest: true)
+                                guard model.focusedConversationIdentity == identity, !model.needsLatestHistory else { return }
+                                scroll.followLatest(animated: hasInitialPosition && !reduceMotion)
+                            }
+                        } else {
+                            scroll.followLatest(animated: hasInitialPosition && !reduceMotion)
                         }
                     } label: {
                         Label("Latest messages", systemImage: "arrow.down")
@@ -2556,9 +2906,9 @@ private struct ConversationContentView: View {
                        revision.items.contains(where: { $0.id == rowGeometry.semanticID(for: id) }) {
                         followsLatest = false
                         pendingReadingRestore = saved
-                        scroll.scrollTo(id, anchor: .top)
+                        scroll.scrollTo(id, topOffset: saved.offsetY)
                     } else {
-                        scroll.scrollTo("latest", anchor: .bottom)
+                        scroll.followLatest()
                     }
                     hasInitialPosition = true
                     return
@@ -2602,52 +2952,26 @@ private final class ConversationNativeScrollState {
 
 private final class ConversationRowGeometry {
     var onToolToggle: ((String) -> Void)?
-    var onFollowLatest: (() -> Void)?
     var semanticIDs: [String: String] = [:]
     var sourceRowIDs: [String: String] = [:]
     func semanticID(for id: String) -> String { semanticIDs[id] ?? id }
-    private var contentFrames: [String: CGRect] = [:]
-    private var orderedFrames: [(key: String, value: CGRect)] = []
-    private var offsetY: CGFloat = 0
+    // Native cells report only realized viewport frames. There is no full
+    // transcript geometry cache or second content-offset coordinate system.
+    private var frames: [String: CGRect] = [:]
 
-    func updateContentFrames(_ value: [String: CGRect]) {
-        contentFrames = value
-        // These are non-overlapping siblings in the measured vertical stack.
-        // Index only when layout changes, never for a native scroll offset.
-        orderedFrames = value.sorted { $0.value.minY < $1.value.minY }
-    }
+    func updateContentFrames(_ value: [String: CGRect]) { frames = value }
 
-    func updateOffset(_ value: CGFloat) { offsetY = value }
-
-    subscript(_ id: String) -> CGRect? {
-        contentFrames[id]?.offsetBy(dx: 0, dy: -offsetY)
-    }
-
-    private var firstVisibleIndex: Int {
-        var lower = 0, upper = orderedFrames.count
-        while lower < upper {
-            let middle = lower + (upper - lower) / 2
-            if orderedFrames[middle].value.maxY <= offsetY { lower = middle + 1 }
-            else { upper = middle }
-        }
-        return lower
-    }
+    subscript(_ id: String) -> CGRect? { frames[id] }
 
     func visibleFrames(height: CGFloat) -> [String: CGRect] {
-        var visible: [String: CGRect] = [:]
-        for entry in orderedFrames.dropFirst(firstVisibleIndex) {
-            guard entry.value.minY < offsetY + height else { break }
-            visible[entry.key] = entry.value.offsetBy(dx: 0, dy: -offsetY)
-        }
-        return visible
+        frames.filter { $0.value.maxY > 0 && $0.value.minY < height }
     }
 
     func firstFrame(where matches: (String) -> Bool) -> (key: String, value: CGRect)? {
-        guard let entry = orderedFrames.dropFirst(firstVisibleIndex).first(where: { matches($0.key) }) else { return nil }
-        return (entry.key, entry.value.offsetBy(dx: 0, dy: -offsetY))
+        frames.filter { matches($0.key) && $0.value.maxY > 0 }
+            .min { $0.value.minY < $1.value.minY }
     }
 
-    var historyRestore: (id: String, offsetY: CGFloat, childID: String?)?
 }
 
 private struct ConversationRowFrames: PreferenceKey {
@@ -3616,65 +3940,530 @@ private struct NativeAppUpdateSection: View {
 }
 
 
-/// Compact controls remain visible while the selected route is pinned.
+/// The full-width dock keeps Chat routing one tap away without another composer row.
+/// These controls apply to the selected conversation, not to TODO processing.
 private struct MobileModelControls: View {
     @ObservedObject var model: InboxModel
     var body: some View {
         if let card = model.focused {
             let selected = ModelChoice.find(card.model.isEmpty ? "gpt-6-astra" : card.model)
             let waiting = model.modelSettingsBusy.contains(card.id)
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 12) {
-                    Menu {
-                        ForEach(ModelChoice.all) { choice in
-                            Button { model.chooseModel(choice.id) } label: {
-                                if card.model == choice.id { Label(choice.name, systemImage: "checkmark") }
-                                else { Text(choice.name) }
-                            }
+            HStack(spacing: 2) {
+                Menu {
+                    ForEach(ModelChoice.all) { choice in
+                        Button { model.chooseModel(choice.id) } label: {
+                            if card.model == choice.id { Label(choice.name, systemImage: "checkmark") }
+                            else { Text(choice.name) }
                         }
-                    } label: {
-                        HStack(spacing: 5) {
-                            Text(card.routingAutomatic && !card.modelPinned ? "Auto" : selected?.name ?? card.model)
-                                .lineLimit(1)
-                            Image(systemName: model.modelChoiceLocked ? "lock.fill" : "chevron.down").font(.caption2)
-                        }.frame(minHeight: 44)
                     }
-                    .disabled(model.modelChoiceLocked || waiting)
-                    .accessibilityLabel("Model: \(selected?.name ?? card.model)")
-                    .accessibilityIdentifier("model-picker")
-                    Spacer(minLength: 0)
-                    Menu {
-                        ForEach(selected?.efforts ?? [], id: \.self) { effort in
-                            Button { model.chooseEffort(effort) } label: {
-                                if effort == card.thinking { Label(ModelChoice.effortName(effort), systemImage: "checkmark") }
-                                else { Text(ModelChoice.effortName(effort)) }
-                            }
+                    if !card.provider.isEmpty {
+                        Divider()
+                        Text(card.provider + " · " + (card.modelLocked ? "Pinned to this conversation" : "Ready"))
+                    }
+                    if let error = model.modelSettingsError { Text(error) }
+                } label: {
+                    HStack(spacing: 3) {
+                        if waiting { ProgressView().controlSize(.mini) }
+                        else {
+                            Text(selected?.name ?? card.model).fixedSize(horizontal: false, vertical: true)
+                            Image(systemName: model.modelChoiceLocked ? "lock.fill" : "chevron.down")
+                                .font(.system(size: 9))
                         }
-                    } label: {
-                        Label(ModelChoice.effortName(card.thinking.isEmpty ? "low" : card.thinking), systemImage: "dial.low")
-                            .lineLimit(1).frame(minHeight: 44)
                     }
-                    .disabled(waiting || card.effortLocked || card.routingAutomatic)
-                    .accessibilityLabel("Thinking effort: \(card.thinking)")
-                    .accessibilityIdentifier("effort-dial")
-                    Button { model.toggleAutoRoute() } label: {
-                        Label("Auto", systemImage: "arrow.triangle.branch").frame(minWidth: 60, minHeight: 44)
-                            .background(card.routingAutomatic ? Color.accentColor.opacity(0.12) : .clear, in: Capsule())
-                    }
-                    .disabled(model.modelChoiceLocked || waiting)
-                    .accessibilityLabel(card.routingAutomatic ? "Disable auto route" : "Enable auto route")
-                    .accessibilityValue(card.routingAutomatic ? "On" : "Off")
-                    .accessibilityIdentifier("auto-route")
-                }.font(.caption.weight(.medium)).buttonStyle(.plain)
-                if waiting { ProgressView().controlSize(.mini).accessibilityLabel("Updating model settings") }
-                else if !card.provider.isEmpty {
-                    Text(card.provider + " · " + (card.modelLocked ? "Pinned to this conversation" : "Ready"))
-                        .font(.caption2).foregroundStyle(.secondary).accessibilityIdentifier("selected-provider")
-                } else if card.routingEnabled {
-                    Text("Provider chosen on first message").font(.caption2).foregroundStyle(.secondary)
+                    .frame(minWidth: InboxChrome.touchTarget, maxWidth: .infinity, minHeight: InboxChrome.touchTarget)
+                    .contentShape(Rectangle())
                 }
-                if let error = model.modelSettingsError { Text(error).font(.caption).foregroundStyle(.red) }
-            }.padding(.horizontal, 16).padding(.bottom, 4)
+                .disabled(model.modelChoiceLocked || waiting)
+                .accessibilityLabel("Chat model: \(selected?.name ?? card.model)")
+                .accessibilityHint("Changes the selected Chat conversation, not TODO decisions")
+                .accessibilityIdentifier("model-picker")
+
+                Menu {
+                    ForEach(selected?.efforts ?? [], id: \.self) { effort in
+                        Button { model.chooseEffort(effort) } label: {
+                            if effort == card.thinking { Label(ModelChoice.effortName(effort), systemImage: "checkmark") }
+                            else { Text(ModelChoice.effortName(effort)) }
+                        }
+                    }
+                } label: {
+                    Text(ModelChoice.effortName(card.thinking.isEmpty ? "low" : card.thinking))
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(minWidth: InboxChrome.touchTarget, maxWidth: .infinity, minHeight: InboxChrome.touchTarget)
+                        .contentShape(Rectangle())
+                }
+                .disabled(waiting || card.effortLocked || card.routingAutomatic)
+                .accessibilityLabel("Chat thinking effort: \(card.thinking)")
+                .accessibilityIdentifier("effort-dial")
+
+                Button { model.toggleAutoRoute() } label: {
+                    Text("Auto").fixedSize(horizontal: false, vertical: true).frame(minWidth: InboxChrome.touchTarget, maxWidth: .infinity, minHeight: InboxChrome.touchTarget)
+                        .background(card.routingAutomatic ? Color.primary.opacity(0.09) : .clear, in: Capsule())
+                        .contentShape(Rectangle())
+                }
+                .disabled(model.modelChoiceLocked || waiting)
+                .accessibilityLabel(card.routingAutomatic ? "Disable Chat auto route" : "Enable Chat auto route")
+                .accessibilityValue(card.routingAutomatic ? "On" : "Off")
+                .accessibilityIdentifier("auto-route")
+            }
+            .multilineTextAlignment(.center)
+            .font(.caption.weight(.medium))
+            .buttonStyle(.plain)
         }
     }
 }
+
+private struct SecureInputCard: View {
+    @ObservedObject var model: InboxModel
+    let intake: SecureInputRequest
+    @State private var showing = false
+    @State private var attempted = false
+    @State private var status: String?
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label(intake.isNative ? "Approve a root command" : (intake.isForm ? "Fill website fields privately" : "Enter website password privately"), systemImage: "lock.shield").font(.headline)
+            Text(intake.machineID ?? intake.origin).font(.subheadline)
+            if let status { Text(status) }
+            else {
+                Text(intake.isNative ? "Review the machine and exact command, then authenticate to send a password privately. Not saved to Vault." : (intake.isForm ? "Enter sensitive details in a private form. Values fill only the bound browser fields and are not saved to Vault." : "Enter your password privately for the bound browser input. Not saved to Vault.")).font(.subheadline)
+                Button(intake.isNative ? "Review command" : "Open private input") { showing = true }
+                    .disabled(attempted || !intake.isCurrent(agentID: model.focused?.id ?? ""))
+                    .accessibilityIdentifier("secure-input-open")
+            }
+        }.padding(16).background(Ink.surface, in: RoundedRectangle(cornerRadius: 16))
+        .sheet(isPresented: $showing) {
+            SecureInputSheet(model: model, intake: intake, attempted: $attempted) { status = $0 }
+        }
+    }
+}
+private struct SecureInputSheet: View {
+    @ObservedObject var model: InboxModel
+    let intake: SecureInputRequest
+    @Binding var attempted: Bool
+    let completed: (String) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var password = ""
+    @State private var fieldValues: [String: String] = [:]
+    @State private var browserDescription: BrowserSecureInputDescription?
+    @State private var account = UUID()
+    @State private var busy = false
+    @State private var failure: String?
+    @State private var submission: Task<Void, Never>?
+    @State private var resolved = false
+    @State private var cancellationStarted = false
+    @State private var nativeDescription: NativeSecureInputDescription?
+    @State private var authentication: LAContext?
+    @State private var commandReviewed = false
+    private var inputIsValid: Bool {
+        if intake.isNative { return nativeDescription != nil && commandReviewed && Self.validValue(password) }
+        guard let browserDescription else { return false }
+        return browserDescription.fields.allSatisfy { Self.validValue(fieldValues[$0.id] ?? "") }
+    }
+    private static func validValue(_ value: String) -> Bool {
+        !value.isEmpty && value.utf8.count <= 4096 && !value.unicodeScalars.contains { $0.value < 32 || $0.value == 127 }
+    }
+    private func cancelRequest() {
+        password = ""; fieldValues = [:]
+        guard !resolved, !cancellationStarted else { return }
+        cancellationStarted = true; attempted = true
+        authentication?.invalidate(); authentication = nil
+        submission?.cancel()
+        Task { @MainActor in
+            do {
+                let receipt = try await model.cancelSecureInput(intake, account: account)
+                model.publishSecureInputReceipt(receipt, intake: intake, account: account)
+                completed("Secure input cancelled.")
+            } catch { completed("Cancellation could not be confirmed. Check the destination before continuing.") }
+        }
+    }
+    var body: some View {
+        SecureInputSheetShell(destination: intake.isNative ? "Machine: " + (intake.machineID ?? "") : intake.origin, password: $password,
+                              passwordDisabled: attempted || (intake.isNative ? nativeDescription == nil : browserDescription == nil),
+                              browserFields: intake.isNative ? nil : (browserDescription?.fields ?? []), fieldValues: $fieldValues, reviewFirst: intake.isNative,
+                              privacy: intake.isNative ? "Encrypted for the enrolled helper, outside chat. This runs as root. Trust the executable and any files it reads. Not saved to Vault. Switching apps cancels this request." : (intake.isForm ? "This app fills only bound fields and does not press Pay. The website may react to input. Outside chat and not saved to Vault." : "Sent privately to the bound password field, outside chat. The website may submit its sign-in form. Not saved to Vault."),
+                              cancel: { cancelRequest(); dismiss() }) {
+            if let failure { Text(failure).foregroundStyle(.red) }
+            if intake.isNative {
+                if let nativeDescription {
+                    NativeSecureInputReview(description: nativeDescription)
+                    Toggle("I reviewed this command and trust the files it runs", isOn: $commandReviewed)
+                        .accessibilityIdentifier("native-secure-command-confirm")
+                }
+                else { Text("Verifying the protected command…") }
+            } else if browserDescription == nil { Text("Verifying the private form…") }
+        } action: {
+                Button(busy ? "Sending…" : (intake.isNative ? "Authenticate & run as root" : intake.isForm ? "Fill fields only" : "Send password to website")) {
+                    attempted = true; busy = true
+                    let value = password
+                    let values = fieldValues
+                    password = ""; fieldValues = [:]
+                    submission = Task { @MainActor in
+                        defer { busy = false }
+                        do {
+                            let receipt: SecureInputReceipt
+                            if intake.isNative {
+                                guard let nativeDescription else { throw APIError.invalidResponse }
+                                let context = LAContext()
+                                authentication = context
+                                defer { context.invalidate(); authentication = nil }
+                                receipt = try await NativeSecureInputAuthorization.perform(
+                                    authenticate: { try await context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: "Approve the displayed command on " + nativeDescription.machineID) },
+                                    isActive: { scenePhase == .active },
+                                    isCancelled: { cancellationStarted || !model.connected || model.vaultIntakeAccount != account || !intake.isCurrent(agentID: model.focused?.id ?? "") }
+                                ) {
+                                    try await model.submitNativeSecureInput(intake, description: nativeDescription, value: value, account: account)
+                                }
+                            } else {
+                                guard let browserDescription else { throw APIError.invalidResponse }
+                                receipt = try await model.submitSecureInput(intake, description: browserDescription, values: values, account: account)
+                            }
+                            guard !Task.isCancelled, model.vaultIntakeAccount == account else { return }
+                            model.publishSecureInputReceipt(receipt, intake: intake, account: account)
+                            resolved = true
+                            completed(intake.isNative && receipt.status == "outcome_unknown" ? "Submission outcome unknown. Check the machine before any further attempt." : receipt.message)
+                            dismiss()
+                        } catch {
+                            guard !cancellationStarted, model.vaultIntakeAccount == account else { return }
+                            failure = "Couldn’t confirm submission. Check the destination directly before any further attempt."
+                            completed("Submission could not be confirmed. Check the destination directly before any further attempt.")
+                        }
+                    }
+                }.disabled(attempted || !inputIsValid || !intake.isCurrent(agentID: model.focused?.id ?? ""))
+                    .accessibilityIdentifier("secure-input-submit")
+        }
+        .overlay { if scenePhase != .active { Color(uiColor: .systemBackground).ignoresSafeArea() } }
+        .interactiveDismissDisabled(busy)
+        .task(id: intake.requestID) {
+            account = model.vaultIntakeAccount
+            if intake.isNative {
+                do { nativeDescription = try await model.describeNativeSecureInput(intake, account: account) }
+                catch { failure = "Couldn’t verify the protected command. Cancel and request it again."; return }
+            } else {
+                do { browserDescription = try await model.describeSecureInput(intake, account: account) }
+                catch { failure = "Couldn’t verify the private form. Cancel and request it again."; return }
+            }
+            while !Task.isCancelled {
+                let remaining = intake.expiresAt / 1000 - Date().timeIntervalSince1970
+                if remaining <= 0 {
+                    password = ""; fieldValues = [:]
+                    if !resolved { cancelRequest(); dismiss() }
+                    return
+                }
+                do { try await Task.sleep(for: .seconds(min(remaining, 60))) }
+                catch { return }
+            }
+        }
+        .onDisappear { password = ""; fieldValues = [:]; if !resolved { cancelRequest() } }
+        .onChange(of: scenePhase) { _, phase in
+            if phase != .active { password = ""; fieldValues = [:] }
+            if phase == .background { cancelRequest(); dismiss() }
+        }
+        .onChange(of: model.vaultIntakeAccount) { _, _ in submission?.cancel(); password = ""; fieldValues = [:]; dismiss() }
+        .onChange(of: model.connected) { _, connected in if !connected { submission?.cancel(); password = ""; fieldValues = [:]; dismiss() } }
+    }
+}
+
+/// The same native presentation is used by conversation requests and UI journeys.
+private struct SecureInputSheetShell<Review: View, Action: View>: View {
+    let destination: String
+    @Binding var password: String
+    var passwordDisabled = false
+    var browserFields: [BrowserSecureInputField]? = nil
+    var fieldValues: Binding<[String: String]> = .constant([:])
+    var reviewFirst = false
+    let privacy: String
+    let cancel: () -> Void
+    @ViewBuilder let review: () -> Review
+    @ViewBuilder let action: () -> Action
+    @FocusState private var focusedField: String?
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: "lock.shield.fill").font(.title2).foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Private input").font(.headline)
+                    Text(destination).font(.subheadline).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 0)
+                Button("Cancel", action: cancel).font(.subheadline)
+            }.padding(.horizontal, 24).padding(.top, 28).padding(.bottom, 16)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    if reviewFirst { review() }
+                    if let browserFields {
+                        ForEach(browserFields) { field in
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text(field.label).font(.subheadline.weight(.medium))
+                                SecureBrowserField(field: field, value: Binding(
+                                    get: { fieldValues.wrappedValue[field.id] ?? "" },
+                                    set: { fieldValues.wrappedValue[field.id] = $0 }))
+                                    .focused($focusedField, equals: field.id)
+                                    .font(.title3).padding(16)
+                                    .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 14))
+                                    .disabled(passwordDisabled)
+                            }
+                        }
+                    } else {
+                        SecurePasswordField(password: $password)
+                            .focused($focusedField, equals: "native-password")
+                            .font(.title3).padding(16)
+                            .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 14))
+                            .disabled(passwordDisabled)
+                    }
+                    if !reviewFirst { review() }
+                    Text(privacy).font(.footnote).foregroundStyle(.secondary)
+                }.frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 24).padding(.bottom, 16)
+            }.scrollDismissesKeyboard(.interactively)
+                .accessibilityIdentifier("secure-input-review")
+        }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            action().buttonStyle(SecureInputPrimaryButtonStyle())
+                .padding(.horizontal, 24).padding(.vertical, 12)
+                .background(.regularMaterial)
+        }
+        .background(Color(uiColor: .systemBackground))
+        .onChange(of: password) { _, value in
+            if value.isEmpty { focusedField = nil }
+        }
+        .onChange(of: fieldValues.wrappedValue) { _, values in
+            if values.values.allSatisfy(\.isEmpty) { focusedField = nil }
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("secure-input-sheet")
+        .presentationDetents([.medium, .large])
+        .presentationDragIndicator(.visible)
+        .presentationCornerRadius(28)
+    }
+}
+
+private struct SecureInputPrimaryButtonStyle: ButtonStyle {
+    @Environment(\.isEnabled) private var isEnabled
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.headline)
+            .frame(maxWidth: .infinity, minHeight: 50)
+            .foregroundStyle(Color.white)
+            .background(Color.accentColor, in: RoundedRectangle(cornerRadius: 14))
+            .opacity(isEnabled ? (configuration.isPressed ? 0.8 : 1) : 0.4)
+    }
+}
+
+private struct NativeSecureInputReview: View {
+    let description: NativeSecureInputDescription
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) { Text("Executable").font(.caption).foregroundStyle(.secondary); Text(NativeSecureInputDescription.displayLiteral(description.executable)).font(.system(.body, design: .monospaced)).fixedSize(horizontal: false, vertical: true) }
+            .accessibilityElement(children: .combine)
+            .accessibilityIdentifier("native-secure-command-executable")
+        VStack(alignment: .leading, spacing: 4) { Text("Working directory").font(.caption).foregroundStyle(.secondary); Text(NativeSecureInputDescription.displayLiteral(description.cwd)).font(.system(.body, design: .monospaced)).fixedSize(horizontal: false, vertical: true) }
+            .accessibilityElement(children: .combine)
+            .accessibilityIdentifier("native-secure-command-cwd")
+        Text("Local user ID: \(description.uid)")
+        Text("Arguments (ordered)").font(.headline)
+        Text("[" + description.arguments.map(NativeSecureInputDescription.displayLiteral).joined(separator: ",\n") + "]")
+            .font(.system(.body, design: .monospaced)).textSelection(.enabled)
+            .accessibilityIdentifier("native-secure-command-arguments")
+    }
+}
+
+struct SecurePasswordField: View {
+    @Binding var password: String
+    var body: some View {
+        SecureField("Password", text: $password)
+            .textContentType(.password).textInputAutocapitalization(.never)
+            .autocorrectionDisabled().privacySensitive()
+            .accessibilityIdentifier("secure-input-password")
+    }
+}
+/// Every supported field stays masked; field kinds select native keyboard and AutoFill hints.
+private struct SecureBrowserField: View {
+    let field: BrowserSecureInputField
+    @Binding var value: String
+
+    private var keyboard: UIKeyboardType {
+        switch field.kind {
+        case .cardNumber, .cardCVC: return .numberPad
+        case .cardExpiry: return .numbersAndPunctuation
+        case .password, .sensitiveText: return .default
+        }
+    }
+    private var contentType: UITextContentType? {
+        switch field.kind {
+        case .password: return .password
+        case .cardNumber: return .creditCardNumber
+        case .cardExpiry: return .creditCardExpiration
+        case .cardCVC: return .creditCardSecurityCode
+        case .sensitiveText: return nil
+        }
+    }
+    var body: some View {
+        SecureField(field.kind == .cardExpiry ? "MM/YY" : field.label, text: $value)
+            .keyboardType(keyboard).textContentType(contentType)
+            .textInputAutocapitalization(.never).autocorrectionDisabled().privacySensitive()
+            .accessibilityIdentifier("secure-input-field:" + field.id)
+    }
+}
+#if DEBUG && targetEnvironment(simulator)
+struct NativeSecureInputUIFixture: View {
+    private let description: NativeSecureInputDescription
+    @State private var password = ""
+    @State private var status = ""
+    @State private var attempts = 0
+    @State private var commandReviewed = false
+    init() {
+        let requestID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        let expiry = Date().addingTimeInterval(300).timeIntervalSince1970 * 1000
+        let args = ["-u", "visible\u{202e}hidden"]
+        let binding = try! JSONSerialization.data(withJSONObject: ["arguments": args, "cwd": "/", "executable": "/usr/bin/id", "uid": 501], options: [.sortedKeys, .withoutEscapingSlashes])
+        let hint: JSON = .object(["type": .string("secure_input"), "status": .string("input_required"), "kind": .string("native_sudo"), "request_id": .string(requestID), "agent_id": .string("fixture"), "machine_id": .string("fixture-machine"), "expires_at": .number(expiry)])
+        let request = SecureInputRequest.parse(hint)!
+        let recipient = P256.KeyAgreement.PrivateKey()
+        description = try! NativeSecureInputDescription.parse(.object(["request_id": .string(requestID), "machine_id": .string("fixture-machine"), "uid": .number(501), "executable": .string("/usr/bin/id"), "arguments": .array(args.map(JSON.string)), "cwd": .string("/"), "command_digest": .string(Data(SHA256.hash(data: binding)).base64EncodedString()), "public_key": .string(recipient.publicKey.x963Representation.base64EncodedString()), "expires_at": .number(expiry)]), intake: request)
+    }
+    var body: some View {
+        SecureInputFixtureConversation(destination: "fixture-machine") { close in
+            SecureInputSheetShell(destination: "Machine: " + description.machineID, password: $password, reviewFirst: true,
+                                  privacy: "Encrypted for the enrolled helper, outside chat. Not saved to Vault.", cancel: close) {
+                if !status.isEmpty { Text(status).foregroundStyle(.red) }
+                NativeSecureInputReview(description: description)
+                Toggle("I reviewed this command and trust the files it runs", isOn: $commandReviewed)
+                    .accessibilityIdentifier("native-secure-command-confirm")
+                Text("Submission attempts: \(attempts)").font(.caption).foregroundStyle(.secondary)
+            } action: {
+                Button("Authenticate & run as root") {
+                    password = ""
+                    Task { @MainActor in
+                        do {
+                            let _: Bool = try await NativeSecureInputAuthorization.perform(authenticate: { false }, isActive: { true }, isCancelled: { false }) {
+                                attempts += 1
+                                return true
+                            }
+                            status = "Unexpected submission"
+                        } catch { status = "Authentication denied" }
+                    }
+                }.disabled(!commandReviewed || password.isEmpty)
+                    .accessibilityIdentifier("secure-input-submit")
+            }
+            .onDisappear { password = "" }
+        }
+    }
+}
+
+/// Synthetic UI journey; HTTP protocol coverage lives in InboxCore tests.
+struct SecureInputUIFixture: View {
+    private let description: BrowserSecureInputDescription
+    @State private var unusedPassword = ""
+    @State private var values: [String: String] = [:]
+    @State private var status: String?
+    init() {
+        let requestID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        let expiry = Date().addingTimeInterval(300).timeIntervalSince1970 * 1000
+        let intake = SecureInputRequest.parse(.object([
+            "type": .string("secure_input"), "status": .string("input_required"),
+            "kind": .string("browser_form"), "request_id": .string(requestID),
+            "agent_id": .string("fixture"), "origin": .string("https://example.com"), "expires_at": .number(expiry)
+        ]))!
+        description = try! BrowserSecureInputDescription.parse(.object([
+            "request_id": .string(requestID), "origin": .string(intake.origin), "expires_at": .number(expiry),
+            "fields": .array([.object(["id": .string("password"), "kind": .string("password"), "selector": .string("#password")])])
+        ]), intake: intake)
+    }
+    var body: some View {
+        SecureInputFixtureConversation(destination: description.origin) { close in
+            SecureInputSheetShell(destination: description.origin, password: $unusedPassword,
+                                  passwordDisabled: status != nil, browserFields: description.fields, fieldValues: $values,
+                                  privacy: "Sent directly to the bound browser input, outside chat. Not saved to Vault.",
+                                  cancel: { values = [:]; close() }) {
+                if let status { Text(status) }
+            } action: {
+                Button("Send password to website") {
+                    values = [:]
+                    let receipt = try? SecureInputReceipt.parse(.object(["type": .string("secure_input_receipt"), "request_id": .string("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"), "status": .string("filled")]), requestID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+                    status = receipt?.message ?? "Invalid receipt"
+                }.disabled((values["password"] ?? "").isEmpty || status != nil)
+                    .accessibilityIdentifier("secure-input-submit")
+            }.onDisappear { values = [:] }
+        }
+    }
+}
+
+/// Synthetic owner metadata and fill-only receipt; no network or payment submission.
+struct CardSecureInputUIFixture: View {
+    private let description: BrowserSecureInputDescription
+    @State private var unusedPassword = ""
+    @State private var values: [String: String] = [:]
+    @State private var receipt: SecureInputReceipt?
+    private var filled: Bool { receipt != nil }
+    @Environment(\.scenePhase) private var scenePhase
+
+    init() {
+        let requestID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        let expiry = Date().addingTimeInterval(300).timeIntervalSince1970 * 1000
+        let intake = SecureInputRequest.parse(.object([
+            "type": .string("secure_input"), "status": .string("input_required"),
+            "kind": .string("browser_form"), "request_id": .string(requestID),
+            "agent_id": .string("fixture"), "origin": .string("https://checkout.example.com"),
+            "expires_at": .number(expiry)
+        ]))!
+        let fields: [JSON] = [("card", "card_number"), ("expiry", "card_expiry"), ("cvc", "card_cvc")].map { id, kind in
+            .object(["id": .string(id), "kind": .string(kind), "selector": .string("#" + id)])
+        }
+        description = try! BrowserSecureInputDescription.parse(.object([
+            "request_id": .string(requestID), "origin": .string(intake.origin),
+            "expires_at": .number(expiry), "fields": .array(fields)
+        ]), intake: intake)
+    }
+    var body: some View {
+        SecureInputFixtureConversation(destination: description.origin) { close in
+            SecureInputSheetShell(destination: description.origin, password: $unusedPassword,
+                                  passwordDisabled: filled, browserFields: description.fields, fieldValues: $values,
+                                  privacy: "This app fills only bound fields and does not press Pay. The website may react to input. Outside chat and not saved to Vault.",
+                                  cancel: { values = [:]; close() }) {
+                if filled {
+                    Text(receipt?.message ?? "")
+                    Text("Fixture: 3 bound fields filled; form submissions: 0").font(.caption).foregroundStyle(.secondary)
+                }
+            } action: {
+                Button("Fill fields only") {
+                    // Exercise the presentation with synthetic values only; protocol coverage uses the owner endpoint.
+                    values = [:]
+                    receipt = try? SecureInputReceipt.parse(.object([
+                        "type": .string("secure_input_receipt"), "request_id": .string(description.requestID), "status": .string("filled")
+                    ]), requestID: description.requestID)
+                }.disabled(filled || !description.fields.allSatisfy { !(values[$0.id] ?? "").isEmpty })
+                    .accessibilityIdentifier("secure-input-submit")
+            }
+            .overlay { if scenePhase != .active { Color(uiColor: .systemBackground).ignoresSafeArea() } }
+            .onDisappear { values = [:] }
+            .onChange(of: scenePhase) { _, phase in
+                if phase != .active { values = [:] }
+                if phase == .background { close() }
+            }
+        }
+    }
+}
+
+private struct SecureInputFixtureConversation<Sheet: View>: View {
+    let destination: String
+    @ViewBuilder let sheet: (@escaping () -> Void) -> Sheet
+    @State private var showing = false
+    var body: some View {
+        NavigationStack {
+            VStack(alignment: .leading, spacing: 24) {
+                HStack { Spacer(); Text("Please complete this action on my machine.").padding(16).background(Ink.surface, in: RoundedRectangle(cornerRadius: 18)) }
+                Text("I need your approval to continue. Review the destination and enter your password privately.")
+                VStack(alignment: .leading, spacing: 10) {
+                    Label("Enter password privately", systemImage: "lock.shield").font(.headline)
+                    Text(destination).font(.subheadline)
+                    Button("Open secure form") { showing = true }.accessibilityIdentifier("secure-input-open")
+                }.padding(16).frame(maxWidth: .infinity, alignment: .leading).background(Ink.surface, in: RoundedRectangle(cornerRadius: 16))
+                Spacer()
+                HStack { Text("Message").foregroundStyle(.secondary); Spacer(); Image(systemName: "arrow.up.circle.fill") }.padding(16).background(Ink.surface, in: Capsule())
+            }.padding(20).navigationTitle("Local maintenance").navigationBarTitleDisplayMode(.inline)
+        }
+        .sheet(isPresented: $showing) { sheet { showing = false } }
+    }
+}
+#endif

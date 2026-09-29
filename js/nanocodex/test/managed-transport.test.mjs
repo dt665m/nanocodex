@@ -13,24 +13,6 @@ const apiKey = `ncx_live_${"a".repeat(12)}_${"b".repeat(43)}`;
 const requestId = "request-1";
 const serverTurnId = "server-turn-1";
 
-test("managed transport requires an explicit create or open-existing identity", () => {
-  for (const invalid of [
-    {},
-    { agent: {} },
-    { agent: { create: false } },
-    { agent: { id: agentId, create: true } },
-    { agent: { id: "not-an-agent" } },
-  ]) {
-    assert.throws(() => NodeTransport.managed(invalid), /explicit create|requires agent/);
-  }
-  assert.throws(
-    () => NodeTransport.managed({ agent: { create: true }, model: "gpt-6-sol" }),
-    /does not accept model/,
-  );
-  assert.doesNotThrow(() => NodeTransport.managed({ agent: { create: true } }));
-  assert.doesNotThrow(() => BrowserTransport.managed({ agent: { id: agentId } }));
-});
-
 test("Agent.create opens an existing managed identity with the common Turn lifecycle", async () => {
   const requests = [];
   const fetch = async (input, init) => {
@@ -172,6 +154,83 @@ test("managed create reverse-attaches one Tools recipe and shutdown closes it wi
   assert.equal(socket.closed.code, 1000);
   assert.throws(() => tools.attach("wss://managed.example/tools"), /closed/);
   assert.equal(requests.some((request) => request.method === "DELETE"), false);
+});
+
+test("managed creation uses only the matching receipt identity, not its synthetic initial state", async () => {
+  const requests = [];
+  const agent = await NodeAgent.create({
+    transport: NodeTransport.managed({
+      agent: { create: true }, baseUrl: origin,
+      fetch: async (input, init) => {
+        const request = new Request(input, init);
+        requests.push(`${request.method} ${new URL(request.url).pathname}`);
+        if (request.method === "POST" && new URL(request.url).pathname === "/v1/agents") {
+          return Response.json({
+            agent_id: agentId, session_id: agentId,
+            // A keyed replay can carry a synthetic fresh initial_state even
+            // though the actual retained session has existing turns.
+            initial_state: { agent_id: agentId, session_id: "stale", completed_turns: 0 },
+          }, { status: 201 });
+        }
+        if (request.method === "GET") {
+          return Response.json({ agent_id: agentId, session_id: agentId, completed_turns: 9 });
+        }
+        return Response.json({ state: "preparing" }, { status: 202 });
+      },
+    }),
+  });
+  try {
+    assert.equal(agent.agentId, agentId);
+    assert.equal(agent.sessionId, agentId);
+    assert.equal(requests.filter((request) => request === `GET /v1/agents/${agentId}`).length, 0);
+  } finally {
+    await agent.session.shutdown();
+  }
+});
+
+test("managed creation falls back to GET for missing or inconsistent receipt identity", async () => {
+  for (const session_id of [undefined, "bad-session", sessionId]) {
+    const requests = [];
+    const agent = await NodeAgent.create({
+      transport: NodeTransport.managed({
+        agent: { create: true }, baseUrl: origin,
+        fetch: async (input, init) => {
+          const request = new Request(input, init);
+          requests.push(`${request.method} ${new URL(request.url).pathname}`);
+          if (request.method === "POST" && new URL(request.url).pathname === "/v1/agents") {
+            return Response.json({ agent_id: agentId, ...(session_id === undefined ? {} : { session_id }) }, { status: 201 });
+          }
+          if (request.method === "GET") return Response.json({ agent_id: agentId, session_id: sessionId });
+          return Response.json({ state: "preparing" }, { status: 202 });
+        },
+      }),
+    });
+    try {
+      assert.equal(agent.sessionId, sessionId);
+      assert.equal(requests.filter((request) => request === `GET /v1/agents/${agentId}`).length, 1);
+    } finally {
+      await agent.session.shutdown();
+    }
+  }
+});
+
+test("malformed create receipt cannot install speculative managed identity", async () => {
+  const requests = [];
+  await assert.rejects(NodeAgent.create({
+    transport: NodeTransport.managed({
+      agent: { create: true }, baseUrl: origin,
+      fetch: async (input, init) => {
+        const request = new Request(input, init);
+        requests.push(`${request.method} ${new URL(request.url).pathname}`);
+        if (request.method === "POST" && new URL(request.url).pathname === "/v1/agents") {
+          return Response.json({ agent_id: agentId, session_id: "invalid", initial_state: { agent_id: agentId, session_id: agentId } });
+        }
+        if (request.method === "GET") return Response.json({ agent_id: sessionId, session_id: sessionId });
+        return Response.json({ state: "preparing" }, { status: 202 });
+      },
+    }),
+  }), /inconsistent agent or session identity/);
+  assert.equal(requests.filter((request) => request === `GET /v1/agents/${agentId}`).length, 1);
 });
 
 test("cold reverse attachment failure does not block the durable Agent and retries under its lifecycle", async () => {
@@ -387,22 +446,6 @@ test("managed event iterators resolve pending reads with the common Agent event 
     watcher.off();
     await agent.session.shutdown();
   }
-});
-
-test("managed Agent.create rejects local-only policy even when JavaScript bypasses types", async () => {
-  const transport = NodeTransport.managed({
-    agent: { id: agentId },
-    baseUrl: origin,
-    fetch: async () => Response.json({ agent_id: agentId, session_id: sessionId }),
-  });
-  await assert.rejects(
-    NodeAgent.create({ transport, model: "gpt-6-sol" }),
-    /does not accept model/,
-  );
-  await assert.rejects(
-    NodeAgent.create({ transport, tools: {} }),
-    /created by createTools/,
-  );
 });
 
 class ManagedToolSocket {

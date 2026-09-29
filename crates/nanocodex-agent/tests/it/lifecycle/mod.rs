@@ -24,7 +24,7 @@ use nanocodex_tools::{ToolContext, ToolDefinition, ToolOutput, runtime::DynamicT
 use serde_json::Value;
 use tempfile::tempdir;
 use tokio::sync::mpsc;
-use tower::{Service, ServiceBuilder, limit::ConcurrencyLimitLayer, timeout::TimeoutLayer};
+use tower::Service;
 
 #[derive(Clone)]
 struct NeverCalled;
@@ -172,6 +172,7 @@ impl Service<ResponsesAttempt> for RetainingCompletedService {
                     .expect("generation attempts have a model call index");
                 ResponsesOutput::Generation(GenerationOutput {
                     id: format!("resp-generation-{call_index}"),
+                    reported_model: None,
                     status: "completed".to_owned(),
                     end_turn: Some(true),
                     final_message: Some("done".to_owned()),

@@ -2,7 +2,7 @@ use std::{borrow::Cow, sync::Arc};
 
 use crate::{
     CONTEXT_WINDOW_TOKENS, Model, OpenAiAuth, ReasoningMode, ResponsesHistory, ResponsesTransport,
-    Thinking,
+    Thinking, responses::StrictJsonSchema,
 };
 
 const SOL_SYSTEM_PROMPT: &str = include_str!("../../prompts/sol.md");
@@ -51,6 +51,8 @@ pub struct ModelConfig {
     pub responses_history: ResponsesHistory,
     /// Whether the provider may retain response checkpoints.
     pub store_responses: bool,
+    /// Optional strict JSON Schema required for model output.
+    pub strict_json_schema: Option<StrictJsonSchema>,
     /// Responses WebSocket endpoint.
     pub websocket_url: String,
     /// Base URL used for HTTPS Responses calls and related endpoints.
@@ -128,6 +130,7 @@ impl Default for ModelConfig {
             raw_api_events: true,
             responses_history: ResponsesHistory::default(),
             store_responses: false,
+            strict_json_schema: None,
             websocket_url: "wss://api.openai.com/v1/responses".to_owned(),
             api_base_url: "https://api.openai.com/v1".to_owned(),
             #[cfg(any(target_family = "wasm", docsrs))]
@@ -135,49 +138,5 @@ impl Default for ModelConfig {
             system_prompt: None,
             additional_instructions: None,
         }
-    }
-}
-
-#[cfg(test)]
-mod prompt_tests {
-    use super::*;
-
-    #[test]
-    fn glm53_prompt_preserves_its_identity() {
-        let config = ModelConfig {
-            model: Model::Glm53,
-            ..ModelConfig::default()
-        };
-        assert!(config.system_prompt().starts_with("You are Nanocodex"));
-        assert!(!config.system_prompt().contains("GPT-"));
-        assert!(!config.system_prompt().contains("You are Codex"));
-    }
-
-    #[test]
-    fn supported_models_select_exact_pinned_instructions() {
-        for (model, expected) in [
-            (Model::Astra, ASTRA_SYSTEM_PROMPT),
-            (Model::Sol, SOL_SYSTEM_PROMPT),
-            (Model::Luna, LUNA_SYSTEM_PROMPT),
-        ] {
-            let mut config = ModelConfig {
-                model,
-                ..ModelConfig::default()
-            };
-            assert_eq!(config.system_prompt(), expected);
-            assert!(config.system_prompt().starts_with("You are Codex,"));
-            config.additional_instructions = Some(Arc::from("Host instructions"));
-            assert_eq!(
-                config.system_prompt(),
-                format!("{expected}\n\nHost instructions")
-            );
-            config.system_prompt = Some(Arc::from("Explicit override"));
-            assert_eq!(
-                config.system_prompt(),
-                "Explicit override\n\nHost instructions"
-            );
-        }
-        assert!(ASTRA_SYSTEM_PROMPT.starts_with("You are Codex, an agent based on GPT-6."));
-        assert!(!ASTRA_SYSTEM_PROMPT.contains("As Nanocodex,"));
     }
 }

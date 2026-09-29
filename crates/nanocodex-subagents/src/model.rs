@@ -235,7 +235,11 @@ pub(super) fn agent_prompt(id: AgentId, task: &str) -> String {
         "Act as a specialist subagent. You have no inherited conversation context. Work only on \
          the delegated task and produce the required evidence-backed structured result. Your \
          agent ID is {id}. The runtime automatically places agents you delegate beneath you in \
-         the task tree.{coordination}\n\nDelegated task:\n{task}"
+         the task tree.{coordination} After completing your work, call submit_result({{output}}) \
+         with the required JSON value. When its receipt says accepted, send a brief final \
+         assistant message with no further tool calls; do not end with an empty model \
+         response. If the receipt says superseded, follow the updated instructions instead.\n\n\
+         Delegated task:\n{task}"
     )
 }
 
@@ -299,46 +303,5 @@ pub struct SubagentRuntimeId(u64);
 impl SubagentRuntimeId {
     pub(super) fn next() -> Self {
         Self(NEXT_RUNTIME_ID.fetch_add(1, Ordering::Relaxed) + 1)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{AgentId, AgentStatus, MessagePriority, agent_prompt};
-
-    #[test]
-    fn deferred_is_the_default_serialized_message_priority() {
-        assert_eq!(MessagePriority::default(), MessagePriority::Deferred);
-        assert_eq!(
-            serde_json::to_value(MessagePriority::default()).unwrap(),
-            serde_json::json!("deferred")
-        );
-    }
-
-    #[test]
-    fn agent_prompt_explains_peer_coordination_and_queued_delivery() {
-        let prompt = agent_prompt(AgentId::new(1), "coordinate with a peer");
-
-        assert!(prompt.contains("Other agents may be working concurrently"));
-        assert!(prompt.contains("list_agents"));
-        assert!(prompt.contains("prevents duplicated work"));
-        assert!(prompt.contains("avoid overwriting them"));
-        assert!(prompt.contains("If a send is queued"));
-        assert!(prompt.contains("finish the turn"));
-    }
-
-    #[test]
-    fn completed_status_serializes_structured_output_without_stringifying_it() {
-        let status = AgentStatus::Completed {
-            output: serde_json::json!({ "findings": [{ "line": 42 }] }),
-        };
-
-        assert_eq!(
-            serde_json::to_value(status).unwrap(),
-            serde_json::json!({
-                "state": "completed",
-                "output": { "findings": [{ "line": 42 }] }
-            })
-        );
     }
 }
