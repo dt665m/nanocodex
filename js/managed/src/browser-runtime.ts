@@ -49,6 +49,8 @@ type FetchImplementation = typeof globalThis.fetch;
 const BROWSERBASE_API_ORIGIN = "https://api.browserbase.com";
 const DEFAULT_KEEP_ALIVE_MS = 10 * 60_000;
 const DEFAULT_TOOL_TIMEOUT_MS = 30_000;
+// One-shot Kitesurf calls must finish navigation and all subsequent interactions.
+const DEFAULT_KITESURF_TOOL_TIMEOUT_MS = 90_000;
 const MAX_BROWSERBASE_RESPONSE_BYTES = 256 * 1024;
 const MANAGED_BROWSER_EXECUTE_DESCRIPTION = [
   "Run browser automation in the retained managed browser session.",
@@ -405,7 +407,7 @@ export async function createManagedBrowserRuntime(
   );
   const timeout = boundedInteger(
     options.env.MANAGED_BROWSER_TOOL_TIMEOUT_MS,
-    DEFAULT_TOOL_TIMEOUT_MS,
+    provider === "kitesurf" ? DEFAULT_KITESURF_TOOL_TIMEOUT_MS : DEFAULT_TOOL_TIMEOUT_MS,
     1_000,
     120_000,
     "MANAGED_BROWSER_TOOL_TIMEOUT_MS",
@@ -982,7 +984,9 @@ function sanitizeValue(
   if (sensitiveKey(key)) return "[redacted]";
   if (typeof value === "string") return sanitizeString(value, secrets);
   if (value === null || typeof value !== "object") return value;
-  if (depth >= 24) return "[truncated]";
+  // CDP DOM trees add an object and a children array per HTML element.
+  // A small JSON-depth cap silently removes ordinary nested page content.
+  if (depth >= 256) return "[truncated]";
   if (seen.has(value)) return "[circular]";
   seen.add(value);
   if (Array.isArray(value)) {

@@ -197,6 +197,17 @@ describe("AI SDK browser tool adapter", () => {
     expect(execute).toHaveBeenCalledOnce();
   });
 
+  it("preserves deeply nested DOM content while redacting secrets at that depth", () => {
+    let dom: unknown = { nodeValue: "Book class", authorization: API_KEY, note: API_KEY };
+    for (let level = 0; level < 40; level++) dom = { nodeName: "DIV", children: [dom] };
+    const result = JSON.stringify(sanitizeBrowserToolResult({ result: { root: dom } }, [API_KEY]));
+    expect(result).toContain("Book class");
+    expect(result).not.toContain("[truncated]");
+    expect(result).not.toContain(API_KEY);
+    expect(result).toContain('"authorization":"[redacted]"');
+    expect(result).toContain('"note":"[redacted]"');
+  });
+
   it("redacts provider URLs and scalar cookie material", () => {
     expect(sanitizeBrowserToolResult({
       provider: "https://live.browser.run/session/signed",
