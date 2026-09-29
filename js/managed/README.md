@@ -654,6 +654,8 @@ Unsupported sites return their browser errors; there is no automatic VM allocati
 or silent provider fallback. Operators can select `cloudflare` when Chromium is
 needed. Neither Browser Run engine requires a Nanocodex VM.
 
+The agent has a guarded native-CDP [Sage checkout recovery recipe](scripts/kitesurf-sage-recovery.md) for the observed missing Stripe script-load notification. It does not change the upstream browser runtime or automatically inject events.
+
 Run the [local Kitesurf smoke test](scripts/kitesurf-smoke.md) to verify the real
 remote binding through the managed runtime before rollout.
 
