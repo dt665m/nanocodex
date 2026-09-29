@@ -11,6 +11,7 @@
   "workers_dev": false,
   "triggers": { "crons": [] },
   "ai": { "binding": "AI" },
+  "browser": { "binding": "BROWSER" },
   "minify": true,
   "upload_source_maps": true,
   "observability": {
@@ -180,6 +181,7 @@
     { "tag": "v11", "new_sqlite_classes": ["InferenceKey", "InferenceAccount", "InferenceSession"] }
   ],
   "vars": {
+    "MANAGED_BROWSER_PROVIDER": "kitesurf",
     "NANOCODEX_THREAD_ROUTING": "true",
     "NANOCODEX_INFERENCE_ENABLED": "true",
     "NANOCODEX_CLOUDFLARE_FRONTIER_ENABLED": "true",
@@ -197,6 +199,7 @@
   "env": {
     "development": {
       "name": "nanocodex-durable-agent",
+      "browser": { "binding": "BROWSER", "remote": true },
       "services": [
         { "binding": "NANOCODEX_X", "service": "nanocodex-x" },
         { "binding": "NANOCODEX", "service": "nanocodex-egress", "remote": false },
@@ -248,6 +251,7 @@
         ]
       },
       "vars": {
+        "MANAGED_BROWSER_PROVIDER": "kitesurf",
         "AGENT_IDLE_TIMEOUT_MS": "1000",
         "MANAGED_AGENT_DIRECT_CREDENTIALS": "true",
         "ENVIRONMENT": "development",

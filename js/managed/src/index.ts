@@ -143,6 +143,7 @@ import {
 import { fetchResponseWithDeadline, withHardDeadline } from "./deadline";
 import { drainRuntimeForDeletion } from "./deletion-runtime";
 import { createManagedComputerRuntime } from "./computer-runtime";
+import { createManagedBrowserRuntime, type ManagedBrowserEnv, type ManagedBrowserRuntime } from "./browser-runtime";
 import {
   exactConnectorAccess,
   handleManagedEgress,
@@ -377,6 +378,7 @@ const MEMORY_ORGANIZATION_ASSERTION = "x-nanocodex-organization-id";
 const MEMORY_TEAM_ASSERTION = "x-nanocodex-team-id";
 const MEMORY_SUBJECT_ASSERTION = "x-nanocodex-subject-id";
 export interface Env extends
+  ManagedBrowserEnv,
   InferenceApiEnv,
   ProviderProbeEnvironment,
   EmailConfig,
@@ -1204,6 +1206,76 @@ export function turnCanUseExecutionNamespace(
     && authorization.connectGrant === undefined
     && authorization.capabilities.includes("agents:write")
     && authorization.capabilities.includes("tools:use");
+}
+
+/** Session-owned hosted browsing. The retained browser is never shared with Connect grants. */
+export class ManagedSessionBrowser {
+  static readonly alarmKey = "managed-browser-sweep-at";
+  #runtime?: Promise<ManagedBrowserRuntime>;
+  constructor(
+    readonly ctx: DurableObjectState,
+    readonly env: ManagedBrowserEnv,
+    readonly sessionId: string,
+    readonly authorize: (context: ToolContext) => boolean,
+    readonly schedule: () => Promise<void>,
+    readonly create = createManagedBrowserRuntime,
+  ) {}
+
+  get available(): boolean {
+    return Boolean(this.env.LOADER && (this.env.BROWSER || this.env.MANAGED_BROWSER_PROVIDER === "browserbase"));
+  }
+
+  #get(): Promise<ManagedBrowserRuntime> {
+    return this.#runtime ??= this.create({ ctx: this.ctx, env: this.env, sessionId: this.sessionId })
+      .catch(error => { this.#runtime = undefined; throw error; });
+  }
+
+  async tools(): Promise<readonly NamedTool[]> {
+    if (!this.available) return [];
+    const runtime = await this.#get();
+    // Private credential tools require separate route and resolver integration.
+    return runtime.tools.filter(tool => tool.name === "browser_execute").map(tool => ({
+      ...tool,
+      handler: async (input, context) => {
+        context.signal.throwIfAborted();
+        if (!this.authorize(context)) throw new ManagedRequestError(403, "forbidden", "hosted browsing requires full account tool authority");
+        const touch = async () => {
+          const configured = Number(this.env.MANAGED_BROWSER_KEEP_ALIVE_MS ?? 600_000);
+          const keepAlive = Number.isFinite(configured) ? Math.max(60_000, Math.min(21_600_000, configured)) : 600_000;
+          // Include the maximum browser tool timeout so an alarm cannot sweep
+          // a live call before its completion refreshes the idle deadline.
+          await this.ctx.storage.put(ManagedSessionBrowser.alarmKey, Date.now() + keepAlive + 121_000);
+          await this.schedule();
+        };
+        await touch();
+        try { return await tool.handler(input, context); }
+        finally { await touch(); }
+      },
+    }));
+  }
+
+  async sweep(): Promise<void> {
+    const deadline = await this.ctx.storage.get<number>(ManagedSessionBrowser.alarmKey);
+    if (deadline === undefined || deadline > Date.now() || !this.available) return;
+    try { await (await this.#get()).expireAndSweep(); }
+    catch (error) {
+      // Keep a durable retry even after the platform's bounded alarm retries.
+      if (await this.ctx.storage.get(ManagedSessionBrowser.alarmKey) === deadline) {
+        await this.ctx.storage.put(ManagedSessionBrowser.alarmKey, Date.now() + 30_000);
+      }
+      await this.schedule();
+      throw error;
+    }
+    if (await this.ctx.storage.get(ManagedSessionBrowser.alarmKey) === deadline) {
+      await this.ctx.storage.delete(ManagedSessionBrowser.alarmKey);
+    }
+  }
+
+  async close(): Promise<void> {
+    if (this.available) await (await this.#get()).close();
+    await this.ctx.storage.delete(ManagedSessionBrowser.alarmKey);
+    this.#runtime = undefined;
+  }
 }
 
 export function turnControlAuthorizationMatches(
@@ -3079,6 +3151,7 @@ export class DurableAgentSession extends DurableComputerSession {
   #operations: SessionOperations;
   #brainStorage?: R2Bucket;
   #agent?: CloudflareAgent.Agent;
+  #browser?: ManagedSessionBrowser;
   #subagentBindings = new ManagedSubagentBindings();
   #agentPromise?: Promise<CloudflareAgent.Agent>;
   #agentConstruction?: AgentConstructionOwnership;
@@ -4266,6 +4339,10 @@ export class DurableAgentSession extends DurableComputerSession {
         await this.#scheduleCleanupRetry();
       }
       return;
+    }
+    if (this.#session()) {
+      try { await this.#sessionBrowser().sweep(); }
+      catch (error) { console.warn({ type: "managed.browser_sweep_pending", error_kind: errorKind(error) }); }
     }
     if (presentationPending(this.ctx.storage)) await this.#sidebarPresentation().flush();
     if (this.#operations.nextAlarm() !== undefined) await this.#operations.drain();
@@ -7410,6 +7487,8 @@ export class DurableAgentSession extends DurableComputerSession {
       },
       inFlight,
     );
+    if (this.#session()) await this.#sessionBrowser().close();
+    this.#browser = undefined;
   }
 
   #assertDeletionGeneration(generation: number): void {
@@ -7798,6 +7877,16 @@ export class DurableAgentSession extends DurableComputerSession {
   #configuration(): AgentConfiguration {
     const row = this.ctx.storage.sql.exec<{ body: string }>("SELECT body FROM managed_configuration WHERE singleton=1").toArray()[0];
     return row ? normalizeToolNames(JSON.parse(row.body) as AgentConfiguration) : {};
+  }
+
+  #sessionBrowser(): ManagedSessionBrowser {
+    const session = this.#session();
+    if (!session) throw new Error("session is not initialized");
+    return this.#browser ??= new ManagedSessionBrowser(
+      this.ctx, this.env, session.session_id,
+      context => this.#canUseExecutionNamespace(this.#authorizationForToolContext(context)),
+      () => this.#scheduleNextAlarm(),
+    );
   }
 
   async #prepareEnvironment(computer: Awaited<ReturnType<typeof createManagedComputerRuntime>>): Promise<void> {
@@ -8207,7 +8296,9 @@ export class DurableAgentSession extends DurableComputerSession {
         return undefined;
       },
     );
+    const browserTools = multiplayer || restrictedEnvironment ? [] : await this.#sessionBrowser().tools();
     const cloudTools: NamedTool[] = [
+      ...browserTools,
       ...(multiplayer ? [computer.tool] : []),
       ...(multiplayer ? [] : [managedMountTool(async (request, context) => {
         if (!this.#canUseExecutionNamespace(this.#authorizationForToolContext(context))) {
@@ -8398,7 +8489,7 @@ export class DurableAgentSession extends DurableComputerSession {
             "Hands appear as logical top-level paths returned by mount or listed in environment().hands. exec_command defaults to /brain; omit workdir or use /brain for Just Bash. For native execution, select the hand whose name and advertised capabilities match the user's project, and set workdir to its exact path or a path beneath it. The mount already maps to that workspace: if /laptop maps to /Users/me/repo, use /laptop for the project root or /laptop/src for its src directory; do not append the host's absolute workspace path. The root of that cwd selects where the process runs. write_stdin remains pinned to the hand that created its session. There is no host argument.",
             "A Code Mode cell captures its mount mapping. Commands in Promise.all may run concurrently on different cwd roots, and subagents use the same cwd rule independently. A disconnect or reconnect never retargets an admitted command or session.",
             "Cloudflare sandbox hands are separate retained workspaces mounted into each other's native filesystem namespaces. A process may write its executing hand through /workspace or that hand's logical mount path, read peer hand paths without mutating them, and read or write /brain using ordinary filesystem syscalls. The trees are mounted, never copied or synchronized. Connected user hands and future providers remain placement-only until their provider advertises a conforming native namespace adapter, so native_cross_mounts remains false globally while runtimeInfo.cloudflare_native_cross_mounts is true.",
-            "Use CUA with an explicit workdir for all browser interaction. Discover its provider contract through a workdir-only CUA JS call and follow that contract. Do not fall back to browser_execute, direct CDP, Playwright, or a separate browser automation runtime. If no suitable CUA Hand is attached, discover an available computer or mount a supported Hand. If that cannot provide CUA, report the concrete missing capability. Hosted browser execution and private browser Vault sessions are disabled. Never retrieve or expose Vault secrets, passwords, cookies, authorization material, or browser connection URLs, or pass them through CUA code or tool arguments. Ordinary public-web search remains available through tools.web__run.",
+            "Use browser_execute for hosted web browsing without mounting a VM or Hand. The managed browser uses the configured BROWSER provider. Follow the tool description: Kitesurf uses a one-shot connection, so complete navigation and inspection within one browser_execute call; protocol discovery is unavailable. For an attached computer's existing browser, use workdir-scoped CUA and discover its contract with a workdir-only call. Private browser Vault tools are unavailable; never retrieve or expose Vault secrets, passwords, cookies, authorization material, or browser connection URLs. Ordinary public-web search remains available through tools.web__run.",
             "Connected services expose first-party deferred tools alongside MCPs in tool_search. Search by service and operation (for example Spotify playlists); environment().accounts lists the tool names for connected services. Use the discovered service_request tool for authenticated JSON reads and writes, selecting the exact accounts[service].connections id when multiple accounts exist. Provider scopes and live grants still apply. Never automatically retry a write after an ambiguous failure.",
             "For ordinary account operations, environment is not a prerequisite to an explicit gh, git, curl, or other shell command. Those commands use transparent authenticated egress when the current grant permits it. environment is a tool, not a shell command.",
             "For a Nanocodex iPhone self-update requested from the phone, prefer the repository's apple/scripts/request-self-update.sh helper from a Cloudflare sandbox Hand. It dispatches the supported signed macOS Xcode delivery workflow, waits for the exact run, and writes its provider receipt to durable /brain/ios-deployments. Do not attempt to install Xcode in Linux or request Apple signing credentials; signing stays in GitHub Actions and Apple TestFlight performs supported distribution.",
@@ -10815,6 +10906,8 @@ export class DurableAgentSession extends DurableComputerSession {
     if (this.#deleting || !this.#sessionId()) return;
     const now = Date.now();
     const targets: number[] = [];
+    const browserAlarm = await this.ctx.storage.get<number>(ManagedSessionBrowser.alarmKey);
+    if (browserAlarm !== undefined) targets.push(browserAlarm);
     if (presentationPending(this.ctx.storage)) targets.push(now + 20_000);
     const webhookAlarm = this.#operations.nextAlarm();
     if (webhookAlarm !== undefined) targets.push(webhookAlarm);

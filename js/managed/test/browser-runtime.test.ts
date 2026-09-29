@@ -12,6 +12,7 @@ import {
   createManagedBrowserRuntime,
   CredentialSafeBrowserBinding,
   managedBrowserProvider,
+  KitesurfBrowserBinding,
   sanitizeBrowserToolResult,
 } from "../src/browser-runtime";
 
@@ -23,12 +24,24 @@ describe("managed browser deployment policy", () => {
   it("accepts only host-selected providers", () => {
     expect(managedBrowserProvider(undefined)).toBe("cloudflare");
     expect(managedBrowserProvider("browserbase")).toBe("browserbase");
+    expect(managedBrowserProvider(" KITESURF ")).toBe("kitesurf");
     expect(() => managedBrowserProvider("model-choice")).toThrow(
-      "MANAGED_BROWSER_PROVIDER must be cloudflare or browserbase",
+      "MANAGED_BROWSER_PROVIDER must be cloudflare, browserbase, or kitesurf",
     );
   });
 
-  it("configures the official runtime for durable provider-scoped reuse", async () => {
+  it("requires a BROWSER binding for Kitesurf before creating the runtime", async () => {
+    const createRuntime = vi.fn();
+    await expect(createManagedBrowserRuntime({
+      ctx: { storage: {} } as DurableObjectState,
+      env: { LOADER: {} as WorkerLoader, MANAGED_BROWSER_PROVIDER: "kitesurf" },
+      sessionId: "missing-binding",
+      createRuntime,
+    })).rejects.toThrow("Kitesurf browser provider requires the BROWSER binding");
+    expect(createRuntime).not.toHaveBeenCalled();
+  });
+
+  it.each(["cloudflare", "kitesurf"])("configures the %s runtime lifecycle", async (provider) => {
     let received: Record<string, unknown> | undefined;
     const swept = vi.fn(async () => ({ swept: [] }));
     const closed = vi.fn(async () => undefined);
@@ -52,29 +65,42 @@ describe("managed browser deployment policy", () => {
         },
       } as unknown as BrowserRuntime;
     });
-    const binding = { fetch: vi.fn(async () => new Response()) };
+    const binding = { fetch: vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => new Response()) };
     const runtime = await createManagedBrowserRuntime({
-      ctx: { storage: {} } as DurableObjectState,
+      ctx: { storage: { get: vi.fn(async () => undefined) } } as unknown as DurableObjectState,
       env: {
         BROWSER: binding,
         LOADER: {} as WorkerLoader,
-        MANAGED_BROWSER_PROVIDER: "cloudflare",
+        MANAGED_BROWSER_PROVIDER: provider,
       },
       sessionId: "agent-a",
+      ...(provider === "kitesurf" ? { resolveVaultLogin: vi.fn(), authorizeVaultAccess: vi.fn() } : {}),
       createRuntime,
     });
 
-    expect(runtime.provider).toBe("cloudflare");
+    expect(runtime.provider).toBe(provider);
     expect(runtime.tools.map(({ name }) => name)).toEqual(["browser_execute"]);
+    if (provider === "kitesurf") {
+      expect(runtime.tools[0]!.description).toContain("one-shot Kitesurf");
+      expect(runtime.tools[0]!.description).not.toContain("cdp.spec");
+      expect(runtime.tools[0]!.description).not.toContain("retained managed browser session");
+      await expect(runtime.submitVaultChallenge({}, new AbortController().signal)).rejects.toThrow("does not support private browser continuation");
+      await expect(runtime.submitVaultTakeover({}, new AbortController().signal)).rejects.toThrow("does not support private browser continuation");
+    }
     expect(received?.browser).toBeInstanceOf(CredentialSafeBrowserBinding);
     expect(received?.loader).toBeDefined();
     expect(received?.quickActions).toBe(false);
-    expect(received?.session).toEqual({
+    expect(received?.session).toEqual(provider === "kitesurf" ? { mode: "one-shot", browser: "kitesurf" } : {
       mode: "reuse",
       key: "primary",
       keepAliveMs: 600_000,
     });
-    expect(received?.name).toBe("managed-browser-cloudflare");
+    expect(received?.name).toBe(`managed-browser-${provider}`);
+    const transport = (received?.browser as CredentialSafeBrowserBinding).browser;
+    expect(transport instanceof KitesurfBrowserBinding).toBe(provider === "kitesurf");
+    await transport.fetch("https://localhost/v1/devtools/browser?targets=true", { headers: { Upgrade: "websocket" } });
+    const forwarded = new URL(String(binding.fetch.mock.calls[0]?.[0]));
+    expect(forwarded.searchParams.get("browser")).toBe(provider === "kitesurf" ? "kitesurf" : null);
 
     await runtime.expireAndSweep();
     await runtime.close();
@@ -592,5 +618,69 @@ describe("private browser verification lifecycle", () => {
       await expect(f.request()).rejects.toThrow("No supported");
       expect(f.stored.has(challengeKey)).toBe(false);
     } finally { f.connect.mockRestore(); }
+  });
+});
+
+describe("Kitesurf binding", () => {
+  it("forwards basic SDK target, navigation and DOM commands through credential policy", async () => {
+    const pair = new WebSocketPair();
+    pair[1].accept();
+    const received: unknown[] = [];
+    pair[1].addEventListener("message", event => { received.push(JSON.parse(String(event.data))); });
+    const binding = new CredentialSafeBrowserBinding(new KitesurfBrowserBinding({
+      fetch: async () => new Response(null, { status: 101, webSocket: pair[0] }),
+    }));
+    const client = (await binding.fetch("https://localhost/v1/devtools/browser")).webSocket!;
+    client.accept();
+    const commands = [
+      { id: 1, method: "Target.getTargets" },
+      { id: 2, method: "Target.attachToTarget", params: { targetId: "page", flatten: true } },
+      { id: 3, method: "Page.navigate", params: { url: "https://example.com" }, sessionId: "tab" },
+      { id: 4, method: "DOM.getDocument", sessionId: "tab" },
+    ];
+    for (const command of commands) client.send(JSON.stringify(command));
+    await vi.waitFor(() => expect(received).toEqual(commands));
+    client.close();
+    pair[1].close();
+  });
+
+  it.each(["string", "url", "request"])("preserves query and upgrade for %s input", async (kind) => {
+    const response = new Response();
+    const fetch = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => response);
+    const binding = new KitesurfBrowserBinding({ fetch });
+    const url = "https://localhost/v1/devtools/browser?browser=chromium&targets=true&tag=a&tag=b";
+    const input = kind === "string" ? url : kind === "url" ? new URL(url) : new Request(url);
+    const init = { headers: { Upgrade: "websocket" } };
+    expect(await binding.fetch(input, init)).toBe(response);
+    const [forwarded, options] = fetch.mock.calls[0]!;
+    const parsed = new URL(forwarded instanceof Request ? forwarded.url : String(forwarded));
+    expect(parsed.searchParams.getAll("browser")).toEqual(["kitesurf"]);
+    expect(parsed.searchParams.getAll("tag")).toEqual(["a", "b"]);
+    expect(parsed.searchParams.get("targets")).toBe("true");
+    expect(options).toBe(init);
+  });
+
+  it("preserves Request body, headers, signal and init overrides", async () => {
+    let captured: Request | undefined;
+    const binding = new KitesurfBrowserBinding({ fetch: async (input, init) => {
+      captured = new Request(input, init);
+      return new Response();
+    } });
+    const abort = new AbortController();
+    const request = new Request("https://localhost/v1/devtools/browser", {
+      method: "POST", body: "original", headers: { "x-original": "yes" }, signal: abort.signal,
+    });
+    await binding.fetch(request);
+    expect(captured!.method).toBe("POST");
+    expect(captured!.headers.get("x-original")).toBe("yes");
+    expect(await captured!.text()).toBe("original");
+    abort.abort();
+    expect(captured!.signal.aborted).toBe(true);
+    await binding.fetch(new Request("https://localhost/v1/devtools/browser", { method: "POST", body: "old" }), {
+      method: "PUT", body: "new", headers: { "x-override": "yes" },
+    });
+    expect(captured!.method).toBe("PUT");
+    expect(captured!.headers.get("x-override")).toBe("yes");
+    expect(await captured!.text()).toBe("new");
   });
 });
