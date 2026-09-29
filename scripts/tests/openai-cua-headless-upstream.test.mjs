@@ -60,7 +60,7 @@ async function syntheticProvider() {
   }
 }
 
-async function upstream(t, binary, sandbox, toolArguments = {}) {
+async function upstream(t, binary, sandbox, toolArguments = {}, cliOverride = false) {
   assert.ok(path.isAbsolute(binary), 'NANOCODEX_TEST_CODEX_BIN must be an absolute binary path');
   const directory = await mkdtemp(path.join(tmpdir(), 'nanocodex-headless-upstream-'));
   let stop;
@@ -73,7 +73,7 @@ async function upstream(t, binary, sandbox, toolArguments = {}) {
   await Promise.all([mkdir(codexHome, { recursive: true }), mkdir(workspace)]);
   // This isolated config never loads the user's CODEX_HOME or account secrets.
   await writeFile(path.join(codexHome, 'config.toml'), [
-    'approval_policy = "never"',
+    `approval_policy = ${JSON.stringify(cliOverride ? 'on-request' : 'never')}`,
     `sandbox_mode = ${JSON.stringify(sandbox)}`,
     '[mcp_servers.cua_repl]',
     `command = ${JSON.stringify(process.execPath)}`,
@@ -81,7 +81,8 @@ async function upstream(t, binary, sandbox, toolArguments = {}) {
     'startup_timeout_sec = 15',
     '',
   ].join('\n'), { mode: 0o600 });
-  const child = spawn(binary, ['app-server'], {
+  const cliArgs = cliOverride ? ['app-server', '-c', 'approval_policy="never"', '-c', 'sandbox_mode="danger-full-access"'] : ['app-server'];
+  const child = spawn(binary, cliArgs, {
     cwd: workspace,
     env: { HOME: home, CODEX_HOME: codexHome, PATH: '/usr/bin:/bin:/usr/sbin:/sbin', TMPDIR: directory },
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -147,7 +148,7 @@ async function upstream(t, binary, sandbox, toolArguments = {}) {
   assert.ok(Object.values(server.tools).some(tool => tool.name === 'js'));
   const thread = await request('thread/start', { ephemeral: true, historyMode: 'paginated', cwd: workspace });
   assert.equal(thread.approvalPolicy, 'never');
-  assert.equal(thread.sandbox.type, sandbox === 'danger-full-access' ? 'dangerFullAccess' : 'readOnly');
+  assert.equal(thread.sandbox.type, cliOverride || sandbox === 'danger-full-access' ? 'dangerFullAccess' : 'readOnly');
   const result = await request('mcpServer/tool/call', {
     threadId: thread.thread.id, server: 'cua_repl', tool: 'js', arguments: toolArguments,
   });
@@ -165,6 +166,11 @@ if (process.argv.includes(fixtureFlag)) {
   const options = { timeout: 60000, skip: !binary && 'Set NANOCODEX_TEST_CODEX_BIN to opt in to the official-runtime test' };
   test('official headless full-access + never resolves CUA empty form without client approval', options, async t => {
     const { decision } = await upstream(t, binary, 'danger-full-access');
+    assert.equal(decision.action, 'accept');
+    assert.deepEqual(decision.content, {});
+  });
+  test('CLI full-access + never overrides conflicting stored read-only and on-request without writing them', options, async t => {
+    const { decision } = await upstream(t, binary, 'read-only', {}, true);
     assert.equal(decision.action, 'accept');
     assert.deepEqual(decision.content, {});
   });

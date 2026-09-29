@@ -10,17 +10,20 @@ apply. Compatibility is capability-checked instead of pinned to a GUI build.
 
 ## Permission handling
 
-The official app server advertises MCP form support and applies the user's existing
-Codex permission policy. Under full-access authority, codex-rs can accept standard
-empty-form confirmations without a GUI. Nanocodex does not inject an approval,
-change sandbox or approval settings, add a permission dialog, or cache consent.
-The provider still checks app policy before issuing its confirmation request.
+The official app server advertises MCP form support. For the dedicated
+Nanocodex CUA child, its CLI invocation sets `approval_policy="never"` and
+`sandbox_mode="danger-full-access"` as **process-local overrides**. It does not
+edit `CODEX_HOME` or change a normal Codex session. Under that effective policy,
+the official server can resolve its standard empty-form CUA app requests
+noninteractively. The provider still checks its own app/organization/safety
+policy, and macOS privacy/accessibility controls remain in force.
 
-If upstream policy requires interactive input, the managed headless bridge declines
-that unresolved request for its own CUA thread. It never accepts it on the user's
-behalf, answers another client's requests, or opens an app to ask. Consequently,
-headless operation does not override restricted profiles, organization policy,
-macOS access controls, or upstream operations that require interactive input.
+There is no per-app Nanocodex approval dialog, no synthetic acceptance, and no
+stored consent decision. If the official server cannot resolve a form under the
+effective policy, the managed headless bridge declines that unresolved request
+for its own CUA thread. Requests for other threads/servers are ignored. This
+policy is not a password channel; one-off sudo authorization uses the separate
+`request_native_secure_input` enrolled-helper flow, bound to an exact command.
 
 ## Installation and lifecycle
 

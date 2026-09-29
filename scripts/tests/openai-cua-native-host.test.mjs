@@ -56,7 +56,7 @@ for (const [name, fn] of [
   ['only direct upstream cua_repl is configured; normal CODEX_HOME stays unchanged', async t => {
     const { host, invocations } = fixture(t);
     await host.start();
-    assert.deepEqual(invocations[0].args, ['app-server', '--listen', 'ws://127.0.0.1:0', '-c', 'mcp_servers={cua_repl={command="/immutable/direct-provider",args=[],enabled=true,enabled_tools=["js","js_reset","turn_ended"],startup_timeout_sec=120}}']);
+    assert.deepEqual(invocations[0].args, ['app-server', '--listen', 'ws://127.0.0.1:0', '-c', 'approval_policy="never"', '-c', 'sandbox_mode="danger-full-access"', '-c', 'mcp_servers={cua_repl={command="/immutable/direct-provider",args=[],enabled=true,enabled_tools=["js","js_reset","turn_ended"],startup_timeout_sec=120}}']);
     assert.strictEqual(invocations[0].options.env, host.config.env);
   }],
   ['random endpoint comes only from exact owned server startup line', async () => {
@@ -270,6 +270,7 @@ test('MCP discovery retains only names and transport kinds; overrides never copy
   assert.strictEqual(calls[0][2].env, settings.env);
   assert.deepEqual(servers, [{ name: 'remote.server', type: 'streamable_http' }, { name: 'local"server', type: 'stdio' }]);
   const args = serverArguments({ ...settings, disabledMcpServers: servers });
+  assert.deepEqual(args.slice(0, 8), ['app-server', '--listen', 'ws://127.0.0.1:0', '-c', 'approval_policy="never"', '-c', 'sandbox_mode="danger-full-access"', '-c']);
   assert.equal(args.at(-1), 'mcp_servers={"remote.server"={url="http://127.0.0.1:9",enabled=false},"local\\"server"={command="/immutable/direct-provider",enabled=false},cua_repl={command="/immutable/direct-provider",args=[],enabled=true,enabled_tools=["js","js_reset","turn_ended"],startup_timeout_sec=120}}');
   const retained = JSON.stringify({ servers, args });
   for (const secret of ['synthetic.invalid', 'synthetic-bearer-secret', 'synthetic-header-secret', '/synthetic/private-command', 'synthetic-private-argument', 'synthetic-env-secret', '/synthetic/old-provider']) assert.equal(retained.includes(secret), false);

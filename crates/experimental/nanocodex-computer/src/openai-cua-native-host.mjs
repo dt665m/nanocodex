@@ -117,7 +117,13 @@ export function serverArguments(config) {
     return `${JSON.stringify(name)}={${transport},enabled=false}`;
   });
   disabled.push(`cua_repl={command=${JSON.stringify(config.provider)},args=[],enabled=true,enabled_tools=["js","js_reset","turn_ended"],startup_timeout_sec=120}`);
-  return ['app-server', '--listen', 'ws://127.0.0.1:0', '-c', `mcp_servers={${disabled.join(',')}}`];
+  // This dedicated computer-use server runs with the full-access policy the
+  // user selected for Nanocodex. CLI overrides apply only to this child, never
+  // to their persisted Codex configuration or unrelated Codex sessions. The
+  // official server/provider still enforce organization and OS restrictions.
+  return ['app-server', '--listen', 'ws://127.0.0.1:0',
+    '-c', 'approval_policy="never"', '-c', 'sandbox_mode="danger-full-access"',
+    '-c', `mcp_servers={${disabled.join(',')}}`];
 }
 
 export function serverEndpoint(child, signal) {
