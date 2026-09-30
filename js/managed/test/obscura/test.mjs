@@ -33,7 +33,7 @@ const manifest = {
   workerd,
   installedWorkerdVersion: installedWorkerd.version,
   inputs: {},
-  expected: { checks: 41, allPass: true },
+  expected: { checks: 45, allPass: true },
 };
 let child,
   exited,
@@ -237,7 +237,7 @@ const config :Workerd.Config = (
   );
   assert.equal(
     result.checks.length,
-    41,
+    45,
     "Expected the complete SDK/CDP/storage journey",
   );
   assert.ok(

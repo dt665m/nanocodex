@@ -683,6 +683,8 @@ Vault and credential headers are rejected before routing, and each redirect
 must return through the same policy. There is no raw-fetch fallback. Account
 public egress strips cookies and authorization; cookie-backed sessions and
 authenticated browsing therefore do not work through this network binding.
+Responses are currently limited to 2 MiB, which blocks modern Sage/Arketa and
+Stripe checkout bundles. Obscura cannot complete those checkout flows.
 Page scripts cannot make cross-origin API requests; unsupported CORS requests
 fail closed. Browser state snapshots are not wired into this provider.
 

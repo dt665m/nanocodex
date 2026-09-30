@@ -103,6 +103,16 @@ async function journey(call, events, checks) {
     "child-edited-typed",
   );
   await page("Runtime.releaseObject", { objectId: resolved.object.objectId });
+  const plain = await page("Runtime.evaluate", {
+    expression: "({answer:42})",
+    awaitPromise: true,
+    returnByValue: true,
+  });
+  eq(
+    "awaitPromise accepts a plain object without releasing it early",
+    plain.result.value,
+    { answer: 42 },
+  );
   const promise = await page("Runtime.evaluate", {
     expression: 'new Promise(r=>setTimeout(()=>r("resolved"),10))',
     awaitPromise: true,
@@ -114,6 +124,34 @@ async function journey(call, events, checks) {
     returnByValue: true,
   });
   eq("exception reported", !!err.exceptionDetails, true);
+  const largeScript = await page("Runtime.evaluate", {
+    expression:
+      'new Promise(resolve=>{const s=document.createElement("script");s.src="/large.js";s.onload=()=>resolve("loaded");s.onerror=()=>resolve("error");document.head.appendChild(s)})',
+    awaitPromise: true,
+    returnByValue: true,
+  });
+  eq(
+    "oversized script dispatches an error event",
+    largeScript.result.value,
+    "error",
+  );
+  const oversized = await page("Runtime.evaluate", {
+    expression:
+      'fetch("/oversized").then(()=>false,e=>String(e).includes("2 MiB"))',
+    awaitPromise: true,
+    returnByValue: true,
+  });
+  eq(
+    "streamed response exceeding 2 MiB is rejected",
+    oversized.result.value,
+    true,
+  );
+  const noContent = await page("Runtime.evaluate", {
+    expression: 'fetch("/no-content").then(r=>r.status)',
+    awaitPromise: true,
+    returnByValue: true,
+  });
+  eq("bodyless HTTP 204 is preserved", noContent.result.value, 204);
   let rejected = false;
   try {
     await page("Page.captureScreenshot");

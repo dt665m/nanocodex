@@ -365,10 +365,8 @@ export class ObscuraBrowser {
         while (true) {
           const state = vm.getPromiseState(h);
           if (state.type === "fulfilled") {
-            if (state.notAPromise) {
-              state.value.dispose();
-              break;
-            }
+            // A non-promise state borrows h; only the outer finally owns it.
+            if (state.notAPromise) break;
             h.dispose();
             h = state.value;
             break;

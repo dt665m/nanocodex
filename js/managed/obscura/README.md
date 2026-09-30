@@ -17,6 +17,11 @@ frames, default execution contexts, JavaScript evaluation, function calls,
 remote object references, pierced DOM queries, focus and text insertion use the
 actual Wasm DOM and QuickJS contexts. Unsupported commands return errors.
 
+Responses are bounded at 2 MiB. Live Sage/Arketa and Stripe checkout scripts
+exceed this limit, so these flows cannot initialize. Raising the limit also
+reproduced a QuickJS teardown assertion after a dynamically loaded 3 MiB script;
+the larger limit is not enabled.
+
 Screenshots, layout and coordinate input are not implemented. This is not a
 complete Chromium/Puppeteer replacement. Named isolated worlds and full
 cross-realm same-origin object identity are not implemented. Documents are

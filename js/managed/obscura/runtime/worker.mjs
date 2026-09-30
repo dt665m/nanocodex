@@ -13,6 +13,8 @@ import { BrowserSession, attachPageSession } from "./browser-session.mjs";
 import bootstrap from "bootstrap-source";
 import { ObscuraBrowser } from "./browser.mjs";
 import { protocol } from "./protocol.mjs";
+// Keep large scripts out until QuickJS large-payload teardown is supported.
+const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 let initialized;
 const sessions = new Map();
 function initialize() {
@@ -103,7 +105,7 @@ export default {
       const { kind, ...options } = init;
       const response = await env.NETWORK.fetch(new Request(target, options));
       const declared = Number(response.headers.get("content-length") || 0);
-      if (declared > 2 * 1024 * 1024)
+      if (declared > MAX_RESPONSE_BYTES)
         throw new Error("Browser response exceeds 2 MiB");
       const reader = response.body?.getReader();
       const chunks = [];
@@ -114,7 +116,7 @@ export default {
             const r = await reader.read();
             if (r.done) break;
             size += r.value.byteLength;
-            if (size > 2 * 1024 * 1024)
+            if (size > MAX_RESPONSE_BYTES)
               throw new Error("Browser response exceeds 2 MiB");
             chunks.push(r.value);
           }
@@ -128,10 +130,13 @@ export default {
         bytes.set(c, offset);
         offset += c.byteLength;
       }
-      const bounded = new Response(bytes, {
-        status: response.status,
-        headers: response.headers,
-      });
+      const bounded = new Response(
+        [204, 205, 304].includes(response.status) ? null : bytes,
+        {
+          status: response.status,
+          headers: response.headers,
+        },
+      );
       Object.defineProperty(bounded, "url", { value: response.url || target });
       return bounded;
     };
