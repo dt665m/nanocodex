@@ -659,7 +659,7 @@ export class ObscuraBrowser {
     if (method === "Input.insertText") {
       const page = t.focused || t.page;
       page.run(
-        `(()=>{const el=document.activeElement;if(!el||!('value' in el))throw new Error('No editable element focused');if(el.disabled||el.readOnly)throw new Error('Focused element is not editable');el.value=el.value+${JSON.stringify(p.text)};el.dispatchEvent(new Event('input',{bubbles:true}));})()`,
+        `(()=>{const el=document.activeElement;if(!el||!('value' in el))throw new Error('No editable element focused');if(el.disabled||el.readOnly)throw new Error('Focused element is not editable');const text=${JSON.stringify(p.text)};const before=new InputEvent('beforeinput',{bubbles:true,cancelable:true,data:text,inputType:'insertText'});if(!el.dispatchEvent(__obscura_markTrusted(before)))return;let proto=Object.getPrototypeOf(el),setter;while(proto&&!(setter=Object.getOwnPropertyDescriptor(proto,'value')?.set))proto=Object.getPrototypeOf(proto);if(!setter)throw new Error('No native editable value setter');setter.call(el,el.value+text);el.dispatchEvent(__obscura_markTrusted(new InputEvent('input',{bubbles:true,data:text,inputType:'insertText'})));})()`,
       );
       return {};
     }

@@ -108,10 +108,25 @@ async function journey(call, events, checks) {
     selector: "#child-input",
   });
   eq("child scoped DOM query", q.nodeId, input.nodeId);
+  await evalAt(
+    'document.querySelector("input").addEventListener("input",e=>globalThis.inputEcho=[e.data,e.inputType,e.isTrusted]);document.querySelector("input").addEventListener("beforeinput",e=>{if(e.data==="blocked")e.preventDefault()})',
+    child,
+  );
   await page("DOM.focus", { nodeId: input.nodeId });
   await page("Input.insertText", { text: "-typed" });
   eq(
     "typing reaches child",
+    (await evalAt('document.querySelector("input").value', child)).result.value,
+    "child-edited-typed",
+  );
+  eq(
+    "typing delivers browser input metadata",
+    (await evalAt("inputEcho", child)).result.value,
+    ["-typed", "insertText", true],
+  );
+  await page("Input.insertText", { text: "blocked" });
+  eq(
+    "cancelled beforeinput prevents editing",
     (await evalAt('document.querySelector("input").value', child)).result.value,
     "child-edited-typed",
   );
@@ -143,6 +158,17 @@ async function journey(call, events, checks) {
     returnByValue: true,
   });
   eq("promise runs jobs and timers", promise.result.value, "resolved");
+  const cancelled = await page("Runtime.evaluate", {
+    expression:
+      'new Promise(resolve=>{const id=setTimeout(()=>resolve("fired"),10);clearTimeout(id);setTimeout(()=>resolve("cancelled"),30)})',
+    awaitPromise: true,
+    returnByValue: true,
+  });
+  eq(
+    "timer cancellation preserves the host bridge contract",
+    cancelled.result.value,
+    "cancelled",
+  );
   const err = await page("Runtime.evaluate", {
     expression: 'throw new Error("fixture error")',
     returnByValue: true,
@@ -169,6 +195,28 @@ async function journey(call, events, checks) {
     "streamed response exceeding 16 MiB is rejected",
     oversized.result.value,
     true,
+  );
+  await evalAt(
+    '(()=>{const e=document.createElement("input");e.id="dynamic-input";e.name="dynamic";e.setAttribute("data-fixture","before\\u0000after");document.body.appendChild(e)})()',
+  );
+  const dynamic = await page("DOM.querySelector", {
+    nodeId: doc.root.nodeId,
+    selector: "input[name=dynamic]",
+  });
+  const dynamicAttributes = dynamic.nodeId
+    ? await page("DOM.getAttributes", { nodeId: dynamic.nodeId })
+    : { attributes: [] };
+  eq(
+    "dynamic attributes including NUL reach the Wasm DOM",
+    dynamicAttributes.attributes,
+    [
+      "id",
+      "dynamic-input",
+      "name",
+      "dynamic",
+      "data-fixture",
+      "before\u0000after",
+    ],
   );
   const noContent = await page("Runtime.evaluate", {
     expression: 'fetch("/no-content").then(r=>r.status)',

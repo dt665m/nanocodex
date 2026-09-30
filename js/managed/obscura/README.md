@@ -16,6 +16,10 @@ Implemented CDP commands are advertised through protocol discovery. Targets,
 frames, default execution contexts, JavaScript evaluation, function calls,
 remote object references, pierced DOM queries, focus and text insertion use the
 actual Wasm DOM and QuickJS contexts. Unsupported commands return errors.
+Host op arguments cross QuickJS as JSON so embedded NUL delimiters and attribute
+values survive the FFI boundary. Text insertion appends to the focused editable
+field through its native setter and emits cancellable `beforeinput` followed by
+`input`; full keyboard and selection editing are not implemented.
 
 Responses are bounded at 16 MiB. QuickJS's FFI output views are refreshed after
 Wasm memory growth through a pinned package patch; large dynamically loaded

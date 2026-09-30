@@ -2976,17 +2976,21 @@ function createObscuraHost({
         h.dispose();
       };
       const json = (value) => vm.newString(JSON.stringify(value));
-      const sync = (name, fn) => expose(name, (...args) => {
-        const values = args.map((h) => vm.dump(h));
-        append(opCalls, [name, ...values]);
-        const v = fn(...values);
-        if (v === void 0) return vm.undefined;
-        if (v === null) return vm.null;
-        if (typeof v === "string") return vm.newString(v);
-        if (typeof v === "number") return vm.newNumber(v);
-        if (typeof v === "boolean") return v ? vm.true : vm.false;
-        return json(v);
-      });
+      const wireOps = /* @__PURE__ */ new Set();
+      const sync = (name, fn) => {
+        wireOps.add(name);
+        expose(name, (encoded) => {
+          const values = JSON.parse(vm.getString(encoded));
+          append(opCalls, [name, ...values]);
+          const v = fn(...values);
+          if (v === void 0) return vm.undefined;
+          if (v === null) return vm.null;
+          if (typeof v === "string") return vm.newString(v);
+          if (typeof v === "number") return vm.newNumber(v);
+          if (typeof v === "boolean") return v ? vm.true : vm.false;
+          return json(v);
+        });
+      };
       const cancelTask = (timer) => {
         const release = pageTasks.get(timer);
         if (!release) return;
@@ -3038,35 +3042,38 @@ function createObscuraHost({
           dom.free?.();
         }
       };
-      const asyncOp = (name, fn) => expose(name, (...args) => {
-        const values = args.map((h) => vm.dump(h)), d = vm.newPromise();
-        pending.add(d);
-        Promise.resolve().then(() => fn(...values)).then(
-          (value) => {
-            if (!closed) {
-              const h = vm.newString(
-                typeof value === "string" ? value : JSON.stringify(value)
-              );
-              d.resolve(h);
-              h.dispose();
+      const asyncOp = (name, fn) => {
+        wireOps.add(name);
+        expose(name, (encoded) => {
+          const values = JSON.parse(vm.getString(encoded)), d = vm.newPromise();
+          pending.add(d);
+          Promise.resolve().then(() => fn(...values)).then(
+            (value) => {
+              if (!closed) {
+                const h = vm.newString(
+                  typeof value === "string" ? value : JSON.stringify(value)
+                );
+                d.resolve(h);
+                h.dispose();
+              }
+            },
+            (error) => {
+              if (!closed) {
+                const h = vm.newError(String(error));
+                d.reject(h);
+                h.dispose();
+              }
             }
-          },
-          (error) => {
+          ).finally(() => {
             if (!closed) {
-              const h = vm.newError(String(error));
-              d.reject(h);
-              h.dispose();
+              pending.delete(d);
+              pump();
+              d.dispose();
             }
-          }
-        ).finally(() => {
-          if (!closed) {
-            pending.delete(d);
-            pump();
-            d.dispose();
-          }
+          });
+          return d.handle;
         });
-        return d.handle;
-      });
+      };
       sync("op_dom", (cmd, a1, a2, requestedFrame) => {
         if (requestedFrame !== frameId) throw new Error("Incorrect DOM frame");
         if (/^(set_|append_child|remove_child|insert_before|document_write)/.test(
@@ -3388,7 +3395,7 @@ function createObscuraHost({
         "op_post_frame_message"
       ];
       run(
-        `globalThis.Deno={core:{ops:{${opNames.map((n) => `${n}:${n}`).join(",")}},createTimer:__hostCreateTimer,cancelTimer:__hostCancelTimer,setUnhandledPromiseRejectionHandler(){},setHandledPromiseRejectionHandler(){}}};`,
+        `(()=>{const encode=JSON.stringify;globalThis.Deno={core:{ops:{${opNames.map((n) => `${n}:${wireOps.has(n) ? `((native)=>(...args)=>native(encode(args)))(${n})` : n}`).join(",")}},createTimer:__hostCreateTimer,cancelTimer:((native)=>(...args)=>native(encode(args)))(__hostCancelTimer),setUnhandledPromiseRejectionHandler(){},setHandledPromiseRejectionHandler(){}}};})();`,
         "host-setup.js"
       );
       run(bootstrap2, "bootstrap.js");
@@ -10913,7 +10920,7 @@ var ObscuraBrowser = class {
     if (method === "Input.insertText") {
       const page = t.focused || t.page;
       page.run(
-        `(()=>{const el=document.activeElement;if(!el||!('value' in el))throw new Error('No editable element focused');if(el.disabled||el.readOnly)throw new Error('Focused element is not editable');el.value=el.value+${JSON.stringify(p.text)};el.dispatchEvent(new Event('input',{bubbles:true}));})()`
+        `(()=>{const el=document.activeElement;if(!el||!('value' in el))throw new Error('No editable element focused');if(el.disabled||el.readOnly)throw new Error('Focused element is not editable');const text=${JSON.stringify(p.text)};const before=new InputEvent('beforeinput',{bubbles:true,cancelable:true,data:text,inputType:'insertText'});if(!el.dispatchEvent(__obscura_markTrusted(before)))return;let proto=Object.getPrototypeOf(el),setter;while(proto&&!(setter=Object.getOwnPropertyDescriptor(proto,'value')?.set))proto=Object.getPrototypeOf(proto);if(!setter)throw new Error('No native editable value setter');setter.call(el,el.value+text);el.dispatchEvent(__obscura_markTrusted(new InputEvent('input',{bubbles:true,data:text,inputType:'insertText'})));})()`
       );
       return {};
     }

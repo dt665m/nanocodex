@@ -142,9 +142,14 @@ export function createObscuraHost({
         h.dispose();
       };
       const json = (value) => vm.newString(JSON.stringify(value));
-      const sync = (name, fn) =>
-        expose(name, (...args) => {
-          const values = args.map((h) => vm.dump(h));
+      const wireOps = new Set();
+      // QuickJS's C-string dump truncates embedded NULs. Serialize complete
+      // argument tuples in the guest before crossing FFI (DOM attributes use
+      // NUL delimiters). Callback-bearing ops keep their handle-based bridge.
+      const sync = (name, fn) => {
+        wireOps.add(name);
+        expose(name, (encoded) => {
+          const values = JSON.parse(vm.getString(encoded));
           append(opCalls, [name, ...values]);
           const v = fn(...values);
           if (v === undefined) return vm.undefined;
@@ -154,6 +159,7 @@ export function createObscuraHost({
           if (typeof v === "boolean") return v ? vm.true : vm.false;
           return json(v);
         });
+      };
       const cancelTask = (timer) => {
         const release = pageTasks.get(timer);
         if (!release) return;
@@ -204,9 +210,10 @@ export function createObscuraHost({
           dom.free?.();
         }
       };
-      const asyncOp = (name, fn) =>
-        expose(name, (...args) => {
-          const values = args.map((h) => vm.dump(h)),
+      const asyncOp = (name, fn) => {
+        wireOps.add(name);
+        expose(name, (encoded) => {
+          const values = JSON.parse(vm.getString(encoded)),
             d = vm.newPromise();
           pending.add(d);
           Promise.resolve()
@@ -238,6 +245,7 @@ export function createObscuraHost({
             });
           return d.handle;
         });
+      };
       sync("op_dom", (cmd, a1, a2, requestedFrame) => {
         if (requestedFrame !== frameId) throw new Error("Incorrect DOM frame");
         if (
@@ -597,7 +605,7 @@ export function createObscuraHost({
         "op_post_frame_message",
       ];
       run(
-        `globalThis.Deno={core:{ops:{${opNames.map((n) => `${n}:${n}`).join(",")}},createTimer:__hostCreateTimer,cancelTimer:__hostCancelTimer,setUnhandledPromiseRejectionHandler(){},setHandledPromiseRejectionHandler(){}}};`,
+        `(()=>{const encode=JSON.stringify;globalThis.Deno={core:{ops:{${opNames.map((n) => `${n}:${wireOps.has(n) ? `((native)=>(...args)=>native(encode(args)))(${n})` : n}`).join(",")}},createTimer:__hostCreateTimer,cancelTimer:((native)=>(...args)=>native(encode(args)))(__hostCancelTimer),setUnhandledPromiseRejectionHandler(){},setHandledPromiseRejectionHandler(){}}};})();`,
         "host-setup.js",
       );
       run(bootstrap, "bootstrap.js");
