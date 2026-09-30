@@ -70,3 +70,24 @@ Actions and persisted saves are serialized. `@State` edits do not write storage.
 ## Host API
 
 Link the `NanocodexApps` Swift package. Supply `NativeAppHost(loadState:saveState:runAgent:)`; state is `[String: AppValue]` with ordinary JSON encoding. Construct `try NativeAppSession(source:host:)`, call `try await session.start()`, and display `NativeAppView(session:)`. Optional synchronous `beginAction` and `commitAction` host callbacks bracket an explicit action. Commit is called only after action execution, rendering, and any persisted save all succeed; errors leave the receipt uncommitted, and bindings invoke neither callback. Hosts can use these callbacks to retain idempotent external-operation receipts across local failures. Keep these callbacks nonthrowing; if durable receipt cleanup fails, retain the receipt for recovery. Call `invalidate()` on teardown. `NativeAppSession.validate(source:)` checks source without executing it.
+
+## Validate before publishing
+
+The `apps` tool's `validate` operation runs the installed `swift-v1` parser and
+interpreter on an online native Hand. Provide `runtime`, `source`, and optional
+isolated `state` and `steps`. Steps support `tap` with a button `title`, `set` with
+`binding` and `value`, `expect` with exact rendered `text`, and `reopen`. The
+validator always initializes the app and reopens its persisted test state. Use
+representative inputs and expected totals before claiming an app is ready.
+
+Saves and restores also require native preflight. An edit is checked against a
+copy of the current saved data; concurrent data changes invalidate that check
+and require a retry. A validation failure includes its stage and native
+line diagnostic and does not replace the saved source. An unavailable validator
+blocks publication; open an updated native Nanocodex Hand and retry.
+
+Validation never changes the app's real data or calls a live agent. An optional
+`agent_response` supplies an explicit test fixture. Results describe only the
+supplied journey and return bounded interpreter trees, not screenshots or a
+full Swift compiler typecheck. Visual layout should also be inspected when
+relevant.
