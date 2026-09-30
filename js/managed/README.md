@@ -663,7 +663,7 @@ or silent provider fallback. Operators can explicitly select `chromium` for
 one-shot Chromium browsing or `cloudflare` for the retained private-browser integration. Neither Browser Run
 engine requires a Nanocodex VM.
 
-Run the [local Kitesurf smoke test](scripts/kitesurf-smoke.md) to verify the real
+Run the [local hosted browser smoke test](scripts/kitesurf-smoke.md) to verify the real
 remote binding through the managed runtime before rollout.
 
 ### Spotify on iPhone
