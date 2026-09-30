@@ -3145,7 +3145,7 @@ mod tests {
     fn secure_input_with_images_fails_locally_without_chat_fallback() {
         let mut composer = Composer::new(Path::new("/work"), ReasoningEffort::Medium);
         composer.replace_draft("/secure-input".to_owned());
-        composer.images.push(PastedImage {
+        composer.images.push(super::PastedImage {
             range: 0..0,
             data_url: "data:image/png;base64,".into(),
         });
