@@ -173,6 +173,9 @@ fn walk(
 /// Authenticated command description, bound to its request and validated digest.
 /// No serialization is available; this is for private local review only.
 pub struct NativeSecureInputDescription {
+    /// Account UUID supplied only by the authenticated private account route.
+    /// It is never taken from model-visible tool output.
+    pub account_id: String,
     /// Pending request UUID.
     pub request_id: String,
     /// Enrolled recipient machine.
@@ -188,6 +191,7 @@ pub struct NativeSecureInputDescription {
     /// Unix-millisecond expiry.
     pub expires_at: u64,
     command_digest: String,
+    authenticated_account_id: String,
     public_key: PublicKey,
     binding: NativeSecureInputRequest,
 }
@@ -201,8 +205,21 @@ struct CommandBinding<'a> {
 }
 
 impl NativeSecureInputDescription {
-    fn parse(value: &Value, request: &NativeSecureInputRequest) -> Result<Self, ManagedError> {
+    /// Canonical base64 SHA-256 binding of the authenticated reviewed command.
+    /// This nonsecret value may be shown in the private approval UI.
+    pub fn command_digest(&self) -> &str {
+        &self.command_digest
+    }
+
+    fn parse(
+        value: &Value,
+        request: &NativeSecureInputRequest,
+        account_id: &str,
+    ) -> Result<Self, ManagedError> {
         request.validate(true)?;
+        if !valid_uuid(account_id) {
+            return Err(invalid());
+        }
         exact_keys(
             value,
             &[
@@ -273,6 +290,8 @@ impl NativeSecureInputDescription {
         }
         let public_key = PublicKey::from_sec1_bytes(&key).map_err(|_| invalid())?;
         Ok(Self {
+            account_id: account_id.to_owned(),
+            authenticated_account_id: account_id.to_owned(),
             request_id: request.request_id.clone(),
             machine_id: machine.to_owned(),
             executable,
@@ -306,7 +325,8 @@ impl NativeSecureInputDescription {
             uid: self.uid,
         })
         .map_err(|_| invalid())?;
-        if self.request_id != self.binding.request_id
+        if self.account_id != self.authenticated_account_id
+            || self.request_id != self.binding.request_id
             || Some(self.machine_id.as_str()) != self.binding.machine_id.as_deref()
             || Some(self.expires_at) != self.binding.expires_at
             || self.uid == 0
@@ -456,13 +476,16 @@ impl ManagedClient {
         request: &NativeSecureInputRequest,
     ) -> Result<NativeSecureInputDescription, ManagedError> {
         request.validate(true)?;
+        // Read identity through the same immutable bearer/transport policy. Never
+        // accept an account label from model-visible receipt metadata.
+        let account_id = self.native_secure_input_account_id().await?;
         let value = self
             .native_secure_input_post(
                 request,
                 json!({"request_id": request.request_id, "action": "describe"}),
             )
             .await?;
-        NativeSecureInputDescription::parse(&value, request)
+        NativeSecureInputDescription::parse(&value, request, &account_id)
     }
 
     /// Submits ciphertext exactly once. No plaintext or model tool dispatch is used.
@@ -511,6 +534,27 @@ impl ManagedClient {
         NativeSecureInputReceipt::parse(&value, request, true)
     }
 
+    async fn native_secure_input_account_id(&self) -> Result<String, ManagedError> {
+        let value = self
+            .native_secure_input_response(
+                self.http
+                    .get(self.url("v1/me")?)
+                    .timeout(Duration::from_secs(30)),
+            )
+            .await?;
+        let account_id = string(&value["user"], "id")?;
+        if !valid_uuid(account_id)
+            || value["user"]["persistent"] != Value::Bool(true)
+            || !matches!(
+                string(&value, "authentication")?,
+                "api_key" | "account_session"
+            )
+        {
+            return Err(invalid());
+        }
+        Ok(account_id.to_owned())
+    }
+
     async fn native_secure_input_post(
         &self,
         request: &NativeSecureInputRequest,
@@ -519,11 +563,19 @@ impl ManagedClient {
         let path = format!("v1/agents/{}/native-secure-input", request.agent_id);
         // Do not use send_with_access: even its rejected-access recovery can replay a write.
         // The pool's fixed bearer authorization and redirect-disabled policy still apply.
-        let mut builder = self
-            .http
-            .post(self.url(&path)?)
-            .timeout(Duration::from_secs(30))
-            .json(&body);
+        self.native_secure_input_response(
+            self.http
+                .post(self.url(&path)?)
+                .timeout(Duration::from_secs(30))
+                .json(&body),
+        )
+        .await
+    }
+
+    async fn native_secure_input_response(
+        &self,
+        mut builder: reqwest::RequestBuilder,
+    ) -> Result<Value, ManagedError> {
         if let Some(origin) = &self.request_origin {
             builder = builder.header("x-nanocodex-client-context", origin);
         }
@@ -607,7 +659,7 @@ mod tests {
     use axum::{
         Json, Router,
         http::{HeaderMap, StatusCode},
-        routing::post,
+        routing::{get, post},
     };
     use p256::{SecretKey, ecdh::diffie_hellman};
     use std::sync::{
@@ -616,6 +668,7 @@ mod tests {
     };
 
     const ID: &str = "cbbfa5ef-2e4b-45f7-9c98-3913f8ca87cf";
+    const ACCOUNT: &str = "a14681d3-6c58-4ff7-9b25-3f56f5a9e8d3";
     const AGENT: &str = "private_agent";
     const MACHINE: &str = "linux-test";
     const PATH: &str = "/v1/agents/private_agent/native-secure-input";
@@ -659,7 +712,7 @@ mod tests {
         request: &NativeSecureInputRequest,
         secret: &SecretKey,
     ) -> NativeSecureInputDescription {
-        NativeSecureInputDescription::parse(&ticket(request, secret), request).unwrap()
+        NativeSecureInputDescription::parse(&ticket(request, secret), request, ACCOUNT).unwrap()
     }
     fn decrypt(secret: &SecretKey, envelope: &NativeSecureInputEnvelope) -> Value {
         let ephemeral =
@@ -680,6 +733,16 @@ mod tests {
         serde_json::from_slice(&plaintext).unwrap()
     }
     async fn client(app: Router) -> (ManagedClient, tokio::task::JoinHandle<()>) {
+        client_without_account(app.route(
+            "/v1/me",
+            get(|headers: HeaderMap| async move {
+                assert_auth(&headers);
+                Json(json!({"user":{"id":ACCOUNT,"persistent":true},"authentication":"api_key"}))
+            }),
+        ))
+        .await
+    }
+    async fn client_without_account(app: Router) -> (ManagedClient, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -805,13 +868,19 @@ mod tests {
                 .as_object_mut()
                 .unwrap()
                 .extend(patch.as_object().unwrap().clone());
-            assert!(NativeSecureInputDescription::parse(&altered, &request).is_err());
+            assert!(NativeSecureInputDescription::parse(&altered, &request, ACCOUNT).is_err());
         }
         let selector = NativeSecureInputRequest::selector(ID, AGENT).unwrap();
-        assert!(NativeSecureInputDescription::parse(&raw, &selector).is_ok());
+        assert!(NativeSecureInputDescription::parse(&raw, &selector, ACCOUNT).is_ok());
+        for account in ["not-account-uuid".to_owned(), ACCOUNT.to_uppercase()] {
+            assert!(NativeSecureInputDescription::parse(&raw, &selector, &account).is_err());
+        }
+        let mut model_account = raw.clone();
+        model_account["account_id"] = Value::String(ACCOUNT.to_owned());
+        assert!(NativeSecureInputDescription::parse(&model_account, &selector, ACCOUNT).is_err());
         let mut expired = request.clone();
         expired.expires_at = Some(now() - 1);
-        assert!(NativeSecureInputDescription::parse(&raw, &expired).is_err());
+        assert!(NativeSecureInputDescription::parse(&raw, &expired, ACCOUNT).is_err());
         assert!(bytes("AA==", 1).is_ok());
         assert!(bytes("AB==", 1).is_err());
     }
@@ -821,6 +890,14 @@ mod tests {
         let request = fixture_request();
         let secret = SecretKey::random(&mut OsRng);
         let mut description = description(&request, &secret);
+        assert_eq!(description.account_id, ACCOUNT);
+        assert_eq!(
+            description.command_digest(),
+            ticket(&request, &secret)["command_digest"]
+        );
+        description.account_id = "00000000-0000-0000-0000-000000000000".to_owned();
+        assert!(description.encrypt("never").is_err());
+        description.account_id = ACCOUNT.to_owned();
         let envelope = description
             .encrypt_secret(Zeroizing::new("fixture-only-雪".to_owned()))
             .unwrap();
@@ -840,6 +917,87 @@ mod tests {
         assert!(description.encrypt(&"x".repeat(4097)).is_err());
         description.arguments.push("tampered".to_owned());
         assert!(description.encrypt("never").is_err());
+    }
+
+    #[tokio::test]
+    async fn private_account_identity_fails_closed_before_describe_and_never_retries() {
+        for (status, response) in [
+            (
+                StatusCode::UNAUTHORIZED,
+                json!({"message":"REMOTE_IDENTITY_BODY"}),
+            ),
+            (
+                StatusCode::OK,
+                json!({"user":{"id":ACCOUNT,"persistent":true},"authentication":"connect_grant"}),
+            ),
+            (
+                StatusCode::OK,
+                json!({"user":{"id":ACCOUNT,"persistent":false},"authentication":"api_key"}),
+            ),
+            (
+                StatusCode::OK,
+                json!({"user":{"id":"bad\nREMOTE_IDENTITY_BODY","persistent":true},"authentication":"api_key"}),
+            ),
+            (
+                StatusCode::OK,
+                json!({"user":{"id":ACCOUNT.to_uppercase(),"persistent":true},"authentication":"api_key"}),
+            ),
+            (
+                StatusCode::OK,
+                json!({"user":{"persistent":true},"authentication":"api_key"}),
+            ),
+            (
+                StatusCode::OK,
+                json!({"user":{"id":ACCOUNT,"persistent":true}}),
+            ),
+            (
+                StatusCode::OK,
+                json!({"user":{"id":ACCOUNT,"persistent":true},"authentication":"api_key","padding":"x".repeat(MAX_RESPONSE+1)}),
+            ),
+        ] {
+            let reads = Arc::new(AtomicUsize::new(0));
+            let posts = Arc::new(AtomicUsize::new(0));
+            let read_count = reads.clone();
+            let post_count = posts.clone();
+            let app = Router::new()
+                .route(
+                    "/v1/me",
+                    get(move |headers: HeaderMap| {
+                        let count = read_count.clone();
+                        let response = response.clone();
+                        async move {
+                            assert_auth(&headers);
+                            count.fetch_add(1, Ordering::SeqCst);
+                            (
+                                status,
+                                [("x-nanocodex-access-rejected", "1")],
+                                Json(response),
+                            )
+                        }
+                    }),
+                )
+                .route(
+                    PATH,
+                    post(move || {
+                        let count = post_count.clone();
+                        async move {
+                            count.fetch_add(1, Ordering::SeqCst);
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        }
+                    }),
+                );
+            let (client, server) = client_without_account(app).await;
+            // Description intentionally has no Debug implementation.
+            let error = client
+                .describe_native_secure_input(&fixture_request())
+                .await
+                .err()
+                .unwrap();
+            assert!(!format!("{error:?} {error}").contains("REMOTE_IDENTITY_BODY"));
+            assert_eq!(reads.load(Ordering::SeqCst), 1);
+            assert_eq!(posts.load(Ordering::SeqCst), 0);
+            server.abort();
+        }
     }
 
     #[tokio::test]
@@ -870,6 +1028,7 @@ mod tests {
         }));
         let (client, server) = client(app).await;
         let description = client.describe_native_secure_input(&request).await.unwrap();
+        assert_eq!(description.account_id, ACCOUNT);
         assert_eq!(description.machine_id, MACHINE);
         assert_eq!(description.uid, 1000);
         let envelope = description
