@@ -627,8 +627,8 @@ or Durable Object migration.
 
 ### Managed browser provider
 
-The managed Worker exposes `browser_execute` through `env.BROWSER` and the
-Agents SDK CDP runtime, without provisioning a VM or desktop Hand. Production
+The managed Worker exposes `browser_execute` through the Agents SDK CDP runtime,
+without provisioning a VM or desktop Hand. Browser Run uses `env.BROWSER`. Production
 and development Wrangler configuration select `MANAGED_BROWSER_PROVIDER=kitesurf`.
 Local development uses a remote Browser Run binding and requires Cloudflare access.
 
@@ -638,6 +638,8 @@ Local development uses a remote Browser Run binding and requires Cloudflare acce
 - `cloudflare`: Browser Run's default Chromium engine.
 - `browserbase`: the existing Browserbase binding adapter; requires the
   `BROWSERBASE_API_KEY` Wrangler secret and optionally `BROWSERBASE_PROJECT_ID`.
+- `obscura`: experimental bundled DOM and QuickJS Wasm engine. Requires `LOADER`
+  and the native `OBSCURA_NETWORK` service binding; no `BROWSER` is required.
 
 Kitesurf uses a one-shot connection: complete navigation and extraction in one
 `browser_execute` call. It cannot retain page state between calls or pause/resume.
@@ -653,6 +655,27 @@ It does not support every Chromium feature or long-running authenticated state.
 Unsupported sites return their browser errors; there is no automatic VM allocation
 or silent provider fallback. Operators can select `cloudflare` when Chromium is
 needed. Neither Browser Run engine requires a Nanocodex VM.
+
+Obscura is opt-in: set `MANAGED_BROWSER_PROVIDER=obscura`. Production and
+local development retain Kitesurf as the default. The Obscura branch lazily loads
+the checked-in `src/obscura-assets` bundle; Wrangler includes its text and binary
+modules at build time. Regenerate those assets with `npm run prepare:obscura`
+when changing the engine. Ordinary builds consume the prepared assets.
+
+Obscura exposes the supported CDP runtime evaluation, function, DOM and frame
+commands through the native SDK tools. Inspect `cdp.spec` for the available
+subset. Complete navigation and inspection in one call: sessions are one-shot,
+with no visual rendering, screenshots, private Vault login or secure-input
+continuation. Unsupported commands fail explicitly.
+
+The `ObscuraNetwork` self-service entrypoint routes every page request through
+`handleManagedEgress` with no account subject and all connector access denied.
+Vault and credential headers are rejected before routing, and each redirect
+must return through the same policy. There is no raw-fetch fallback. Account
+public egress strips cookies and authorization; cookie-backed sessions and
+authenticated browsing therefore do not work through this network binding.
+Page scripts cannot make cross-origin API requests; unsupported CORS requests
+fail closed. Browser state snapshots are not wired into this provider.
 
 Run the [local Kitesurf smoke test](scripts/kitesurf-smoke.md) to verify the real
 remote binding through the managed runtime before rollout.
