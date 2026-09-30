@@ -889,7 +889,7 @@ mod tests {
         let mut model_account = raw.clone();
         model_account["account_id"] = Value::String(ACCOUNT.to_owned());
         assert!(NativeSecureInputDescription::parse(&model_account, &selector, ACCOUNT).is_err());
-        let mut expired = request.clone();
+        let mut expired = request;
         expired.expires_at = Some(now() - 1);
         assert!(NativeSecureInputDescription::parse(&raw, &expired, ACCOUNT).is_err());
         assert!(bytes("AA==", 1).is_ok());
@@ -1279,7 +1279,7 @@ mod tests {
                     .is_err()
             );
         }
-        let mut expired = request.clone();
+        let mut expired = request;
         expired.expires_at = Some(now() - 1);
         assert!(client.describe_native_secure_input(&expired).await.is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 0);

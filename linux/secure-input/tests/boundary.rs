@@ -319,3 +319,98 @@ fn caps_paths_and_canonical_base64() {
     assert!(!valid_path("relative"));
     assert!(!valid_path("/x\0"));
 }
+
+#[test]
+fn every_ticket_signature_binding_rejects_mutation_or_wrong_helper_pin() {
+    let (mut broker, _, identity) = setup();
+    let ticket = broker.prepare(command(), 1000, 1, ()).unwrap();
+    let sig = Signature::from_slice(&B64.decode(&ticket.helper_signature).unwrap()).unwrap();
+    let wrong_helper = SigningKey::random(&mut OsRng);
+    assert!(
+        wrong_helper
+            .verifying_key()
+            .verify(&ticket.signing_data(), &sig)
+            .is_err()
+    );
+    for field in 0..5 {
+        let mut changed = ticket.clone();
+        match field {
+            0 => changed.request_id.push('x'),
+            1 => changed.command_digest.push('x'),
+            2 => changed.public_key.push('x'),
+            3 => changed.expires_at += 1,
+            _ => changed.uid = 998,
+        }
+        assert!(
+            identity
+                .verifying_key()
+                .verify(&changed.signing_data(), &sig)
+                .is_err()
+        );
+    }
+    for field in 0..3 {
+        let mut changed = command();
+        match field {
+            0 => changed.executable = "/usr/bin/true".into(),
+            1 => changed.arguments.push("modified".into()),
+            _ => changed.cwd = "/usr".into(),
+        }
+        assert!(command_digest(&changed, 1000).unwrap() != ticket.command_digest);
+    }
+}
+
+#[test]
+fn signed_invalid_points_and_nonce_tamper_consume_without_dispatch() {
+    for field in 0..3 {
+        let (mut broker, backend, _) = setup();
+        let ticket = broker.prepare(command(), 1000, 1, ()).unwrap();
+        let mut e = envelope(&ticket, &backend, input(&ticket));
+        match field {
+            0 => e.ephemeral_public_key = B64.encode([0u8; 65]),
+            1 => e.ephemeral_public_key = B64.encode([4u8; 33]),
+            _ => {
+                let mut sealed = B64.decode(&e.ciphertext).unwrap();
+                sealed[0] ^= 1;
+                e.ciphertext = B64.encode(sealed);
+            }
+        }
+        sign(&mut e, &backend);
+        assert!(
+            broker
+                .submit(e, 1000, 2, |_, _, _, ()| panic!(
+                    "invalid crypto dispatched"
+                ))
+                .is_err()
+        );
+        assert!(
+            broker
+                .submit(
+                    envelope(&ticket, &backend, input(&ticket)),
+                    1000,
+                    2,
+                    |_, _, _, ()| panic!("consumed ticket dispatched")
+                )
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn bounded_arguments_overflow_and_global_rate_window() {
+    let (mut broker, _, _) = setup();
+    let mut oversized = command();
+    oversized.arguments = vec!["x".into(); 129];
+    assert!(broker.prepare(oversized, 1000, 1, ()).is_err());
+    let mut oversized = command();
+    oversized.arguments.push("x".repeat(4097));
+    assert!(broker.prepare(oversized, 1000, 1, ()).is_err());
+    let mut control = command();
+    control.arguments.push("x\0".into());
+    assert!(broker.prepare(control, 1000, 1, ()).is_err());
+    assert!(broker.prepare(command(), 1000, u64::MAX, ()).is_err());
+    let mut limiter = Admission::default();
+    for uid in 1..=256 {
+        assert!(limiter.admit(uid));
+    }
+    assert!(!limiter.admit(257));
+}

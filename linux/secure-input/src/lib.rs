@@ -289,15 +289,9 @@ pub fn read_frame(reader: impl Read) -> io::Result<Vec<u8>> {
         .map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
     Ok(bytes)
 }
+#[derive(Default)]
 pub struct Admission {
     windows: HashMap<u32, (Instant, u8)>,
-}
-impl Default for Admission {
-    fn default() -> Self {
-        Self {
-            windows: HashMap::new(),
-        }
-    }
 }
 impl Admission {
     pub fn admit(&mut self, uid: u32) -> bool {

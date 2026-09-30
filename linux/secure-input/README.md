@@ -99,10 +99,10 @@ containing `synthetic-only-disposable`. That marker is not a release bypass: the
 helper and askpass contain no test mode, relaxed checks, or alternative paths.
 
 In that disposable environment only, install distro `sudo`, PAM and Python's
-`cryptography`; build this package; compile `tests/e2e-os-boundary.c` with
-`cc -O2 -Wall -Wextra -Werror -fstack-protector-strong -D_FORTIFY_SOURCE=2
- tests/e2e-os-boundary.c -o target/e2e-os-boundary` and locally set that test fixture
-root4755. Then `/usr/bin/python3 tests/disposable_e2e.py`. The controller generates
+`cryptography`; build this package; then run `/usr/bin/python3 tests/disposable_e2e.py`.
+The script compiles `tests/e2e-os-boundary.c` against the unchanged release runner,
+sets that root-owned test fixture4755 for the actual setuid boundary checks,
+and removes its setuid mode during cleanup. The controller generates
 synthetic keys/password at runtime, invokes the unchanged local installer in a
 virtual TTY, independently captures/pins the public enrollment result, and
 requires real sudo/PAM password authentication. It tests separate peer998/admin1000,

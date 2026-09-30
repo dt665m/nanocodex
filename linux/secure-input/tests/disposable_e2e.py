@@ -116,6 +116,10 @@ def start():
         if os.path.exists(SOCKET): return
         time.sleep(.05)
     raise AssertionError('Daemon socket timeout')
+def reject_start():
+    p = subprocess.run([HELPER], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+    assert p.returncode == 78 and not p.stdout and not p.stderr, 'Unsafe installation was not rejected quietly'
+
 def stop():
     global daemon
     if daemon:
@@ -135,6 +139,12 @@ try:
     # This policy requires PAM password auth; no NOPASSWD/no pam_permit bypass.
     pathlib.Path(POLICY).write_text('Defaults:nc-e2e-admin !requiretty, timestamp_timeout=0, passwd_tries=2\nnc-e2e-admin ALL=(root) PASSWD: ' + COMMAND + '\n')
     os.chmod(POLICY, 0o440); quiet(['visudo', '-c'])
+    # Root-owned test-only executable validates actual setuid startup hardening.
+    # It is compiled from the unchanged runner and removed from setuid mode below.
+    fixture = ROOT / 'target/e2e-os-boundary'
+    fixture.parent.mkdir(exist_ok=True)
+    quiet(['cc', '-O2', '-Wall', '-Wextra', '-Werror', '-fstack-protector-strong', '-D_FORTIFY_SOURCE=2', str(ROOT / 'tests/e2e-os-boundary.c'), '-o', str(fixture)])
+    os.chmod(fixture, 0o4755)
     source = ROOT / 'tests/e2e-command.c'
     quiet(['cc', '-O2', '-Wall', '-Wextra', '-Werror', str(source), '-o', COMMAND]); os.chmod(COMMAND, 0o755)
     release = pathlib.Path(os.environ.get('CARGO_TARGET_DIR', ROOT / 'target')) / 'release'
@@ -152,7 +162,43 @@ try:
     pinned = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), un64(public))
     assert password.encode() not in output
     ok('trusted disposable local installer and independent public identity')
+    # Actual installed mode, no-follow, link-count and ancestor checks.
+    os.chmod(ASKPASS, 0o755)
+    try: reject_start()
+    finally: os.chmod(ASKPASS, 0o4755)
+    configfile = pathlib.Path(CONFIG) / 'configuration.json'
+    os.chmod(configfile, 0o644)
+    try: reject_start()
+    finally: os.chmod(configfile, 0o600)
+    alias = pathlib.Path(CONFIG) / 'configuration-alias'
+    os.link(configfile, alias)
+    try: reject_start()
+    finally: alias.unlink()
+    backup = pathlib.Path(CONFIG) / 'configuration-backup'
+    configfile.rename(backup); configfile.symlink_to(backup)
+    try: reject_start()
+    finally: configfile.unlink(); backup.rename(configfile)
+    oldmode = pathlib.Path('/usr/libexec').stat().st_mode & 0o7777
+    os.chmod('/usr/libexec', 0o777)
+    try: reject_start()
+    finally: os.chmod('/usr/libexec', oldmode)
+    uninstalled = subprocess.run([str(release / 'nanocodex-secure-input')], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert uninstalled.returncode == 78 and not uninstalled.stdout and not uninstalled.stderr
+    ok('installed askpass/config modes symlink hardlink mutable ancestors and inode checks')
     start()
+    # Actual root identity/config are inaccessible from both unprivileged UIDs.
+    for uid in [998, 1000]:
+        pid = os.fork()
+        if pid == 0:
+            drop(uid)
+            for path in [str(configfile), '/proc/' + str(daemon.pid) + '/mem']:
+                try: fd = os.open(path, os.O_RDONLY); os.close(fd); os._exit(1)
+                except PermissionError: pass
+            os._exit(0)
+        _, status = os.waitpid(pid, 0); assert status == 0, 'Unprivileged secret boundary failed'
+    assert password.encode() not in pathlib.Path('/proc/' + str(daemon.pid) + '/cmdline').read_bytes()
+    assert password.encode() not in pathlib.Path('/proc/' + str(daemon.pid) + '/environ').read_bytes()
+    ok('transport/admin cannot read root configuration or memory; argv/env secret free')
     assert request({'operation':'cancel','request_id':'x'}, uid=1000) is None
     assert request({'operation':'prepare','executable':COMMAND,'arguments':[],'cwd':'/','uid':1000}) == {'status':'rejected'}
     ok('kernel transport UID and caller-selected UID rejection')
@@ -186,7 +232,17 @@ try:
     t = prepare(['timeout']); begin = time.monotonic(); r = request(approved(t, password, backend))
     assert r and r.get('status') == 'outcome_unknown' and 119 <= time.monotonic() - begin < 135, 'Release timeout/receipt failed'
     no_endpoints(); assert request(approved(t, password, backend)) == {'status':'rejected'}
+    # A stale socket is not enough: no live approved command may survive timeout.
+    for proc in pathlib.Path('/proc').glob('[0-9]*/exe'):
+        try: target = os.readlink(proc)
+        except OSError: continue
+        assert target != COMMAND, 'Live approved command survived timeout'
     ok('120-second timeout process-group cleanup and nonretryable receipt')
+    # Admission budget is actual enforced transport policy, not just a unit test.
+    stop(); start()
+    for _ in range(24): assert request({'operation':'cancel','request_id':'absent'}) == {'status':'rejected'}
+    assert request({'operation':'cancel','request_id':'absent'}) is None
+    ok('24 admissions per transport UID per minute cap')
     # Blocked framing cannot be extended by single byte progress.
     stop(); start()
     readfd, writefd = os.pipe(); pid = os.fork()
@@ -210,3 +266,5 @@ finally:
     for path in [CONFIG, RUN]:
         if os.path.exists(path): shutil.rmtree(path)
     for name in reversed(created_users): subprocess.run(['userdel', name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    fixture = ROOT / 'target/e2e-os-boundary'
+    if fixture.exists(): os.chmod(fixture, 0o755)
