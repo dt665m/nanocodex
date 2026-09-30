@@ -141,7 +141,12 @@ fn walk(
                     expires_at: Some(value["expires_at"].as_u64().ok_or_else(invalid)?),
                 };
                 request.validate(false)?;
-                found.push(request);
+                // MCP commonly presents the same receipt in text and structured
+                // content. Only exact full-binding duplicates are equivalent;
+                // distinct requests and malformed parallel siblings still fail.
+                if !found.contains(&request) {
+                    found.push(request);
+                }
                 if found.len() > 1 {
                     return Err(invalid());
                 }
@@ -706,6 +711,7 @@ mod tests {
             json!({"content":[{"type":"text","text":raw.to_string()}]}),
             json!({"result":{"structuredContent":raw}}),
             json!({"success":true,"structuredResult":raw}),
+            json!({"content":[{"type":"text","text":raw.to_string()}],"structuredContent":raw}),
         ] {
             assert_eq!(
                 NativeSecureInputRequest::parse(&wrapped),
@@ -737,7 +743,31 @@ mod tests {
         );
         assert!(NativeSecureInputRequest::parse(&json!({"isError":true,"content":raw})).is_none());
         assert!(NativeSecureInputRequest::parse(&json!({"success":false,"output":raw})).is_none());
-        assert!(NativeSecureInputRequest::parse(&json!([raw, raw])).is_none());
+        assert_eq!(
+            NativeSecureInputRequest::parse(&json!([raw, raw])),
+            Some(request.clone())
+        );
+        for patch in [
+            json!({"request_id":"00000000-0000-0000-0000-000000000000"}),
+            json!({"agent_id":"other"}),
+            json!({"machine_id":"other"}),
+            json!({"expires_at":request.expires_at.unwrap()+1}),
+            json!({"kind":"browser_password"}),
+            json!({"value":"malformed-parallel-sibling"}),
+        ] {
+            let mut sibling = raw.clone();
+            sibling
+                .as_object_mut()
+                .unwrap()
+                .extend(patch.as_object().unwrap().clone());
+            assert!(
+                NativeSecureInputRequest::parse(&json!({
+                    "content":[{"type":"text","text":raw.to_string()}],
+                    "structuredContent":sibling
+                }))
+                .is_none()
+            );
+        }
         let mut nested = receipt(&request);
         for _ in 0..12 {
             nested = json!({"output":nested});
