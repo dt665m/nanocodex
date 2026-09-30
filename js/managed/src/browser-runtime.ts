@@ -22,7 +22,7 @@ import {
   type BrowserVaultResolver, type BrowserVaultQuarantine,
 } from "./browser-vault";
 
-export type ManagedBrowserProvider = "cloudflare" | "browserbase" | "kitesurf" | "obscura";
+export type ManagedBrowserProvider = "cloudflare" | "browserbase" | "kitesurf" | "chromium" | "obscura";
 
 export interface ManagedBrowserEnv {
   BROWSER?: BrowserBinding;
@@ -51,8 +51,8 @@ type FetchImplementation = typeof globalThis.fetch;
 const BROWSERBASE_API_ORIGIN = "https://api.browserbase.com";
 const DEFAULT_KEEP_ALIVE_MS = 10 * 60_000;
 const DEFAULT_TOOL_TIMEOUT_MS = 30_000;
-// One-shot Kitesurf calls must finish navigation and all subsequent interactions.
-const DEFAULT_KITESURF_TOOL_TIMEOUT_MS = 90_000;
+// One-shot hosted calls must finish navigation and all subsequent interactions.
+const DEFAULT_ONE_SHOT_TOOL_TIMEOUT_MS = 90_000;
 const MAX_BROWSERBASE_RESPONSE_BYTES = 256 * 1024;
 const MANAGED_BROWSER_EXECUTE_DESCRIPTION = [
   "Run browser automation in the retained managed browser session.",
@@ -365,9 +365,9 @@ function browserCdpCommandAllowed(method: string, params: unknown): boolean {
 }
 
 export function managedBrowserProvider(value: string | undefined): ManagedBrowserProvider {
-  const provider = value?.trim().toLowerCase() || "cloudflare";
-  if (provider === "cloudflare" || provider === "browserbase" || provider === "kitesurf" || provider === "obscura") return provider;
-  throw new TypeError("MANAGED_BROWSER_PROVIDER must be cloudflare, browserbase, kitesurf, or obscura");
+  const provider = value?.trim().toLowerCase() || "chromium";
+  if (provider === "cloudflare" || provider === "browserbase" || provider === "kitesurf" || provider === "chromium" || provider === "obscura") return provider;
+  throw new TypeError("MANAGED_BROWSER_PROVIDER must be cloudflare, browserbase, kitesurf, chromium, or obscura");
 }
 
 export async function createManagedBrowserRuntime(
@@ -383,6 +383,7 @@ export async function createManagedBrowserRuntime(
   }>,
 ): Promise<ManagedBrowserRuntime> {
   const provider = managedBrowserProvider(options.env.MANAGED_BROWSER_PROVIDER);
+  const oneShot = provider === "kitesurf" || provider === "chromium";
   const loader = options.env.LOADER;
   if (!loader) throw new Error("Managed browser runtime requires the LOADER binding");
   const keepAliveMs = boundedInteger(
@@ -394,23 +395,26 @@ export async function createManagedBrowserRuntime(
   );
   const timeout = boundedInteger(
     options.env.MANAGED_BROWSER_TOOL_TIMEOUT_MS,
-    provider === "kitesurf" ? DEFAULT_KITESURF_TOOL_TIMEOUT_MS : DEFAULT_TOOL_TIMEOUT_MS,
+    (oneShot || provider === "obscura") ? DEFAULT_ONE_SHOT_TOOL_TIMEOUT_MS : DEFAULT_TOOL_TIMEOUT_MS,
     1_000,
     120_000,
     "MANAGED_BROWSER_TOOL_TIMEOUT_MS",
   );
-  if (provider === "kitesurf") {
-    if (!options.env.BROWSER) throw new Error("Kitesurf browser provider requires the BROWSER binding");
+  if (oneShot) {
+    const providerName = provider === "kitesurf" ? "Kitesurf" : "Chromium";
+    if (!options.env.BROWSER) throw new Error(`${providerName} browser provider requires the BROWSER binding`);
     const runtime = (options.createRuntime ?? createBrowserRuntime)({
       ctx: options.ctx, browser: options.env.BROWSER, loader,
-      session: { mode: "one-shot", browser: "kitesurf" },
-      quickActions: false, timeout, name: "managed-browser-kitesurf",
+      session: provider === "kitesurf"
+        ? { mode: "one-shot", browser: "kitesurf" }
+        : { mode: "one-shot" },
+      quickActions: false, timeout, name: `managed-browser-${provider}`,
     });
     const tools = await adaptAiSdkTools(runtime.tools, { native: true });
-    const unsupported = async () => { throw new Error("Kitesurf does not support private browser continuation"); };
+    const unsupported = async () => { throw new Error(`${providerName} does not support private browser continuation`); };
     return {
       provider,
-      tools: tools.map(tool => ({ ...tool, handler: (input, context) => {
+      tools: tools.map(tool => ({ ...tool, handler: async (input, context) => {
         options.authorizeVaultAccess?.(context);
         return tool.handler(input, context);
       } })),
@@ -436,7 +440,7 @@ export async function createManagedBrowserRuntime(
         description: tool.name === "browser_execute"
           ? `${tool.description}\nExperimental Obscura runs a bounded DOM and JavaScript subset in Wasm. It is not Chromium and has no visual rendering, screenshots, or private login support. Sessions last for one execution; complete all navigation and inspection in one call. Use cdp.spec to inspect supported commands; unsupported commands fail explicitly.`
           : tool.description,
-        handler: (input, context) => {
+        handler: async (input, context) => {
           options.authorizeVaultAccess?.(context);
           return tool.handler(input, context);
         },

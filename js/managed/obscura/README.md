@@ -5,7 +5,7 @@ Agents browser SDK against a local CDP implementation, with QuickJS Wasm,
 Obscura DOM Wasm and the original Obscura JavaScript bootstrap loaded through
 Worker Loader. The Obscura branch does not require `env.BROWSER`.
 
-The existing Kitesurf defaults are unchanged. The overlay is experimental and
+The existing hosted Chromium defaults are unchanged. The overlay is experimental and
 has not been deployed. It includes a native `OBSCURA_NETWORK` service entrypoint
 and default/development self-service bindings. This entrypoint uses the existing
 anonymous public egress boundary and does not grant connector or Vault access.
