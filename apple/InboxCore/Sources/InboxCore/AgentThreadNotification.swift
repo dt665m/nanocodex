@@ -4,12 +4,16 @@ import CryptoKit
 /// One native notification per conversation. Reuse the bounded, user-facing
 /// projection without putting other agents or private outbox input in the body.
 public struct AgentThreadNotification: Equatable, Sendable, Identifiable {
+    public enum Kind: Equatable, Sendable { case status, response, delivery }
+
     public let id: String
     public let revision: String
     public let title: String
     public let subtitle: String
     public let body: String
     public let isRunning: Bool
+    public var kind: Kind = .status
+    public var deliveryIDs: Set<String> = []
 
     public var fingerprint: String {
         let data = (try? JSONEncoder().encode([revision, title, subtitle, body])) ?? Data()
@@ -32,21 +36,26 @@ public struct AgentThreadNotification: Equatable, Sendable, Identifiable {
             default: phase = "Running when last checked"
             }
             let turn = card.activeTurns.first ?? "outcome-" + card.outcomeCursor.rawValue
-            let delivery = outbox.filter { $0.phase == .failed }.map(\.id).sorted().joined(separator: ",")
-            let revision = entry.status + ":" + turn + ":" + delivery
+            let deliveryIDs = Set(outbox.filter { $0.phase == .failed }.map(\.id))
+            let delivery = deliveryIDs.sorted().joined(separator: ",")
+            // A background turn changing must not re-alert for the same unsent message.
+            let revision = entry.status == "delivery" ? "delivery:" + delivery : entry.status + ":" + turn
+            let kind: Kind = entry.status == "delivery" ? .delivery :
+                entry.status == "ready" && card.checked && card.error == nil ? .response : .status
             var body = entry.detail
             if let queued = entry.queued, queued > 0 {
                 body += "\n\(queued) queued \(queued == 1 ? "follow-up" : "follow-ups")."
             }
             if card.isRunning { body += "\nOpen for current status." }
             return Self(id: card.id, revision: revision, title: entry.title,
-                        subtitle: phase, body: body, isRunning: card.isRunning)
+                        subtitle: phase, body: body, isRunning: card.isRunning, kind: kind, deliveryIDs: deliveryIDs)
         }
     }
 }
 
 /// Persist only IDs and hashes. Clearing a thread suppresses its current phase
-/// across polling and relaunch; only a new terminal outcome can notify again.
+/// across polling and relaunch. A response consumes its observed run; delivery
+/// failures are identified by message, independently of background agent turns.
 public struct AgentNotificationLedger: Codable, Sendable {
     public struct Receipt: Codable, Sendable {
         public var revision: String
@@ -55,31 +64,50 @@ public struct AgentNotificationLedger: Codable, Sendable {
     public private(set) var tracked = Set<String>()
     public private(set) var published: [String: Receipt] = [:]
     public private(set) var dismissed: [String: String] = [:]
+    public private(set) var handledDeliveries: [String: Set<String>] = [:]
     public init() {}
 
-    public mutating func reconcile(_ threads: [AgentThreadNotification], retaining unchecked: Set<String>) -> Set<String> {
+    public mutating func reconcile(_ threads: [AgentThreadNotification], retaining unchecked: Set<String>, foreground: Bool = false) -> Set<String> {
         let allowed = Set(threads.map(\.id)).union(unchecked)
-        let removed = tracked.subtracting(allowed)
+        let removed = tracked.union(published.keys).union(dismissed.keys).union(handledDeliveries.keys).subtracting(allowed)
         tracked.formIntersection(allowed)
         published = published.filter { allowed.contains($0.key) }
         dismissed = dismissed.filter { allowed.contains($0.key) }
+        handledDeliveries = handledDeliveries.filter { allowed.contains($0.key) }
         tracked.formUnion(threads.filter(\.isRunning).map(\.id))
+        for thread in threads {
+            if thread.kind == .delivery {
+                // Delivery of a follow-up is independent of the running turn.
+                if foreground { handledDeliveries[thread.id, default: []].formUnion(thread.deliveryIDs) }
+            } else if !thread.isRunning && (foreground || thread.kind == .status) {
+                // An outcome already visible in-app must not become a late alert.
+                tracked.remove(thread.id)
+                dismissed[thread.id] = thread.revision
+            }
+        }
         return removed
     }
 
     public func shouldPublish(_ thread: AgentThreadNotification, foreground: Bool) -> Bool {
-        !foreground && !thread.isRunning && tracked.contains(thread.id)
+        !foreground && thread.kind != .status
+            && (thread.kind == .delivery
+                ? !thread.deliveryIDs.isSubset(of: handledDeliveries[thread.id] ?? [])
+                : !thread.isRunning && tracked.contains(thread.id))
             && dismissed[thread.id] != thread.revision
             && published[thread.id]?.revision != thread.revision
     }
 
     public mutating func didPublish(_ thread: AgentThreadNotification) {
+        if thread.kind == .delivery {
+            handledDeliveries[thread.id, default: []].formUnion(thread.deliveryIDs)
+        } else { tracked.remove(thread.id) }
+        dismissed[thread.id] = nil
         published[thread.id] = Receipt(revision: thread.revision, fingerprint: thread.fingerprint)
     }
 
     public mutating func dismiss(id: String, revision: String) {
         // Late callbacks for older notifications must not suppress newer work.
-        guard published[id]?.revision == revision else { return }
+        guard published[id]?.revision == revision, dismissed[id] == nil || dismissed[id] == revision else { return }
         dismissed[id] = revision
     }
 }
