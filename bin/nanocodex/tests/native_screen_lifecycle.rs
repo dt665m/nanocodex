@@ -126,8 +126,9 @@ fn quoted(path: &Path) -> String {
 #[tokio::test]
 #[ignore = "real isolated Linux desktop; requires Xvfb, openbox, xterm and fonts"]
 async fn standalone_screen_retries_and_exits_on_replacement() {
-    assert!(
-        cfg!(target_os = "linux"),
+    assert_eq!(
+        std::env::consts::OS,
+        "linux",
         "this opt-in journey requires an isolated Linux desktop; never capture the shared macOS display"
     );
     let xvfb = executable("Xvfb");
@@ -350,8 +351,9 @@ async fn standalone_screen_retries_and_exits_on_replacement() {
 #[tokio::test]
 #[ignore = "isolated Linux infrastructure cancellation; requires Xvfb"]
 async fn standalone_screen_sigterm_during_startup_reaps_desktop() {
-    assert!(
-        cfg!(target_os = "linux"),
+    assert_eq!(
+        std::env::consts::OS,
+        "linux",
         "requires isolated Linux infrastructure"
     );
     let xvfb = executable("Xvfb");
