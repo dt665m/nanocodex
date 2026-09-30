@@ -14,6 +14,7 @@ public struct AgentThreadNotification: Equatable, Sendable, Identifiable {
     public let isRunning: Bool
     public var kind: Kind = .status
     public var deliveryIDs: Set<String> = []
+    public var pendingDeliveryIDs: Set<String> = []
 
     public var fingerprint: String {
         let data = (try? JSONEncoder().encode([revision, title, subtitle, body])) ?? Data()
@@ -27,7 +28,14 @@ public struct AgentThreadNotification: Equatable, Sendable, Identifiable {
             let outbox = messages[card.id] ?? []
             let snapshot = AgentActivitySnapshot.make(cards: [card], seen: seen, deferred: deferred,
                                                       paused: true, pending: outbox)
-            guard let entry = snapshot.entries.first, !entry.id.isEmpty else { return nil }
+            let pendingIDs = Set(outbox.map(\.id))
+            guard let entry = snapshot.entries.first, !entry.id.isEmpty else {
+                // Retain retry receipts while an idle/read thread temporarily has
+                // no visible outcome. This bookkeeping entry can never notify.
+                guard !pendingIDs.isEmpty, !card.id.isEmpty, card.id.utf8.count <= 256 else { return nil }
+                return Self(id: card.id, revision: "pending", title: "", subtitle: "", body: "",
+                            isRunning: card.isRunning, pendingDeliveryIDs: pendingIDs)
+            }
             let phase: String
             switch entry.status {
             case "delivery": phase = "Delivery unconfirmed"
@@ -48,7 +56,7 @@ public struct AgentThreadNotification: Equatable, Sendable, Identifiable {
             }
             if card.isRunning { body += "\nOpen for current status." }
             return Self(id: card.id, revision: revision, title: entry.title,
-                        subtitle: phase, body: body, isRunning: card.isRunning, kind: kind, deliveryIDs: deliveryIDs)
+                        subtitle: phase, body: body, isRunning: card.isRunning, kind: kind, deliveryIDs: deliveryIDs, pendingDeliveryIDs: pendingIDs)
         }
     }
 }
@@ -73,12 +81,22 @@ public struct AgentNotificationLedger: Codable, Sendable {
         tracked.formIntersection(allowed)
         published = published.filter { allowed.contains($0.key) }
         dismissed = dismissed.filter { allowed.contains($0.key) }
-        handledDeliveries = handledDeliveries.filter { allowed.contains($0.key) }
+        let pendingIDs = Dictionary(uniqueKeysWithValues: threads.map {
+            ($0.id, $0.pendingDeliveryIDs.union($0.deliveryIDs))
+        })
+        handledDeliveries = handledDeliveries.compactMapValues { $0.isEmpty ? nil : $0 }
+        for (id, ids) in handledDeliveries where !unchecked.contains(id) {
+            let remaining = ids.intersection(pendingIDs[id] ?? [])
+            handledDeliveries[id] = remaining.isEmpty ? nil : remaining
+        }
         tracked.formUnion(threads.filter(\.isRunning).map(\.id))
         for thread in threads {
             if thread.kind == .delivery {
                 // Delivery of a follow-up is independent of the running turn.
-                if foreground { handledDeliveries[thread.id, default: []].formUnion(thread.deliveryIDs) }
+                if foreground {
+                    handledDeliveries[thread.id, default: []].formUnion(thread.deliveryIDs)
+                    if !thread.isRunning { tracked.remove(thread.id) }
+                }
             } else if !thread.isRunning && (foreground || thread.kind == .status) {
                 // An outcome already visible in-app must not become a late alert.
                 tracked.remove(thread.id)

@@ -92,6 +92,32 @@ final class AgentThreadNotificationTests: XCTestCase {
         ledger.didPublish(delivery)
         XCTAssertTrue(ledger.shouldPublish(thread("a", status: "Ready"), foreground: false))
     }
+    func testRealProjectionRetainsDeliveryReceiptDuringRetry() throws {
+        var card = AgentCard(id: "a", title: "Report")
+        card.checked = true; card.status = "Idle"
+        var message = PendingMessage(agentID: "a", input: "Private request", predecessor: "", id: "message")
+        message.phase = .failed
+        var ledger = AgentNotificationLedger()
+        let failed = try XCTUnwrap(AgentThreadNotification.make(cards: [card], seen: [:], deferred: [:], pending: [message]).first)
+        _ = ledger.reconcile([failed], retaining: [])
+        ledger.didPublish(failed)
+        message.phase = .submitting
+        let retrying = AgentThreadNotification.make(cards: [card], seen: [:], deferred: [:], pending: [message])
+        _ = ledger.reconcile(retrying, retaining: [])
+        XCTAssertTrue(retrying.allSatisfy { !ledger.shouldPublish($0, foreground: false) })
+        message.phase = .failed
+        let again = try XCTUnwrap(AgentThreadNotification.make(cards: [card], seen: [:], deferred: [:], pending: [message]).first)
+        _ = ledger.reconcile([again], retaining: [])
+        XCTAssertFalse(ledger.shouldPublish(again, foreground: false))
+        _ = ledger.reconcile([], retaining: [])
+        XCTAssertTrue(ledger.handledDeliveries.isEmpty)
+    }
+    func testForegroundCompletionMaskedByDeliveryDoesNotNotifyLater() {
+        var ledger = AgentNotificationLedger()
+        _ = ledger.reconcile([thread("a")], retaining: [])
+        _ = ledger.reconcile([thread("a", turn: "followup", status: "Delivery")], retaining: [], foreground: true)
+        XCTAssertFalse(ledger.shouldPublish(thread("a", status: "Ready"), foreground: false))
+    }
     func testUncheckedRestorationRetainsReceiptsAndVerifiedRemovalCleansOnlyThatThread() {
         var ledger = AgentNotificationLedger()
         let a = thread("a", status: "Ready"), b = thread("b", status: "Ready")
