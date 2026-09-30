@@ -629,7 +629,7 @@ or Durable Object migration.
 
 The managed Worker exposes `browser_execute` through `env.BROWSER` and the
 Agents SDK CDP runtime, without provisioning a VM or desktop Hand. Production
-and development Wrangler configuration select `MANAGED_BROWSER_PROVIDER=kitesurf`.
+and development Wrangler configuration select `MANAGED_BROWSER_PROVIDER=chromium`.
 Local development uses a remote Browser Run binding and requires Cloudflare access.
 
 `MANAGED_BROWSER_PROVIDER` is host deployment policy, never a tool argument:
@@ -653,15 +653,15 @@ input tools are unavailable with either one-shot provider.
 `cloudflare` and `browserbase` retain bounded sessions per durable agent, with
 separate storage for each provider. Their existing CDP restrictions and private
 browser flows remain in place. Use workdir-scoped CUA when operating an existing
-computer's browser. An unset `MANAGED_BROWSER_PROVIDER` still selects `cloudflare`;
-the checked-in Wrangler configurations explicitly select `kitesurf`.
+computer's browser. An unset `MANAGED_BROWSER_PROVIDER` selects `chromium`,
+matching the checked-in production and development Wrangler configurations.
 
 [Kitesurf is currently beta](https://developers.cloudflare.com/browser-run/kitesurf/).
 It does not support every Chromium feature or long-running authenticated state.
 Unsupported sites return their browser errors; there is no automatic VM allocation
-or silent provider fallback. Operators can explicitly select `chromium` for
-one-shot Chromium browsing or `cloudflare` for the retained private-browser integration. Neither Browser Run
-engine requires a Nanocodex VM.
+or silent provider fallback. Operators can explicitly select `kitesurf` for its
+beta engine or `cloudflare` for the retained private-browser integration. Neither
+Browser Run engine requires a Nanocodex VM.
 
 Run the [local hosted browser smoke test](scripts/kitesurf-smoke.md) to verify the real
 remote binding through the managed runtime before rollout.

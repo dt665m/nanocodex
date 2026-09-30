@@ -363,7 +363,7 @@ function browserCdpCommandAllowed(method: string, params: unknown): boolean {
 }
 
 export function managedBrowserProvider(value: string | undefined): ManagedBrowserProvider {
-  const provider = value?.trim().toLowerCase() || "cloudflare";
+  const provider = value?.trim().toLowerCase() || "chromium";
   if (provider === "cloudflare" || provider === "browserbase" || provider === "kitesurf" || provider === "chromium") return provider;
   throw new TypeError("MANAGED_BROWSER_PROVIDER must be cloudflare, browserbase, kitesurf, or chromium");
 }
@@ -411,7 +411,7 @@ export async function createManagedBrowserRuntime(
     const unsupported = async () => { throw new Error(`${providerName} does not support private browser continuation`); };
     return {
       provider,
-      tools: tools.map(tool => ({ ...tool, handler: (input, context) => {
+      tools: tools.map(tool => ({ ...tool, handler: async (input, context) => {
         options.authorizeVaultAccess?.(context);
         return tool.handler(input, context);
       } })),
