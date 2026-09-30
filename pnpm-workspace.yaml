@@ -26,3 +26,4 @@ minimumReleaseAgeExclude:
 
 patchedDependencies:
   '@cloudflare/sandbox@0.12.4': patches/@cloudflare__sandbox@0.12.4.patch
+  quickjs-emscripten-core@0.32.0: patches/quickjs-emscripten-core@0.32.0.patch

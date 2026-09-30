@@ -9,6 +9,7 @@ overrides:
 
 patchedDependencies:
   '@cloudflare/sandbox@0.12.4': 7fa7387e610c11eed36979117adfdd317b44eed0f2feffba0c35cdfa24aed2b2
+  quickjs-emscripten-core@0.32.0: ff1291ddccb44935e1d8832364f5ab11f7a815904cafdb587e6a7e91cc4f270e
 
 importers:
 
@@ -512,7 +513,7 @@ importers:
         version: 0.14.36(typescript@5.9.3)(zod@4.5.4)
       quickjs-emscripten-core:
         specifier: 0.32.0
-        version: 0.32.0
+        version: 0.32.0(patch_hash=ff1291ddccb44935e1d8832364f5ab11f7a815904cafdb587e6a7e91cc4f270e)
       tough-cookie:
         specifier: 6.0.0
         version: 6.0.0
@@ -666,7 +667,7 @@ importers:
         version: 0.0.79
       quickjs-emscripten-core:
         specifier: 0.32.0
-        version: 0.32.0
+        version: 0.32.0(patch_hash=ff1291ddccb44935e1d8832364f5ab11f7a815904cafdb587e6a7e91cc4f270e)
       typescript:
         specifier: 5.9.3
         version: 5.9.3
@@ -9696,7 +9697,7 @@ snapshots:
       es-define-property: 1.0.1
       side-channel: 1.1.1
 
-  quickjs-emscripten-core@0.32.0:
+  quickjs-emscripten-core@0.32.0(patch_hash=ff1291ddccb44935e1d8832364f5ab11f7a815904cafdb587e6a7e91cc4f270e):
     dependencies:
       '@jitl/quickjs-ffi-types': 0.32.0
 
@@ -9706,7 +9707,7 @@ snapshots:
       '@jitl/quickjs-wasmfile-debug-sync': 0.32.0
       '@jitl/quickjs-wasmfile-release-asyncify': 0.32.0
       '@jitl/quickjs-wasmfile-release-sync': 0.32.0
-      quickjs-emscripten-core: 0.32.0
+      quickjs-emscripten-core: 0.32.0(patch_hash=ff1291ddccb44935e1d8832364f5ab11f7a815904cafdb587e6a7e91cc4f270e)
 
   randombytes@2.1.0:
     dependencies:

@@ -1,7 +1,10 @@
+import { checkCors, preflight, exposedCorsHeaders } from "./cors.mjs";
 import { CookieJar, Cookie } from "tough-cookie";
 import ipaddr from "ipaddr.js";
 const forbidden = new Set([
   "authorization",
+  "access-control-request-headers",
+  "access-control-request-method",
   "proxy-authorization",
   "cookie",
   "cookie2",
@@ -209,6 +212,8 @@ export class BrowserSession {
     if (!["fetch", "script", "module", "navigation"].includes(kind))
       throw new TypeError("Unsupported resource kind");
     let u = publicHttpURL(target, documentURL);
+    // Fragments never leave the host, but are part of a navigated document URL.
+    let fragment = new URL(target, documentURL).hash;
     if (!documentURL && kind !== "navigation")
       throw new TypeError("Document URL required");
     const docOrigin = documentURL ? origin(documentURL) : u.origin,
@@ -216,6 +221,8 @@ export class BrowserSession {
         init.credentials ?? (kind === "navigation" ? "include" : "same-origin");
     if (!["omit", "same-origin", "include"].includes(credentials))
       throw new TypeError("Invalid credentials");
+    if (init.mode && !["cors", "same-origin", "no-cors"].includes(init.mode))
+      throw new TypeError("Unsupported request mode");
     const headers = new Headers(init.headers);
     for (const n of headers.keys())
       if (
@@ -240,8 +247,21 @@ export class BrowserSession {
           this.#allow &&
           init.mode !== "cors" &&
           init.mode !== "same-origin";
-      if (cross && kind !== "navigation" && !classic)
-        throw new TypeError("Cross-origin fetch unsupported and blocked");
+      const cors = cross && kind !== "navigation" && !classic;
+      if (cors && ["same-origin", "no-cors"].includes(init.mode))
+        throw new TypeError(
+          "Cross-origin request mode unsupported and blocked",
+        );
+      if (cors)
+        await preflight(
+          this.#transport,
+          u.href,
+          method,
+          headers,
+          docOrigin,
+          credentials,
+          init.signal,
+        );
       const cookies = credentials !== "omit" && !cross,
         outgoing = new Headers(headers);
       if (cookies) {
@@ -251,6 +271,7 @@ export class BrowserSession {
         });
         if (c) outgoing.set("cookie", c);
       }
+      if (cors) outgoing.set("origin", docOrigin);
       const r = await this.#transport.fetch(u.href, {
         method,
         headers: outgoing,
@@ -265,6 +286,14 @@ export class BrowserSession {
         (r.url && publicHttpURL(r.url).href !== u.href)
       )
         throw new TypeError("Transport violated manual redirect policy");
+      if (cors) {
+        try {
+          checkCors(r, docOrigin, credentials);
+        } catch (error) {
+          await r.body?.cancel();
+          throw error;
+        }
+      }
       if (cookies) {
         if (
           r.headers.has("set-cookie") &&
@@ -284,7 +313,18 @@ export class BrowserSession {
           hops === 10
         )
           throw new TypeError("Redirect not supported or limit exceeded");
-        u = publicHttpURL(r.headers.get("location"), u);
+        const location = r.headers.get("location");
+        const destination = new URL(location, u);
+        // Until redirect-tainted origins are modeled, fail closed on CORS
+        // origin transitions (including a same-origin fetch redirecting out).
+        if (
+          kind !== "navigation" &&
+          !classic &&
+          destination.origin !== u.origin
+        )
+          throw new TypeError("Cross-origin fetch redirect unsupported");
+        if (location.includes("#")) fragment = destination.hash;
+        u = publicHttpURL(destination);
         if (
           (r.status === 303 && method !== "HEAD") ||
           ([301, 302].includes(r.status) && method === "POST")
@@ -295,7 +335,9 @@ export class BrowserSession {
         }
         continue;
       }
-      const exposed = new Headers(r.headers);
+      const exposed = cors
+        ? exposedCorsHeaders(r.headers, credentials)
+        : new Headers(r.headers);
       exposed.delete("set-cookie");
       exposed.delete("set-cookie2");
       const safe = new Response(r.body, {
@@ -304,8 +346,9 @@ export class BrowserSession {
         headers: exposed,
       });
       Object.defineProperties(safe, {
-        url: { value: u.href },
+        url: { value: u.href + (kind === "navigation" ? fragment : "") },
         redirected: { value: hops > 0 },
+        type: { value: cors ? "cors" : "basic" },
       });
       return safe;
     }

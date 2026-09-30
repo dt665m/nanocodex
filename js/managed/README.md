@@ -683,10 +683,14 @@ Vault and credential headers are rejected before routing, and each redirect
 must return through the same policy. There is no raw-fetch fallback. Account
 public egress strips cookies and authorization; cookie-backed sessions and
 authenticated browsing therefore do not work through this network binding.
-Responses are currently limited to 2 MiB, which blocks modern Sage/Arketa and
-Stripe checkout bundles. Obscura cannot complete those checkout flows.
-Page scripts cannot make cross-origin API requests; unsupported CORS requests
-fail closed. Browser state snapshots are not wired into this provider.
+Responses are limited to 16 MiB. Server-authorized cross-origin API requests
+support CORS checks, preflights and filtered response headers. Cross-origin
+`no-cors` page fetches and fetch redirects that change origin fail closed.
+Iframe fragments, stable window identity, parser-complete load events and linked
+stylesheet inspection support modern application initialization. This remains
+experimental: authenticated checkout, secure Link handoff and full payment
+completion are not established. Browser state snapshots are not wired into this
+provider.
 
 Run the [local hosted browser smoke test](scripts/kitesurf-smoke.md) to verify the real
 remote binding through the managed runtime before rollout.

@@ -4563,7 +4563,7 @@ class Element extends Node {
     this._iframeLoadedUrl = 'about:blank';
     this._iframeDoc = new _IframeDocument(
       '<!DOCTYPE html><html><head></head><body></body></html>', 'about:blank', this);
-    this._iframeWin = new _IframeWindow(this._iframeDoc, 'about:blank');
+    this._iframeWin = _retargetIframeWindow(this._iframeWin, this._iframeDoc, 'about:blank');
   }
   _loadIframeSrc(url) {
     let fullUrl = url;
@@ -4580,7 +4580,7 @@ class Element extends Node {
     try { pageOrigin = new URL(_domParse('document_url') || 'about:blank').origin; } catch (_) {}
     __obscuraCore.ops.op_fetch_url(
       fullUrl, 'GET', '{}', new Uint8Array(0), pageOrigin,
-      'no-cors', 'same-origin', true
+      'no-cors', 'same-origin', 'navigation'
     ).then(raw => {
       if (el._iframeLoadingUrl !== fullUrl) return;
       const response = JSON.parse(raw);
@@ -4597,7 +4597,7 @@ class Element extends Node {
           loadedUrl, html, Math.round(box.width) || 300, Math.round(box.height) || 150);
         if (el._frameId) globalThis.__obscura_frameElements[el._frameId] = el;
         el._iframeDoc = new _IframeDocument(html, loadedUrl, el);
-        el._iframeWin = new _IframeWindow(el._iframeDoc, loadedUrl);
+        el._iframeWin = _retargetIframeWindow(el._iframeWin, el._iframeDoc, loadedUrl);
         // Bind the window to the realm the host just queued. This is what makes
         // posting into the frame reach the frame's own listeners, and makes a
         // message coming back out arrive with this window as its `source`.
@@ -4609,18 +4609,21 @@ class Element extends Node {
       } else {
         el._iframeLoadedUrl = fullUrl;
         el._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', fullUrl, el);
-        el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
+        el._iframeWin = _retargetIframeWindow(el._iframeWin, el._iframeDoc, fullUrl);
       }
 
       // Dispatch through the element so the onload property/attribute and any
       // addEventListener('load', ...) listeners all run. Calling el.onload()
       // directly bypasses listeners registered via addEventListener.
-      el.dispatchEvent(new Event('load'));
+      // A real child realm signals load only after its parser scripts finish.
+      // The host dispatches that event; immediate dispatch loses onload messages
+      // while the child is still downloading its listeners.
+      if (!el._frameId) el.dispatchEvent(new Event('load'));
     }).catch(() => {
       if (el._iframeLoadingUrl !== fullUrl) return;
       el._iframeLoadedUrl = fullUrl;
       el._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', fullUrl, el);
-      el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
+      el._iframeWin = _retargetIframeWindow(el._iframeWin, el._iframeDoc, fullUrl);
 
       el.dispatchEvent(new Event('load'));
     });
@@ -4642,7 +4645,7 @@ class Element extends Node {
     }
     if (!this._iframeDoc) {
       this._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', 'about:blank', this);
-      this._iframeWin = new _IframeWindow(this._iframeDoc, 'about:blank');
+      this._iframeWin = _retargetIframeWindow(this._iframeWin, this._iframeDoc, 'about:blank');
     }
     return this._iframeDoc;
   }
@@ -7632,7 +7635,7 @@ globalThis.fetch = async (input, init = {}) => {
     throw new TypeError("Failed to execute 'fetch': '" + fetchCredentials + "' is not a valid RequestCredentials value");
   }
   const pageOrigin = (function() { try { const u = new URL(_domParse("document_url") || "about:blank"); return u.origin; } catch(e) { return ""; } })();
-  const raw = await __obscuraCore.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode, fetchCredentials, false);
+  const raw = await __obscuraCore.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode, fetchCredentials, false, fetchRedirect);
   const parsed = JSON.parse(raw);
   if (parsed.blocked) {
     const err = new TypeError('net::ERR_FAILED');
@@ -7643,7 +7646,7 @@ globalThis.fetch = async (input, init = {}) => {
   if (parsed.corsBlocked) {
     throw new TypeError('Failed to fetch: ' + (parsed.corsError || 'CORS error'));
   }
-  const respType = parsed.status === 0 || parsed.opaque ? "opaque" : "basic";
+  const respType = parsed.status === 0 || parsed.opaque ? "opaque" : (parsed.type === "cors" ? "cors" : "basic");
   const exposeRedirectMetadata = respType !== "opaque" && fetchRedirect === "follow";
   const responseBody = respType === "opaque"
     ? null
@@ -13398,6 +13401,18 @@ function _installFramingRelationships() {
       });
     } catch (_) {}
   }
+}
+
+// WindowProxy identity survives iframe navigation. Parent integrations capture
+// contentWindow before load and compare it with subsequent message.source.
+function _retargetIframeWindow(current, doc, url) {
+  const next = new _IframeWindow(doc, url);
+  if (!current) return next;
+  current.document = doc;
+  current._url = url;
+  current.location = next.location;
+  current._frameId = 0;
+  return current;
 }
 
 class _IframeWindow {

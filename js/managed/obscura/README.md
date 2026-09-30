@@ -17,12 +17,20 @@ frames, default execution contexts, JavaScript evaluation, function calls,
 remote object references, pierced DOM queries, focus and text insertion use the
 actual Wasm DOM and QuickJS contexts. Unsupported commands return errors.
 
-Responses are bounded at 2 MiB. Live Sage/Arketa and Stripe checkout scripts
-exceed this limit, so these flows cannot initialize. Raising the limit also
-reproduced a QuickJS teardown assertion after a dynamically loaded 3 MiB script;
-the larger limit is not enabled. A live-site teardown also logged that assertion
-with the conservative cap. The fixture journey passes, but live-site cleanup
-remains an unresolved runtime defect.
+Responses are bounded at 16 MiB. QuickJS's FFI output views are refreshed after
+Wasm memory growth through a pinned package patch; large dynamically loaded
+scripts can execute and their runtimes can be disposed normally. The patch
+implements the memory-view repair proposed in upstream
+[QuickJS PR #248](https://github.com/justjake/quickjs-emscripten/pull/248), which
+addresses [issue #269](https://github.com/justjake/quickjs-emscripten/issues/269).
+Both CommonJS and ESM builds are patched. Remove the patch when upgrading to an
+upstream release containing the repair, after running the large-script journey.
+
+Iframe navigation preserves URL fragments, including redirect inheritance.
+`contentWindow` identity remains stable while a frame loads, and its load event
+follows its parser scripts. Linked stylesheets retain fetched CSS and CSSOM edits
+for rule inspection and load events; this does not provide visual rendering.
+Stylesheet storage is bounded to 512 entries and 16 MiB per realm.
 
 Screenshots, layout and coordinate input are not implemented. This is not a
 complete Chromium/Puppeteer replacement. Named isolated worlds and full
@@ -40,8 +48,12 @@ storage have a host-owned session implementation; snapshot serialization is
 available separately but is not wired to account Durable Object storage.
 IndexedDB remains in-memory per realm. The managed public gateway removes
 response cookies and rejects cookie/authorization request headers, so it cannot
-support authenticated website sessions. Cross-origin page fetch and module
-loading fail closed; classic scripts and frame HTML may load without cookies.
+support authenticated website sessions. Cross-origin fetch and module loading enforce server origin permission,
+credential-mode checks, preflight authorization and response-header exposure.
+Cross-origin `no-cors` page fetches and fetch redirects that change origin remain
+unsupported and fail closed. Classic scripts and frame HTML may load without
+cookies. Cross-origin credential transport and authenticated sessions are not
+implemented.
 
 ## Rebuild
 

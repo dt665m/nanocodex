@@ -261,8 +261,10 @@ export class ObscuraBrowser {
         ),
       );
     if (pierce && name === "IFRAME") {
-      const child = t.host.pages.get(page.run(`_wrap(${nid})._frameId`));
-      if (child) {
+      const childId = page.run(`_wrap(${nid})._frameId`);
+      // Zero denotes an iframe without a loaded realm, not the top document.
+      const child = childId > 0 ? t.host.pages.get(childId) : undefined;
+      if (child && child.parentFrameId === page.frameId) {
         node.frameId = this.frameId(t, child);
         node.contentDocument = this.describeNode(
           t,

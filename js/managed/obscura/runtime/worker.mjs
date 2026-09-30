@@ -13,8 +13,8 @@ import { BrowserSession, attachPageSession } from "./browser-session.mjs";
 import bootstrap from "bootstrap-source";
 import { ObscuraBrowser } from "./browser.mjs";
 import { protocol } from "./protocol.mjs";
-// Keep large scripts out until QuickJS large-payload teardown is supported.
-const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
+// Bound responses while accommodating modern application script bundles.
+const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
 let initialized;
 const sessions = new Map();
 function initialize() {
@@ -105,8 +105,10 @@ export default {
       const { kind, ...options } = init;
       const response = await env.NETWORK.fetch(new Request(target, options));
       const declared = Number(response.headers.get("content-length") || 0);
-      if (declared > MAX_RESPONSE_BYTES)
-        throw new Error("Browser response exceeds 2 MiB");
+      if (declared > MAX_RESPONSE_BYTES) {
+        await response.body?.cancel();
+        throw new Error("Browser response exceeds 16 MiB");
+      }
       const reader = response.body?.getReader();
       const chunks = [];
       let size = 0;
@@ -117,7 +119,7 @@ export default {
             if (r.done) break;
             size += r.value.byteLength;
             if (size > MAX_RESPONSE_BYTES)
-              throw new Error("Browser response exceeds 2 MiB");
+              throw new Error("Browser response exceeds 16 MiB");
             chunks.push(r.value);
           }
         } finally {

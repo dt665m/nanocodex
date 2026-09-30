@@ -580,7 +580,7 @@ var init_dist = __esm({
   }
 });
 
-// ../../node_modules/.pnpm/quickjs-emscripten-core@0.32.0/node_modules/quickjs-emscripten-core/dist/chunk-V2S4ZYJR.mjs
+// ../../node_modules/.pnpm/quickjs-emscripten-core@0.32.0_patch_hash=ff1291ddccb44935e1d8832364f5ab11f7a815904cafdb587e6a7e91cc4f270e/node_modules/quickjs-emscripten-core/dist/chunk-V2S4ZYJR.mjs
 function debugLog(...args) {
   QTS_DEBUG && console.log("quickjs-emscripten:", ...args);
 }
@@ -667,7 +667,7 @@ function applyModuleEvalRuntimeOptions(runtime, options) {
 }
 var __defProp2, __export2, QTS_DEBUG, errors_exports, QuickJSUnwrapError, QuickJSWrongOwner, QuickJSUseAfterFree, QuickJSNotImplemented, QuickJSAsyncifyError, QuickJSAsyncifySuspended, QuickJSMemoryLeakDetected, QuickJSEmscriptenModuleError, QuickJSUnknownIntrinsic, QuickJSPromisePending, QuickJSEmptyGetOwnPropertyNames, QuickJSHostRefRangeExceeded, QuickJSHostRefInvalid, AwaitYield, UsingDisposable, SymbolDispose, prototypeAsAny, Lifetime, StaticLifetime, WeakLifetime, Scope, AbstractDisposableResult, DisposableSuccess, DisposableFail, DisposableResult, QuickJSDeferredPromise, ModuleMemory, DefaultIntrinsics, QuickJSIterator, INT32_MIN, INT32_MAX, INVALID_HOST_REF_ID, HostRefMap, HostRef, ContextMemory, QuickJSContext, QuickJSRuntime, QuickJSEmscriptenModuleCallbacks, QuickJSModuleCallbacks, QuickJSWASMModule;
 var init_chunk_V2S4ZYJR = __esm({
-  "../../node_modules/.pnpm/quickjs-emscripten-core@0.32.0/node_modules/quickjs-emscripten-core/dist/chunk-V2S4ZYJR.mjs"() {
+  "../../node_modules/.pnpm/quickjs-emscripten-core@0.32.0_patch_hash=ff1291ddccb44935e1d8832364f5ab11f7a815904cafdb587e6a7e91cc4f270e/node_modules/quickjs-emscripten-core/dist/chunk-V2S4ZYJR.mjs"() {
     init_dist();
     init_dist();
     __defProp2 = Object.defineProperty;
@@ -965,8 +965,13 @@ Lifetime used`) : new QuickJSUseAfterFree("Lifetime not alive");
         return new Uint8Array(this.module.HEAPU8.buffer, ptr, numBytes).set(new Uint8Array(typedArray.buffer)), new Lifetime(ptr, void 0, (ptr2) => this.module._free(ptr2));
       }
       newTypedArray(kind, length) {
-        let zeros = new kind(new Array(length).fill(0)), numBytes = zeros.length * zeros.BYTES_PER_ELEMENT, ptr = this.module._malloc(numBytes), typedArray = new kind(this.module.HEAPU8.buffer, ptr, length);
-        return typedArray.set(zeros), new Lifetime({ typedArray, ptr }, void 0, (value) => this.module._free(value.ptr));
+        const module = this.module, ptr = module._malloc(length * kind.BYTES_PER_ELEMENT);
+        let view = new kind(module.HEAPU8.buffer, ptr, length);
+        view.fill(0);
+        return new Lifetime({ ptr, get typedArray() {
+          if (view.buffer !== module.HEAPU8.buffer) view = new kind(module.HEAPU8.buffer, ptr, length);
+          return view;
+        } }, void 0, (value) => module._free(value.ptr));
       }
       newMutablePointerArray(length) {
         return this.newTypedArray(Int32Array, length);
@@ -1697,7 +1702,7 @@ Attempted to suspend at:`);
   }
 });
 
-// ../../node_modules/.pnpm/quickjs-emscripten-core@0.32.0/node_modules/quickjs-emscripten-core/dist/module-ES6BEMUI.mjs
+// ../../node_modules/.pnpm/quickjs-emscripten-core@0.32.0_patch_hash=ff1291ddccb44935e1d8832364f5ab11f7a815904cafdb587e6a7e91cc4f270e/node_modules/quickjs-emscripten-core/dist/module-ES6BEMUI.mjs
 var module_ES6BEMUI_exports = {};
 __export(module_ES6BEMUI_exports, {
   QuickJSModuleCallbacks: () => QuickJSModuleCallbacks,
@@ -1706,7 +1711,7 @@ __export(module_ES6BEMUI_exports, {
   applyModuleEvalRuntimeOptions: () => applyModuleEvalRuntimeOptions
 });
 var init_module_ES6BEMUI = __esm({
-  "../../node_modules/.pnpm/quickjs-emscripten-core@0.32.0/node_modules/quickjs-emscripten-core/dist/module-ES6BEMUI.mjs"() {
+  "../../node_modules/.pnpm/quickjs-emscripten-core@0.32.0_patch_hash=ff1291ddccb44935e1d8832364f5ab11f7a815904cafdb587e6a7e91cc4f270e/node_modules/quickjs-emscripten-core/dist/module-ES6BEMUI.mjs"() {
     init_chunk_V2S4ZYJR();
   }
 });
@@ -2496,7 +2501,7 @@ var require_ipaddr = __commonJS({
 var variant = { type: "sync", importFFI: () => Promise.resolve().then(() => (init_ffi(), ffi_exports)).then((mod) => mod.QuickJSFFI), importModuleLoader: () => Promise.resolve().then(() => __toESM(require_emscripten_module_cloudflare(), 1)).then((mod) => mod.default) };
 var src_default = variant;
 
-// ../../node_modules/.pnpm/quickjs-emscripten-core@0.32.0/node_modules/quickjs-emscripten-core/dist/index.mjs
+// ../../node_modules/.pnpm/quickjs-emscripten-core@0.32.0_patch_hash=ff1291ddccb44935e1d8832364f5ab11f7a815904cafdb587e6a7e91cc4f270e/node_modules/quickjs-emscripten-core/dist/index.mjs
 init_chunk_V2S4ZYJR();
 init_dist();
 async function newQuickJSWASMModuleFromVariant(variantOrPromise) {
@@ -2913,6 +2918,28 @@ function createObscuraHost({
       );
       const timers = /* @__PURE__ */ new Map(), pending = /* @__PURE__ */ new Set(), pageTasks = /* @__PURE__ */ new Map(), opCalls = [], moduleSources = /* @__PURE__ */ new Map(), moduleFetches = /* @__PURE__ */ new Map(), moduleWaits = /* @__PURE__ */ new Set();
       let moduleSequence = 0;
+      const externalStylesheets = /* @__PURE__ */ new Map(), cssomStylesheets = /* @__PURE__ */ new Map();
+      let stylesheetGeneration = 0;
+      const checkStyleFrame = (requestedFrame) => {
+        if (requestedFrame !== frameId)
+          throw new Error("Incorrect stylesheet frame");
+      };
+      const saveStylesheet = (map, id, value) => {
+        const candidate = new Map(map).set(id, value);
+        const external = map === externalStylesheets ? candidate : externalStylesheets;
+        const cssom = map === cssomStylesheets ? candidate : cssomStylesheets;
+        const size = [...external.values()].reduce(
+          (n, sheet) => n + 2 * sheet.css.length,
+          0
+        ) + [...cssom.values()].reduce(
+          (n, rules2) => n + 2 * rules2.join("").length,
+          0
+        );
+        if (external.size + cssom.size > 512 || size > 16 * 1024 * 1024)
+          throw new Error("Stylesheet storage budget exceeded");
+        map.set(id, value);
+        stylesheetGeneration++;
+      };
       const take = (result) => {
         if (result.error) {
           const e = vm.dump(result.error);
@@ -3042,6 +3069,10 @@ function createObscuraHost({
       });
       sync("op_dom", (cmd, a1, a2, requestedFrame) => {
         if (requestedFrame !== frameId) throw new Error("Incorrect DOM frame");
+        if (/^(set_|append_child|remove_child|insert_before|document_write)/.test(
+          cmd
+        ))
+          stylesheetGeneration++;
         return dom.command(cmd, a1, a2);
       });
       sync("op_session_history", () => "0,0,1");
@@ -3145,29 +3176,70 @@ function createObscuraHost({
         if (session) return session.setDocumentCookie(url, value);
         throw new Error("Cookie persistence not implemented");
       });
-      sync("op_stylesheet_generation", () => 0);
-      sync("op_cssom_stylesheet_has", () => false);
-      sync("op_cssom_stylesheet_clear", () => {
+      sync("op_stylesheet_generation", (frame) => {
+        checkStyleFrame(frame);
+        return stylesheetGeneration;
       });
+      sync(
+        "op_external_stylesheet_set",
+        (id, css, href, originClean, frame) => {
+          checkStyleFrame(frame);
+          saveStylesheet(externalStylesheets, id, {
+            css: String(css),
+            href: String(href),
+            originClean: originClean === true
+          });
+        }
+      );
+      sync("op_external_stylesheet_get", (id, frame) => {
+        checkStyleFrame(frame);
+        return JSON.stringify(externalStylesheets.get(id) || null);
+      });
+      sync("op_external_stylesheet_remove", (id, frame) => {
+        checkStyleFrame(frame);
+        externalStylesheets.delete(id);
+        stylesheetGeneration++;
+      });
+      sync("op_cssom_stylesheet_has", (id, frame) => {
+        checkStyleFrame(frame);
+        return cssomStylesheets.has(id);
+      });
+      sync("op_cssom_stylesheet_clear", (id, frame) => {
+        checkStyleFrame(frame);
+        cssomStylesheets.delete(id);
+        stylesheetGeneration++;
+      });
+      sync(
+        "op_cssom_stylesheet_update",
+        (id, index, count, rules2, reset, frame) => {
+          checkStyleFrame(frame);
+          const next = reset ? [] : [...cssomStylesheets.get(id) || []];
+          next.splice(index, count, ...rules2.map(String));
+          saveStylesheet(cssomStylesheets, id, next);
+          return true;
+        }
+      );
       sync("op_shadow_root_info", (nid) => dom.shadow_root_info(nid));
       sync("op_shadow_attach", (nid, mode) => dom.shadow_attach(nid, mode));
       asyncOp(
         "op_fetch_url",
-        async (target, method, headers, body, _origin, _mode, _credentials, _script) => {
+        async (target, method, headers, body, _origin, _mode, _credentials, _script, redirect) => {
           const bytes = Array.isArray(body) ? body : Object.values(body || {});
           const response = await fetchResource(
             target,
             {
               method,
               mode: _mode,
+              redirect,
               credentials: _credentials,
               headers: JSON.parse(headers),
               ...bytes.length ? { body: new Uint8Array(bytes) } : {}
             },
-            _script ? "script" : "fetch"
+            _script === "navigation" ? "navigation" : _script ? "script" : "fetch"
           );
           return {
             status: response.status,
+            type: response.type,
             body: await response.text(),
             headers: Object.fromEntries(response.headers),
             url: response.url || target,
@@ -3244,7 +3316,16 @@ function createObscuraHost({
                   phase: "frame-parser",
                   error: String(error)
                 })
-              ).finally(() => parserTasks.delete(loading));
+              ).finally(() => {
+                parserTasks.delete(loading);
+                if (!closed && pages.has(id)) {
+                  run(
+                    `(()=>{const el=globalThis.__obscura_frameElements[${id}];if(el?._frameId===${id})el.dispatchEvent(new Event('load'));})()`,
+                    "frame-load.js"
+                  );
+                  pump();
+                }
+              });
             },
             0,
             () => pendingFrames.delete(id)
@@ -3291,6 +3372,10 @@ function createObscuraHost({
         "op_text_decode",
         "op_get_cookies",
         "op_set_cookie",
+        "op_external_stylesheet_set",
+        "op_external_stylesheet_get",
+        "op_external_stylesheet_remove",
+        "op_cssom_stylesheet_update",
         "op_stylesheet_generation",
         "op_cssom_stylesheet_has",
         "op_cssom_stylesheet_clear",
@@ -7190,6 +7275,103 @@ var source = `/* QuickJS-side Intl implementation delegates all formatting to ac
 })();
 `;
 
+// obscura/runtime/cors.mjs
+var safeMethods = /* @__PURE__ */ new Set(["GET", "HEAD", "POST"]);
+var safeResponseHeaders = /* @__PURE__ */ new Set([
+  "cache-control",
+  "content-language",
+  "content-length",
+  "content-type",
+  "expires",
+  "last-modified",
+  "pragma"
+]);
+var unsafeBytes = /[\x00-\x08\x0a-\x1f\x7f"():<>?@\[\]\\{}]/;
+function safeHeader(name, value) {
+  if (new TextEncoder().encode(value).length > 128) return false;
+  if (name === "accept") return !unsafeBytes.test(value);
+  if (name === "accept-language" || name === "content-language")
+    return /^[0-9A-Za-z *,\-.;=]*$/.test(value);
+  if (name === "content-type")
+    return !unsafeBytes.test(value) && [
+      "application/x-www-form-urlencoded",
+      "multipart/form-data",
+      "text/plain"
+    ].includes(value.split(";", 1)[0].trim().toLowerCase());
+  if (name === "range") {
+    const match = /^bytes=(\d+)-(\d*)$/.exec(value);
+    return !!match && (!match[2] || Number(match[1]) <= Number(match[2]));
+  }
+  return false;
+}
+var tokens = (headers, name) => (headers.get(name) || "").split(",").map((s) => s.trim()).filter(Boolean);
+function unsafeHeaderNames(headers) {
+  const names = [], safe = [];
+  let size = 0;
+  for (const [name, value] of headers) {
+    if (safeHeader(name, value)) {
+      safe.push(name);
+      size += new TextEncoder().encode(value).length;
+    } else names.push(name);
+  }
+  if (size > 1024) names.push(...safe);
+  return names.sort();
+}
+function checkCors(response, documentOrigin, credentials) {
+  const allowed = response.headers.get("access-control-allow-origin");
+  if (allowed !== documentOrigin && !(allowed === "*" && credentials !== "include"))
+    throw new TypeError("CORS origin denied");
+  if (credentials === "include" && response.headers.get("access-control-allow-credentials") !== "true")
+    throw new TypeError("CORS credentials denied");
+}
+async function preflight(transport, url, method, headers, documentOrigin, credentials, signal) {
+  const unsafe = unsafeHeaderNames(headers);
+  if (safeMethods.has(method) && !unsafe.length) return;
+  const requestHeaders = new Headers({
+    origin: documentOrigin,
+    "access-control-request-method": method
+  });
+  if (unsafe.length)
+    requestHeaders.set("access-control-request-headers", unsafe.join(","));
+  const response = await transport.fetch(url, {
+    method: "OPTIONS",
+    headers: requestHeaders,
+    redirect: "manual",
+    credentials: "omit",
+    signal
+  });
+  try {
+    if (!response.ok || response.redirected || response.url && response.url !== url)
+      throw new TypeError("CORS preflight failed");
+    checkCors(response, documentOrigin, credentials);
+    const methods = tokens(response.headers, "access-control-allow-methods");
+    if (!safeMethods.has(method) && !methods.includes(method) && !(credentials !== "include" && methods.includes("*")))
+      throw new TypeError("CORS method denied");
+    const allowed = tokens(
+      response.headers,
+      "access-control-allow-headers"
+    ).map((h) => h.toLowerCase());
+    if (unsafe.some(
+      (name) => !allowed.includes(name) && !(credentials !== "include" && allowed.includes("*"))
+    ))
+      throw new TypeError("CORS headers denied");
+  } finally {
+    await response.body?.cancel();
+  }
+}
+function exposedCorsHeaders(headers, credentials) {
+  const allowed = tokens(headers, "access-control-expose-headers").map(
+    (h) => h.toLowerCase()
+  );
+  const result = new Headers();
+  for (const [name, value] of headers) {
+    if (name === "set-cookie" || name === "set-cookie2") continue;
+    if (safeResponseHeaders.has(name) || allowed.includes(name) || credentials !== "include" && allowed.includes("*"))
+      result.set(name, value);
+  }
+  return result;
+}
+
 // ../../node_modules/.pnpm/tldts-core@7.0.5/node_modules/tldts-core/dist/es6/src/domain.js
 function shareSameDomainSuffix(hostname, vhost) {
   if (hostname.endsWith(vhost)) {
@@ -8139,15 +8321,15 @@ function parseDate(cookieDate) {
   if (!cookieDate) {
     return;
   }
-  const tokens = cookieDate.split(DATE_DELIM);
+  const tokens2 = cookieDate.split(DATE_DELIM);
   let hour;
   let minute;
   let second;
   let dayOfMonth;
   let month;
   let year;
-  for (let i = 0; i < tokens.length; i++) {
-    const token = (tokens[i] ?? "").trim();
+  for (let i = 0; i < tokens2.length; i++) {
+    const token = (tokens2[i] ?? "").trim();
     if (!token.length) {
       continue;
     }
@@ -9784,6 +9966,8 @@ var CookieJar = class _CookieJar {
 var import_ipaddr = __toESM(require_ipaddr(), 1);
 var forbidden = /* @__PURE__ */ new Set([
   "authorization",
+  "access-control-request-headers",
+  "access-control-request-method",
   "proxy-authorization",
   "cookie",
   "cookie2",
@@ -9956,11 +10140,14 @@ var BrowserSession = class {
     if (!["fetch", "script", "module", "navigation"].includes(kind))
       throw new TypeError("Unsupported resource kind");
     let u = publicHttpURL(target, documentURL);
+    let fragment = new URL(target, documentURL).hash;
     if (!documentURL && kind !== "navigation")
       throw new TypeError("Document URL required");
     const docOrigin = documentURL ? origin(documentURL) : u.origin, credentials = init.credentials ?? (kind === "navigation" ? "include" : "same-origin");
     if (!["omit", "same-origin", "include"].includes(credentials))
       throw new TypeError("Invalid credentials");
+    if (init.mode && !["cors", "same-origin", "no-cors"].includes(init.mode))
+      throw new TypeError("Unsupported request mode");
     const headers = new Headers(init.headers);
     for (const n of headers.keys())
       if (forbidden.has(n) || n.startsWith("sec-") || n.startsWith("proxy-") || n.startsWith("x-nanocodex-"))
@@ -9972,8 +10159,21 @@ var BrowserSession = class {
       throw new TypeError("Invalid method");
     for (let hops = 0; hops <= 10; hops++) {
       const cross = u.origin !== docOrigin, classic = kind === "script" && this.#allow && init.mode !== "cors" && init.mode !== "same-origin";
-      if (cross && kind !== "navigation" && !classic)
-        throw new TypeError("Cross-origin fetch unsupported and blocked");
+      const cors = cross && kind !== "navigation" && !classic;
+      if (cors && ["same-origin", "no-cors"].includes(init.mode))
+        throw new TypeError(
+          "Cross-origin request mode unsupported and blocked"
+        );
+      if (cors)
+        await preflight(
+          this.#transport,
+          u.href,
+          method,
+          headers,
+          docOrigin,
+          credentials,
+          init.signal
+        );
       const cookies = credentials !== "omit" && !cross, outgoing = new Headers(headers);
       if (cookies) {
         const c = this.#jar.getCookieStringSync(u.href, {
@@ -9982,6 +10182,7 @@ var BrowserSession = class {
         });
         if (c) outgoing.set("cookie", c);
       }
+      if (cors) outgoing.set("origin", docOrigin);
       const r = await this.#transport.fetch(u.href, {
         method,
         headers: outgoing,
@@ -9992,6 +10193,14 @@ var BrowserSession = class {
       });
       if (r.redirected || r.type === "opaqueredirect" || r.url && publicHttpURL(r.url).href !== u.href)
         throw new TypeError("Transport violated manual redirect policy");
+      if (cors) {
+        try {
+          checkCors(r, docOrigin, credentials);
+        } catch (error) {
+          await r.body?.cancel();
+          throw error;
+        }
+      }
       if (cookies) {
         if (r.headers.has("set-cookie") && typeof r.headers.getSetCookie !== "function")
           throw new TypeError("Separate cookie headers required");
@@ -10005,7 +10214,12 @@ var BrowserSession = class {
         await r.body?.cancel();
         if (init.redirect === "error" || init.redirect === "manual" || hops === 10)
           throw new TypeError("Redirect not supported or limit exceeded");
-        u = publicHttpURL(r.headers.get("location"), u);
+        const location = r.headers.get("location");
+        const destination = new URL(location, u);
+        if (kind !== "navigation" && !classic && destination.origin !== u.origin)
+          throw new TypeError("Cross-origin fetch redirect unsupported");
+        if (location.includes("#")) fragment = destination.hash;
+        u = publicHttpURL(destination);
         if (r.status === 303 && method !== "HEAD" || [301, 302].includes(r.status) && method === "POST") {
           method = "GET";
           body = void 0;
@@ -10013,7 +10227,7 @@ var BrowserSession = class {
         }
         continue;
       }
-      const exposed = new Headers(r.headers);
+      const exposed = cors ? exposedCorsHeaders(r.headers, credentials) : new Headers(r.headers);
       exposed.delete("set-cookie");
       exposed.delete("set-cookie2");
       const safe = new Response(r.body, {
@@ -10022,8 +10236,9 @@ var BrowserSession = class {
         headers: exposed
       });
       Object.defineProperties(safe, {
-        url: { value: u.href },
-        redirected: { value: hops > 0 }
+        url: { value: u.href + (kind === "navigation" ? fragment : "") },
+        redirected: { value: hops > 0 },
+        type: { value: cors ? "cors" : "basic" }
       });
       return safe;
     }
@@ -10321,8 +10536,9 @@ var ObscuraBrowser = class {
         )
       );
     if (pierce && name === "IFRAME") {
-      const child = t.host.pages.get(page.run(`_wrap(${nid})._frameId`));
-      if (child) {
+      const childId = page.run(`_wrap(${nid})._frameId`);
+      const child = childId > 0 ? t.host.pages.get(childId) : void 0;
+      if (child && child.parentFrameId === page.frameId) {
         node.frameId = this.frameId(t, child);
         node.contentDocument = this.describeNode(
           t,
@@ -10758,7 +10974,7 @@ var protocol = {
 };
 
 // obscura/runtime/worker.mjs
-var MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
+var MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
 var initialized;
 var sessions = /* @__PURE__ */ new Map();
 function initialize() {
@@ -10844,8 +11060,10 @@ var worker_default = {
       const { kind, ...options } = init;
       const response = await env.NETWORK.fetch(new Request(target, options));
       const declared = Number(response.headers.get("content-length") || 0);
-      if (declared > MAX_RESPONSE_BYTES)
-        throw new Error("Browser response exceeds 2 MiB");
+      if (declared > MAX_RESPONSE_BYTES) {
+        await response.body?.cancel();
+        throw new Error("Browser response exceeds 16 MiB");
+      }
       const reader = response.body?.getReader();
       const chunks = [];
       let size = 0;
@@ -10856,7 +11074,7 @@ var worker_default = {
             if (r.done) break;
             size += r.value.byteLength;
             if (size > MAX_RESPONSE_BYTES)
-              throw new Error("Browser response exceeds 2 MiB");
+              throw new Error("Browser response exceeds 16 MiB");
             chunks.push(r.value);
           }
         } finally {

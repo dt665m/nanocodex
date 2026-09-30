@@ -11,13 +11,18 @@ workerd or external network service is needed. The HTTP listener uses an ephemer
 loopback port; all browser traffic goes to a local fixture Worker, including
 unexpected URLs (404). Runtime startup and the journey have bounded timeouts.
 
-The 45 observable checks exercise the real `agents` browser helper API through
+The 58 observable checks exercise the real `agents` browser helper API through
 `createObscuraBrowserBinding`, WorkerLoader, and the current packaged assets in
 `src/obscura-assets`. They cover discovery and caching, session creation/deletion,
-WebSocket CDP transport, scripts, child-frame contexts, DOM traversal and typing,
+WebSocket CDP transport, scripts, child-frame contexts, DOM traversal and typing
+(including unloaded iframes without recursive parent-document traversal),
 promises, errors, unsupported screenshots, stale contexts, cookies and storage
-isolation across navigations/tabs/origins, cleanup, plain values with awaitPromise, oversized script error events, streamed
-response rejection above 2 MiB, and bodyless HTTP 204. This is a helper API
+isolation across navigations/tabs/origins, cleanup, plain values with awaitPromise,
+a 3 MiB dynamic script with Wasm memory growth, streamed response rejection above
+16 MiB, and bodyless HTTP 204. Additional journeys verify iframe fragments and
+redirect inheritance, parser-complete iframe load with stable message-source
+identity, stylesheet load/error and CSSOM access restrictions, and CORS read,
+preflight write, header filtering and denied-request behavior. This is a helper API
 integration journey; it does not exercise BrowserConnector, the full managed
 Worker, a rendered browser, or external sites.
 

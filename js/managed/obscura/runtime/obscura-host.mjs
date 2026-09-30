@@ -80,6 +80,32 @@ export function createObscuraHost({
         moduleFetches = new Map(),
         moduleWaits = new Set();
       let moduleSequence = 0;
+      const externalStylesheets = new Map(),
+        cssomStylesheets = new Map();
+      let stylesheetGeneration = 0;
+      const checkStyleFrame = (requestedFrame) => {
+        if (requestedFrame !== frameId)
+          throw new Error("Incorrect stylesheet frame");
+      };
+      const saveStylesheet = (map, id, value) => {
+        const candidate = new Map(map).set(id, value);
+        const external =
+          map === externalStylesheets ? candidate : externalStylesheets;
+        const cssom = map === cssomStylesheets ? candidate : cssomStylesheets;
+        const size =
+          [...external.values()].reduce(
+            (n, sheet) => n + 2 * sheet.css.length,
+            0,
+          ) +
+          [...cssom.values()].reduce(
+            (n, rules) => n + 2 * rules.join("").length,
+            0,
+          );
+        if (external.size + cssom.size > 512 || size > 16 * 1024 * 1024)
+          throw new Error("Stylesheet storage budget exceeded");
+        map.set(id, value);
+        stylesheetGeneration++;
+      };
       const take = (result) => {
         if (result.error) {
           const e = vm.dump(result.error);
@@ -214,6 +240,12 @@ export function createObscuraHost({
         });
       sync("op_dom", (cmd, a1, a2, requestedFrame) => {
         if (requestedFrame !== frameId) throw new Error("Incorrect DOM frame");
+        if (
+          /^(set_|append_child|remove_child|insert_before|document_write)/.test(
+            cmd,
+          )
+        )
+          stylesheetGeneration++;
         return dom.command(cmd, a1, a2);
       });
       sync("op_session_history", () => "0,0,1");
@@ -317,9 +349,51 @@ export function createObscuraHost({
         if (session) return session.setDocumentCookie(url, value);
         throw new Error("Cookie persistence not implemented");
       });
-      sync("op_stylesheet_generation", () => 0);
-      sync("op_cssom_stylesheet_has", () => false);
-      sync("op_cssom_stylesheet_clear", () => {});
+      // Retain real fetched CSS and CSSOM edits for the bootstrap's stylesheet
+      // model. This enables load/rule inspection; there is still no renderer.
+      sync("op_stylesheet_generation", (frame) => {
+        checkStyleFrame(frame);
+        return stylesheetGeneration;
+      });
+      sync(
+        "op_external_stylesheet_set",
+        (id, css, href, originClean, frame) => {
+          checkStyleFrame(frame);
+          saveStylesheet(externalStylesheets, id, {
+            css: String(css),
+            href: String(href),
+            originClean: originClean === true,
+          });
+        },
+      );
+      sync("op_external_stylesheet_get", (id, frame) => {
+        checkStyleFrame(frame);
+        return JSON.stringify(externalStylesheets.get(id) || null);
+      });
+      sync("op_external_stylesheet_remove", (id, frame) => {
+        checkStyleFrame(frame);
+        externalStylesheets.delete(id);
+        stylesheetGeneration++;
+      });
+      sync("op_cssom_stylesheet_has", (id, frame) => {
+        checkStyleFrame(frame);
+        return cssomStylesheets.has(id);
+      });
+      sync("op_cssom_stylesheet_clear", (id, frame) => {
+        checkStyleFrame(frame);
+        cssomStylesheets.delete(id);
+        stylesheetGeneration++;
+      });
+      sync(
+        "op_cssom_stylesheet_update",
+        (id, index, count, rules, reset, frame) => {
+          checkStyleFrame(frame);
+          const next = reset ? [] : [...(cssomStylesheets.get(id) || [])];
+          next.splice(index, count, ...rules.map(String));
+          saveStylesheet(cssomStylesheets, id, next);
+          return true;
+        },
+      );
       sync("op_shadow_root_info", (nid) => dom.shadow_root_info(nid));
       sync("op_shadow_attach", (nid, mode) => dom.shadow_attach(nid, mode));
       asyncOp(
@@ -333,6 +407,7 @@ export function createObscuraHost({
           _mode,
           _credentials,
           _script,
+          redirect,
         ) => {
           const bytes = Array.isArray(body) ? body : Object.values(body || {});
           const response = await fetchResource(
@@ -340,14 +415,20 @@ export function createObscuraHost({
             {
               method,
               mode: _mode,
+              redirect,
               credentials: _credentials,
               headers: JSON.parse(headers),
               ...(bytes.length ? { body: new Uint8Array(bytes) } : {}),
             },
-            _script ? "script" : "fetch",
+            _script === "navigation"
+              ? "navigation"
+              : _script
+                ? "script"
+                : "fetch",
           );
           return {
             status: response.status,
+            type: response.type,
             body: await response.text(),
             headers: Object.fromEntries(response.headers),
             url: response.url || target,
@@ -427,7 +508,18 @@ export function createObscuraHost({
                     error: String(error),
                   }),
                 )
-                .finally(() => parserTasks.delete(loading));
+                .finally(() => {
+                  parserTasks.delete(loading);
+                  // The iframe load event follows the child parser scripts;
+                  // parents commonly send initialization data from onload.
+                  if (!closed && pages.has(id)) {
+                    run(
+                      `(()=>{const el=globalThis.__obscura_frameElements[${id}];if(el?._frameId===${id})el.dispatchEvent(new Event('load'));})()`,
+                      "frame-load.js",
+                    );
+                    pump();
+                  }
+                });
             },
             0,
             () => pendingFrames.delete(id),
@@ -489,6 +581,10 @@ export function createObscuraHost({
         "op_text_decode",
         "op_get_cookies",
         "op_set_cookie",
+        "op_external_stylesheet_set",
+        "op_external_stylesheet_get",
+        "op_external_stylesheet_remove",
+        "op_cssom_stylesheet_update",
         "op_stylesheet_generation",
         "op_cssom_stylesheet_has",
         "op_cssom_stylesheet_clear",

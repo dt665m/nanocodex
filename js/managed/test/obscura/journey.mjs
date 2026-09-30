@@ -47,6 +47,23 @@ async function journey(call, events, checks) {
     "Child",
   );
   eq(
+    "iframe onload reaches child listeners after external scripts",
+    (
+      await page("Runtime.evaluate", {
+        expression:
+          'new Promise((resolve,reject)=>{const end=Date.now()+2000;function check(){if(globalThis.frameHandshake)return resolve(frameHandshake);if(Date.now()>end)return reject(new Error("No frame handshake"));setTimeout(check,10)}check()})',
+        awaitPromise: true,
+        returnByValue: true,
+      })
+    ).result.value,
+    { data: "child-ready", stable: true },
+  );
+  eq(
+    "iframe keeps initialization fragment",
+    (await evalAt("location.hash", child)).result.value,
+    "#init=fixture",
+  );
+  eq(
     "parent remains parent",
     (await evalAt("document.title")).result.value,
     "Parent",
@@ -76,8 +93,15 @@ async function journey(call, events, checks) {
     (n) => n.nodeName === "INPUT" && n.attributes.includes("child-input"),
   );
   eq("DOM pierces real child", !!input, true);
+  eq(
+    "unloaded iframe never points back at the top document",
+    flat
+      .filter((n) => n.nodeName === "IFRAME" && n.attributes.includes("blank"))
+      .every((n) => !n.contentDocument),
+    true,
+  );
   const childDoc = flat.find(
-    (n) => n.documentURL === "https://child.example.com/frame",
+    (n) => n.documentURL === "https://child.example.com/frame#init=fixture",
   );
   const q = await page("DOM.querySelector", {
     nodeId: childDoc.nodeId,
@@ -126,23 +150,23 @@ async function journey(call, events, checks) {
   eq("exception reported", !!err.exceptionDetails, true);
   const largeScript = await page("Runtime.evaluate", {
     expression:
-      'new Promise(resolve=>{const s=document.createElement("script");s.src="/large.js";s.onload=()=>resolve("loaded");s.onerror=()=>resolve("error");document.head.appendChild(s)})',
+      'new Promise(resolve=>{const s=document.createElement("script");s.src="/large.js";s.onload=()=>resolve(globalThis.largeScriptLoaded===true);s.onerror=()=>resolve("error");document.head.appendChild(s)})',
     awaitPromise: true,
     returnByValue: true,
   });
   eq(
-    "oversized script dispatches an error event",
+    "large script executes after Wasm memory growth",
     largeScript.result.value,
-    "error",
+    true,
   );
   const oversized = await page("Runtime.evaluate", {
     expression:
-      'fetch("/oversized").then(()=>false,e=>String(e).includes("2 MiB"))',
+      'fetch("/oversized").then(()=>false,e=>String(e).includes("16 MiB"))',
     awaitPromise: true,
     returnByValue: true,
   });
   eq(
-    "streamed response exceeding 2 MiB is rejected",
+    "streamed response exceeding 16 MiB is rejected",
     oversized.result.value,
     true,
   );
@@ -152,6 +176,83 @@ async function journey(call, events, checks) {
     returnByValue: true,
   });
   eq("bodyless HTTP 204 is preserved", noContent.result.value, 204);
+  const asyncEval = async (expression) =>
+    (
+      await page("Runtime.evaluate", {
+        expression,
+        awaitPromise: true,
+        returnByValue: true,
+      })
+    ).result.value;
+  eq(
+    "stylesheet load retains CSSOM and edits",
+    await asyncEval(
+      'new Promise(resolve=>{const l=document.createElement("link");l.rel="stylesheet";l.href="/fixture.css";l.onload=()=>{const before=l.sheet.cssRules[0].selectorText;l.sheet.insertRule(".inserted { color: blue; }",1);const after=l.sheet.cssRules[1].selectorText;resolve([before,after,l.sheet.cssRules.length])};l.onerror=()=>resolve("error");document.head.appendChild(l)})',
+    ),
+    [".fixture", ".inserted", 2],
+  );
+  eq(
+    "cross-origin stylesheet loads but protects rules",
+    await asyncEval(
+      'new Promise(resolve=>{const l=document.createElement("link");l.rel="stylesheet";l.href="https://child.example.com/fixture.css";l.onload=()=>{try{l.sheet.cssRules;resolve("exposed")}catch(e){resolve(e.name)}};l.onerror=()=>resolve("error");document.head.appendChild(l)})',
+    ),
+    "SecurityError",
+  );
+  eq(
+    "failed stylesheet emits error",
+    await asyncEval(
+      'new Promise(resolve=>{const l=document.createElement("link");l.rel="stylesheet";l.href="/missing.css";l.onload=()=>resolve("load");l.onerror=()=>resolve("error");document.head.appendChild(l)})',
+    ),
+    "error",
+  );
+  eq(
+    "CORS allows server-authorized reads and filters headers",
+    await asyncEval(
+      'fetch("https://child.example.com/cors-read").then(async r=>({type:r.type,data:await r.json(),visible:r.headers.get("x-visible"),hidden:r.headers.get("x-hidden")}))',
+    ),
+    {
+      type: "cors",
+      data: {
+        method: "GET",
+        origin: "https://fixture.example.com",
+        header: null,
+        body: null,
+      },
+      visible: "public",
+      hidden: null,
+    },
+  );
+  eq(
+    "CORS preflight authorizes a custom-header write",
+    await asyncEval(
+      'fetch("https://child.example.com/cors-write",{method:"PUT",headers:{"x-fixture":"test"},body:"synthetic"}).then(r=>r.json())',
+    ),
+    {
+      method: "PUT",
+      origin: "https://fixture.example.com",
+      header: "test",
+      body: "synthetic",
+    },
+  );
+  eq(
+    "CORS denies origin, mode, credentials and preflight violations",
+    await asyncEval(
+      'Promise.all([fetch("https://child.example.com/cors-wrong"),fetch("https://child.example.com/cors-read",{mode:"same-origin"}),fetch("https://child.example.com/cors-read",{mode:"no-cors"}),fetch("https://child.example.com/cors-wildcard",{credentials:"include"}),fetch("https://child.example.com/cors-read",{credentials:"include"}),fetch("https://child.example.com/cors-deny",{method:"PUT",headers:{"x-fixture":"test"},body:"denied"})].map(p=>p.then(()=>false,e=>e instanceof Error)))',
+    ),
+    [true, true, true, true, true, true],
+  );
+  eq(
+    "failed preflight never sends the write",
+    await asyncEval('fetch("/cors-stats").then(r=>r.json())'),
+    { deniedWrites: 0 },
+  );
+  eq(
+    "CORS accepts wildcard without credentials and explicit credentials permission",
+    await asyncEval(
+      'Promise.all([fetch("https://child.example.com/cors-wildcard"),fetch("https://child.example.com/cors-credentials",{credentials:"include"})].map(p=>p.then(r=>r.status)))',
+    ),
+    [200, 200],
+  );
   let rejected = false;
   try {
     await page("Page.captureScreenshot");
@@ -159,6 +260,22 @@ async function journey(call, events, checks) {
     rejected = /does not implement/.test(String(e));
   }
   eq("unsupported renderer fails explicitly", rejected, true);
+  await page("Page.navigate", {
+    url: "https://fixture.example.com/redirect-fragment#kept",
+  });
+  eq(
+    "navigation redirects inherit absent fragments",
+    (await evalAt("location.hash")).result.value,
+    "#kept",
+  );
+  await page("Page.navigate", {
+    url: "https://fixture.example.com/redirect-new-fragment#discarded",
+  });
+  eq(
+    "navigation redirects replace explicit fragments",
+    (await evalAt("location.hash")).result.value,
+    "#replaced",
+  );
   await page("Page.navigate", { url: "about:blank" });
   rejected = false;
   try {
@@ -177,9 +294,9 @@ async function journey(call, events, checks) {
 }
 const fixtures = {
   "https://fixture.example.com/parent":
-    '<!doctype html><title>Parent</title><input id="parent-input" value="parent"><iframe src="https://child.example.com/frame"></iframe><script>globalThis.scriptResult={executed:0,loaded:0};const s=document.createElement("script");s.src="/external.js";s.async=true;s.addEventListener("load",()=>scriptResult.loaded++);document.head.appendChild(s)<\/script>',
+    '<!doctype html><title>Parent</title><input id="parent-input" value="parent"><iframe id="blank" src="about:blank"></iframe><iframe src="https://child.example.com/frame#init=fixture" onload="this.contentWindow.postMessage(&quot;parent-ready&quot;,&quot;https://child.example.com&quot;)"></iframe><script>globalThis.capturedWindow=document.querySelectorAll("iframe")[1].contentWindow;addEventListener("message",e=>{if(e.origin==="https://child.example.com")globalThis.frameHandshake={data:e.data,stable:e.source===capturedWindow}});globalThis.scriptResult={executed:0,loaded:0};const s=document.createElement("script");s.src="/external.js";s.async=true;s.addEventListener("load",()=>scriptResult.loaded++);document.head.appendChild(s)<\/script>',
   "https://fixture.example.com/external.js": "scriptResult.executed++",
   "https://child.example.com/frame":
-    '<!doctype html><title>Child</title><input id="child-input" value="child">',
+    '<!doctype html><title>Child</title><input id="child-input" value="child"><script src="/frame-listener.js"></script>',
 };
 export { fixtures, journey };
