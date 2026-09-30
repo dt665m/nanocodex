@@ -54,6 +54,7 @@ pub(crate) enum ComposerEffect {
     ShowAgentId,
     Share(Result<crate::tui::share::Command, String>),
     Vault(crate::tui::vault::Command),
+    SecureInput(crate::tui::secure_input::Command),
     Submit(Submission),
     Queue(Submission),
     RunShell(String),
@@ -1127,15 +1128,18 @@ impl Composer {
             }
             return None;
         }
-        let effect = if let Some(command) = crate::tui::share::Command::parse(self.draft.trim()) {
-            ComposerEffect::Share(command)
-        } else if let Some(command) = crate::tui::vault::Command::parse(self.draft.trim()) {
-            ComposerEffect::Vault(command)
-        } else if self.draft.trim() == "/id" {
-            ComposerEffect::ShowAgentId
-        } else {
-            ComposerEffect::Settings(SettingsCommand::parse(self.draft.trim())?)
-        };
+        let effect =
+            if let Some(command) = crate::tui::secure_input::Command::parse(self.draft.trim()) {
+                ComposerEffect::SecureInput(command)
+            } else if let Some(command) = crate::tui::share::Command::parse(self.draft.trim()) {
+                ComposerEffect::Share(command)
+            } else if let Some(command) = crate::tui::vault::Command::parse(self.draft.trim()) {
+                ComposerEffect::Vault(command)
+            } else if self.draft.trim() == "/id" {
+                ComposerEffect::ShowAgentId
+            } else {
+                ComposerEffect::Settings(SettingsCommand::parse(self.draft.trim())?)
+            };
         self.history.record(self.draft.trim().to_owned());
         self.replace_draft(String::new());
         Some(ComposerUpdate::effect(effect, true))
