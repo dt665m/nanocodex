@@ -20,7 +20,9 @@ actual Wasm DOM and QuickJS contexts. Unsupported commands return errors.
 Responses are bounded at 2 MiB. Live Sage/Arketa and Stripe checkout scripts
 exceed this limit, so these flows cannot initialize. Raising the limit also
 reproduced a QuickJS teardown assertion after a dynamically loaded 3 MiB script;
-the larger limit is not enabled.
+the larger limit is not enabled. A live-site teardown also logged that assertion
+with the conservative cap. The fixture journey passes, but live-site cleanup
+remains an unresolved runtime defect.
 
 Screenshots, layout and coordinate input are not implemented. This is not a
 complete Chromium/Puppeteer replacement. Named isolated worlds and full
