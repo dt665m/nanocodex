@@ -217,7 +217,7 @@ impl NativeSecureInputDescription {
         account_id: &str,
     ) -> Result<Self, ManagedError> {
         request.validate(true)?;
-        if !valid_uuid(account_id) {
+        if !valid_account_id(account_id) {
             return Err(invalid());
         }
         exact_keys(
@@ -543,7 +543,7 @@ impl ManagedClient {
             )
             .await?;
         let account_id = string(&value["user"], "id")?;
-        if !valid_uuid(account_id)
+        if !valid_account_id(account_id)
             || value["user"]["persistent"] != Value::Bool(true)
             || !matches!(
                 string(&value, "authentication")?,
@@ -616,6 +616,12 @@ fn now() -> u64 {
 }
 fn valid_uuid(value: &str) -> bool {
     uuid::Uuid::parse_str(value).is_ok_and(|id| id.hyphenated().to_string() == value)
+}
+// Matches account-auth.ts USER_ID: canonical UUIDv4 with RFC4122 variant.
+fn valid_account_id(value: &str) -> bool {
+    valid_uuid(value)
+        && value.as_bytes()[14] == b'4'
+        && matches!(value.as_bytes()[19], b'8' | b'9' | b'a' | b'b')
 }
 fn valid_agent(value: &str) -> bool {
     !value.is_empty()
@@ -872,7 +878,12 @@ mod tests {
         }
         let selector = NativeSecureInputRequest::selector(ID, AGENT).unwrap();
         assert!(NativeSecureInputDescription::parse(&raw, &selector, ACCOUNT).is_ok());
-        for account in ["not-account-uuid".to_owned(), ACCOUNT.to_uppercase()] {
+        for account in [
+            "not-account-uuid".to_owned(),
+            ACCOUNT.to_uppercase(),
+            "00000000-0000-0000-0000-000000000000".to_owned(),
+            "a14681d3-6c58-1ff7-9b25-3f56f5a9e8d3".to_owned(),
+        ] {
             assert!(NativeSecureInputDescription::parse(&raw, &selector, &account).is_err());
         }
         let mut model_account = raw.clone();
