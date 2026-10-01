@@ -54,10 +54,10 @@ export class FixtureModel extends DurableObject {
     if(request.headers.get('upgrade')!=='websocket')return Response.json({tools:[],machines:[],connections:[]});
     const pair=new WebSocketPair();const client=pair[0],server=pair[1];server.accept();let childSocket=false;
     server.addEventListener('message',event=>{this.ctx.storage.sql.exec('UPDATE model_fixture SET requests=requests+1');const row=this.ctx.storage.sql.exec('SELECT requests,complete,stage,emitted,child_emitted FROM model_fixture').one();if(row.stage===10){
-      const body=JSON.parse(event.data);childSocket ||= JSON.stringify((body.input??[]).filter(item=>item.role==='user')).includes('ND_CHILD_FIXTURE');const child=childSocket;
+      const body=JSON.parse(event.data);childSocket ||= JSON.stringify((body.input??[]).filter(item=>item.role==='user')).includes('JOURNAL_CHILD_FIXTURE');const child=childSocket;
       let output;
-      if(child&&!row.child_emitted){this.ctx.storage.sql.exec('UPDATE model_fixture SET child_emitted=1');output=[{type:'function_call',name:'exec_command',call_id:'fixture-child-command',arguments:JSON.stringify({cmd:'printf ND_CHILD_FIXTURE > /brain/child-proof.txt',workdir:'/brain'})}];}
-      else if(!child&&!row.emitted){this.ctx.storage.sql.exec('UPDATE model_fixture SET emitted=1');output=[{type:'function_call',name:'spawn_agent',call_id:'fixture-child-spawn',arguments:JSON.stringify({role:'Fixture child',task:'ND_CHILD_FIXTURE: write the synthetic proof once using exec_command, then finish.',model:'sol',thinking:'low',output_contract:{kind:'string'}})}];}
+      if(child&&!row.child_emitted){this.ctx.storage.sql.exec('UPDATE model_fixture SET child_emitted=1');output=[{type:'function_call',name:'exec_command',call_id:'fixture-child-command',arguments:JSON.stringify({cmd:'printf JOURNAL_CHILD_FIXTURE > /brain/child-proof.txt',workdir:'/brain'})}];}
+      else if(!child&&!row.emitted){this.ctx.storage.sql.exec('UPDATE model_fixture SET emitted=1');output=[{type:'function_call',name:'spawn_agent',call_id:'fixture-child-spawn',arguments:JSON.stringify({role:'Fixture child',task:'JOURNAL_CHILD_FIXTURE: write the synthetic proof once using exec_command, then finish.',model:'sol',thinking:'low',output_contract:{kind:'string'}})}];}
       else if(!child&&row.emitted===1){this.ctx.storage.sql.exec('UPDATE model_fixture SET emitted=2');output=[{type:'function_call',name:'wait_agent',call_id:'fixture-child-wait',arguments:JSON.stringify({agent_ids:[1],timeout_ms:300000})}];}
       else if(child&&row.child_emitted===1){this.ctx.storage.sql.exec('UPDATE model_fixture SET child_emitted=2');output=[{type:'function_call',name:'submit_result',call_id:'fixture-child-submit',arguments:JSON.stringify({output:'CHILD_OK'})}];}
       else output=[{type:'message',role:'assistant',content:[{type:'output_text',text:child?'CHILD_OK':'ROOT_CHILD_SPAWNED'}]}];
@@ -137,7 +137,7 @@ test('abrupt managed Worker loss stops at its durable budget and admits the next
     await call('seed','after-direct');await call('resume');
     const afterDirect=await poll(async()=>{const value=await call('inspect');return value.session.turns.find(row=>row.id==='after-direct')?.state==='completed'?value:undefined;});trace.push({after_direct:afterDirect});
     await call('seed','child-stage');await call('stage',10);await call('resume');
-    const childProof=await poll(async()=>{try{const value=await call('childProof');return value.text==='ND_CHILD_FIXTURE'?value:undefined;}catch{lastInspection=await call('inspect');return undefined;}});
+    const childProof=await poll(async()=>{try{const value=await call('childProof');return value.text==='JOURNAL_CHILD_FIXTURE'?value:undefined;}catch{lastInspection=await call('inspect');return undefined;}});
     const childCompleted=await poll(async()=>{
       const value=await call('inspect');
       const effect=value.session.effects.find(row=>row.call_id==='fixture-child-command');

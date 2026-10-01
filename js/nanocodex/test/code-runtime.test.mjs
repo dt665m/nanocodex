@@ -492,7 +492,7 @@ test("owned host routes multiplexed child calls by trusted accepted turn, not pa
   const contexts = [];
   let effects = 0;
   const host = createNodeHost({ toolMode: "direct", tools: { probe: {
-    async handler() { effects += 1; return "ND_CHILD_OK"; },
+    async handler() { effects += 1; return "JOURNAL_CHILD_OK"; },
   } }, codeEffectJournal: {
     async begin(context) { contexts.push(context); return { status: "execute" }; },
     async complete() {},
