@@ -55,6 +55,7 @@ export function createNodeHost(options = {}) {
     require: createRequire(resolve(options.workspace ?? process.cwd(), ".nanocodex-code-mode.cjs")),
     console: new Console({ stdout: process.stderr, stderr: process.stderr }),
     evaluate: options.codeEvaluator,
+    effectJournal: options.codeEffectJournal,
   });
   const filesystem = options.filesystem
     ? import("../runtime/workspace.mjs")

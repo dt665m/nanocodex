@@ -847,6 +847,26 @@ session and are invalidated when the host shuts down; a persisted `wait` never
 restarts missing work. Embedded cells retain ownership of all nested tool calls
 until they finish or are cancelled.
 
+Owned `nanocodex/node` and `nanocodex/host` agents may opt into
+`codeEffectJournal` alongside their durability store. This trusted host adapter
+must durably acknowledge `begin(context)` before dispatch, validate the original
+session/cell/ordinal plus source/tool/input fingerprint, and fence stale owners.
+Return `execute` for a new retained intent, `replay` with its exact completed
+receipt, or `unknown` for an intent without a durable outcome. `complete` must
+acknowledge storage before the guest receives the result. Unknown effects fail
+the recovered cell even if guest code catches the error; they are never silently
+rerun. Reconcile external state using the original operation identity.
+
+Receipts must contain plain JSON data and are bounded to an aggregate 8 MiB
+and 32,768 entries before output/value copies. Undefined results and raw undefined
+rejections have explicit markers. Identical output/structured/value payloads use
+receipt-local references (or derived JSON text), so ordinary inline media does
+not consume three copies. An oversized or unretainable post-effect receipt interrupts the host and
+leaves its original intent unknown, rather than granting permission to redispatch. Route larger media through a bounded
+artifact/reference tool instead of embedding it in the replay receipt.
+The journal is opt-in for generic SDK hosts; durability alone does not make nested
+effects safe to rerun after abrupt owner loss.
+
 Custom evaluators receive `audio`, `notify`, `yield_control`, `setTimeout`, and
 `clearTimeout` alongside the existing globals in `CodeEvaluatorEnvironment`.
 Forward those helpers into the guest environment to preserve the model-visible

@@ -520,6 +520,49 @@ export type CodeEvaluator = (
   environment: CodeEvaluatorEnvironment,
 ) => void | Promise<void>;
 
+/** Trusted host-owned receipts for nested Code Mode effects. Never supplied by guest source. */
+export type CodeEffectContext = Readonly<{
+  sessionId: string;
+  turnId?: string;
+  parentCallId: string;
+  callId: string;
+  name: string;
+  /** Exact admitted guest source, included in the host fingerprint, never a new instruction. */
+  source: string;
+  input: unknown;
+}>;
+/** JSON wire receipt, bounded to 8 MiB/32,768 entries before host output copies.
+ * Optional references deduplicate identical payloads within this receipt only.
+ * Replay expands outputJsonRef or structuredResultRef first, then valueRef. */
+export type CodeEffectReceipt = Readonly<{
+  output: unknown;
+  /** Compact derived JSON text; output is null and restores JSON.stringify(structured_result). */
+  outputJsonRef?: "structured_result";
+  structured_result: unknown;
+  /** Compact wire alias; structured_result is null and restores output on replay. */
+  structuredResultRef?: "output";
+  success: boolean;
+  metadata: unknown;
+  value: unknown;
+  /** JSON has no undefined value; this restores a fulfilled/rejected undefined. */
+  valueUndefined?: boolean;
+  /** Compact wire alias; value is null and restores this receipt field on replay. */
+  valueRef?: "output" | "structured_result";
+  thrown: boolean;
+  failure?: unknown;
+}>;
+/** Admission must durably retain intent; completion must durably retain the exact receipt.
+ * A recovered intent without an outcome is unknown, never permission to execute again.
+ * Implementations must validate identity/input and fence concurrent runtime generations. */
+export type CodeEffectJournal = Readonly<{
+  begin(context: CodeEffectContext): Promise<
+    | { status: "execute" }
+    | { status: "replay"; receipt: CodeEffectReceipt }
+    | { status: "unknown" }
+  >;
+  complete(context: CodeEffectContext, receipt: CodeEffectReceipt): Promise<void>;
+}>;
+
 declare const mcpPaymentBrand: unique symbol;
 
 /** MCP payment options returned by `mcpPayment()` from `nanocodex/tempo`. */

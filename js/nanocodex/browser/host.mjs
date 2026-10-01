@@ -78,6 +78,7 @@ export function createBrowserHost(options = {}) {
         )));
   const code = createCodeRuntime(options.tools, {
     evaluate: codeEvaluator,
+    effectJournal: options.codeEffectJournal,
     subagentSessions: options.subagentSessions,
   });
   const toolProviders = options.toolProviders ?? [];
