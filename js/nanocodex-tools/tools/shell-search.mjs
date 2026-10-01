@@ -173,7 +173,7 @@ function parseTemplate(pattern, mode) {
     if (char === "\\") {
       const next = pattern[++i];
       if (next === undefined || !/[.*+?^${}()|[\]\\/\-]/.test(next)) return;
-      // BRE escaped grouping/quantifiers are operators, not literals.
+      // Basic regular expression escaped grouping/quantifiers are operators, not literals.
       if (mode === "basic" && /[(){}|]/.test(next)) return;
       literal += next;
     } else {

@@ -520,14 +520,20 @@ export type CodeEvaluator = (
   environment: CodeEvaluatorEnvironment,
 ) => void | Promise<void>;
 
-/** Trusted host-owned receipts for nested Code Mode effects. Never supplied by guest source. */
+/** Trusted host-owned receipts for direct application tools and nested Code Mode effects. Never supplied by guest source. */
 export type CodeEffectContext = Readonly<{
   sessionId: string;
+  /** Host turn metadata only; not canonical identity for effect replay. */
   turnId?: string;
+  /** Original Rust request/idempotency key, stable across cold recovery. Owned SDK journal calls require it. */
+  operationId?: string;
+  /** Original model-call ordinal; provider call IDs may repeat within an operation. */
+  modelCallIndex?: number;
+  /** Direct tools use parentCallId = callId; Code Mode uses its cell ID and nested ordinal. */
   parentCallId: string;
   callId: string;
   name: string;
-  /** Exact admitted guest source, included in the host fingerprint, never a new instruction. */
+  /** Exact admitted guest source, or `host-tool:<name>` for a direct application tool. Included in the host fingerprint, never a new instruction. */
   source: string;
   input: unknown;
 }>;
@@ -543,17 +549,19 @@ export type CodeEffectReceipt = Readonly<{
   structuredResultRef?: "output";
   success: boolean;
   metadata: unknown;
+  /** Direct receipts always use null: no guest value is exposed. */
   value: unknown;
   /** JSON has no undefined value; this restores a fulfilled/rejected undefined. */
   valueUndefined?: boolean;
   /** Compact wire alias; value is null and restores this receipt field on replay. */
   valueRef?: "output" | "structured_result";
+  /** Direct receipts always use false, including failed handler results. */
   thrown: boolean;
   failure?: unknown;
 }>;
 /** Admission must durably retain intent; completion must durably retain the exact receipt.
  * A recovered intent without an outcome is unknown, never permission to execute again.
- * Implementations must validate identity/input and fence concurrent runtime generations. */
+ * Keys must scope [sessionId, operationId ?? "", modelCallIndex ?? 0, parentCallId, callId]; validate identity/input and fence concurrent runtime generations. */
 export type CodeEffectJournal = Readonly<{
   begin(context: CodeEffectContext): Promise<
     | { status: "execute" }

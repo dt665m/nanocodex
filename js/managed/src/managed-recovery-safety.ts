@@ -16,6 +16,10 @@ export class ManagedRecoverySafety {
     );
     CREATE TABLE IF NOT EXISTS managed_recovery_progress (
       turn_id TEXT NOT NULL, progress_key TEXT NOT NULL, PRIMARY KEY (turn_id, progress_key)
+    );
+    CREATE TABLE IF NOT EXISTS managed_recovery_call_indices (
+      turn_id TEXT NOT NULL, call_id TEXT NOT NULL, model_call_index INTEGER NOT NULL,
+      PRIMARY KEY (turn_id, call_id)
     )`);
   }
 
@@ -40,13 +44,14 @@ export class ManagedRecoverySafety {
     // Bounded metadata-only SQL; avoid materializing event bodies in JS. Call
     // identities stay stable while projected request/run identities change.
     return this.storage.sql.exec<{ call_id: string }>(`SELECT
-      json_extract(message_json, '$.event.payload.call_id') AS call_id
+      json_extract(message_json, '$.event.payload.call_id') AS call_id,
+      COALESCE(json_extract(message_json, '$.event.payload.model_call_index'), 0) AS model_call_index
       FROM (SELECT message_json FROM managed_events WHERE turn_id = ?
         ORDER BY cursor DESC LIMIT 256)
       WHERE json_valid(message_json) AND json_extract(message_json, '$.type') = 'event'
         AND json_extract(message_json, '$.event.type') IN ('tool.call', 'tool.call.started')
         AND json_extract(message_json, '$.event.payload.call_id') IS NOT NULL
-      GROUP BY call_id HAVING COUNT(*) >= 3 LIMIT 1`, id).toArray().length > 0;
+      GROUP BY model_call_index, call_id HAVING COUNT(*) >= 3 LIMIT 1`, id).toArray().length > 0;
   }
 
   stopped(id: string): boolean {
@@ -56,24 +61,50 @@ export class ManagedRecoverySafety {
   }
 
   settle(id: string): void {
+    this.storage.sql.exec("DELETE FROM managed_recovery_call_indices WHERE turn_id = ?", id);
     this.storage.sql.exec(`UPDATE managed_recovery_safety SET armed = 0,
       abrupt_attempts = CASE WHEN stopped = 1 THEN abrupt_attempts ELSE 0 END WHERE turn_id = ?`, id);
   }
 
   progress(id: string, event: AgentEvent): void {
-    // Recovered run/model events aren't progress. A call's first durable result
-    // moves the unfinished effect boundary; duplicate result replay cannot.
-    if (event.type !== "tool.result" || typeof event.payload.call_id !== "string") return;
-    const key = event.payload.call_id;
-    const inserted = this.storage.sql.exec(`INSERT OR IGNORE INTO managed_recovery_progress
-      (turn_id, progress_key) VALUES (?, ?) RETURNING progress_key`, id, key).toArray();
-    if (inserted.length) this.storage.sql.exec(`UPDATE managed_recovery_safety
-      SET abrupt_attempts = 0 WHERE turn_id = ? AND stopped = 0`, id);
+    const callId = event.payload.call_id;
+    if (typeof callId !== "string" || !callId) return;
+    const modelIndex = event.payload.model_call_index;
+    const validIndex = typeof modelIndex === "number" && Number.isSafeInteger(modelIndex) && modelIndex > 0;
+    this.storage.transactionSync(() => {
+      if (event.type === "tool.call" || event.type === "tool.call.started") {
+        if (!validIndex) {
+          this.storage.sql.exec("DELETE FROM managed_recovery_call_indices WHERE turn_id = ? AND call_id = ?", id, callId);
+          return;
+        }
+        this.storage.sql.exec(`INSERT INTO managed_recovery_call_indices VALUES (?, ?, ?)
+          ON CONFLICT(turn_id, call_id) DO UPDATE SET model_call_index = excluded.model_call_index`, id, callId, modelIndex);
+        // Outstanding calls only; lost predecessors cannot grow cold metadata.
+        this.storage.sql.exec(`DELETE FROM managed_recovery_call_indices WHERE turn_id = ?
+          AND call_id NOT IN (SELECT call_id FROM managed_recovery_call_indices WHERE turn_id = ?
+            ORDER BY model_call_index DESC, rowid DESC LIMIT 256)`, id, id);
+        return;
+      }
+      if (event.type !== "tool.result") return;
+      const index = validIndex ? modelIndex : this.storage.sql.exec<{ model_call_index: number }>(
+        "SELECT model_call_index FROM managed_recovery_call_indices WHERE turn_id = ? AND call_id = ?", id, callId,
+      ).toArray()[0]?.model_call_index;
+      this.storage.sql.exec("DELETE FROM managed_recovery_call_indices WHERE turn_id = ? AND call_id = ?", id, callId);
+      // Rust result events may omit the model ordinal. An unproved result is
+      // not permission to replenish the recovery budget; projected IDs aren't
+      // an identity, and a cached same-index result must not reset it again.
+      if (index === undefined || !Number.isSafeInteger(index) || index < 1) return;
+      const key = JSON.stringify([index, callId]);
+      const inserted = this.storage.sql.exec(`INSERT OR IGNORE INTO managed_recovery_progress
+        (turn_id, progress_key) VALUES (?, ?) RETURNING progress_key`, id, key).toArray();
+      if (inserted.length) this.storage.sql.exec(`UPDATE managed_recovery_safety
+        SET abrupt_attempts = 0 WHERE turn_id = ? AND stopped = 0`, id);
+    });
   }
 }
 
 /** Account-private host journal: guest source cannot select or clear receipts.
- * Scope to the original session/cell/ordinal, never projected turn identities.
+ * Scope to the original session/operation/model/cell/ordinal, never projected turn identities.
  * Retain unknown intents and receipts after settlement for reconciliation. */
 export function createManagedCodeEffectJournal(storage: DurableObjectStorage): CodeEffectJournal {
   storage.sql.exec(`CREATE TABLE IF NOT EXISTS managed_code_effect_runtime (
@@ -89,6 +120,15 @@ export function createManagedCodeEffectJournal(storage: DurableObjectStorage): C
     effect_key TEXT NOT NULL, chunk_index INTEGER NOT NULL, receipt_json TEXT NOT NULL,
     PRIMARY KEY (effect_key, chunk_index)
   )`);
+  // Preserve older live schemas without assigning their unscoped receipts to
+  // a guessed operation. Old three-tuple keys remain conservative unknowns.
+  addScopeColumns(storage, "managed_code_effects", [
+    ["operation_id", "TEXT NOT NULL DEFAULT ''"],
+    ["model_call_index", "INTEGER NOT NULL DEFAULT 0"],
+    ["scope_version", "INTEGER NOT NULL DEFAULT 1"],
+  ]);
+  storage.sql.exec(`CREATE INDEX IF NOT EXISTS managed_code_effect_parent_scope
+    ON managed_code_effects(session_id, operation_id, model_call_index, parent_call_id)`);
   // Admission must see the old Rust head before any new runtime callbacks.
   // Event history can be archived; old global code ordinals are not identities.
   snapshotLegacyCodeParents(storage);
@@ -105,21 +145,31 @@ export function createManagedCodeEffectJournal(storage: DurableObjectStorage): C
       .every(value => typeof value === "string" && value.length > 0)) {
       throw new Error("Code Mode effect journal requires original call identity");
     }
-    const key = JSON.stringify([context.sessionId, context.parentCallId, context.callId]);
+    const operation = context.operationId ?? "";
+    const index = context.modelCallIndex ?? 0;
+    if ((context.operationId === undefined) !== (context.modelCallIndex === undefined)
+      || (context.operationId !== undefined && (typeof operation !== "string" || !operation))
+      || (context.modelCallIndex !== undefined && (!Number.isSafeInteger(index) || index < 1))) {
+      throw new Error("Effect journal requires a stable operation/model identity; outcome unknown");
+    }
+    const key = JSON.stringify([context.sessionId, operation, index, context.parentCallId, context.callId]);
+    const oldKey = JSON.stringify([context.sessionId, context.parentCallId, context.callId]);
+    const parentScope = JSON.stringify([operation, index, context.parentCallId]);
     const hash = createHash("sha256").update(JSON.stringify([context.source, context.name, context.input])).digest("hex");
-    return { key, hash };
+    return { key, hash, oldKey, parentScope, operation, index };
   };
-  type Effect = { input_hash: string; state: string; generation: string; receipt_chunks: number | null };
+  type Effect = { input_hash: string; state: string; generation: string; receipt_chunks: number | null; scope_version: number };
   const read = (key: string) => storage.sql.exec<Effect>(
-    "SELECT input_hash, state, generation, receipt_chunks FROM managed_code_effects WHERE effect_key = ?", key,
+    "SELECT input_hash, state, generation, receipt_chunks, scope_version FROM managed_code_effects WHERE effect_key = ?", key,
   ).toArray()[0];
   return {
     async begin(context) {
-      const { key, hash } = identity(context);
+      const { key, hash, oldKey, parentScope, operation, index } = identity(context);
       const result = storage.transactionSync(() => {
         assertOwner();
         const existing = read(key);
         if (existing) {
+          if (existing.scope_version !== 2) return { status: "unknown" as const };
           if (existing.input_hash !== hash) throw new Error("Code Mode effect identity/input conflict; outcome unknown");
           if (existing.state !== "completed") return { status: "unknown" as const };
           const chunks = storage.sql.exec<{ chunk_index: number; receipt_json: string }>(
@@ -130,16 +180,25 @@ export function createManagedCodeEffectJournal(storage: DurableObjectStorage): C
           }
           return { status: "replay" as const, receipt: JSON.parse(chunks.map(chunk => chunk.receipt_json).join("")) as CodeEffectReceipt };
         }
+        if (read(oldKey)) return { status: "unknown" as const };
+        if ((!operation || !index) && storage.sql.exec(`SELECT 1 FROM managed_code_effects
+          WHERE session_id = ? AND parent_call_id = ? AND scope_version = 2
+            AND (operation_id <> '' OR model_call_index <> 0) LIMIT 1`,
+          context.sessionId, context.parentCallId).toArray().length) return { status: "unknown" as const };
         const legacy = storage.sql.exec(`SELECT 1 FROM managed_code_effect_legacy_parents
-          WHERE session_id IN (?, '') AND parent_call_id = ?
+          WHERE session_id IN (?, '') AND (
+            (scope_version = 2 AND parent_call_id = ?) OR
+            (scope_version = 1 AND parent_call_id = ?) OR
+            (? = 1 AND scope_version = 2 AND json_extract(CASE WHEN scope_version = 2 THEN parent_call_id ELSE '[]' END, '$[2]') = ?))
           UNION ALL SELECT 1 FROM managed_code_effect_legacy_sessions
           WHERE session_id IN (?, '') LIMIT 1`,
-          context.sessionId, context.parentCallId, context.sessionId).toArray().length > 0;
+          context.sessionId, parentScope, context.parentCallId,
+          !operation || !index ? 1 : 0, context.parentCallId, context.sessionId).toArray().length > 0;
         storage.sql.exec(`INSERT INTO managed_code_effects
-          (effect_key, session_id, turn_id, parent_call_id, call_id, name, input_hash, generation, state, created_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
+          (effect_key, session_id, turn_id, parent_call_id, call_id, name, input_hash, generation, state, created_at, operation_id, model_call_index, scope_version)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, 2)`,
         key, context.sessionId, context.turnId ?? null, context.parentCallId, context.callId,
-        context.name, hash, generation, Date.now());
+        context.name, hash, generation, Date.now(), operation, index);
         return legacy ? { status: "unknown" as const } : { status: "execute" as const };
       });
       // A local evaluator can run before output-gated network I/O. Explicitly
@@ -160,7 +219,7 @@ export function createManagedCodeEffectJournal(storage: DurableObjectStorage): C
       storage.transactionSync(() => {
         assertOwner();
         const existing = read(key);
-        if (!existing || existing.input_hash !== hash || existing.generation !== generation || existing.state !== "pending") {
+        if (!existing || existing.scope_version !== 2 || existing.input_hash !== hash || existing.generation !== generation || existing.state !== "pending") {
           throw new Error("Code Mode effect completion lost its original intent; outcome unknown");
         }
         let count = 0;
@@ -191,6 +250,9 @@ function snapshotLegacyCodeParents(storage: DurableObjectStorage): void {
   CREATE TABLE IF NOT EXISTS managed_code_effect_migration (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1), version INTEGER NOT NULL
   )`);
+  // Keep the old PK: v2 parent_call_id stores [operation, model index, parent].
+  // Existing v1 plain-parent fences stay broad because their scope is unproved.
+  addScopeColumns(storage, "managed_code_effect_legacy_parents", [["scope_version", "INTEGER NOT NULL DEFAULT 1"]]);
   const block = (session: string, reason: string) => storage.sql.exec(
     "INSERT OR IGNORE INTO managed_code_effect_legacy_sessions VALUES (?, ?)", session, reason);
   // One transaction freezes the legacy-parent decision, including the absence
@@ -200,8 +262,9 @@ function snapshotLegacyCodeParents(storage: DurableObjectStorage): void {
     const migrated = storage.sql.exec<{ version: number }>(
       "SELECT version FROM managed_code_effect_migration WHERE singleton = 1",
     ).toArray()[0];
-    if (migrated) {
-      if (migrated.version !== 1) block("", "unsupported Code Mode migration version; outcome unknown");
+    if (migrated?.version === 2) return;
+    if (migrated && migrated.version !== 1) {
+      block("", "unsupported effect migration version; outcome unknown");
       return;
     }
     try {
@@ -267,16 +330,20 @@ function snapshotLegacyCodeParents(storage: DurableObjectStorage): void {
               throw new Error("unreadable durable step");
             }
             if (step.kind !== "tool_call" || step.status !== "effect_pending") continue;
-            const match = /^tool-[1-9][0-9]*-(.+)$/s.exec(stepKey);
+            const match = /^tool-([1-9][0-9]*)-(.+)$/s.exec(stepKey);
             if (!match) throw new Error("unreadable pending tool identity");
             const session = stateId === rootStateId ? rootSession ?? "" : "";
-            const parent = match[1]!;
+            const modelCallIndex = Number(match[1]);
+            if (!Number.isSafeInteger(modelCallIndex)) throw new Error("unreadable pending model ordinal");
+            const parent = match[2]!;
+            const parentScope = JSON.stringify([operationId, modelCallIndex, parent]);
             // Only a proved exact session/parent may be excluded. An orphan
             // head cannot borrow a different session's journal as authority.
             if (session && storage.sql.exec(`SELECT 1 FROM managed_code_effects
-              WHERE session_id = ? AND parent_call_id = ? LIMIT 1`, session, parent).toArray().length) continue;
+              WHERE session_id = ? AND operation_id = ? AND model_call_index = ?
+                AND parent_call_id = ? AND scope_version = 2 LIMIT 1`, session, operationId, modelCallIndex, parent).toArray().length) continue;
             storage.sql.exec(`INSERT OR IGNORE INTO managed_code_effect_legacy_parents
-              (session_id, parent_call_id, state_id, step_key) VALUES (?, ?, ?, ?)`, session, parent, stateId, stepKey);
+              (session_id, parent_call_id, state_id, step_key, scope_version) VALUES (?, ?, ?, ?, 2)`, session, parentScope, stateId, stepKey);
           }
         }
       }
@@ -318,10 +385,18 @@ function snapshotLegacyCodeParents(storage: DurableObjectStorage): void {
     } catch {
       block("", "legacy durability head or session lineage unreadable or exceeds migration budget; outcome unknown");
     }
-    storage.sql.exec("INSERT INTO managed_code_effect_migration VALUES (1, 1)");
+    storage.sql.exec("INSERT INTO managed_code_effect_migration VALUES (1, 2) ON CONFLICT(singleton) DO UPDATE SET version = 2");
   });
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+
+function addScopeColumns(storage: DurableObjectStorage, table: string, columns: readonly (readonly [string, string])[]): void {
+  const existing = new Set(storage.sql.exec<{ name: string }>(`PRAGMA table_info(${table})`).toArray().map(row => row.name));
+  for (const [name, definition] of columns) {
+    if (!existing.has(name)) storage.sql.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${definition}`);
+  }
 }

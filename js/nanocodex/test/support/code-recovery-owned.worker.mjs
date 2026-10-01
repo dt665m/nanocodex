@@ -12,6 +12,7 @@ import variant from '@jitl/quickjs-wasmfile-release-asyncify';
 import { newQuickJSAsyncWASMModuleFromVariant } from 'quickjs-emscripten-core';
 let next = 1;
 let activeTurn;
+let queuedTurn;
 const pending = new Map();
 function rpc(method, ...args) {
   const id = next++;
@@ -40,11 +41,17 @@ const shared = {
   codeEvaluator: workerData.evaluator === "native" ? undefined
     : createQuickJsEvaluator(await newQuickJSAsyncWASMModuleFromVariant(variant)),
   codeEffectJournal,
+  toolMode: workerData.direct ? "direct" : "code",
   tools: { effect: {
     description: 'Synthetic externally observable effect', supportsParallelToolCalls: true,
     parameters: { type: 'object', properties: { kind: { type: 'string' } }, required: ['kind'] },
     async handler({ kind }, context) {
       const outcome = rpc('effect', kind, context.callId);
+      if (workerData.queuedProviderIds && !queuedTurn && kind === 'read-one') {
+        queuedTurn = agent.turn.prompt({ id: 'follow-on', input: 'Queued while original effect is outstanding.' });
+        void queuedTurn.result().catch(() => {});
+        parentPort.postMessage({ type: 'queued-operation-submitted' });
+      }
       if (kind === 'abortable') {
         await Promise.race([outcome, new Promise((_, reject) => {
           context.signal.addEventListener('abort', () => reject(context.signal.reason), { once: true });
@@ -97,7 +104,7 @@ if (workerData.sdk === 'cloudflare') {
   };
   agent = await bindAgent(shared.module).create(owner, { durabilityId: shared.durabilityId,
     eventPersistence: 'caller', tools: shared.tools,
-    [Symbol.for('nanocodex.cloudflare.internalRuntime')]: { toolMode: 'code',
+    [Symbol.for('nanocodex.cloudflare.internalRuntime')]: { toolMode: shared.toolMode,
       codeEvaluator: shared.codeEvaluator, codeEffectJournal: shared.codeEffectJournal },
   });
 } else agent = await api.Agent.create({ ...shared,
@@ -109,8 +116,12 @@ try {
   activeTurn = agent.turn.prompt({ id: 'original', input: 'Execute the synthetic recovery journey.' });
   const result = await activeTurn.result();
   parentPort.postMessage({ type: 'result', finalMessage: result.finalMessage });
-  const follow = await agent.turn.prompt({ id: 'follow-on', input: 'Reply after recovery.' }).result();
+  const follow = await (queuedTurn ?? agent.turn.prompt({ id: 'follow-on', input: 'Reply after recovery.' })).result();
   parentPort.postMessage({ type: 'follow-on', finalMessage: follow.finalMessage });
+  if (workerData.reusedProviderIds) {
+    const third = await agent.turn.prompt({ id: 'third-turn', input: 'Execute a new tool call with the reused provider ID.' }).result();
+    parentPort.postMessage({ type: 'third-on', finalMessage: third.finalMessage });
+  }
   await agent.session.shutdown();
 } catch (error) {
   parentPort.postMessage({ type: 'failure', error: { message: error.message, code: error.code } });

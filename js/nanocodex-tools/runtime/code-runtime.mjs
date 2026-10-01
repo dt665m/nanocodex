@@ -65,6 +65,7 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
     try {
       const tool = resolveTool(name);
       if (!tool) return encodeToolOutput(`unknown application tool: ${name}`, false, null);
+      if (extras.effectJournal) return await executeJournalledTool(name, input, execution, model, turnId);
       const result = await router.execute(name, input, {
         sessionId,
         parentCallId: "",
@@ -86,6 +87,99 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
     } finally {
       activeExecutions.delete(execution);
     }
+  }
+
+  async function executeJournalledTool(name, input, execution, model, turnId) {
+    const { sessionId, callId, controller } = execution;
+    const journal = extras.effectJournal;
+    function interrupt(cause) {
+      const error = Object.assign(new Error("Application tool effect journal interrupted", { cause }),
+        { code: "host_interrupted" });
+      execution.interruption = error;
+      controller.abort(error);
+      throw error;
+    }
+    let recordedInput;
+    try { recordedInput = boundedEffectSnapshot(input, "direct effect input"); }
+    catch (cause) { interrupt(cause); }
+    let identity;
+    try { identity = extras.effectIdentity?.(sessionId, callId, turnId) ?? {}; }
+    catch (cause) { interrupt(cause); }
+    const effectContext = { ...identity, sessionId, parentCallId: callId, callId, name,
+      source: "host-tool:" + name, input: recordedInput, ...(turnId == null ? {} : { turnId }) };
+    controller.signal.throwIfAborted();
+    let decision;
+    try { decision = await journal.begin(effectContext); }
+    catch (cause) { interrupt(cause); }
+    controller.signal.throwIfAborted();
+    if (decision?.status === "unknown") {
+      const message = "Application tool effect has a retained dispatch intent but no completed receipt; outcome unknown. Reconcile the original operation before retrying.";
+      return encodeToolOutput(message, false, { error: message, code: "TOOL_CALL_INTERRUPTED", outcome: "unknown" });
+    }
+    if (decision?.status === "replay") {
+      let receipt;
+      try {
+        receipt = boundedEffectSnapshot(decision.receipt, "direct effect replay");
+        if (!receipt || Array.isArray(receipt) || typeof receipt.success !== "boolean"
+          || receipt.thrown !== false || receipt.value !== null
+          || ["output", "structured_result", "metadata", "value"].some(key => !Object.hasOwn(receipt, key))
+          || receipt.valueRef !== undefined || receipt.valueUndefined !== undefined
+          || (receipt.structuredResultRef !== undefined && receipt.structuredResultRef !== "output")
+          || (receipt.outputJsonRef !== undefined && receipt.outputJsonRef !== "structured_result")
+          || (receipt.outputJsonRef !== undefined && receipt.structuredResultRef !== undefined)) {
+          throw new Error("invalid direct effect receipt");
+        }
+        if (receipt.outputJsonRef === "structured_result") receipt.output = JSON.stringify(receipt.structured_result);
+        if (receipt.structuredResultRef === "output") receipt.structured_result = receipt.output;
+      } catch (cause) { interrupt(cause); }
+      return encodeToolOutput(receipt.output, receipt.success, receipt.structured_result, receipt.metadata);
+    }
+    if (decision?.status !== "execute") interrupt(new Error("invalid direct effect admission"));
+    let result, receipt;
+    try {
+      controller.signal.throwIfAborted();
+      result = await router.execute(name, input, {
+        sessionId, parentCallId: callId, callId, model,
+        ...(turnId == null ? {} : { turnId }), signal: controller.signal,
+        subagent: subagentBindingsBySession.get(sessionId)?.descriptor,
+      });
+    } catch (error) {
+      if (error?.code === "host_interrupted") interrupt(error);
+      // An abort is not proof that the dispatched operation did not write.
+      // Leave its retained intent pending, even if the handler rejects or ignores abort.
+      if (controller.signal.aborted) throw error;
+      receipt = { output: errorMessage(error), success: false, structured_result: null,
+        metadata: null, value: null, thrown: false };
+    }
+    controller.signal.throwIfAborted();
+    let wire;
+    try {
+      if (!receipt) {
+        // No guest value is exposed by executeTool. Bound unique output/structured
+        // payloads BEFORE outputBody or structuredResult clone/stringify them.
+        const raw = isToolResult(result) ? { output: result.output, metadata: result.metadata } : { result };
+        if (isToolResult(result) && result.structuredResult !== result.output) raw.structured_result = result.structuredResult;
+        boundedEffectSnapshot(raw, "direct effect result");
+        receipt = { output: outputBody(result), success: toolSucceeded(result),
+          structured_result: structuredResult(result, `tool ${name} result`),
+          metadata: toolMetadata(result, `tool ${name} metadata`), value: null, thrown: false };
+      }
+      wire = { ...receipt };
+      const rawOutput = isToolResult(result) ? result.output : result;
+      if (result !== undefined && typeof receipt.output === "string" && typeof rawOutput !== "string"
+        && (!isToolResult(result) || result.output === result.structuredResult)) {
+        wire.output = null; wire.outputJsonRef = "structured_result";
+      } else if (receipt.structured_result === receipt.output
+        || (Array.isArray(receipt.output) && (!isToolResult(result) || result.output === result.structuredResult))) {
+        wire.structured_result = null; wire.structuredResultRef = "output";
+      }
+      wire = boundedEffectSnapshot(wire, "direct effect receipt");
+    } catch (cause) { interrupt(cause); }
+    controller.signal.throwIfAborted();
+    try { await journal.complete(effectContext, wire); }
+    catch (cause) { interrupt(cause); }
+    controller.signal.throwIfAborted();
+    return encodeToolOutput(receipt.output, receipt.success, receipt.structured_result, receipt.metadata);
   }
 
   async function executeCode(source, sessionId = "default", parentCallId = "exec", model = "unknown", observer, cell, turnId) {
@@ -131,6 +225,7 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
     // A journalled replay must address the same effects regardless of earlier cells.
     let nextJournalCallId = 1;
     const journal = extras.effectJournal;
+    let canonicalIdentity;
     function closePendingCalls() {
       // Guest completion still ends the cell immediately, as in Codex. Host
       // receipts outlive guest promises: every observed start needs a terminal
@@ -203,7 +298,9 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
           name,
           input: recordedInput,
         });
-        const effectContext = { sessionId, parentCallId, callId, name, source, input: recordedInput,
+        try { canonicalIdentity ??= journal ? extras.effectIdentity?.(sessionId, parentCallId, turnId) ?? {} : {}; }
+        catch (cause) { interrupt(cause); }
+        const effectContext = { ...canonicalIdentity, sessionId, parentCallId, callId, name, source, input: recordedInput,
           ...(turnId == null ? {} : { turnId }) };
         // Never resolve a guest promise before its durable outcome is acknowledged.
         async function retain(receipt, valueRef, outputJsonRef) {

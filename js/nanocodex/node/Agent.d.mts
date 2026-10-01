@@ -28,7 +28,7 @@ export declare namespace create {
   }>;
   type Options = AgentOptions & ToolExposureOptions & {
     codeEvaluator?: CodeEvaluator | undefined;
-    /** Opt-in durable nested-effect receipts for safe cold Code Mode recovery. */
+    /** Opt-in durable direct-tool and nested Code Mode receipts for safe cold recovery. */
     codeEffectJournal?: CodeEffectJournal | undefined;
     /** Caller-owned rooted filesystem mounted through standard workspace tools. */
     filesystem?: Workspace | undefined;
