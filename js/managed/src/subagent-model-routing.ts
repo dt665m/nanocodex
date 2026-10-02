@@ -173,8 +173,9 @@ export function createSubagentRouteController(options: {
         pending.set(routeId, { expiresAt: now() + CHILD_ROUTE_TICKET_TTL_MS,
           binding: { routeId, parentSessionId: request.parentSessionId,
             hostContextRef: request.hostContextRef, route } });
+        // Routed models use Codex even when the invoking parent uses Claude.
         return route === null ? { native: true as const, routeId }
-          : { model: route.model, thinking: route.thinking, routeId, statelessHttp: true };
+          : { harness: "codex" as const, model: route.model, thinking: route.thinking, routeId, statelessHttp: true };
       } finally { resolving--; }
     },
     bind(raw: unknown) {

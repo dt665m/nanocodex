@@ -69,7 +69,7 @@ function sse(block, stop, id) {
 }
 test('Managed native Claude and mixed-family public delegation, account gates, cancellation and recovery', {timeout:240_000}, async () => {
   await mkdir(evidence,{recursive:true});
-  const trace = [], upstream = [], providerErrors = []; let calls=0, summaries=0, writes=0, taskWrites=0, canonicalWrites=0, codexWrites=0, allowResponses=false, sidebarCalls=0, holds=0, responsesAttempts=0, catalogOutage=false, catalogUnsupportedOnly=false, retainedTaskId, mf;
+  const trace = [], upstream = [], providerErrors = []; let calls=0, summaries=0, writes=0, taskWrites=0, canonicalWrites=0, codexWrites=0, nestedWrites=0, allowResponses=false, sidebarCalls=0, holds=0, responsesAttempts=0, catalogOutage=false, catalogUnsupportedOnly=false, retainedTaskId, mf;
   const providerImpl = async request => {
     const url = new URL(request.url);
     if (url.origin === 'https://api.openai.com' || url.origin === 'https://chatgpt.com') {
@@ -78,7 +78,7 @@ test('Managed native Claude and mixed-family public delegation, account gates, c
       const body=await request.json(), encoded=JSON.stringify(body.input);
       if (body.model==='gpt-6-luna') {
         assert.match(body.instructions,/Write a short session title/);
-        assert.match(encoded,/Delegate mixed Claude child|Try disconnected mixed child/,'only the Codex gateway root requests a sidebar title');
+        assert.match(encoded,/Delegate mixed Claude child|Try disconnected mixed child|Delegate nested gateway grandchild/,'only the Codex gateway root requests a sidebar title');
         sidebarCalls++;
         return Response.json({id:'synthetic-title',output:[{type:'message',role:'assistant',content:[{type:'output_text',text:'Verify native Claude delegation'}]}],usage:{input_tokens:2,output_tokens:2,total_tokens:4}});
       }
@@ -110,6 +110,28 @@ test('Managed native Claude and mixed-family public delegation, account gates, c
       ].map(value=>`data: ${typeof value==='string'?value:JSON.stringify(value)}\n\n`).join(''),{headers:{'content-type':'text/event-stream'}});
       const use=(name,input)=>reply({tool_calls:[{id:'mixed-'+crypto.randomUUID(),type:'function',function:{name:tool(name),arguments:JSON.stringify(input)}}]},'tool_calls');
       const latest=body.messages.at(-1);
+      if (body.model==='xiaomi/mimo-v2.6-pro') {
+        assert.match(JSON.stringify(body.messages),/GATEWAY_GRANDCHILD_TASK/);
+        const used=body.messages.flatMap(message=>message.tool_calls??[]).map(call=>call.function.name);
+        if (!used.includes(tool('exec'))) {
+          nestedWrites++;
+          return use('exec',{input:'const effect = await tools.exec_command({cmd:"printf GATEWAY_GRANDCHILD_DURABLE_PROOF > /brain/gateway-grandchild.txt && cat /brain/gateway-grandchild.txt",workdir:"/brain"}); if (effect.exit_code !== 0) throw new Error(JSON.stringify(effect)); text(effect.output);'});
+        }
+        if (!used.includes(tool('submit_result'))) {
+          assert.match(latest.content,/GATEWAY_GRANDCHILD_DURABLE_PROOF/,'gateway grandchild receives its real filesystem effect result');
+          return use('submit_result',{output:'GATEWAY_GRANDCHILD_DURABLE_PROOF'});
+        }
+        return reply({content:'gateway grandchild finished'},'stop');
+      }
+      if (JSON.stringify(body.messages).includes('Delegate nested gateway grandchild')) {
+        assert.equal(body.model,'moonshotai/kimi-k3','root retains its gateway model');
+        if (latest.role!=='tool') return use('spawn_agent',{role:'nested Claude specialist',task:'NESTED_CLAUDE_PARENT: delegate a gateway Codex grandchild and return its proof',harness:'claude',model:'claude-opus-4-6',thinking:'low',output_contract:{kind:'string'}});
+        const decoded=JSON.parse(latest.content);
+        if (decoded.agent_id!==undefined) return use('wait_agent',{agent_ids:[decoded.agent_id],timeout_ms:10000});
+        assert.equal(decoded.agents[0].status.state,'completed',latest.content);
+        assert.equal(decoded.agents[0].status.output,'GATEWAY_GRANDCHILD_DURABLE_PROOF');
+        return reply({content:'CLAUDE_TOOL_DONE_NESTED_GATEWAY: '+decoded.agents[0].status.output},'stop');
+      }
       if(latest.role!=='tool') return use('spawn_agent',{role:'mixed proof specialist',task:'CANONICAL_CHILD_PROOF: write proof then submit result',harness:'claude',model:'claude-opus-4-6',thinking:'low',output_contract:{kind:'string'}});
       if(JSON.stringify(body.messages).includes('Try disconnected mixed child')) {
         assert.match(latest.content,/failed|unavailable|authorized/i);
@@ -167,6 +189,18 @@ test('Managed native Claude and mixed-family public delegation, account gates, c
       const unavailableChild = encodedHistory.includes('Try unavailable canonical child');
       const disabledChild = encodedHistory.includes('Try disabled canonical child');
       const use = (name, input) => sse({type:'tool_use',id:`canonical-${name}-${calls}`,name,input},'tool_use',`message-${calls}`);
+      if (encodedHistory.includes('NESTED_CLAUDE_PARENT')) {
+        assert.equal(body.model,'claude-opus-4-6','middle generation uses the native Claude provider');
+        const toolsUsed=body.messages.flatMap(message=>Array.isArray(message.content)?message.content.filter(block=>block.type==='tool_use').map(block=>block.name.replace(/^_/,'')):[]);
+        if (!toolsUsed.length) return use('spawn_agent',{role:'gateway proof specialist',task:'GATEWAY_GRANDCHILD_TASK: write proof, read it back, then submit result',harness:'codex',model:'mimo',thinking:'low',output_contract:{kind:'string'}});
+        if (toolsUsed.includes('submit_result')) return sse({type:'text',text:'nested Claude parent finished'},'end_turn',`message-${calls}`);
+        assert.equal(result?.is_error??false,false,JSON.stringify(result));
+        const decoded=JSON.parse(typeof result.content==='string'?result.content:JSON.stringify(result.content));
+        if (toolsUsed.at(-1)==='spawn_agent') return use('wait_agent',{agent_ids:[decoded.agent_id],timeout_ms:10000});
+        assert.equal(decoded.agents[0].status.state,'completed',JSON.stringify(decoded));
+        assert.equal(decoded.agents[0].status.output,'GATEWAY_GRANDCHILD_DURABLE_PROOF');
+        return use('submit_result',{output:decoded.agents[0].status.output});
+      }
       if (canonicalTask && !canonicalRoot && !unavailableChild && !disabledChild) {
         assert.equal(body.model,'claude-opus-4-6','explicit child model is routed separately from the root');
         const toolsUsed = body.messages.flatMap(message => Array.isArray(message.content) ? message.content.filter(block => block.type==='tool_use').map(block => block.name.replace(/^_/,'')) : []);
@@ -405,6 +439,25 @@ test('Managed native Claude and mixed-family public delegation, account gates, c
     const mixedHistory=await call(`/v1/agents/${gateway.agent_id}/events/history?after=0&limit=256`);
     assert.ok(mixedHistory.data.some(row=>row.agent_id!==undefined && row.event?.type==='tool.result' && row.event.payload.tool==='Write'),'mixed child Write is attributed to a public child event');
     assert.equal((await call(`/v1/agents/${gateway.agent_id}`)).settings.model,'kimi-k3','child selection never changes the root backend');
+    const nested=(await call('/v1/agents','POST',{},201)).agent_id;
+    await call(`/v1/agents/${nested}/routing`,'POST',{model:'kimi-k3',thinking:'low'});
+    const nestedResult=await turn(nested,'Delegate nested gateway grandchild','journey-nested-gateway');
+    assert.match(JSON.stringify(nestedResult),/GATEWAY_GRANDCHILD_DURABLE_PROOF/,'grandchild proof reaches the public root turn result');
+    assert.equal(nestedWrites,1,'gateway grandchild executes one real Code Mode filesystem effect');
+    const nestedHistory=await call(`/v1/agents/${nested}/events/history?after=0&limit=256`);
+    await writeFile(resolve(evidence,'nested-public-history.json'),JSON.stringify(nestedHistory,null,2));
+    const nestedTools=nestedHistory.data.filter(row=>row.event?.type==='tool.result');
+    const claudeChildId=nestedTools.find(row=>row.agent_id===undefined&&row.event.payload.tool==='spawn_agent').event.payload.structured_result.agent_id;
+    const gatewayGrandchildId=nestedTools.find(row=>row.agent_id===claudeChildId&&row.event.payload.tool==='spawn_agent').event.payload.structured_result.agent_id;
+    assert.notEqual(gatewayGrandchildId,claudeChildId);
+    const grandchildEffect=nestedTools.find(row=>row.agent_id===gatewayGrandchildId&&row.event.payload.tool==='exec_command').event.payload.structured_result;
+    assert.equal(grandchildEffect.exit_code,0);
+    assert.equal(grandchildEffect.output,'GATEWAY_GRANDCHILD_DURABLE_PROOF','grandchild filesystem effect is visible in public events');
+    const grandchildReceipt=nestedTools.find(row=>row.agent_id===claudeChildId&&row.event.payload.tool==='wait_agent').event.payload.structured_result.agents[0];
+    assert.equal(grandchildReceipt.agent_id,gatewayGrandchildId);
+    assert.equal(grandchildReceipt.parent_agent_id,claudeChildId,'public receipt confirms the three-generation hierarchy');
+    for (const id of [claudeChildId,gatewayGrandchildId]) assert.equal(nestedTools.find(row=>row.agent_id===id&&row.event.payload.tool==='submit_result').event.payload.structured_result.accepted,true);
+    assert.equal((await call(`/v1/agents/${nested}`)).settings.model,'kimi-k3');
     await call('/v1/credentials/claude','DELETE');catalogOutage=false;
     const beforeDisconnected=calls;
     await turn(gateway.agent_id,'Try disconnected mixed child','journey-mixed-disconnected');
@@ -417,7 +470,7 @@ test('Managed native Claude and mixed-family public delegation, account gates, c
     assert.ok((await call('/v1/models')).data.some(row=>row.id==='claude-sonnet-4-6'));
     const validationTrace=await (await claudeProvider(new Request('https://claude-fixture.invalid/trace?scenario=profile-uncertain'))).json();assert.equal(validationTrace.exchange,1);assert.equal(validationTrace.profile,2);
     assert.deepEqual(providerErrors,[],"all provider fixtures matched the real public journeys");
-    console.info('CLAUDE_MANAGED_JOURNEY',{calls,summaries,writes,taskWrites,canonicalWrites,codexWrites,sidebarCalls,holds,responsesAttempts,DOReopens:4,nativeTools:['Write','Read','Bash'],actualModels:catalog.data.map(m=>m.id),staleSelectionDenied:true,gatewayOnlyDefault:gatewayOnly.default_model,unsupportedOnlyAvailable:unsupportedOnly.availability.claude.available,exactToolAllowlist:true,uninstalledCapabilityDeniedBeforeInference:true});
+    console.info('CLAUDE_MANAGED_JOURNEY',{calls,summaries,writes,taskWrites,canonicalWrites,codexWrites,nestedWrites,sidebarCalls,holds,responsesAttempts,DOReopens:4,nativeTools:['Write','Read','Bash'],actualModels:catalog.data.map(m=>m.id),staleSelectionDenied:true,gatewayOnlyDefault:gatewayOnly.default_model,unsupportedOnlyAvailable:unsupportedOnly.availability.claude.available,exactToolAllowlist:true,uninstalledCapabilityDeniedBeforeInference:true});
   } finally {
     await mf?.dispose();
     await writeFile(resolve(evidence,'public-api-trace.json'),JSON.stringify(trace,null,2));
