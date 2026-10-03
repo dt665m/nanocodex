@@ -1956,6 +1956,12 @@ final class InboxModel: ObservableObject {
         guard generation == account, connected, !Task.isCancelled else { throw APIError.invalidCredential }
         return receipt
     }
+    func browserLoginApproved(intake: VaultIntake, account: UUID) async throws -> Bool {
+        guard let client, connected, !isDemo, generation == account else { throw APIError.invalidCredential }
+        let approved = try await client.browserLoginApproved(intake: intake)
+        guard generation == account, connected, !Task.isCancelled else { throw APIError.invalidCredential }
+        return approved
+    }
     func browserTakeover(intake: VaultIntake, action: [String: JSON], account: UUID) async throws -> BrowserTakeoverFrame {
         #if DEBUG && targetEnvironment(simulator)
         if ProcessInfo.processInfo.arguments.contains("--browser-native-form-ui-fixture") {
@@ -1980,7 +1986,8 @@ final class InboxModel: ObservableObject {
             "status": .string(intake.operation == "browser_takeover" ? "finished" : "submitted"), "challenge_id": .string(challenge)])
         let predecessor = pending.last(where: { $0.agentID == agentID })?.id ?? (focused?.id == agentID ? focusedTurn : "")
         let message = PendingMessage(agentID: agentID, input: value.pretty, predecessor: predecessor,
-            id: intake.operation == "browser_login" ? "browser-login-\(challenge)-\(cancelled ? "cancelled" : "finished")" : UUID().uuidString)
+            id: intake.operation == "browser_login" ? "browser-login-\(challenge)-\(cancelled ? "cancelled" : "finished")"
+                : intake.operation == "browser_takeover" ? "browser-takeover-\(challenge)-finished" : UUID().uuidString)
         guard !pending.contains(where: { $0.id == message.id }) else { return }
         pending.append(message); busy.insert(agentID); persist()
         Task { await submit(message, epoch: account) }
