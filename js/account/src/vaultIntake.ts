@@ -121,10 +121,12 @@ export async function browserTakeover(intake: VaultIntake, action: BrowserTakeov
       || typeof form.document_id !== "string" || !/^[0-9a-f-]{36}$/.test(form.document_id)
       || !Array.isArray(form.fields) || form.fields.length < 1 || form.fields.length > 32
       || !form.fields.every(f => f && typeof f === "object" && !Array.isArray(f)
-        && Object.keys(f).every(k => ["ref", "label", "type", "multiline"].includes(k))
+        && Object.keys(f).every(k => ["ref", "label", "type", "multiline", "autocomplete", "inputmode"].includes(k))
         && typeof f.ref === "string" && /^[0-9a-f-]{36}$/.test(f.ref)
         && typeof f.label === "string" && f.label.length <= 160 && !/[\u0000-\u001f\u007f]/.test(f.label)
-        && keyboard({type:f.type,multiline:f.multiline}))
+        && keyboard({type:f.type,multiline:f.multiline})
+        && (f.autocomplete === undefined || ["username", "current-password", "new-password", "one-time-code", "email", "tel", "cc-number", "cc-exp", "cc-exp-month", "cc-exp-year", "cc-csc", "name", "given-name", "family-name", "street-address", "postal-code"].includes(f.autocomplete))
+        && (f.inputmode === undefined || ["text", "email", "url", "tel", "numeric", "decimal", "search"].includes(f.inputmode)))
       || new Set(form.fields.map(f => f.ref)).size !== form.fields.length) throw new Error("Invalid native form");
   }
   return { status: "active", image: v.image, width: v.width, height: v.height, ...(typeof v.origin === "string" ? {origin:v.origin} : {}), ...(v.keyboard === undefined ? {} : { keyboard: v.keyboard as BrowserKeyboard }), ...(v.inputs === undefined ? {} : { inputs: v.inputs as BrowserInputRegion[] }) };

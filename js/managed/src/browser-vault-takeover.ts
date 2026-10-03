@@ -2,7 +2,7 @@ import { browserLoginIdentity } from "./browser-login";
 import { PrivateBrowserNoActiveTouch, isBrowserVaultOrigin, type BrowserVaultIdentity, type PrivateBrowserCdp } from "./browser-vault";
 
 export type BrowserVaultTakeoverAction =
-  | { action: "observe"; native_fields?: boolean; viewport?: { width: number; height: number; mobile: boolean } }
+  | { action: "observe"; native_fields?: boolean; native_field_hints?: boolean; viewport?: { width: number; height: number; mobile: boolean } }
   | { action: "click"; x: number; y: number }
   | { action: "type"; text: string }
   | { action: "fill_fields"; document_id: string; fields: { ref: string; value: string }[] }
@@ -10,9 +10,11 @@ export type BrowserVaultTakeoverAction =
   | { action: "touch"; phase: "start" | "move" | "end" | "cancel"; x?: number; y?: number }
   | { action: "key"; key: "Enter" | "Tab" | "Backspace" | "Escape" }
   | { action: "scroll"; delta_y: number };
-export type BrowserVaultTouchState = { active?: boolean; uncertain?: boolean; nativeFields?: boolean; nativeForm?: { documentId: string; contextId: number; frameId: string; loaderId: string; origin: string } };
+export type BrowserVaultTouchState = { active?: boolean; uncertain?: boolean; nativeFields?: boolean; nativeFieldHints?: boolean; nativeForm?: { documentId: string; contextId: number; frameId: string; loaderId: string; origin: string } };
 export type BrowserVaultKeyboard = { type: "text" | "email" | "url" | "tel" | "number" | "password"; multiline: boolean };
-export type BrowserVaultNativeForm = { document_id: string; fields: (BrowserVaultKeyboard & { ref: string; label: string })[] };
+const NATIVE_AUTOCOMPLETE = ["username", "current-password", "new-password", "one-time-code", "email", "tel", "cc-number", "cc-exp", "cc-exp-month", "cc-exp-year", "cc-csc", "name", "given-name", "family-name", "street-address", "postal-code"] as const;
+const NATIVE_INPUTMODES = ["text", "email", "url", "tel", "numeric", "decimal", "search"] as const;
+export type BrowserVaultNativeForm = { document_id: string; fields: (BrowserVaultKeyboard & { ref: string; label: string; autocomplete?: typeof NATIVE_AUTOCOMPLETE[number]; inputmode?: typeof NATIVE_INPUTMODES[number] })[] };
 export type BrowserVaultTakeoverResult = { native_form?: BrowserVaultNativeForm; status: "active"; image: string; width: number; height: number; keyboard?: BrowserVaultKeyboard; inputs?: (BrowserVaultKeyboard & { x: number; y: number; width: number; height: number })[] };
 
 /** Register before dispatch: browser value sanitization may finish even if CDP
@@ -37,13 +39,14 @@ export function validateBrowserVaultTakeoverAction(value: BrowserVaultTakeoverAc
   switch (value.action) {
     case "observe":
       if (value.native_fields !== undefined && typeof value.native_fields !== "boolean") throw new Error();
+      if (value.native_field_hints !== undefined && (typeof value.native_field_hints !== "boolean" || value.native_fields !== true)) throw new Error();
       if (value.viewport !== undefined) {
         const v = value.viewport;
         if (!v || typeof v !== "object" || Array.isArray(v) || typeof v.mobile !== "boolean"
           || ![v.width,v.height].every(n => Number.isInteger(n) && n >= 240 && n <= 1920)
           || Object.keys(v).some(k => !["width","height","mobile"].includes(k))) throw new Error();
       }
-      allowed = ["action", "viewport", "native_fields"]; break;
+      allowed = ["action", "viewport", "native_fields", "native_field_hints"]; break;
     case "click":
       if (![value.x, value.y].every(n => Number.isFinite(n) && n >= 0 && n <= 1)) throw new Error();
       allowed = ["action", "x", "y"]; break;
@@ -134,6 +137,7 @@ export async function privateVaultTakeover(
     await check();
     if (action.action === "observe") {
       touch.nativeFields = action.native_fields === true;
+      touch.nativeFieldHints = touch.nativeFields && action.native_field_hints === true;
       // Observation is explicit recovery after an ambiguous gesture, never a replay.
       await check();
       // Chrome rejects touchCancel when no touch sequence has started.
@@ -273,13 +277,17 @@ export async function privateVaultTakeover(
         const result = await cdp.send("Runtime.callFunctionOn", {
           executionContextId: world.executionContextId, returnByValue: true, silent: true,
           functionDeclaration: NATIVE_FORM_DISCOVER,
-          arguments: [documentId, currentOrigin, refs].map(value => ({value})),
+          arguments: [documentId, currentOrigin, refs, touch.nativeFieldHints === true].map(value => ({value})),
         }, sid);
         const fields = result?.result?.value;
         if (!result?.exceptionDetails && Array.isArray(fields) && fields.length > 0 && fields.length <= 32
           && fields.every((f: any, i: number) => f && f.ref === refs[i] && typeof f.label === "string" && f.label.length <= 160
-            && ["text","email","url","tel","number","password"].includes(f.type) && typeof f.multiline === "boolean")) {
-          nativeForm = { document_id: documentId, fields: fields.map((f: any) => ({ref:f.ref,label:f.label,type:f.type,multiline:f.multiline})) };
+            && ["text","email","url","tel","number","password"].includes(f.type) && typeof f.multiline === "boolean"
+            && (f.autocomplete === undefined || NATIVE_AUTOCOMPLETE.includes(f.autocomplete))
+            && (f.inputmode === undefined || NATIVE_INPUTMODES.includes(f.inputmode)))) {
+          nativeForm = { document_id: documentId, fields: fields.map((f: any) => ({ref:f.ref,label:f.label,type:f.type,multiline:f.multiline,
+            ...(touch.nativeFieldHints && f.autocomplete ? {autocomplete:f.autocomplete} : {}),
+            ...(touch.nativeFieldHints && f.inputmode ? {inputmode:f.inputmode} : {})})) };
           touch.nativeForm = {documentId,contextId:world.executionContextId,frameId,loaderId,origin:currentOrigin};
         }
       }
@@ -338,7 +346,7 @@ const NATIVE_FORM_VISIBLE = `e => (e instanceof HTMLInputElement || e instanceof
       && r.right <= innerWidth && r.bottom <= innerHeight
       && document.elementFromPoint(r.left + r.width/2, r.top + r.height/2) === e;
   })()`;
-const NATIVE_FORM_DISCOVER = `function(documentId, origin, refs) {
+const NATIVE_FORM_DISCOVER = `function(documentId, origin, refs, hints) {
   if (window.top !== window || location.origin !== origin) return null;
   const visible = ${NATIVE_FORM_VISIBLE};
   const entries = [], fields = [];
@@ -347,11 +355,20 @@ const NATIVE_FORM_DISCOVER = `function(documentId, origin, refs) {
     if (!visible(e)) continue;
     const ref = refs[entries.length], multiline = e instanceof HTMLTextAreaElement;
     const type = multiline || e.type === 'search' ? 'text' : e.type;
-    const label = (Array.from(e.labels || [], l => l.textContent || '').join(' ').trim()
-      || e.getAttribute('aria-label') || e.getAttribute('placeholder') || (type === 'password' ? 'Password' : 'Field ' + (entries.length + 1)))
+    const labelledBy = (e.getAttribute('aria-labelledby') || '').trim().split(/\\s+/).slice(0,16)
+      .map(id => document.getElementById(id)?.textContent || '').join(' ').trim();
+    const label = (labelledBy || e.getAttribute('aria-label') || Array.from(e.labels || [], l => l.textContent || '').join(' ').trim()
+      || e.getAttribute('placeholder') || (type === 'password' ? 'Password' : 'Field ' + (entries.length + 1)))
       .replace(/[\\u0000-\\u001f\\u007f]/g, ' ').slice(0,160);
-    entries.push({ref,element:e,type:e.type,form:e.form,name:e.name});
-    fields.push({ref,label,type,multiline});
+    // Export only recognized purpose hints, never arbitrary attribute contents.
+    // A trailing webauthn token is deliberately not an assertion of passkey support.
+    const tokens = (e.autocomplete || '').toLowerCase().trim().split(/\\s+/);
+    if (tokens[tokens.length - 1] === 'webauthn') tokens.pop();
+    const autocomplete = tokens[tokens.length - 1], inputmode = e.inputMode;
+    entries.push({ref,element:e,type:e.type,form:e.form,name:e.name,autocomplete:e.autocomplete,inputmode:e.inputMode});
+    fields.push({ref,label,type,multiline,
+      ...(hints && ${JSON.stringify(NATIVE_AUTOCOMPLETE)}.includes(autocomplete) ? {autocomplete} : {}),
+      ...(hints && ${JSON.stringify(NATIVE_INPUTMODES)}.includes(inputmode) ? {inputmode} : {})});
   }
   globalThis.__nanocodexNativeForm = {documentId,document,origin,entries};
   return fields;
@@ -363,7 +380,8 @@ const NATIVE_FORM_FILL = `function(documentId, origin, fields) {
     || bound.origin !== origin || location.origin !== origin || window.top !== window) return false;
   const visible = ${NATIVE_FORM_VISIBLE};
   const valid = b => b && visible(b.element) && b.element.type === b.type
-    && b.element.form === b.form && b.element.name === b.name && location.origin === origin;
+    && b.element.form === b.form && b.element.name === b.name
+    && b.element.autocomplete === b.autocomplete && b.element.inputMode === b.inputmode && location.origin === origin;
   const selected = fields.map(f => ({field:f,binding:bound.entries.find(b => b.ref === f.ref)}));
   if (!selected.every(s => valid(s.binding))) return false;
   for (const {field,binding} of selected) {

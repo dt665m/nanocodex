@@ -22,6 +22,10 @@ try {
   server = https.createServer({key:readFileSync(join(temp,'key')),cert:readFileSync(join(temp,'cert'))}, (req,res) => {
     if (req.url.startsWith('/v1/agents/')) { handleControl(req,res); return; }
     res.setHeader('Content-Type','text/html');
+    if (req.url === '/otp') {
+      res.end('<meta name="viewport" content="width=device-width,initial-scale=1"><style>input{display:block;height:40px;margin:12px}</style><span id="code-label">Verification code</span> <span id="delivery-label">from your device</span><input id="otp" aria-labelledby="code-label delivery-label" aria-label="Fallback label" autocomplete="section-login one-time-code" inputmode="numeric"><input id="account" aria-label="Account" autocomplete="username webauthn"><input id="unsupported" aria-label="Other" autocomplete="arbitrary-private-marker" inputmode="none"><iframe title="Embedded unsupported input" srcdoc="<input autocomplete=one-time-code>"></iframe>');
+      return;
+    }
     res.end('<meta name="viewport" content="width=device-width,initial-scale=1"><style>body{margin:20px;font:16px sans-serif;min-height:2800px}input{display:block;height:48px;width:90%;margin:16px 0;font:inherit}</style><h1>Private browser fixture</h1><input type="email" placeholder="Email"><input type="password" placeholder="Password"><textarea aria-label="Notes"></textarea><input type="hidden" value="never exposed"><input disabled placeholder="Disabled"><input readonly placeholder="Read only"><div contenteditable>Custom fallback</div><p>Swipe this page</p><script>window.counts={input:0,change:0};document.addEventListener("input",()=>counts.input++);document.addEventListener("change",()=>counts.change++);Object.defineProperty(document.querySelector("input[type=email]"),"value",{get(){return Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,"value").get.call(this)},set(){throw Error("framework setter must be bypassed")}})</script>');
   });
   await new Promise(resolve => server.listen(0,'127.0.0.1',resolve));
@@ -190,12 +194,35 @@ try {
   const normalized=await loginPage.locator('input:not([type=hidden]):not([disabled]):not([readonly]),textarea').evaluateAll(es=>es.map(e=>e.value));
   assert.deepEqual(normalized,['synthetic@example.test,second@example.test','synthetic-password-78235','Unicode 🙂 notes\nwith newlines\nand more']);
   await loginPage.evaluate(vals=>{const p=document.createElement('p');p.textContent=vals.join(' ');document.body.append(p);},normalized);
+  // Native OTP sheet: the user types once into a labeled native field, with the
+  // code keyboard/autofill purpose preserved, then sends a private batch over HTTPS.
+  await loginPage.goto(origin + '/otp');
+  const oldNative=await human({action:'observe',native_fields:true});
+  assert.ok(oldNative.native_form.fields.every(f=>Object.keys(f).sort().join(',')==='label,multiline,ref,type'),'old native clients receive the original descriptor keys');
+  const hinted=await human({action:'observe',native_fields:true,native_field_hints:true});
+  const descriptors=hinted.native_form.fields.map(({ref,...f})=>f);
+  assert.deepEqual(descriptors,[
+    {label:'Verification code from your device',type:'text',multiline:false,autocomplete:'one-time-code',inputmode:'numeric'},
+    {label:'Account',type:'text',multiline:false,autocomplete:'username'},
+    {label:'Other',type:'text',multiline:false},
+  ]);
+  assert.ok(!JSON.stringify(hinted.native_form).includes('webauthn'),'autocomplete is never represented as passkey capability');
+  const otpValues=['783492','synthetic-otp-user','synthetic-other'];
+  await browserTakeover(intake,batch(hinted,otpValues),requestPrivate);
+  assert.deepEqual(await loginPage.locator('input').evaluateAll(es=>es.map(e=>e.value)),otpValues);
+  const changedPurpose=await human({action:'observe',native_fields:true,native_field_hints:true});
+  await loginPage.locator('#otp').evaluate(e=>e.autocomplete='cc-csc');
+  await assert.rejects(browserTakeover(intake,batch(changedPurpose,['must-not-fill','must-not-fill','must-not-fill']),requestPrivate));
+  assert.deepEqual(await loginPage.locator('input').evaluateAll(es=>es.map(e=>e.value)),otpValues,'changed purpose rejects the entire batch before mutation');
+  await human({action:'observe',native_fields:true,native_field_hints:true});
+  await loginPage.evaluate(vals=>{const p=document.createElement('p');p.textContent=vals.join(' ');document.body.append(p);},[...normalized,...otpValues]);
   assert.equal((await browserTakeover(intake,{action:'finish'},requestPrivate)).status,'finished');
   const snapshot=JSON.stringify(await tool('browser_login_snapshot',{request_id:operation}));
-  for(const value of [...privateValues,...normalized]){assert.ok(!snapshot.includes(value));assert.ok(!JSON.stringify([...durable]).includes(value));}
+  for(const value of [...privateValues,...normalized,...otpValues]){assert.ok(!snapshot.includes(value));assert.ok(!JSON.stringify([...durable]).includes(value));}
   await tool('browser_login_close',{});
   const output=new URL('../../../output/private-native-fields/',import.meta.url);mkdirSync(output,{recursive:true});
-  writeFileSync(new URL('takeover-journey.json',output),JSON.stringify({batch_ms:batchMs,checks:['legacy clients receive no native_form until explicit opt-in','explicit opt-out and legacy observation retain viewport','document-bound labels and types without values','single native setter plus input/change per field','Unicode batch','replayed batch rejected','lost batch response is consumed; explicit observation recovers','HTTPS account decoder accepts new optional metadata','browser-normalized CR/LF and multiple-email whitespace variants redacted','formless and methodless custom JS login returns filled/action_required','private-login batch values redacted from model snapshot and durable storage','replaced or occluded element rejects entire batch before mutation','same-origin reload rejects stale document','forged and duplicate refs rejected','viewport touch/keyboard fallback retained']},null,2));
+  writeFileSync(new URL('takeover-journey.json',output),JSON.stringify({batch_ms:batchMs,checks:['OTP autocomplete and numeric keyboard hints survive private HTTPS fill','aria-labelledby labels identify OTP fields','hint opt-in preserves old native descriptor schema','unrecognized hint values and iframe fields are excluded','webauthn suffix is not passkey capability','changed input purpose rejects batch before mutation','OTP values redacted from model snapshot and durable storage','legacy clients receive no native_form until explicit opt-in','explicit opt-out and legacy observation retain viewport','document-bound labels and types without values','single native setter plus input/change per field','Unicode batch','replayed batch rejected','lost batch response is consumed; explicit observation recovers','HTTPS account decoder accepts new optional metadata','browser-normalized CR/LF and multiple-email whitespace variants redacted','formless and methodless custom JS login returns filled/action_required','private-login batch values redacted from model snapshot and durable storage','replaced or occluded element rejects entire batch before mutation','same-origin reload rejects stale document','forged and duplicate refs rejected','viewport touch/keyboard fallback retained']},null,2));
+  console.log('PASS: native OTP hints, accessible labels, private HTTPS fill, purpose-change rejection, legacy descriptor compatibility');
   console.log('PASS: HTTPS decoder compatibility, raw/normalized private-login snapshot redaction, synthetic JS custom-login action_required');
   console.log('PASS: native batched form fill, stale/replaced/forged refs fail closed; batch '+batchMs+'ms');
   console.log('PASS: mobile viewport, native touch focus, keyboard traits, Unicode edit/delete, real touch scrolling, cancel recovery, viewport cleanup');
