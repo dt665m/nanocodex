@@ -128,6 +128,14 @@ actions, and verify the result; handback is not proof of sign-in or task complet
 An uncertain fill is never automatically retried. A confirmed fill followed by
 an uncertain handback offers handback recovery without sending the values again.
 
+For a later password or verification-code step in a one-time login, call
+`request_browser_login_input({request_id, operation_id})` after handback. It
+retains the same browser and redaction state and returns a fresh
+`request_id == challenge_id`; use that new ID for subsequent operations. The
+fresh ID opens a new native sheet and invalidates controls from the earlier
+sheet. Repeating the identical operation returns the same request without
+replaying the website action. A finished receipt releases human control only.
+
 The remote website is an explicit fallback for visual challenges or unsupported
 controls. Native clients do not switch to it after filling a form.
 Account web clients continue using
