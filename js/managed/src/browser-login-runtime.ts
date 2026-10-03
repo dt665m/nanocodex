@@ -65,7 +65,7 @@ export function createBrowserLoginRuntime(options: { storage: DurableObjectStora
     return v;
   };
   const tools: NamedTool[] = [{name:"request_browser_login",supportsParallelToolCalls:false,
-    description:"Open a retained private browser and ask the user to sign in on their phone, without saving a Vault login. Supply one stable operation_id UUID, a public HTTPS URL, and the exact allowed_origins required for authentication redirects/frames. The user reviews the sites before typing. Return login_url as a clickable phone fallback. Passwords, codes and private screenshots never enter chat or model tools. Wait for browser_login_receipt; finished is not proof of account access. Continue with browser_login_snapshot/action using request_id. Browser authentication does not authenticate a CLI or export cookies. Reuse the same operation ID after uncertainty; never silently retry login.",
+    description:"Open a retained private browser and ask the user to sign in on their phone, without saving a Vault login. Supply one stable operation_id UUID, a public HTTPS URL, and the exact allowed_origins required for authentication redirects/frames. The user reviews the sites before typing. The native app automatically presents the secure input sheet. Use login_url only when the client cannot render native intake or the user explicitly asks for the browser fallback. Passwords, codes and private screenshots never enter chat or model tools. Wait for browser_login_receipt; finished is not proof of account access. Continue with browser_login_snapshot/action using request_id. Browser authentication does not authenticate a CLI or export cookies. Reuse the same operation ID after uncertainty; never silently retry login.",
     parameters:{type:"object",additionalProperties:false,properties:{operation_id:{type:"string"},url:{type:"string"},allowed_origins:{type:"array",items:{type:"string"},minItems:1,maxItems:8}},required:["operation_id","url"]},
     handler:(input,ctx)=>exclusive(async()=>{
       options.authorize(ctx);ctx.signal.throwIfAborted();const request=parseBrowserLoginRequest(input);
@@ -89,6 +89,24 @@ export function createBrowserLoginRuntime(options: { storage: DurableObjectStora
         }catch{transport.close();if(sessionId)try{await deleteBrowserSession(options.browser,sessionId);}catch{}throw new Error("Private login opening could not be confirmed");}
       }});
     })},
+    {name:"request_browser_login_input",supportsParallelToolCalls:false,
+      description:"Ask for more private input in the same retained login browser, such as a later password or verification code. Requires the current request_id and one stable operation_id UUID. The native app automatically presents the secure input sheet; use login_url only when native intake is unavailable or the user requests the browser fallback. Returns a fresh request_id/challenge_id without navigating, creating a browser, or losing login state. Use the new request_id for subsequent snapshots/actions. Wait for browser_login_receipt, then inspect a snapshot. Reuse identical arguments after uncertainty; never repeat the browser action that prompted the input.",
+      parameters:{type:"object",additionalProperties:false,properties:{request_id:{type:"string"},operation_id:{type:"string"}},required:["request_id","operation_id"]},
+      handler:(input,ctx)=>exclusive(async()=>{
+        options.authorize(ctx);ctx.signal.throwIfAborted();const v=requestId(input,["operation_id"]);
+        // Look up the operation before the current request: a successful request
+        // rotates the identity, but an identical retry must return its same panel.
+        return privateBrowserOperation({storage:options.storage,scope:key,operationId:v.operation_id,input:{action:"request_input",request_id:v.request_id},run:async()=>{
+          const login=await current(v.request_id,"finished");
+          return transport.run(login.sessionId,identity(login),ctx.signal,async cdp=>{
+            const bound=await browserLoginIdentity(cdp,identity(login),login.allowedOrigins);
+            const next:Login={...login,id:crypto.randomUUID(),origin:bound.expected_origin,phase:"human",expiresAt:Date.now()+TTL};
+            await options.storage.put(key,next);
+            touch={};segment=undefined;
+            return metadata(next);
+          });
+        }});
+      })},
     {name:"browser_login_snapshot",supportsParallelToolCalls:false,
       description:"Read a bounded redacted account view after the user finishes a one-time private login. Requires request_id. Finished is not proof of authentication; verify account content. No input values, cookies, raw DOM, screenshots or provider URLs. Unavailable during human control or after runtime recovery; close and request new login if private state is lost.",
       parameters:{type:"object",additionalProperties:false,properties:{request_id:{type:"string"}},required:["request_id"]},
@@ -112,7 +130,10 @@ export function createBrowserLoginRuntime(options: { storage: DurableObjectStora
     if(!input || typeof input!=="object" || Array.isArray(input))throw new Error("Invalid private login control");
     const v=input as Record<string,unknown>,stored=await options.storage.get<Login>(key);
     if(!stored || stored.id!==v.challenge_id){
-      if(v.action==="cancel" && Object.keys(v).length===2){const prior=await options.storage.get(terminalKey(v.challenge_id));if(prior)return prior;}
+      if(["cancel","finish"].includes(String(v.action)) && Object.keys(v).length===2){
+        const prior=await options.storage.get<{status:string}>(terminalKey(v.challenge_id));
+        if(prior?.status===(v.action==="finish"?"finished":"cancelled"))return prior;
+      }
       throw new Error("Private login unavailable");
     }
     signal.throwIfAborted();const {challenge_id,...action}=v;
@@ -129,8 +150,12 @@ export function createBrowserLoginRuntime(options: { storage: DurableObjectStora
       if(login.phase!=="human")throw new Error("Private login is not active");
       // Finish relinquishes user control; account access still requires a model snapshot check.
       await transport.run(login.sessionId,identity(login),signal,cdp=>releasePrivateVaultTakeover(cdp,login.targetId));
-      await options.storage.put(key,{...login,phase:"finished",expiresAt:Date.now()+TTL});touch={};segment=undefined;
-      return {type:"browser_login_receipt",status:"finished",request_id:login.id};
+      const receipt={type:"browser_login_receipt",status:"finished",request_id:login.id};
+      await options.storage.transaction(async tx=>{
+        await tx.put(key,{...login,phase:"finished",expiresAt:Date.now()+TTL});
+        await tx.put(terminalKey(login.id),receipt);
+      });touch={};segment=undefined;
+      return receipt;
     }
     const login=await current(v.challenge_id,"human");validateBrowserVaultTakeoverAction(action as BrowserVaultTakeoverAction);remember(action);
     try{return await transport.run(login.sessionId,identity(login),signal,async cdp=>{

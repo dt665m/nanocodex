@@ -6,9 +6,24 @@ import { execFileSync, spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { registerHooks } from 'node:module';
-registerHooks({resolve(specifier, context, nextResolve) { if (specifier === 'agents/browser') return {url:'data:text/javascript,export const createBrowserSession=(b,o)=>b.create(o);export const deleteBrowserSession=(b,id)=>b.delete(id);',shortCircuit:true}; return nextResolve(specifier.startsWith('./browser-') && !specifier.endsWith('.ts') ? specifier + '.ts' : specifier, context); }});
+// Cloudflare allocation/storage and the unused public browser factory are local
+// adapters; the private runtime, HTTPS route, CDP and DOM all execute unchanged.
+const browserAdapter = `export const createBrowserSession=(b,o)=>b.create(o);
+export const deleteBrowserSession=(b,id)=>b.delete?.(id);
+export const connectBrowser=()=>{throw Error('Unused public browser adapter')};
+export class DurableBrowserSessionStore {
+  constructor(storage){this.storage=storage}
+  get(k){return this.storage.get(k)} set(k,v){return this.storage.put(k,v)} delete(k){return this.storage.delete(k)}
+  async acquireLock(){return {release:async()=>{}}}
+}`;
+registerHooks({resolve(specifier, context, nextResolve) {
+  if (specifier === 'agents/browser') return {url:'data:text/javascript,'+encodeURIComponent(browserAdapter),shortCircuit:true};
+  if (specifier === 'agents/browser/ai') return {url:'data:text/javascript,export const createBrowserRuntime=()=>{throw Error("Provide local browser allocation")};',shortCircuit:true};
+  return nextResolve(specifier.startsWith('./browser-') && !specifier.endsWith('.ts') ? specifier + '.ts' : specifier, context);
+}});
 const { createBrowserLoginRuntime } = await import('../src/browser-login-runtime.ts');
-const { browserTakeover } = await import('../../account/src/vaultIntake.ts');
+const { createManagedBrowserRuntime } = await import('../src/browser-runtime.ts');
+const { browserTakeover, decodeVaultIntake } = await import('../../account/src/vaultIntake.ts');
 const { PrivateBrowserCdp, fillBrowserVault } = await import('../src/browser-vault.ts');
 const { default: WebSocket } = await import('ws');
 const { privateVaultTakeover, releasePrivateVaultTakeover } = await import('../src/browser-vault-takeover.ts');
@@ -16,7 +31,7 @@ const packages = new URL('../../../node_modules/.pnpm/', import.meta.url);
 const entry = readdirSync(packages).find(name => /^playwright-core@/.test(name));
 const { chromium } = await import(new URL(`${entry}/node_modules/playwright-core/index.mjs`, packages));
 const temp = mkdtempSync(join(tmpdir(), 'private-touch-'));
-let browser, server, chrome, privateCdp, loginRuntime, handleControl, loginBrowser, runtimeChrome;
+let browser, server, chrome, privateCdp, loginRuntime, vaultRuntime, handleControl, loginBrowser, runtimeChrome;
 try {
   execFileSync('openssl', ['req','-x509','-newkey','rsa:2048','-nodes','-keyout',join(temp,'key'),'-out',join(temp,'cert'),'-days','1','-subj','/CN=localhost'],{stdio:'ignore'});
   server = https.createServer({key:readFileSync(join(temp,'key')),cert:readFileSync(join(temp,'cert'))}, (req,res) => {
@@ -152,7 +167,8 @@ try {
     ['--headless','--ignore-certificate-errors','--no-first-run','--no-default-browser-check','--remote-debugging-port=0',`--user-data-dir=${join(temp,'runtime-profile')}`,'about:blank'],{stdio:'ignore'});
   for(let i=0;i<100;i++){try{readFileSync(join(temp,'runtime-profile','DevToolsActivePort'));break;}catch{await new Promise(resolve=>setTimeout(resolve,100));}}
   const [runtimePort,runtimeEndpoint]=readFileSync(join(temp,'runtime-profile','DevToolsActivePort'),'utf8').trim().split('\n');
-  const binding={create:async()=>({sessionId:'native-fields-fixture'}),delete:async()=>{},fetch:async()=>{
+  let allocations=0;
+  const binding={create:async()=>{allocations++;return {sessionId:'native-fields-fixture'};},delete:async()=>{},fetch:async()=>{
     const socket=new WebSocket(`ws://127.0.0.1:${runtimePort}${runtimeEndpoint}`);
     await new Promise((resolve,reject)=>{socket.once('open',resolve);socket.once('error',reject);});socket.accept=()=>{};return {webSocket:socket};
   }};
@@ -161,7 +177,8 @@ try {
   const tool=(name,args)=>loginRuntime.tools.find(t=>t.name===name).handler(args,ctx);
   const operation=crypto.randomUUID();
   const login=await tool('request_browser_login',{operation_id:operation,url:origin,allowed_origins:[origin]});
-  const human=action=>loginRuntime.submit({challenge_id:operation,...action},ctx.signal);
+  let activeId=operation;
+  const human=action=>loginRuntime.submit({challenge_id:activeId,...action},ctx.signal);
   await assert.rejects(human({action:'observe',native_fields:true}));
   await human({action:'approve'});
   loginBrowser=await chromium.connectOverCDP(`http://127.0.0.1:${runtimePort}`);
@@ -169,7 +186,7 @@ try {
   for(let i=0;i<100;i++){loginPage=loginBrowser.contexts().flatMap(c=>c.pages()).find(p=>p.url().startsWith(origin));if(loginPage)break;await new Promise(resolve=>setTimeout(resolve,50));}
   assert.ok(loginPage,'private login target navigated: '+JSON.stringify(loginBrowser.contexts().map(c=>c.pages().map(p=>p.url()))));
   await loginPage.locator('input[type=email]').waitFor();
-  const intake={operation:'browser_login',kind:'login',agent_id:'fixture-agent',challenge_id:operation,request_id:operation,allowed_origins:[origin]};
+  let intake={operation:'browser_login',kind:'login',agent_id:'fixture-agent',challenge_id:operation,request_id:operation,allowed_origins:[origin]};
   handleControl=(req,res)=>{let body='';req.on('data',c=>body+=c);req.on('end',async()=>{
     res.setHeader('content-type','application/json');res.setHeader('cache-control','no-store');
     try{res.end(JSON.stringify(await loginRuntime.submit(JSON.parse(body),ctx.signal)));}catch{res.statusCode=409;res.end('{}');}
@@ -196,7 +213,32 @@ try {
   await loginPage.evaluate(vals=>{const p=document.createElement('p');p.textContent=vals.join(' ');document.body.append(p);},normalized);
   // Native OTP sheet: the user types once into a labeled native field, with the
   // code keyboard/autofill purpose preserved, then sends a private batch over HTTPS.
-  await loginPage.goto(origin + '/otp');
+  assert.equal((await browserTakeover(intake,{action:'finish'},requestPrivate)).status,'finished');
+  const firstSnapshot=JSON.stringify(await tool('browser_login_snapshot',{request_id:operation}));
+  for(const value of [...privateValues,...normalized])assert.ok(!firstSnapshot.includes(value));
+  await loginPage.evaluate(()=>sessionStorage.setItem('synthetic-session-marker','retained'));
+  await tool('browser_login_action',{request_id:operation,operation_id:crypto.randomUUID(),action:'navigate',url:origin+'/otp'});
+  await loginPage.locator('#otp').waitFor();
+  const beforeReentry=structuredClone(durable.get('browser-login:fixture-agent'));
+  const reentryOperation=crypto.randomUUID();
+  const followup=await tool('request_browser_login_input',{request_id:operation,operation_id:reentryOperation});
+  assert.equal(followup.status,'input_required');assert.equal(followup.approved,true);
+  assert.notEqual(followup.request_id,operation);assert.equal(followup.request_id,followup.challenge_id);
+  assert.deepEqual(await tool('request_browser_login_input',{operation_id:reentryOperation,request_id:operation}),followup,'reordered retry replays the same fresh panel');
+  assert.equal(allocations,1,'reentry reuses the original browser');
+  const afterReentry=durable.get('browser-login:fixture-agent');
+  assert.equal(afterReentry.sessionId,beforeReentry.sessionId);assert.equal(afterReentry.targetId,beforeReentry.targetId);
+  assert.equal(await loginPage.evaluate(()=>sessionStorage.getItem('synthetic-session-marker')),'retained');
+  for(const action of [{action:'observe'},{action:'approve'},{action:'cancel'},batch(beforeFill,privateValues)])
+    await assert.rejects(loginRuntime.submit({challenge_id:operation,...action},ctx.signal),'old panel cannot control the new epoch');
+  assert.deepEqual(await loginRuntime.submit({challenge_id:operation,action:'finish'},ctx.signal),{type:'browser_login_receipt',status:'finished',request_id:operation});
+  assert.equal(durable.get('browser-login:fixture-agent').phase,'human','old finish receipt must not release the new epoch');
+  await assert.rejects(tool('browser_login_snapshot',{request_id:followup.request_id}),'model stays blocked during native input');
+  activeId=followup.request_id;
+  intake=decodeVaultIntake({name:'request_browser_login_input',status:'completed',output:JSON.stringify(followup)});
+  assert.ok(intake,'account client recognizes followup native intake');
+  const described=await requestPrivate('/v1/agents/fixture-agent/browser-vault/takeover',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({challenge_id:activeId,action:'describe'})});
+  assert.equal((await described.json()).approved,true,'authenticated describe skips repeated origin review');
   const oldNative=await human({action:'observe',native_fields:true});
   assert.ok(oldNative.native_form.fields.every(f=>Object.keys(f).sort().join(',')==='label,multiline,ref,type'),'old native clients receive the original descriptor keys');
   const hinted=await human({action:'observe',native_fields:true,native_field_hints:true});
@@ -217,16 +259,52 @@ try {
   await human({action:'observe',native_fields:true,native_field_hints:true});
   await loginPage.evaluate(vals=>{const p=document.createElement('p');p.textContent=vals.join(' ');document.body.append(p);},[...normalized,...otpValues]);
   assert.equal((await browserTakeover(intake,{action:'finish'},requestPrivate)).status,'finished');
-  const snapshot=JSON.stringify(await tool('browser_login_snapshot',{request_id:operation}));
+  const snapshot=JSON.stringify(await tool('browser_login_snapshot',{request_id:activeId}));
   for(const value of [...privateValues,...normalized,...otpValues]){assert.ok(!snapshot.includes(value));assert.ok(!JSON.stringify([...durable]).includes(value));}
   await tool('browser_login_close',{});
+  // Vault Finish: actual runtime and CDP, with HTTP response loss simulated only
+  // after the real finish completed. Retry cannot release a newer lease.
+  const vaultData=new Map();
+  const vaultStorage={get:async k=>structuredClone(vaultData.get(k)),put:async(k,v)=>vaultData.set(k,structuredClone(v)),delete:async k=>vaultData.delete(k),transaction:async f=>f(vaultStorage)};
+  const vaultBinding={fetch:async()=>{
+    const ws=new WebSocket(`ws://127.0.0.1:${port}${endpoint}`);
+    await new Promise((resolve,reject)=>{ws.once('open',resolve);ws.once('error',reject);});ws.accept=()=>{};return {webSocket:ws};
+  }};
+  const makeVaultRuntime=()=>createManagedBrowserRuntime({ctx:{storage:vaultStorage},env:{MANAGED_BROWSER_PROVIDER:'cloudflare',BROWSER:vaultBinding,LOADER:{}},sessionId:'vault-fixture',privateOnly:true,
+    resolveVaultLogin:async()=>({username:'synthetic-vault-user',password:'synthetic-vault-password'}),authorizeVaultAccess:()=>{},
+    createRuntime:()=>({connector:{sessionInfo:async()=>({sessionId:'vault-session'}),closeSession:async()=>{}},tools:{},runtime:{expirePaused:async()=>{}}})});
+  vaultRuntime=await makeVaultRuntime();
+  const vaultTool=name=>vaultRuntime.tools.find(t=>t.name===name).handler(identity,ctx);
+  const lease=await vaultTool('browser_vault_request_takeover');
+  const vaultIntake={operation:'browser_takeover',kind:'login',agent_id:'vault-fixture',challenge_id:lease.challenge_id};
+  handleControl=(req,res)=>{let body='';req.on('data',c=>body+=c);req.on('end',async()=>{
+    res.setHeader('content-type','application/json');res.setHeader('cache-control','no-store');
+    try{res.end(JSON.stringify(await vaultRuntime.submitVaultTakeover(JSON.parse(body),ctx.signal)));}catch{res.statusCode=409;res.end('{}');}
+  });};
+  const lostFinish=async(url,init)=>{const response=await requestPrivate(url,init);assert.equal(response.status,200);await response.body.cancel();throw Error('Synthetic lost Finish response');};
+  await assert.rejects(browserTakeover(vaultIntake,{action:'finish'},lostFinish));
+  assert.equal((await browserTakeover(vaultIntake,{action:'finish'},requestPrivate)).status,'finished');
+  const newerLease=await vaultTool('browser_vault_request_takeover');
+  assert.notEqual(newerLease.challenge_id,lease.challenge_id);
+  assert.equal((await browserTakeover(vaultIntake,{action:'finish'},requestPrivate)).status,'finished');
+  assert.equal(vaultData.get('browser-vault-takeover:private:cloudflare:vault-fixture').id,newerLease.challenge_id,'old finish does not release newer lease');
+  await assert.rejects(vaultRuntime.submitVaultTakeover({challenge_id:lease.challenge_id,action:'observe'},ctx.signal));
+  await assert.rejects(vaultRuntime.submitVaultTakeover({challenge_id:crypto.randomUUID(),action:'finish'},ctx.signal));
+  assert.equal((await browserTakeover({...vaultIntake,challenge_id:newerLease.challenge_id},{action:'finish'},requestPrivate)).status,'finished');
+  assert.equal((await browserTakeover(vaultIntake,{action:'finish'},requestPrivate)).status,'finished','first receipt survives second completion');
+  await vaultRuntime.close();vaultRuntime=await makeVaultRuntime();
+  assert.equal((await browserTakeover({...vaultIntake,challenge_id:newerLease.challenge_id},{action:'finish'},requestPrivate)).status,'finished','durable finish survives runtime recreation');
+  assert.equal((await browserTakeover(vaultIntake,{action:'finish'},requestPrivate)).status,'finished','both epochs remain retryable after recreation');
   const output=new URL('../../../output/private-native-fields/',import.meta.url);mkdirSync(output,{recursive:true});
-  writeFileSync(new URL('takeover-journey.json',output),JSON.stringify({batch_ms:batchMs,checks:['OTP autocomplete and numeric keyboard hints survive private HTTPS fill','aria-labelledby labels identify OTP fields','hint opt-in preserves old native descriptor schema','unrecognized hint values and iframe fields are excluded','webauthn suffix is not passkey capability','changed input purpose rejects batch before mutation','OTP values redacted from model snapshot and durable storage','legacy clients receive no native_form until explicit opt-in','explicit opt-out and legacy observation retain viewport','document-bound labels and types without values','single native setter plus input/change per field','Unicode batch','replayed batch rejected','lost batch response is consumed; explicit observation recovers','HTTPS account decoder accepts new optional metadata','browser-normalized CR/LF and multiple-email whitespace variants redacted','formless and methodless custom JS login returns filled/action_required','private-login batch values redacted from model snapshot and durable storage','replaced or occluded element rejects entire batch before mutation','same-origin reload rejects stale document','forged and duplicate refs rejected','viewport touch/keyboard fallback retained']},null,2));
+  writeFileSync(new URL('takeover-journey.json',output),JSON.stringify({batch_ms:batchMs,checks:['vault Finish response loss retries exact durable receipt','old vault Finish cannot release newer lease','both vault Finish epochs remain retryable after later completion and runtime recreation','same-session fresh-ID OTP reentry without allocation/navigation','reordered operation replay returns identical fresh panel','old panel input and cancel rejected; old finish does not release new epoch','authenticated describe reports prior approval','original and OTP secrets remain redacted after reentry','OTP autocomplete and numeric keyboard hints survive private HTTPS fill','aria-labelledby labels identify OTP fields','hint opt-in preserves old native descriptor schema','unrecognized hint values and iframe fields are excluded','webauthn suffix is not passkey capability','changed input purpose rejects batch before mutation','OTP values redacted from model snapshot and durable storage','legacy clients receive no native_form until explicit opt-in','explicit opt-out and legacy observation retain viewport','document-bound labels and types without values','single native setter plus input/change per field','Unicode batch','replayed batch rejected','lost batch response is consumed; explicit observation recovers','HTTPS account decoder accepts new optional metadata','browser-normalized CR/LF and multiple-email whitespace variants redacted','formless and methodless custom JS login returns filled/action_required','private-login batch values redacted from model snapshot and durable storage','replaced or occluded element rejects entire batch before mutation','same-origin reload rejects stale document','forged and duplicate refs rejected','viewport touch/keyboard fallback retained']},null,2));
+  console.log('PASS: vault Finish loss/retry over HTTPS, newer-lease protection, durable receipt after runtime recreation');
+  console.log('PASS: same-session OTP reentry, fresh challenge, replay, stale-panel fencing, redaction continuity');
   console.log('PASS: native OTP hints, accessible labels, private HTTPS fill, purpose-change rejection, legacy descriptor compatibility');
   console.log('PASS: HTTPS decoder compatibility, raw/normalized private-login snapshot redaction, synthetic JS custom-login action_required');
   console.log('PASS: native batched form fill, stale/replaced/forged refs fail closed; batch '+batchMs+'ms');
   console.log('PASS: mobile viewport, native touch focus, keyboard traits, Unicode edit/delete, real touch scrolling, cancel recovery, viewport cleanup');
 } finally {
+  await vaultRuntime?.close();
   await loginRuntime?.close();
   privateCdp?.close();
   await loginBrowser?.close();

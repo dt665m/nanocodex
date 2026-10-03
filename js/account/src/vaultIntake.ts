@@ -3,7 +3,7 @@ import { decodeVaultEntries, type VaultEntryKind } from "./vaultEntries.ts";
 
 export type VaultIntake = Readonly<{ operation: "create" | "authorize_origin" | "browser_verification" | "browser_takeover" | "browser_login"; request_id?: string; allowed_origins?: readonly string[]; vault_id?: string; challenge_id?: string; agent_id?: string; kind: VaultEntryKind; name?: string; origin?: string }>;
 export function decodeVaultIntake(tool: ToolActivity): VaultIntake | undefined {
-  if (tool.name.split(".").at(-1) === "request_browser_login" && tool.status === "completed" && tool.output) {
+  if (["request_browser_login", "request_browser_login_input"].includes(tool.name.split(".").at(-1) ?? "") && tool.status === "completed" && tool.output) {
     try {
       const v = JSON.parse(tool.output);
       const validOrigin = (origin: unknown): origin is string => {

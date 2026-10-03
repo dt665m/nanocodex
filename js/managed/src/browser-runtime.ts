@@ -519,6 +519,7 @@ export async function createManagedBrowserRuntime(
   const privateScope = `${options.privateOnly ? "private:" : ""}${provider}:${options.sessionId}`;
   const quarantineKey = `browser-vault-quarantine:${privateScope}`;
   const takeoverKey = `browser-vault-takeover:${privateScope}`;
+  const takeoverFinishedKey = `${takeoverKey}:finished`;
   const takeoverMemoryKey = `browser-vault-private-memory:${privateScope}`;
   const challengeKey = `browser-vault-challenge:${privateScope}`;
   let isolated = Boolean(await options.ctx.storage.get(quarantineKey));
@@ -949,12 +950,24 @@ export async function createManagedBrowserRuntime(
     });
   }
   type HumanLease = { id: string; expiresAt: number; sessionId: string; identity: BrowserVaultIdentity };
+  type FinishedTakeover = {id:string;expiresAt:number};
+  const MAX_TAKEOVER_RECEIPTS = 32;
   if (options.resolveVaultLogin) tools.push({ name: "browser_vault_request_takeover",
     description: "Give the user exclusive private control of this browser to complete CAPTCHA, MFA, or unsupported login controls. Shows a client-only viewport and input panel for the same browser session, never a model screenshot or provider URL. Model reads and actions pause until the user finishes. Wait for the finished receipt, then inspect a private snapshot to verify account access.",
     supportsParallelToolCalls: false, parameters: { type: "object", additionalProperties: false, properties: identityProperties, required: identityRequired },
     handler: (input, context) => exclusive(async () => {
       const identity = parseIdentity(input);
       options.authorizeVaultAccess?.(context);
+      // Retain every unexpired completion so a delayed phone retry can finish
+      // its own panel even after later panels have completed. Bound admission
+      // instead of evicting a live receipt and stranding its client.
+      const room = await options.ctx.storage.transaction(async tx => {
+        const receipts = (await tx.get<FinishedTakeover[]>(takeoverFinishedKey) ?? []).filter(r=>r.expiresAt>Date.now());
+        if (receipts.length >= MAX_TAKEOVER_RECEIPTS) return false;
+        await tx.put(takeoverFinishedKey,receipts);
+        return true;
+      });
+      if (!room) throw new Error("Private control receipt limit reached; retry after earlier panels expire");
       // Renew an expired user panel without restoring ordinary browser access.
       const prior = await options.ctx.storage.get<HumanLease>(takeoverKey);
       if (prior && prior.expiresAt <= Date.now()) await options.ctx.storage.delete(takeoverKey);
@@ -1005,15 +1018,25 @@ export async function createManagedBrowserRuntime(
     if (typeof value.challenge_id !== "string" || !/^[0-9a-f-]{36}$/.test(value.challenge_id)
       || !["observe", "click", "type", "edit", "fill_fields", "touch", "key", "scroll", "finish"].includes(String(value.action))) throw new Error("Invalid private control request");
     signal.throwIfAborted();
+    if (value.action === "finish") {
+      if (Object.keys(value).some(key => !["challenge_id", "action"].includes(key))) throw new Error("Invalid private control request");
+      // A lost Finish response must be retryable without touching a later lease.
+      const finished = await options.ctx.storage.get<FinishedTakeover[]>(takeoverFinishedKey) ?? [];
+      if (finished.some(r=>r.id===value.challenge_id && r.expiresAt>Date.now())) return {status:"finished"};
+    }
     const lease = await options.ctx.storage.get<HumanLease>(takeoverKey);
     if (!lease || value.challenge_id !== lease.id) throw new Error("Private control is unavailable");
     if (value.action === "finish") {
-      if (Object.keys(value).some(key => !["challenge_id", "action"].includes(key))) throw new Error("Invalid private control request");
       try {
         await privateTakeover.run(lease.sessionId, lease.identity, signal, cdp => releasePrivateVaultTakeover(cdp, lease.identity.target_id));
       } catch { /* No screenshot or retry is needed to relinquish the lease. */ }
       privateTakeover.close();
-      await options.ctx.storage.delete(takeoverKey);
+      await options.ctx.storage.transaction(async tx => {
+        const receipts = (await tx.get<FinishedTakeover[]>(takeoverFinishedKey) ?? []).filter(r=>r.expiresAt>Date.now() && r.id!==lease.id);
+        if (receipts.length >= MAX_TAKEOVER_RECEIPTS) throw new Error("Private control receipt limit reached");
+        await tx.put(takeoverFinishedKey, [...receipts,{id:lease.id,expiresAt:Date.now()+10*60_000}]);
+        if ((await tx.get<HumanLease>(takeoverKey))?.id===lease.id) await tx.delete(takeoverKey);
+      });
       takeoverTouch = undefined; takeoverTyping = undefined;
       return { status: "finished" };
     }
