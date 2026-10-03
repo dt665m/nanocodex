@@ -1,5 +1,6 @@
 // Human-only takeover protocol in real Chrome, using synthetic content and fake input.
 import assert from 'node:assert/strict';
+import {createNamecheapFixture,namecheapSynthetic} from './fixtures/namecheap-login.mjs';
 import https from 'node:https';
 import { readFileSync, mkdtempSync, rmSync, readdirSync, mkdirSync, writeFileSync } from 'node:fs';
 import { execFileSync, spawn } from 'node:child_process';
@@ -31,10 +32,12 @@ const packages = new URL('../../../node_modules/.pnpm/', import.meta.url);
 const entry = readdirSync(packages).find(name => /^playwright-core@/.test(name));
 const { chromium } = await import(new URL(`${entry}/node_modules/playwright-core/index.mjs`, packages));
 const temp = mkdtempSync(join(tmpdir(), 'private-touch-'));
+const namecheapFixture=createNamecheapFixture();
 let browser, server, chrome, privateCdp, loginRuntime, vaultRuntime, handleControl, loginBrowser, runtimeChrome;
 try {
   execFileSync('openssl', ['req','-x509','-newkey','rsa:2048','-nodes','-keyout',join(temp,'key'),'-out',join(temp,'cert'),'-days','1','-subj','/CN=localhost'],{stdio:'ignore'});
   server = https.createServer({key:readFileSync(join(temp,'key')),cert:readFileSync(join(temp,'cert'))}, (req,res) => {
+    if (namecheapFixture.handler(req,res)) return;
     if (req.url.startsWith('/v1/agents/')) { handleControl(req,res); return; }
     res.setHeader('Content-Type','text/html');
     if (req.url === '/otp') {
@@ -262,6 +265,78 @@ try {
   const snapshot=JSON.stringify(await tool('browser_login_snapshot',{request_id:activeId}));
   for(const value of [...privateValues,...normalized,...otpValues]){assert.ok(!snapshot.includes(value));assert.ok(!JSON.stringify([...durable]).includes(value));}
   await tool('browser_login_close',{});
+  // Public Namecheap login structure, then a synthetic server-verified OTP.
+  // No live Namecheap credentials, post-password markup or WebAuthn are used.
+  await loginBrowser.close();loginBrowser=undefined;
+  const namecheapOperation=crypto.randomUUID();
+  const namecheapRequest=await tool('request_browser_login',{operation_id:namecheapOperation,url:origin+'/namecheap/login',allowed_origins:[origin]});
+  activeId=namecheapOperation;
+  intake=decodeVaultIntake({name:'request_browser_login',status:'completed',output:JSON.stringify(namecheapRequest)});
+  assert.ok(intake);
+  await human({action:'approve'});
+  loginBrowser=await chromium.connectOverCDP(`http://127.0.0.1:${runtimePort}`);
+  loginPage=loginBrowser.contexts().flatMap(c=>c.pages()).find(p=>p.url()===origin+'/namecheap/login');
+  assert.ok(loginPage);
+  await loginPage.locator('input[name=LoginPassword]:visible').waitFor();
+  const namecheapFrame=await human({action:'observe',native_fields:true,native_field_hints:true,viewport:{width:390,height:740,mobile:true}});
+  assert.deepEqual(namecheapFrame.native_form.fields.map(({ref,...field})=>field),[
+    {label:'Username',type:'text',multiline:false},
+    {label:'Password',type:'password',multiline:false},
+  ],'hidden duplicates and offscreen newsletter excluded; placeholder-only labels survive');
+  const namecheapValues=[namecheapSynthetic.username,namecheapSynthetic.password];
+  await browserTakeover(intake,batch(namecheapFrame,namecheapValues),requestPrivate);
+  assert.deepEqual(await loginPage.locator('input[name=LoginUserName],input[name=LoginPassword]').evaluateAll(es=>es.map(e=>e.value)),['','',...namecheapValues]);
+  assert.deepEqual(namecheapFixture.counts,{passwordPosts:0,otpPosts:0,authenticatedVisits:0},'native fill never submits');
+  const namecheapClickReceipts=[];
+  const clickNamecheap=async locator=>{
+    const box=await locator.boundingBox();assert.ok(box);
+    const view=await human({action:'observe',native_fields:true,native_field_hints:true});
+    // A POST navigation can destroy the observation context after the click.
+    // Do not retry; the caller verifies the resulting URL and server counters.
+    try{await browserTakeover(intake,{action:'click',x:(box.x+box.width/2)/view.width,y:(box.y+box.height/2)/view.height},requestPrivate);namecheapClickReceipts.push('received');}
+    catch(error){assert.equal(error.message,'Takeover unavailable');namecheapClickReceipts.push('navigation response uncertain');}
+  };
+  await clickNamecheap(loginPage.locator('input[type=submit]'));
+  await loginPage.waitForURL(origin+'/namecheap/otp');
+  assert.equal(namecheapFixture.counts.passwordPosts,1);
+  await browserTakeover(intake,{action:'finish'},requestPrivate);
+  assert.ok(JSON.stringify(await tool('browser_login_snapshot',{request_id:activeId})).includes('Synthetic second-factor code'));
+  const namecheapState=structuredClone(durable.get('browser-login:fixture-agent'));
+  const namecheapAllocations=allocations;
+  const otpRequest=await tool('request_browser_login_input',{request_id:activeId,operation_id:crypto.randomUUID()});
+  assert.equal(otpRequest.approved,true);
+  assert.notEqual(otpRequest.request_id,activeId);
+  const otpState=durable.get('browser-login:fixture-agent');
+  assert.equal(otpState.targetId,namecheapState.targetId);assert.equal(otpState.sessionId,namecheapState.sessionId);
+  assert.equal(allocations,namecheapAllocations);
+  activeId=otpRequest.request_id;
+  intake=decodeVaultIntake({name:'request_browser_login_input',status:'completed',output:JSON.stringify(otpRequest)});
+  assert.ok(intake);
+  const namecheapOtp=await human({action:'observe',native_fields:true,native_field_hints:true});
+  assert.deepEqual(namecheapOtp.native_form.fields.map(({ref,...field})=>field),[{label:'Verification code',type:'text',multiline:false,autocomplete:'one-time-code',inputmode:'numeric'}]);
+  await browserTakeover(intake,batch(namecheapOtp,[namecheapSynthetic.otp]),requestPrivate);
+  assert.equal(namecheapFixture.counts.otpPosts,0,'OTP native fill never submits');
+  await clickNamecheap(loginPage.getByRole('button',{name:'Verify'}));
+  await loginPage.waitForURL(origin+'/namecheap/account');
+  await browserTakeover(intake,{action:'finish'},requestPrivate);
+  const namecheapSnapshot=JSON.stringify(await tool('browser_login_snapshot',{request_id:activeId}));
+  assert.ok(namecheapSnapshot.includes('Synthetic Namecheap-shaped account verified'));
+  assert.deepEqual(namecheapFixture.counts,{passwordPosts:1,otpPosts:1,authenticatedVisits:1});
+  for(const value of Object.values(namecheapSynthetic)){
+    assert.ok(!namecheapSnapshot.includes(value));assert.ok(!JSON.stringify([...durable]).includes(value));
+  }
+  const namecheapOutput=new URL('../../../output/private-native-fields/',import.meta.url);mkdirSync(namecheapOutput,{recursive:true});
+  writeFileSync(new URL('namecheap-journey.json',namecheapOutput),JSON.stringify({
+    public_source:'https://www.namecheap.com/myaccount/login/',observed:'2026-10-03',
+    scope:'Synthetic structural compatibility only; no authenticated Namecheap or WebAuthn test',
+    descriptors:namecheapFrame.native_form.fields.map(({ref,...field})=>field),
+    otp_descriptors:namecheapOtp.native_form.fields.map(({ref,...field})=>field),
+    merchant_counts:namecheapFixture.counts,click_receipts:namecheapClickReceipts,same_session:true,new_browser_allocations:allocations-namecheapAllocations,
+    checks:['duplicate hidden header credentials left empty','offscreen newsletter excluded','placeholder-only labels and generic autocomplete=on','native HTTPS fill does not submit','explicit login click reaches synthetic OTP','OTP reentry keeps target and pending session cookie','native code hints survive HTTPS','explicit OTP click reaches server-authenticated synthetic account','no synthetic inputs in snapshot or durable metadata'],
+    limitations:['OTP markup is synthetic, not inspected after a live Namecheap login','CAPTCHA/trusted-device challenges untested','no iOS system credential autofill or passkey assertion tested'],
+  },null,2));
+  await tool('browser_login_close',{});
+  console.log('PASS: Namecheap-shaped public form discovery/private fill -> retained-session synthetic OTP -> server-confirmed fixture account; no live Namecheap authentication or passkey claim');
   // Vault Finish: actual runtime and CDP, with HTTP response loss simulated only
   // after the real finish completed. Retry cannot release a newer lease.
   const vaultData=new Map();
