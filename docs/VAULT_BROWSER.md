@@ -118,13 +118,27 @@ applies to subsequent actions until the next observation. Observations that omit
 the flag or set it to false restore the original frame schema for older iOS versions
 with strict decoders. An opted-in frame can include a `native_form` descriptor with a
 `document_id` and up to 32 fields (`ref`, `label`, `type`, `multiline`). It contains
-no input values. iPhone and iPad can collect these values locally and send one
+no input values. iPhone and iPad present a native sheet above the conversation,
+starting at medium height. They collect values locally and send one
 `fill_fields` action with the current document ID and `{ref, value}` entries to
-the authenticated private takeover endpoint. Account web clients continue using
+the authenticated private takeover endpoint. After a confirmed fill, the native
+client releases human control in the same session and dismisses the sheet. The
+agent must inspect the new snapshot, continue only already-authorized website
+actions, and verify the result; handback is not proof of sign-in or task completion.
+An uncertain fill is never automatically retried. A confirmed fill followed by
+an uncertain handback offers handback recovery without sending the values again.
+
+The remote website is an explicit fallback for visual challenges or unsupported
+controls. Native clients do not switch to it after filling a form.
+Account web clients continue using
 the screenshot controls and accept the optional descriptor.
 
 Discovery includes supported editable, unobstructed top-frame inputs and text areas
-inside the viewport. Custom controls, shadow DOM and iframes retain the viewport fallback. Each descriptor
+inside the viewport. Clients can additionally negotiate `native_field_hints: true`
+with `native_fields: true` to receive allowlisted `autocomplete` and `inputmode`
+metadata for native password, verification-code and keyboard behavior. Older
+clients retain their original strict field schema. A `webauthn` autocomplete token
+is not proof of passkey support. Custom controls, shadow DOM and iframes retain the viewport fallback. Each descriptor
 is bound to its document, origin and exact elements, and consumed once. A refresh
 or any other action issues fresh references. Batches are bounded to 32 fields,
 4096 UTF-16 code units per value and 32768 UTF-8 bytes in total. The batch HTTP
@@ -150,3 +164,25 @@ It writes its timing and checked outcomes to ignored `output/private-native-fiel
 Updated native clients retry a rejected capability observation once without the
 capability flag when an older server returns HTTP 400, then retain the legacy
 viewport for that sheet. Fills and other user actions are never retried.
+
+## Passkeys
+
+Native text entry and password AutoFill do not implement WebAuthn. This app does
+not currently bridge a website's passkey ceremony from its retained remote
+browser to the phone. Ordinary native passkey APIs require an associated domain
+that authorizes the app; an arbitrary third-party relying-party ID is insufficient.
+Apple's [browser public-key credential entitlement](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.developer.web-browser.public-key-credential)
+is a managed capability with browser-app requirements, not an entitlement that
+can be enabled solely by adding it to the project.
+
+A native remote-browser implementation requires an approved browser capability
+and a trusted remote authentication transport, such as Chrome's
+[webAuthenticationProxy](https://developer.chrome.com/docs/extensions/reference/api/webAuthenticationProxy).
+It must complete the original website ceremony in the same browser session,
+preserve the verified origin and challenge, keep assertions outside the agent
+transcript, and handle cancellation and replay. Provider support for extensions
+and signed iOS capability approval must be established before shipping this path.
+The normal [cross-device passkey flow](https://fidoalliance.org/passkeys-2/)
+requires proximity; displaying a cloud browser's QR code on a phone does not
+establish that proximity. Do not report passkey support based on native text
+fields, Face ID approval of another action, or a successful handback receipt.
