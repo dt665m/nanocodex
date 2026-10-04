@@ -83,3 +83,7 @@ __pycache__/
 
 # Materialized by third_party/codex-voice/patches/webrtc-sys/prepare.py
 third_party/codex-voice/vendor/
+
+# Root SwiftPM SDK consumer builds
+/.build/
+/.swiftpm/

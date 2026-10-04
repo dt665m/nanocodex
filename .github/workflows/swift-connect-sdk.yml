@@ -1,0 +1,26 @@
+name: Swift Connect SDK
+on:
+  pull_request:
+    paths: ['Package.swift', 'apple/InboxCore/**', 'apple/NanocodexUI/**', 'apple/NanocodexRemote/**', 'apple/NanocodexConnectEmbed/**', '.github/workflows/swift-connect-sdk.yml']
+  push:
+    branches: [master]
+    paths: ['Package.swift', 'apple/InboxCore/**', 'apple/NanocodexUI/**', 'apple/NanocodexRemote/**', 'apple/NanocodexConnectEmbed/**', '.github/workflows/swift-connect-sdk.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: swift-connect-sdk-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+jobs:
+  package:
+    name: SwiftPM macOS and iOS consumer builds
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - name: Compile remote-package product on macOS
+        run: swift build --target NanocodexConnectEmbed --jobs 3
+      - name: Compile iOS simulator product without signing
+        run: xcodebuild -scheme NanocodexConnectEmbed -destination 'generic/platform=iOS Simulator' -derivedDataPath output/swift-connect-sdk -jobs 3 CODE_SIGNING_ALLOWED=NO build
