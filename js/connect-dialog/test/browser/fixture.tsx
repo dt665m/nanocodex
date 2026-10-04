@@ -42,7 +42,7 @@ function Fixture() {
     },
   }), []);
   const preset = new URLSearchParams(location.search).get("appearance");
-  const appearance = preset === "brand" ? {theme: "dark" as const, accentColor: "#c4b5fd", borderRadius: 6, fontFamily: "Georgia, serif"}
+  const appearance = preset === "brand" ? {theme: "dark" as const, accentColor: "#c4b5fd", borderRadius: 6, fontFamily: "system-ui"}
     : preset === "invalid" ? {accentColor: "url(https://invalid.example)", borderRadius: -1, fontFamily: "bad; display:none"} : appearanceFromSearch(location.search);
   return outcome ? <p role="status">{outcome}</p> : <ConnectOnboarding appearance={appearance} host={host} request={request} />;
 }

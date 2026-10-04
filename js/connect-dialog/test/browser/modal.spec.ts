@@ -62,6 +62,12 @@ for (const theme of ["light", "dark"] as const) {
       const phone = page.getByRole("textbox", { name: "Mobile number" });
       await expect(phone).toBeFocused();
       await contained(page);
+      const intro = await page.locator(".sms-auth-panel .wizard-intro").boundingBox();
+      const form = await page.locator(".sms-otp-form").boundingBox();
+      expect(form!.y).toBeGreaterThanOrEqual(intro!.y + intro!.height);
+      expect(Math.abs(form!.x - intro!.x)).toBeLessThan(1);
+      expect(form!.width).toBeLessThanOrEqual(372);
+      expect(await page.locator("h1").evaluate(el => getComputedStyle(el).fontFamily)).toBe(await phone.evaluate(el => getComputedStyle(el).fontFamily));
       await screenshot(page, info, "phone");
       await phone.fill("123456");
       await phone.press("Enter");
@@ -247,7 +253,7 @@ for (const width of [1280, 390]) {
     await page.goto("/?appearance=brand");
     const shell = page.locator(".connect-onboarding");
     await expect(shell).toHaveCSS("color-scheme", "dark");
-    await expect(shell).toHaveCSS("font-family", "Georgia, serif");
+    await expect(shell).toHaveCSS("font-family", "system-ui");
     const send = page.getByRole("button", {name:"Text me a code"});
     await expect(send).toHaveCSS("background-color", "rgb(196, 181, 253)");
     await expect(send).toHaveCSS("color", "rgb(0, 0, 0)");
@@ -284,7 +290,7 @@ test("SDK popup forwards developer appearance into hosted parser and UI", async 
   await expect(send).toHaveCSS("background-color", "rgb(196, 181, 253)");
   await expect(send).toHaveCSS("border-radius", "6px");
   await expect(popup.locator(".connect-onboarding")).toHaveCSS("color-scheme", "dark");
-  await expect(popup.locator(".connect-onboarding")).toHaveCSS("font-family", "Georgia, serif");
+  await expect(popup.locator(".connect-onboarding")).toHaveCSS("font-family", "system-ui");
   await popup.getByRole("button", {name:"Cancel",exact:true}).click();
   await expect(popup.getByRole("status")).toHaveText("Request cancelled");
 });

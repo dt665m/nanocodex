@@ -106,6 +106,7 @@ export function AccountConnectionCard({
     <div className="wizard-connector-card" role="listitem">
       <button
         className={`connection-card${connected ? " is-connected" : ""}`}
+        title={detail}
         disabled={disabled}
         onClick={onClick}
         type="button"
@@ -113,7 +114,7 @@ export function AccountConnectionCard({
         {logo}
         <span className="connection-card-copy">
           <strong>{title}</strong>
-          <span>{detail}</span>
+          <span className="sr-only">{detail}</span>
         </span>
         <span className="connection-card-action">{action}</span>
       </button>
@@ -209,7 +210,7 @@ export function McpConnectionCard({
       )}
       <span className={account ? "connection-card-copy" : "mcp-connection-copy"}>
         <strong>{connection.name}</strong>
-        <span>{status}</span>
+        <span className="sr-only">{status}</span>
         {error ? <small className="mcp-connection-error" role="alert">{error}</small> : null}
       </span>
       <span className="mcp-connection-actions">

@@ -36,11 +36,11 @@
   button:disabled { cursor: default; opacity: .45; }
   button:focus-visible, input:focus-visible, summary:focus-visible, a:focus-visible { outline: 2px solid var(--connect-accent, var(--text)); outline-offset: 3px; }
   h1, h2, p, dl, dd { margin: 0; }
-  h1 { font-size: 26px; line-height: 1.18; font-weight: 600; letter-spacing: -.025em; overflow-wrap: anywhere; }
-  h2 { font-size: 14px; line-height: 1.5; font-weight: 600; }
+  h1 { font-size: 24px; line-height: 1.22; font-weight: 500; letter-spacing: -.025em; overflow-wrap: anywhere; }
+  h2 { font-size: 14px; line-height: 1.5; font-weight: 500; }
   .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
   .dialog-header { padding: 20px 24px 0; }
-  .wordmark { font-weight: 600; font-size: 13px; }
+  .wordmark { font-weight: 500; font-size: 13px; }
   .secure-label { color: var(--muted); font-size: 12px; }
   .dialog-content { flex: 0 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }
   .wizard-page { width: 100%; }
@@ -71,17 +71,17 @@
   .sms-otp-input-row input:focus-visible { outline: 2px solid color-mix(in srgb, var(--text) 35%, transparent); outline-offset: 2px; }
   .sms-otp-input-row input[aria-invalid="true"] { border-color: var(--negative); }
   .sms-otp-input-row input[autocomplete="one-time-code"] { height: 56px; text-align: center; font-size: 24px; font-variant-numeric: tabular-nums; letter-spacing: .32em; }
-  .sms-otp-input-row button { height: 46px; border: 0; border-radius: var(--connect-radius, 10px); background: var(--connect-accent, var(--text)); color: var(--connect-on-accent, var(--surface)); font-weight: 600; }
+  .sms-otp-input-row button { height: 46px; border: 0; border-radius: var(--connect-radius, 10px); background: var(--connect-accent, var(--text)); color: var(--connect-on-accent, var(--surface)); font-weight: 500; }
   .sms-otp-input-row button:hover:not(:disabled) { opacity: .88; }
   .sms-otp-form .auth-terms { font-size: 11px; text-align: center; margin-top: 8px; line-height: 1.55; }
   .sms-otp-change { justify-self: center; min-height: 44px; border: 0; background: transparent; font-size: 13px; }
   .auth-boundary { margin-top: 16px; text-align: center; color: var(--muted); font-size: 12px; }
-  .auth-brand { display: flex; gap: 5px; justify-content: center; align-items: center; padding-top: 16px; color: var(--muted); font-size: 11px; font-weight: 600; }
+  .auth-brand { display: flex; gap: 5px; justify-content: center; align-items: center; padding-top: 16px; color: var(--muted); font-size: 11px; font-weight: 500; }
   .auth-brand span { font-weight: 400; }
   .wizard-review-page { display: grid; gap: 20px; width: min(420px, 100%); margin: 0 auto; padding: 0 24px; }
   .wizard-review-page > .wizard-intro { display: flex; flex-direction: column; align-items: center; text-align: center; gap: 12px; }
   .wizard-review-page .request-identity { justify-items: center; }
-  .wizard-review-page h1 { font-size: 24px; line-height: 1.2; }
+  .wizard-review-page h1 { font-size: 24px; line-height: 1.22; }
   .consent-account { display: inline-flex; gap: 8px; align-items: center; max-width: 100%; border: 1px solid var(--border); border-radius: 24px; padding: 6px 10px; font-size: 12px; overflow-wrap: anywhere; }
   .consent-account > span:first-child { color: var(--muted); }
   .wizard-sections { display: grid; align-content: start; gap: 16px; min-width: 0; }
@@ -102,7 +102,7 @@
   .is-connected .connection-card-action { color: var(--positive); border: 0; padding-inline: 0; font-size: 11px; }
   .connector-logo { width: 32px; height: 32px; display: grid; place-items: center; background: var(--surface-raised); border-radius: 9px; }
   .connector-logo svg { width: 19px; height: 19px; fill: currentColor; }
-  .connector-logo-google { color: #4285f4; font-weight: 600; }
+  .connector-logo-google { color: #4285f4; font-weight: 500; }
   .connector-logo-mercator svg { fill: none; stroke: currentColor; stroke-width: 1.5; }
   .wizard-section:has(.wizard-request-summary) > .wizard-section-title { display: none; }
   .permission-icons { display: flex; justify-content: center; gap: 8px; }
@@ -188,13 +188,8 @@
     .wizard-review-page { width: min(800px, 100%); grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); column-gap: 36px; padding: 24px 40px 0; }
     .wizard-review-page > .wizard-intro { align-items: flex-start; text-align: left; justify-content: center; }
     .wizard-review-page .request-identity { justify-items: start; }
-    .wizard-review-page h1 { font-size: 27px; font-weight: 500; line-height: 1.22; }
+    .wizard-review-page h1 { font-size: 24px; font-weight: 500; line-height: 1.22; }
     .dialog-actions { width: min(800px, 100%); padding: 20px 40px 24px calc(min(800px, 100vw) / 2 + 18px); }
-    .sms-auth-panel { width: min(800px, 100%); display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); column-gap: 36px; padding: 24px 40px; }
-    .sms-auth-panel .wizard-intro { grid-column: 1; grid-row: 1 / span 4; text-align: left; align-content: center; margin: 0; }
-    .sms-auth-panel .request-identity { justify-items: start; }
-    .sms-auth-panel h1 { font-size: 27px; font-weight: 500; line-height: 1.22; }
-    .sms-auth-panel > :not(.wizard-intro) { grid-column: 2; }
-    .sms-auth-panel .auth-close { margin-top: 8px; }
+
   }
 }
