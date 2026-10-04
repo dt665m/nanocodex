@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { Worker } from 'node:worker_threads';
 import test from 'node:test';
+import { createManagedCodeEffectJournal } from '../../managed/src/managed-recovery-safety.ts';
 import { createSqliteDurabilityStore, sqliteDurabilitySchema } from '../runtime/durability-store.mjs';
 import { startResponsesServer, messageReader, sendCompleted, sendFinal, sendWarmup } from './support/responses.mjs';
 
@@ -24,12 +25,25 @@ function persistentBoundary(database, parallelReads, lostAcknowledgement, lostAd
     try { const value = callback(query); database.exec('COMMIT'); return value; }
     catch (error) { database.exec('ROLLBACK'); throw error; }
   } });
-  let generation = 0;
+  const storage = {
+    sql: { exec(sql, ...args) {
+      if (!args.length && sql.includes(';')) { database.exec(sql); return { toArray: () => [] }; }
+      const rows = query(sql, args);
+      return { toArray: () => rows, one: () => { assert.equal(rows.length, 1); return rows[0]; }, [Symbol.iterator]: () => rows[Symbol.iterator]() };
+    } },
+    transactionSync(callback) {
+      database.exec('BEGIN IMMEDIATE');
+      try { const result = callback(); database.exec('COMMIT'); return result; }
+      catch (error) { database.exec('ROLLBACK'); throw error; }
+    }, async sync() {},
+  };
+  let generation = 0, cells;
   return {
-    nextGeneration: () => ++generation,
+    nextGeneration() { cells = createManagedCodeEffectJournal(storage); return ++generation; },
     run(owner, method, args) {
       if (owner !== generation) throw new Error('old journal owner fenced');
       if (method.startsWith('durability.')) return durability[method.slice(11)](...args);
+      if (method === 'journal.beginCell' || method === 'journal.completeCell') return cells[method.slice(8)](...args);
       if (method === 'effect') {
         database.prepare('INSERT INTO dispatches VALUES (?, ?)').run(...args);
         if (['poison', 'abortable'].includes(args[0])) return new Promise(() => {});
@@ -84,7 +98,7 @@ async function journey(t, { sdk = 'node', journal = true, source, expected, over
   function start() {
     const owner = boundary.nextGeneration();
     worker = new Worker(new URL('./support/code-recovery-owned.worker.mjs', import.meta.url), {
-      workerData: { sdk, journal, direct, reusedProviderIds, queuedProviderIds: queuedProviderIds && owner > 1, url: server.url, cancellation, evaluator, databasePath: join(directory, 'recovery.sqlite') },
+      workerData: { sdk, journal, cellJournal: journal, direct, reusedProviderIds, queuedProviderIds: queuedProviderIds && owner > 1, url: server.url, cancellation, evaluator, databasePath: join(directory, 'recovery.sqlite') },
     });
     const started = worker;
     workers.push(worker);
@@ -156,13 +170,6 @@ async function journey(t, { sdk = 'node', journal = true, source, expected, over
     trace.push({ owner, type: 'abrupt-terminate' });
     socket.terminate();
     owner = start();
-    if (!journal) {
-      await until(message => message.owner === owner && message.type === 'dispatch' && message.kind === 'poison');
-      assert.deepEqual(database.prepare('SELECT kind, COUNT(*) AS count FROM dispatches GROUP BY kind ORDER BY kind').all()
-        .map(row => ({ ...row })), direct ? [{ kind: 'poison', count: 2 }] : [{ kind: 'poison', count: 2 }, { kind: 'read-one', count: 2 }, { kind: 'read-two', count: 2 }]);
-      t.diagnostic(direct ? 'Negative control: real direct tool redispatched poison twice without opt-in journal.' : 'Negative control: real abrupt restart without journal redispatched both completed reads and poison twice.');
-      return;
-    }
     socket = await server.nextConnection();
     reader = messageReader(socket);
     const recoveredRequest = await reader.next();
@@ -261,7 +268,7 @@ async function journey(t, { sdk = 'node', journal = true, source, expected, over
     assert.ok(!dispatches.some(row => row.kind === 'retry'));
     if (lostAdmissionAcknowledgement) assert.equal(dispatches.length, 0, 'no dispatch before intent ACK');
     if (direct) {
-      for (const entry of trace.filter(entry => entry.type === 'rpc' && entry.method.startsWith('journal.'))) {
+      for (const entry of trace.filter(entry => entry.type === 'rpc' && ['journal.begin', 'journal.complete'].includes(entry.method))) {
         const context = entry.args[0];
         assert.equal(context.parentCallId, 'owned-tool'); assert.equal(context.callId, 'owned-tool');
         assert.equal(context.source, 'host-tool:effect'); assert.equal(context.name, 'effect');
@@ -288,7 +295,7 @@ async function journey(t, { sdk = 'node', journal = true, source, expected, over
       }
     }
     const effects = database.prepare('SELECT key, generation, receipt IS NOT NULL AS completed FROM effects ORDER BY key').all().map(row => ({ ...row }));
-    assert.equal(effects.filter(row => row.completed === 0).length, lostAcknowledgement ? 0 : 1,
+    assert.equal(effects.filter(row => row.completed === 0).length, !journal || lostAcknowledgement ? 0 : 1,
       'only genuinely uncertain original intents remain pending for reconciliation');
     t.diagnostic(JSON.stringify({ sdk, dispatches, effects, original: 'RECOVERED', followOn: 'FOLLOW_ON_OK' }));
   } finally { await cleanup(); }
@@ -313,7 +320,7 @@ try { await tools.effect({kind:'poison'}); } catch (error) {
 }`;
 for (const sdk of ['node', 'host', 'cloudflare']) test(`${sdk} owned SDK: abrupt Rust WASM/QuickJS restart replays reads, fences pending write, unblocks original and follow-on`,
   { timeout: 30000 }, t => journey(t, { sdk, source, parallelReads: true }));
-test('negative control: abrupt Rust WASM/QuickJS restart actually repeats nested effects without opt-in journal',
+test('unsafe Code Mode without journal: abrupt Rust WASM restart reports unknown without redispatch',
   { timeout: 30000 }, t => journey(t, { journal: false, source, parallelReads: true }));
 test('owned SDK: failed/undefined Promise.allSettled receipts survive abrupt restart without new dispatch',
   { timeout: 30000 }, t => journey(t, { label: 'errors', source: `
@@ -374,7 +381,7 @@ test('owned direct SDK: compact 2 MiB PNG receipt replays after lost ACK and abr
 test('owned direct SDK: lost intent ACK interrupts before dispatch, restart reports unknown and next turn healthy',
   { timeout: 30000 }, t => journey(t, { direct: true, label: 'direct-intent-ack', lostAdmissionAcknowledgement: true }));
 
-test('negative control: owned direct SDK without opt-in journal preserves abrupt redispatch semantics',
+test('unsafe direct tool without journal: abrupt Rust WASM restart reports unknown without redispatch',
   { timeout: 30000 }, t => journey(t, { direct: true, journal: false, label: 'direct-no-journal' }));
 
 for (const direct of [false, true]) test(`owned ${direct ? 'direct' : 'Code Mode'} SDK: reused provider call IDs across model responses and operations dispatch fresh same and different inputs`,
