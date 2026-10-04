@@ -173,6 +173,8 @@ impl ToolSource for crate::mcp::Mcp {
 /// Declarative selection of the built-in tools installed for an agent.
 #[derive(Clone)]
 pub struct Tools {
+    #[cfg(all(not(target_family = "wasm"), feature = "code-mode"))]
+    pub(super) code_journal: Option<Arc<dyn crate::code_mode::CodeModeJournal>>,
     exposure: ToolExposure,
     #[cfg(feature = "code-mode")]
     pub(crate) inline_docs_token_budget: usize,
@@ -207,6 +209,8 @@ pub struct Tools {
 impl Default for Tools {
     fn default() -> Self {
         Self {
+            #[cfg(all(not(target_family = "wasm"), feature = "code-mode"))]
+            code_journal: None,
             exposure: ToolExposure::default(),
             #[cfg(feature = "code-mode")]
             inline_docs_token_budget: 3000,
@@ -310,6 +314,14 @@ impl fmt::Debug for Tools {
 }
 
 impl Tools {
+    /// Attaches native Code Mode persistence to this session’s tool selection.
+    #[cfg(all(not(target_family = "wasm"), feature = "code-mode"))]
+    #[must_use]
+    pub fn with_code_journal(mut self, journal: Arc<dyn crate::code_mode::CodeModeJournal>) -> Self {
+        self.code_journal = Some(journal);
+        self
+    }
+
     /// Starts a builder with all standard tools enabled.
     #[must_use]
     pub fn builder() -> ToolsBuilder {

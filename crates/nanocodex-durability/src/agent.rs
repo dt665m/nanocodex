@@ -83,8 +83,9 @@ async fn attach<F>(builder: NanocodexBuilder<F>, state: DurableSession,
                                 .to_owned(),
                         )
                     })?;
-                let mut policy = DurableExecution::ready(owner);
+                let mut policy = DurableExecution::ready(owner, state.clone());
                 policy.settings = settings.clone();
+
                 policy.remember(keys)?;
                 let policy: Arc<dyn ExecutionPolicy> = Arc::new(policy);
                 Ok(policy)
@@ -92,14 +93,21 @@ async fn attach<F>(builder: NanocodexBuilder<F>, state: DurableSession,
 }
 
 struct DurableExecution {
-    owner: DurableOwner,
+    owner: Arc<DurableOwner>,
+    #[cfg(not(target_family = "wasm"))]
+    code_journal: Arc<crate::code_mode::DurableCodeJournal>,
     context_records: Mutex<HashSet<String>>,
     settings: Option<crate::request_policy::RequestPolicySettings>,
 }
 
 impl DurableExecution {
-    fn ready(owner: DurableOwner) -> Self {
+    fn ready(owner: DurableOwner, state: DurableSession) -> Self {
+        let owner = Arc::new(owner);
+        #[cfg(target_family = "wasm")]
+        let _ = state;
         Self {
+            #[cfg(not(target_family = "wasm"))]
+            code_journal: Arc::new(crate::code_mode::DurableCodeJournal::new(Arc::clone(&owner), state)),
             owner,
             context_records: Mutex::new(HashSet::new()),
             settings: None,
@@ -154,6 +162,11 @@ impl ExecutionPolicy for DurableExecution {
         })
     }
 
+    #[cfg(not(target_family = "wasm"))]
+    fn code_mode_journal(&self) -> Option<Arc<dyn nanocodex_oai_tools::code_mode::CodeModeJournal>> {
+        Some(self.code_journal.clone())
+    }
+
     fn recover_failure<'a>(
         &'a self,
         operation_id: String,
@@ -166,7 +179,7 @@ impl ExecutionPolicy for DurableExecution {
             ) {
                 return error;
             }
-            let owner = &self.owner;
+            let owner = self.owner.as_ref();
             match owner.recover_failure(operation_id).await {
                 Ok(Some(OperationStatus::Failed { error, .. })) => {
                     NanocodexError::ReplayedExecutionFailed(error)
@@ -219,7 +232,7 @@ impl ExecutionPolicy for DurableExecution {
     ) -> ExecutionFuture<'a, AgentResult<ExecutionAdmission>> {
         Box::pin(async move {
             let input = raw(input_json)?;
-            let owner = &self.owner;
+            let owner = self.owner.as_ref();
             let admission = owner
                 .admit_typed::<_, crate::context::Snapshot, ExecutionOutput>(operation_id, &input)
                 .await
@@ -410,7 +423,7 @@ impl ExecutionPolicy for DurableExecution {
         operation_id: String,
     ) -> ExecutionFuture<'a, AgentResult<Option<ExecutionContinuation>>> {
         Box::pin(async move {
-            let owner = &self.owner;
+            let owner = self.owner.as_ref();
             match owner
                 .continuation(operation_id)
                 .await
@@ -495,6 +508,10 @@ impl ExecutionPolicy for DurableExecution {
         replay_safety: crate::ReplaySafety,
     ) -> ExecutionFuture<'a, AgentResult<ExecutionStepAdmission>> {
         Box::pin(async move {
+            #[cfg(not(target_family = "wasm"))]
+            if kind == "tool_call" {
+                self.code_journal.bind(&operation_id, &step_id, &input_json).map_err(agent_error)?;
+            }
             let input = raw(input_json)?;
             match self
                 .owner
@@ -641,7 +658,7 @@ mod tests {
             .admit_typed::<_, u32, String>("turn".into(), &"input")
             .await
             .unwrap();
-        let policy = DurableExecution::ready(owner);
+        let policy = DurableExecution::ready(owner, state.clone());
         let failure = policy
             .recover_failure(
                 "turn".into(),
@@ -666,7 +683,7 @@ mod tests {
             .await
             .unwrap();
         owner.begin_attempt("first".into()).await.unwrap();
-        let policy = DurableExecution::ready(owner);
+        let policy = DurableExecution::ready(owner, state.clone());
         let failure = policy
             .recover_failure(
                 "first".into(),
@@ -735,7 +752,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let policy = DurableExecution::ready(owner);
+        let policy = DurableExecution::ready(owner, state.clone());
         let failure = policy
             .recover_failure("newer".into(), NanocodexError::TurnStopped)
             .await;

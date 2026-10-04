@@ -128,6 +128,9 @@ impl ToolRuntime {
     }
 
     fn with_tools(mut self, tools: &Tools) -> Self {
+        if let Some(journal) = &tools.code_journal {
+            self.code_mode.set_journal(Arc::clone(journal));
+        }
         tools.start_providers();
         self.inline_docs_token_budget = tools.inline_docs_token_budget;
         let registry = Arc::make_mut(&mut self.registry);

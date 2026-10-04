@@ -5,6 +5,8 @@
 mod agent;
 mod child_journal;
 pub use child_journal::ChildJournal;
+#[cfg(not(target_family = "wasm"))]
+mod code_mode;
 #[cfg(feature = "claude")]
 mod claude;
 mod context;

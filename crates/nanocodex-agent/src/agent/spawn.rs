@@ -180,6 +180,8 @@ where
         origin.parent_session_id.as_deref(),
         initial_resume.as_ref().map(InitialResume::history_len),
     )?;
+    #[cfg(not(target_family = "wasm"))]
+    let tools = execution.configure_tools(tools);
     let (runtime, event_stream) = BackendRuntime::new_openai(session_id);
     let events = EventSink::from_publisher(runtime.events());
     shutdown.set_execution_policy_owned(execution.identifies_prompts());

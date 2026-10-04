@@ -2460,6 +2460,19 @@ pub(crate) struct DurableOwner {
 }
 
 impl DurableOwner {
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) async fn complete_code_cell(
+        &self, operation_id: String, step_id: String, output: &serde_json::Value,
+        writes: Vec<crate::DocumentWrite>,
+    ) -> Result<()> {
+        let (result, receiver) = oneshot::channel();
+        self.send(Command::CompleteDocuments {
+            caller: self.caller()?, operation_id, step_id: Some(step_id),
+            checkpoint: None, output: EncodedPayload::encode(output)?, writes, result,
+        }).await?;
+        receive(receiver).await
+    }
+
     pub(crate) async fn load_payloads(
         &self,
         payloads: Vec<EncodedPayload>,

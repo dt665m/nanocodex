@@ -127,6 +127,11 @@ pub trait ExecutionPolicy: Send + Sync {
         Box::pin(async { Ok(None) })
     }
 
+    /// Supplies the native cell journal owned by this execution policy.
+    fn code_mode_journal(&self) -> Option<Arc<dyn nanocodex_oai_tools::code_mode::CodeModeJournal>> {
+        None
+    }
+
     /// Resolves a failed attempt against the authoritative operation state.
     /// A pending operation must return a retry/reopen disposition, even when
     /// its original failure was not a transport or storage error.
@@ -780,6 +785,14 @@ impl Execution {
     #[cfg(not(target_family = "wasm"))]
     pub(crate) const fn info(&self) -> Option<&RolloutInfo> {
         self.platform.info()
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn configure_tools(&self, tools: crate::Tools) -> crate::Tools {
+        match self.policy.as_ref().and_then(|policy| policy.code_mode_journal()) {
+            Some(journal) => tools.with_code_journal(journal),
+            None => tools,
+        }
     }
 
     pub(crate) const fn identifies_prompts(&self) -> bool {
