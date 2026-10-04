@@ -1305,7 +1305,7 @@ inspection, immutable turn artifacts and HTTP tool results are documented in
 
 Managed agents discover first-party `github_request`, Google Workspace capability
 `*_request`, `slack_request`, `x_request`, `spotify_request`, and
-`soundcloud_request` tools through the same `tool_search` used by connected MCPs.
+`soundcloud_request`, and `cloudflare_request` tools through the same `tool_search` used by connected MCPs.
 `environment().accounts` advertises tools for connected, grant-visible services;
 `accounts[service].connections` supplies exact account selectors. Each call uses authenticated
 egress with live grant and connection checks, broker-owned token refresh, fixed

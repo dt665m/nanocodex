@@ -23,6 +23,24 @@ function setup() {
 }
 
 describe("connected service discovery and requests", () => {
+  it("discovers and routes Cloudflare telemetry through an exact granted connection", async () => {
+    const { router, fetch, revoke } = setup();
+    const discovery = await router.execute("tool_search", { query: "Cloudflare Workers logs traces", limit: 20 }, context);
+    expect(JSON.stringify(discovery)).toContain("cloudflare_request");
+    const path = "/client/v4/accounts/" + "d".repeat(32) + "/workers/observability/telemetry/query";
+    const body = { dry: true, queryId: "synthetic-query", view: "events" };
+    expect(await router.execute("cloudflare_request", { method: "POST", path, body, connection_id: ID }, context)).toMatchObject({ ok: true, status: 200 });
+    const request = fetch.mock.calls[0]![0];
+    expect(request.url).toBe("https://api.cloudflare.com" + path);
+    expect(request.headers.get("authorization")).toBe("Bearer NANOCODEX_PROVIDER_CREDENTIAL");
+    expect(request.headers.get("x-nanocodex-connector-connection")).toBe(ID);
+    expect(await request.json()).toEqual(body);
+    expect(await router.execute("cloudflare_request", { path: "/client/v4/accounts", connection_id: OTHER }, context)).toMatchObject({ status: 403 });
+    expect(fetch).toHaveBeenCalledTimes(1);
+    revoke();
+    await expect(router.execute("cloudflare_request", { path: "/client/v4/accounts" }, context)).rejects.toThrow();
+  });
+
   it("sends Link approval requests once through the selected account and refuses delegated endpoints", async () => {
     const { router, fetch } = setup();
     await router.execute("link_request", { method: "POST", path: "/spend_requests/lsrq_123/request_approval", connection_id: ID }, context);

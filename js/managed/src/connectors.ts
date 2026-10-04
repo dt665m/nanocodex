@@ -327,6 +327,16 @@ export async function routeConnectorRequest(
     return env.NANOCODEX.fetch(target, { method: "DELETE" });
   }
 
+  if (provider === "cloudflare") {
+    const body: unknown = await request.json().catch(() => undefined);
+    if (!isRecord(body) || Object.keys(body).some(key => key !== "vault_id")
+      || typeof body.vault_id !== "string" || !/^[A-Za-z0-9_-]{22,64}$/.test(body.vault_id)) {
+      return json({ error: "invalid_request" }, 400);
+    }
+    return env.NANOCODEX.fetch(target, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ vault_id: body.vault_id }),
+    });
+  }
   const returnTo = await decodeReturnTo(request, url);
   if (!returnTo) return json({ error: "invalid_return_to" }, 400);
   const local = routeConnector === "link" ? undefined : localConnectorAuthorization(url.origin, routeConnector, "managed");

@@ -1,4 +1,5 @@
 export const CONNECTOR_CAPABILITY_IDS = [
+  "cloudflare",
   "github",
   "gmail",
   "gdrive",
@@ -15,7 +16,7 @@ export const CONNECTOR_CAPABILITY_IDS = [
   "link",
 ] as const;
 
-export const CONNECTOR_PROVIDER_IDS = ["github", "google", "slack", "x", "spotify", "soundcloud", "link"] as const;
+export const CONNECTOR_PROVIDER_IDS = ["cloudflare", "github", "google", "slack", "x", "spotify", "soundcloud", "link"] as const;
 
 export const CONNECTOR_PROVIDER_CATALOG = Object.freeze([
   {
