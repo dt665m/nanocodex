@@ -15,7 +15,8 @@ use nanocodex::{
     agent::{
         AgentHandle, ExecutionEnvironment, PromptRequest, SpawnOptions,
         durability::{
-            OwnedState, OwnerId, OwnerToken, StateStore, StoreError, StoreFuture, StoredState,
+            DurableSession, OwnedState, OwnerId, OwnerToken, StateStore, StoreError, StoreFuture,
+            StoredState,
         },
         input::{Prompt, UserInput},
         session::{SessionId, SessionSnapshot},
@@ -1172,6 +1173,8 @@ struct WasmConfig {
     #[serde(default)]
     durability_id: Option<String>,
     #[serde(default)]
+    document_fork: Option<WasmDocumentFork>,
+    #[serde(default)]
     durability_host_id: Option<String>,
     #[serde(default)]
     terminal_receipt_retention: Option<usize>,
@@ -1181,6 +1184,13 @@ struct WasmConfig {
     subagent_routing: bool,
     #[serde(default)]
     claude_harness: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct WasmDocumentFork {
+    checkpoint: SessionSnapshot,
+    documents: nanocodex::durability::DocumentFork,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1375,6 +1385,7 @@ fn encode_subscription_credential(
 #[wasm_bindgen(js_name = Nanocodex)]
 pub struct WasmNanocodex {
     inner: RustNanocodex,
+    durable_session: Option<DurableSession>,
     subagents: Option<WasmSubagents>,
     event_forwarding: Rc<Cell<bool>>,
 }
@@ -1429,6 +1440,8 @@ impl WasmHarnessFactory {
             "terminal_receipt_retention",
             "terminalReceiptRetention",
             "resume",
+            "document_fork",
+            "documentFork",
             "before_compaction",
         ] {
             object.remove(key);
@@ -1474,16 +1487,15 @@ impl WasmHarnessFactory {
             .and_then(serde_json::Value::as_u64)
             .ok_or_else(unavailable)? as u32;
         let built = match family {
-            HarnessFamily::Codex => {
-                build_codex(
-                    serde_json::from_value(recipe).map_err(|_| unavailable())?,
-                    auth.expect("Codex authentication"),
-                    Some(factory.clone()),
-                    snapshot,
-                    host_context,
-                )
-                .await
-            }
+            HarnessFamily::Codex => build_codex(
+                serde_json::from_value(recipe).map_err(|_| unavailable())?,
+                auth.expect("Codex authentication"),
+                Some(factory.clone()),
+                snapshot,
+                host_context,
+            )
+            .await
+            .map(|(inner, events, _)| (inner, events)),
             HarnessFamily::Claude => {
                 claude::build_claude(
                     serde_json::from_value(recipe).map_err(|_| unavailable())?,
@@ -1777,11 +1789,14 @@ impl WasmNanocodex {
         } else {
             (None, None)
         };
-        let (inner, events) = build_codex(config, auth, factory, None, None).await?;
+        let (inner, events, durable_session) =
+            build_codex(config, auth, factory, None, None).await?;
         if let (Some(subagents), Some(durability)) = (&subagents, durability) {
             subagents.recover(&inner, durability.route_id).await?;
         }
-        Ok(Self::from_parts(inner, events, subagents))
+        let mut agent = Self::from_parts(inner, events, subagents);
+        agent.durable_session = durable_session;
+        Ok(agent)
     }
 
     /// Returns the stable Agent identity.
@@ -1970,6 +1985,59 @@ impl WasmNanocodex {
         serde_json::to_string(&self.inner.snapshot().await.map_err(js_error)?).map_err(js_error)
     }
 
+    /// Reads the committed JSON document from this session's retained durable handle.
+    pub async fn document(&self, key: &str) -> Result<String, JsValue> {
+        let document = self
+            .durable_session()?
+            .document(key)
+            .await
+            .map_err(js_error)?;
+        serde_json::to_string(&document).map_err(js_error)
+    }
+
+    /// Atomically publishes conditional host journal writes under the session owner.
+    #[wasm_bindgen(js_name = compareExchangeDocuments)]
+    pub async fn compare_exchange_documents(&self, writes_json: &str) -> Result<(), JsValue> {
+        let writes = serde_json::from_str::<Vec<nanocodex::durability::DocumentWrite>>(writes_json)
+            .map_err(js_error)?;
+        self.durable_session()?
+            .compare_exchange_documents(writes)
+            .await
+            .map_err(js_error)
+    }
+
+    /// Stages conditional writes for the running operation's successful commit.
+    #[wasm_bindgen(js_name = stageDocumentWrites)]
+    pub async fn stage_document_writes(
+        &self,
+        operation_id: &str,
+        writes_json: &str,
+    ) -> Result<(), JsValue> {
+        validate_operation_id(Some(operation_id))?;
+        let writes = serde_json::from_str::<Vec<nanocodex::durability::DocumentWrite>>(writes_json)
+            .map_err(js_error)?;
+        self.durable_session()?
+            .stage_document_writes(operation_id, writes)
+            .await
+            .map_err(js_error)
+    }
+
+    /// Exports an exact historical model checkpoint and policy-selected session documents.
+    #[wasm_bindgen(js_name = documentFork)]
+    pub async fn document_fork(&self, operation_id: &str) -> Result<String, JsValue> {
+        validate_operation_id(Some(operation_id))?;
+        let (checkpoint, documents) = self
+            .durable_session()?
+            .agent_document_fork(operation_id)
+            .await
+            .map_err(js_error)?;
+        serde_json::to_string(&WasmDocumentFork {
+            checkpoint,
+            documents,
+        })
+        .map_err(js_error)
+    }
+
     /// Starts a clean sibling with the same private agent policy.
     ///
     /// # Errors
@@ -2147,6 +2215,12 @@ impl WasmNanocodex {
 }
 
 impl WasmNanocodex {
+    fn durable_session(&self) -> Result<&DurableSession, JsValue> {
+        self.durable_session.as_ref().ok_or_else(|| {
+            js_error("session documents require an agent with durability and durabilityId")
+        })
+    }
+
     fn from_parts(
         inner: RustNanocodex,
         events: AgentEvents,
@@ -2156,6 +2230,7 @@ impl WasmNanocodex {
         forward_events(events, Rc::clone(&event_forwarding));
         Self {
             inner,
+            durable_session: None,
             subagents,
             event_forwarding,
         }
@@ -3596,6 +3671,12 @@ fn validate(config: &WasmConfig) -> Result<(), JsValue> {
     {
         return Err(js_error("durability_host_id must not be empty"));
     }
+    if config.document_fork.is_some() && (config.durability_id.is_none() || config.resume.is_some())
+    {
+        return Err(js_error(
+            "document_fork requires durability and cannot be combined with resume",
+        ));
+    }
     if config.durability_id.is_some() != config.durability_host_id.is_some() {
         return Err(js_error(
             "durability_id and durability_host_id must be supplied together",
@@ -3828,7 +3909,7 @@ async fn build_codex(
     factory: Option<Arc<WasmHarnessFactory>>,
     snapshot: Option<nanocodex_agent::ChildSnapshot>,
     host_context: Option<Arc<str>>,
-) -> Result<(RustNanocodex, AgentEvents), JsValue> {
+) -> Result<(RustNanocodex, AgentEvents, Option<DurableSession>), JsValue> {
     validate(&config)?;
 
     let model = config.model.parse::<Model>().map_err(js_error)?;
@@ -3928,6 +4009,7 @@ async fn build_codex(
     if let Some(resume) = config.resume {
         builder = builder.resume(resume);
     }
+    let mut retained_durable_session = None;
     if let (Some(route_id), Some(state_id)) = (config.durability_host_id, config.durability_id) {
         let store = JavaScriptDurabilityStore { route_id };
         let durable_state = if let Some(limit) = config.terminal_receipt_retention {
@@ -3944,6 +4026,13 @@ async fn build_codex(
             nanocodex::agent::durability::DurableSession::open(store, state_id).await
         }
         .map_err(js_error)?;
+        if let Some(seed) = config.document_fork {
+            durable_state
+                .initialize_agent_document_fork(seed.documents, &seed.checkpoint)
+                .await
+                .map_err(js_error)?;
+        }
+        retained_durable_session = Some(durable_state.clone());
         builder = builder.durability(durable_state).await.map_err(js_error)?;
     }
     // Restored and forked lineages keep their original key and prefix IDs.
@@ -3953,5 +4042,5 @@ async fn build_codex(
         builder = builder.prompt_cache_key(key);
     }
     let (inner, events) = builder.build().map_err(js_error)?;
-    Ok((inner, events))
+    Ok((inner, events, retained_durable_session))
 }
