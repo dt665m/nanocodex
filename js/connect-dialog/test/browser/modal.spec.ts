@@ -239,3 +239,52 @@ test("provider cancellation and partial grants do not authorize the app", async 
   await page.getByRole("button", {name:"Cancel",exact:true}).click();
   await expect(page.getByRole("status")).toHaveText("Request cancelled");
 });
+
+for (const width of [1280, 390]) {
+  test(`developer appearance ${width} survives sign-in and authorization`, async ({ page }, info) => {
+    await page.setViewportSize({width, height:900});
+    await page.emulateMedia({colorScheme:"light"});
+    await page.goto("/?appearance=brand");
+    const shell = page.locator(".connect-onboarding");
+    await expect(shell).toHaveCSS("color-scheme", "dark");
+    await expect(shell).toHaveCSS("font-family", "Georgia, serif");
+    const send = page.getByRole("button", {name:"Text me a code"});
+    await expect(send).toHaveCSS("background-color", "rgb(196, 181, 253)");
+    await expect(send).toHaveCSS("color", "rgb(0, 0, 0)");
+    await expect(send).toHaveCSS("border-radius", "6px");
+    await contained(page);
+    await screenshot(page, info, "signin");
+    await page.getByRole("textbox", {name:"Mobile number"}).fill("+12025550100");
+    await send.click();
+    await page.getByRole("textbox", {name:"6-digit code"}).fill("123456");
+    await page.getByRole("button", {name:"Continue",exact:true}).click();
+    const allow = page.getByRole("button", {name:"Allow access",exact:true});
+    await expect(allow).toBeEnabled();
+    await expect(allow).toHaveCSS("background-color", "rgb(196, 181, 253)");
+    await page.mouse.move(0, 0);
+    await contained(page);
+    await screenshot(page, info, "authorization");
+    await allow.click();
+    await expect(page.getByRole("status")).toHaveText("Request approved");
+  });
+}
+test("invalid appearance falls back without CSS injection", async ({page}) => {
+  await page.goto("/?appearance=invalid");
+  const shell = page.locator(".connect-onboarding");
+  expect(await shell.getAttribute("style")).toBeNull();
+  await expect(page.getByRole("textbox", {name:"Mobile number"})).toBeVisible();
+});
+
+test("SDK popup forwards developer appearance into hosted parser and UI", async ({page}) => {
+  await page.goto("/launcher.html?themed=1");
+  const opened = page.waitForEvent("popup");
+  await page.getByRole("button", {name:"Connect account"}).click();
+  const popup = await opened;
+  const send = popup.getByRole("button", {name:"Text me a code"});
+  await expect(send).toHaveCSS("background-color", "rgb(196, 181, 253)");
+  await expect(send).toHaveCSS("border-radius", "6px");
+  await expect(popup.locator(".connect-onboarding")).toHaveCSS("color-scheme", "dark");
+  await expect(popup.locator(".connect-onboarding")).toHaveCSS("font-family", "Georgia, serif");
+  await popup.getByRole("button", {name:"Cancel",exact:true}).click();
+  await expect(popup.getByRole("status")).toHaveText("Request cancelled");
+});

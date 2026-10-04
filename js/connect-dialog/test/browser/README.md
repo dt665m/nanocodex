@@ -17,3 +17,8 @@ This verifies the real React rendering and user flow. It does not test the exter
 Four connection-list journeys also cover grouped GitHub/Google rows, the approval gate for missing connections, keyboard focus visibility, and cancellation.
 
 The connection journeys continue through a synthetic Google provider popup, the real origin/source-validated completion message, connector refresh, and explicit Allow access. They capture requested access, waiting for Google, and approval ready on desktop/mobile in both themes. Cancellation and a Gmail-only partial grant keep approval disabled; connecting Calendar still requires explicit final app approval. The provider fixture is clearly labeled local test content, not a reproduction of Google’s consent page.
+
+Appearance journeys verify developer color scheme, accent contrast, font family,
+and corner radius across sign-in and approval on desktop/mobile. An SDK popup
+journey exercises the URL transport through the hosted parser into the real UI.
+Malformed CSS-bearing values fall back to native defaults.

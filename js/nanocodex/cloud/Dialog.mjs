@@ -2,6 +2,9 @@ import { DialogBusyError, UserRejectedRequestError } from "./Errors.mjs";
 
 export const DEFAULT_HOST = "https://nanocodex.gakonst.workers.dev/connect-dialog/";
 
+const APPEARANCE_PARAMETER = "nanocodex_appearance";
+const MAX_APPEARANCE_LENGTH = 1024;
+
 const iframeInstances = new Map();
 const popupInstances = new Map();
 
@@ -22,6 +25,7 @@ export function from(parameters) {
 
 export function iframe(options = {}) {
   const host = new URL(options.host ?? DEFAULT_HOST).toString();
+  const appearance = serializeAppearance(options.appearance);
   return from({
     key: options.key ?? "nanocodex-iframe",
     name: options.name ?? "Nanocodex Connect",
@@ -35,7 +39,7 @@ export function iframe(options = {}) {
           },
         };
       }
-      const source = dialogUrl(host, "iframe", appId);
+      const source = dialogUrl(host, "iframe", appId, appearance);
       let instance = iframeInstances.get(source);
       if (!instance) {
         instance = createIframeInstance(source);
@@ -48,6 +52,7 @@ export function iframe(options = {}) {
 
 export function popup(options = {}) {
   const host = new URL(options.host ?? DEFAULT_HOST).toString();
+  const appearance = serializeAppearance(options.appearance);
   return from({
     key: options.key ?? "nanocodex-popup",
     name: options.name ?? "Nanocodex Connect",
@@ -61,7 +66,7 @@ export function popup(options = {}) {
           },
         };
       }
-      const source = dialogUrl(host, "popup", appId);
+      const source = dialogUrl(host, "popup", appId, appearance);
       let instance = popupInstances.get(source);
       if (!instance) {
         instance = createPopupInstance(source, options);
@@ -202,6 +207,8 @@ function createIframeInstance(host) {
     const url = new URL(nextHost ?? host);
     if (!url.searchParams.has("origin")) url.searchParams.set("origin", window.location.origin);
     url.searchParams.set("mode", "iframe");
+    // Accounts may supply a fresh host URL; retain this dialog's visual options.
+    setAppearance(url, new URL(host).searchParams.get(APPEARANCE_PARAMETER));
     const source = url.toString();
     if (walletFrame && walletModal && walletHost === source) return;
     walletModal?.remove();
@@ -350,11 +357,12 @@ function createPopupInstance(host, options) {
   };
 }
 
-function dialogUrl(host, mode, appId) {
+function dialogUrl(host, mode, appId, appearance) {
   const url = new URL(host);
   url.searchParams.set("app_id", appId);
   url.searchParams.set("origin", window.location.origin);
   url.searchParams.set("mode", mode);
+  setAppearance(url, appearance);
   return url.toString();
 }
 
@@ -363,4 +371,42 @@ function requiredString(value, label) {
     throw new TypeError(`${label} must be a non-empty string`);
   }
   return value;
+}
+
+function setAppearance(url, appearance) {
+  // Explicit SDK options own this parameter, including clearing stale host values.
+  url.searchParams.delete(APPEARANCE_PARAMETER);
+  if (appearance) url.searchParams.set(APPEARANCE_PARAMETER, appearance);
+}
+
+function serializeAppearance(appearance) {
+  if (appearance === undefined) return undefined;
+  if (!appearance || typeof appearance !== "object" || Array.isArray(appearance)) {
+    throw new TypeError("Dialog appearance must be an object");
+  }
+  const keys = ["theme", "accentColor", "fontFamily", "borderRadius"];
+  if (Object.keys(appearance).some((key) => !keys.includes(key))) {
+    throw new TypeError("Dialog appearance contains an unsupported option");
+  }
+  const { theme, accentColor, fontFamily, borderRadius } = appearance;
+  if (theme !== undefined && !["light", "dark", "system"].includes(theme)) {
+    throw new TypeError("Dialog appearance theme must be light, dark, or system");
+  }
+  if (accentColor !== undefined && (typeof accentColor !== "string" || !/^#[\da-f]{6}$/i.test(accentColor))) {
+    throw new TypeError("Dialog appearance accentColor must be a six-digit hex color");
+  }
+  if (fontFamily !== undefined && (typeof fontFamily !== "string" || fontFamily.length > 160
+    || !/^[a-zA-Z0-9 ,"'_-]+$/.test(fontFamily) || !fontFamily.trim())) {
+    throw new TypeError("Dialog appearance fontFamily must be a font list of at most 160 characters");
+  }
+  if (borderRadius !== undefined && (typeof borderRadius !== "number" || !Number.isFinite(borderRadius)
+    || borderRadius < 0 || borderRadius > 24)) {
+    throw new TypeError("Dialog appearance borderRadius must be between 0 and 24 pixels");
+  }
+  // Pick known scalar fields, never invoking a caller's toJSON or carrying CSS.
+  const serialized = JSON.stringify({ theme, accentColor, fontFamily, borderRadius });
+  if (serialized.length > MAX_APPEARANCE_LENGTH) {
+    throw new TypeError("Dialog appearance is too large");
+  }
+  return serialized;
 }

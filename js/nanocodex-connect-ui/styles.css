@@ -23,7 +23,7 @@
 .connect-dialog-standalone, .connect-dialog-standalone body, .connect-dialog-standalone #root { height: 100%; min-width: 0; margin: 0; }
 .connect-dialog-standalone body { overflow: hidden; }
 .connect-dialog-standalone #root { width: 100%; }
-.connect-onboarding { color: var(--text); font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+.connect-onboarding { color: var(--text); font: 14px/1.45 var(--connect-font, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif); -webkit-font-smoothing: antialiased; }
 .connect-onboarding, .connect-onboarding * { box-sizing: border-box; }
 @scope (.connect-onboarding) {
   :scope.dialog-shell {
@@ -34,9 +34,9 @@
   button, input { font: inherit; }
   button { color: inherit; cursor: pointer; touch-action: manipulation; transition: background-color 120ms ease; }
   button:disabled { cursor: default; opacity: .45; }
-  button:focus-visible, input:focus-visible, summary:focus-visible, a:focus-visible { outline: 2px solid var(--text); outline-offset: 3px; }
+  button:focus-visible, input:focus-visible, summary:focus-visible, a:focus-visible { outline: 2px solid var(--connect-accent, var(--text)); outline-offset: 3px; }
   h1, h2, p, dl, dd { margin: 0; }
-  h1 { font-size: 26px; line-height: 1.18; font-weight: 600; letter-spacing: -.035em; overflow-wrap: anywhere; }
+  h1 { font-size: 26px; line-height: 1.18; font-weight: 600; letter-spacing: -.025em; overflow-wrap: anywhere; }
   h2 { font-size: 14px; line-height: 1.5; font-weight: 600; }
   .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
   .dialog-header { padding: 20px 24px 0; }
@@ -67,11 +67,11 @@
   .sms-otp-form label { font-weight: 500; font-size: 13px; }
   .sms-otp-form > p { color: var(--muted); font-size: 12px; line-height: 1.5; }
   .sms-otp-input-row { display: grid; gap: 12px; margin-top: 4px; }
-  .sms-otp-input-row input { width: 100%; min-width: 0; height: 48px; padding: 0 14px; background: var(--surface); color: var(--text); border: 1px solid var(--border-strong); border-radius: 10px; font-size: 16px; }
+  .sms-otp-input-row input { width: 100%; min-width: 0; height: 48px; padding: 0 14px; background: var(--surface); color: var(--text); border: 1px solid var(--border-strong); border-radius: var(--connect-radius, 10px); font-size: 16px; }
   .sms-otp-input-row input:focus-visible { outline: 2px solid color-mix(in srgb, var(--text) 35%, transparent); outline-offset: 2px; }
   .sms-otp-input-row input[aria-invalid="true"] { border-color: var(--negative); }
   .sms-otp-input-row input[autocomplete="one-time-code"] { height: 56px; text-align: center; font-size: 24px; font-variant-numeric: tabular-nums; letter-spacing: .32em; }
-  .sms-otp-input-row button { height: 46px; border: 0; border-radius: 10px; background: var(--text); color: var(--surface); font-weight: 600; }
+  .sms-otp-input-row button { height: 46px; border: 0; border-radius: var(--connect-radius, 10px); background: var(--connect-accent, var(--text)); color: var(--connect-on-accent, var(--surface)); font-weight: 600; }
   .sms-otp-input-row button:hover:not(:disabled) { opacity: .88; }
   .sms-otp-form .auth-terms { font-size: 11px; text-align: center; margin-top: 8px; line-height: 1.55; }
   .sms-otp-change { justify-self: center; min-height: 44px; border: 0; background: transparent; font-size: 13px; }
@@ -96,7 +96,7 @@
   .connection-card:focus-visible { outline-offset: -3px; background: var(--surface-raised); }
   .connection-card:hover:not(:disabled) { background: var(--surface-subtle); }
   .connection-card-copy { display: grid; min-width: 0; gap: 3px; }
-  .connection-card-copy strong { font-size: 13px; font-weight: 600; }
+  .connection-card-copy strong { font-size: 13px; font-weight: 500; }
   .connection-card-copy > span { font-size: 12px; line-height: 1.5; color: var(--muted); overflow-wrap: anywhere; }
   .connection-card-action { font-size: 12px; font-weight: 500; border: 1px solid var(--border-strong); padding: 5px 9px; border-radius: 7px; }
   .is-connected .connection-card-action { color: var(--positive); border: 0; padding-inline: 0; font-size: 11px; }
@@ -107,7 +107,7 @@
   .wizard-section:has(.wizard-request-summary) > .wizard-section-title { display: none; }
   .permission-icons { display: flex; justify-content: center; gap: 8px; }
   .permission-icon { position: relative; }
-  .permission-icon button { display: grid; place-items: center; width: 44px; height: 44px; border: 1px solid var(--border); border-radius: 14px; background: var(--surface-subtle); }
+  .permission-icon button { display: grid; place-items: center; width: 44px; height: 44px; border: 1px solid var(--border); border-radius: var(--connect-radius, 14px); background: var(--surface-subtle); }
   .permission-icon svg { width: 20px; height: 20px; }
   .permission-tooltip { display: none; position: absolute; z-index: 2; bottom: calc(100% + 8px); left: 50%; transform: translateX(-50%); width: 190px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface-raised); font-size: 12px; text-align: center; box-shadow: 0 4px 16px #0002; }
   .permission-tooltip small { display: block; color: var(--muted); margin-top: 3px; }
@@ -128,12 +128,12 @@
   .resource-list { margin: 0; padding: 12px 0; list-style: none; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
   .advanced-details pre { overflow: auto; max-height: 160px; white-space: pre-wrap; word-break: break-word; font-size: 11px; }
   .dialog-actions { display: flex; justify-content: flex-end; gap: 10px; flex: 0 0 auto; width: min(420px, 100%); margin: 0 auto; padding: 16px 24px 0; }
-  .dialog-actions button { min-height: 44px; padding: 10px 20px; border: 1px solid var(--border-strong); border-radius: 10px; background: var(--surface); font-size: 13px; font-weight: 500; }
-  .dialog-actions button:last-child { flex: 1; background: var(--text); color: var(--surface); border-color: transparent; }
+  .dialog-actions button { min-height: 44px; padding: 10px 20px; border: 1px solid var(--border-strong); border-radius: var(--connect-radius, 10px); background: var(--surface); font-size: 13px; font-weight: 500; }
+  .dialog-actions button:last-child { flex: 1; background: var(--connect-accent, var(--text)); color: var(--connect-on-accent, var(--surface)); border-color: transparent; }
   .dialog-actions button:hover:not(:disabled) { opacity: .8; }
-  .account-failure, .dialog-error { margin: 12px 0; border-radius: 10px; padding: 10px 12px; color: var(--negative); background: color-mix(in srgb, var(--negative) 7%, var(--surface)); font-size: 12px; line-height: 1.5; }
+  .account-failure, .dialog-error { margin: 12px 0; border-radius: var(--connect-radius, 10px); padding: 10px 12px; color: var(--negative); background: color-mix(in srgb, var(--negative) 7%, var(--surface)); font-size: 12px; line-height: 1.5; }
   .dialog-content > .dialog-error { margin-inline: 24px; }
-  .wizard-terminal-code, .wizard-device-code, .terminal-code { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; font-size: 12px; }
+  .wizard-terminal-code, .wizard-device-code, .terminal-code { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--connect-radius, 10px); font-size: 12px; }
   .wizard-terminal-code strong, .wizard-device-code strong, .terminal-code strong { font-variant-numeric: tabular-nums; letter-spacing: .08em; }
   .wizard-terminal-code span { color: var(--muted); }
   .mcp-connections { display: grid; gap: 8px; }
@@ -185,15 +185,15 @@
   @media (min-width: 760px) {
     :scope.dialog-shell[data-request="walletConnect"] { display: grid; grid-template-columns: minmax(0, 1fr); align-content: center; }
     .dialog-content { overflow-y: auto; max-height: calc(100dvh - 116px); }
-    .wizard-review-page { width: min(880px, 100%); grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); column-gap: 64px; padding: 24px 40px 0; }
+    .wizard-review-page { width: min(800px, 100%); grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); column-gap: 36px; padding: 24px 40px 0; }
     .wizard-review-page > .wizard-intro { align-items: flex-start; text-align: left; justify-content: center; }
     .wizard-review-page .request-identity { justify-items: start; }
-    .wizard-review-page h1 { font-size: 28px; }
-    .dialog-actions { width: min(880px, 100%); padding: 20px 40px 24px calc(min(880px, 100vw) / 2 + 32px); }
-    .sms-auth-panel { width: min(880px, 100%); display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); column-gap: 64px; padding: 24px 40px; }
+    .wizard-review-page h1 { font-size: 27px; font-weight: 500; line-height: 1.22; }
+    .dialog-actions { width: min(800px, 100%); padding: 20px 40px 24px calc(min(800px, 100vw) / 2 + 18px); }
+    .sms-auth-panel { width: min(800px, 100%); display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); column-gap: 36px; padding: 24px 40px; }
     .sms-auth-panel .wizard-intro { grid-column: 1; grid-row: 1 / span 4; text-align: left; align-content: center; margin: 0; }
     .sms-auth-panel .request-identity { justify-items: start; }
-    .sms-auth-panel h1 { font-size: 28px; }
+    .sms-auth-panel h1 { font-size: 27px; font-weight: 500; line-height: 1.22; }
     .sms-auth-panel > :not(.wizard-intro) { grid-column: 2; }
     .sms-auth-panel .auth-close { margin-top: 8px; }
   }

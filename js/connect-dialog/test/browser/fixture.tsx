@@ -1,3 +1,4 @@
+import { appearanceFromSearch } from "../../src/appearance";
 import { useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { ConnectOnboarding, type ConnectRequest } from "nanocodex-connect-ui/App";
@@ -40,7 +41,10 @@ function Fixture() {
       setOutcome("Request cancelled");
     },
   }), []);
-  return outcome ? <p role="status">{outcome}</p> : <ConnectOnboarding host={host} request={request} />;
+  const preset = new URLSearchParams(location.search).get("appearance");
+  const appearance = preset === "brand" ? {theme: "dark" as const, accentColor: "#c4b5fd", borderRadius: 6, fontFamily: "Georgia, serif"}
+    : preset === "invalid" ? {accentColor: "url(https://invalid.example)", borderRadius: -1, fontFamily: "bad; display:none"} : appearanceFromSearch(location.search);
+  return outcome ? <p role="status">{outcome}</p> : <ConnectOnboarding appearance={appearance} host={host} request={request} />;
 }
 
 createRoot(document.getElementById("root")!).render(<Fixture />);

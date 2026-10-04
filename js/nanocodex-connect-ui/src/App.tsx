@@ -1,3 +1,5 @@
+import { appearanceStyle, type ConnectAppearance } from "./appearance.js";
+export type { ConnectAppearance } from "./appearance.js";
 import { Provider, Storage, webAuthn } from "accounts";
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import type { Dialog } from "nanocodex/connect";
@@ -154,11 +156,13 @@ export type ConnectOnboardingHost = Readonly<{
 }>;
 
 export function ConnectOnboarding({
+  appearance,
   host,
   presentation = "dialog",
   request,
 }: Readonly<{
   host: ConnectOnboardingHost;
+  appearance?: ConnectAppearance | undefined;
   presentation?: "dialog" | "wizard";
   request: ConnectRequest | undefined;
 }>) {
@@ -1335,6 +1339,7 @@ export function ConnectOnboarding({
   return (
     <section
       className={`connect-onboarding ${wizard ? "connect-wizard" : "dialog-shell"}`}
+      style={appearanceStyle(appearance)}
       data-presentation={presentation}
       data-request={request.type}
       data-testid={wizard ? "device-connect-wizard" : "remote-connect-dialog"}
