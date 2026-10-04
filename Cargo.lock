@@ -5778,6 +5778,7 @@ dependencies = [
  "nanocodex-oai-tools",
  "nanocodex-observability",
  "nanocodex-subagents",
+ "nanocodex-xai",
  "reqwest",
  "rustls",
  "serde_json",
@@ -6511,6 +6512,24 @@ dependencies = [
  "tokio",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+]
+
+[[package]]
+name = "nanocodex-xai"
+version = "0.6.6"
+dependencies = [
+ "axum",
+ "futures-util",
+ "js-sys",
+ "nanocodex-agent",
+ "reqwest",
+ "rustls",
+ "serde_json",
+ "tokio",
+ "uuid",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-time",
 ]
 
 [[package]]

@@ -106,6 +106,7 @@ impl ModelArgs {
         let variable = match family {
             HarnessFamily::Codex => "OPENAI_REASONING_EFFORT",
             HarnessFamily::Claude => "ANTHROPIC_REASONING_EFFORT",
+            HarnessFamily::Xai => "XAI_REASONING_EFFORT",
         };
         std::env::var(variable)
             .ok()
@@ -308,6 +309,7 @@ impl AgentArgs {
         let variable = match family {
             HarnessFamily::Codex => "OPENAI_MODEL",
             HarnessFamily::Claude => "ANTHROPIC_MODEL",
+            HarnessFamily::Xai => "XAI_MODEL",
         };
         let environment = std::env::var(variable).ok();
         self.model
@@ -481,7 +483,9 @@ impl AgentArgs {
         };
         let model = match requested_model {
             Some(HarnessModel::Codex(model)) => model,
-            Some(HarnessModel::Claude(_)) => unreachable!("model family was validated"),
+            Some(HarnessModel::Claude(_) | HarnessModel::Xai(_)) => {
+                unreachable!("model family was validated")
+            }
             None => connected_account_default_model(auth.mode()),
         };
         let direct_websocket_url = direct_websocket_url(self.websocket_url, auth.mode());

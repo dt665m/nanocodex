@@ -1399,6 +1399,7 @@ impl WasmHarnessFactory {
                 (recipe, Some(auth))
             }
             HarnessFamily::Claude => (factory.claude.clone().ok_or_else(unavailable)?, None),
+            HarnessFamily::Xai => return Err(unavailable()),
         };
         let object = recipe.as_object_mut().ok_or_else(unavailable)?;
         for key in [
@@ -1448,6 +1449,7 @@ impl WasmHarnessFactory {
                 )
                 .await
             }
+            HarnessFamily::Xai => return Err(unavailable()),
         }
         .map_err(|_| NanocodexError::InvalidRequest("target harness construction failed".into()))?;
         factory

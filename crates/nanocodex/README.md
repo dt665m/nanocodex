@@ -96,6 +96,37 @@ OpenAI dependency. On native targets, add `workspace-tools` to expose Claude's o
 file tools as well as the standard workspace runtime. The `claude` feature
 alone does not enable durability or workspace tools.
 
+## xAI
+
+Enable the default-off `xai` feature for the Grok Build Responses source
+adaptation. `default-features = false, features = ["xai"]` selects this backend
+without enabling the OpenAI runtime or durability:
+
+```rust,no_run
+# #[cfg(feature = "xai")]
+# async fn xai_turn() -> Result<(), Box<dyn std::error::Error>> {
+use nanocodex::{Nanocodex, Xai, XaiModel};
+use nanocodex::xai::XaiClient;
+
+let client = XaiClient::new(
+    reqwest::Client::new(),
+    "https://api.x.ai/v1/responses",
+    std::env::var("XAI_API_KEY")?,
+);
+let (agent, _events) = Nanocodex::builder(Xai::new(client, XaiModel::Grok46.as_str()))
+    .build()?;
+println!("{}", agent.prompt("Explain this protocol.").await?.await?.final_message());
+agent.shutdown().await?;
+# Ok(())
+# }
+```
+
+The host supplies credentials and function handlers. Conversation state is held
+in memory. This feature does not install Grok CLI tools or add a durability
+adapter. No `grok` executable is required. See the
+[xAI backend guide](../../docs/NANOXAI.md) for the exact upstream revision,
+license provenance, supported surface and limitations.
+
 ## Reusable native harnesses
 
 `Harness` composes explicitly registered construction recipes. Each recipe
@@ -231,6 +262,8 @@ embedding needs more control:
 - [`oai`] — managed Responses sessions and the concrete Tower boundary
 - `claude` — Anthropic Messages client, builder, protocol, and authentication
   when the default-off `claude` feature is enabled
+- `xai` — xAI Responses client, builder and host tool contracts when the
+  default-off `xai` feature is enabled
 - [`tools`] — tool contracts, built-ins, Code Mode, and MCP
 - `observability` — native tracing and OTLP setup when the default-off
   `observability` feature is enabled
