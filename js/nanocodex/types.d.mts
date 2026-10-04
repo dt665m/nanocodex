@@ -1,3 +1,4 @@
+import type { CodeDiscovery } from "nanocodex-tools/runtime/code-discovery";
 import type { Options as ClaudeOptions } from './runtime/claude.mjs';
 export type Thinking = "none" | "low" | "medium" | "high" | "xhigh" | "max";
 export type ReasoningMode = "standard" | "pro";
@@ -505,7 +506,7 @@ export type ToolConfiguration<Extension = never> =
   | readonly (NamedTool | Extension)[]
   | import("./tools/Tools.mjs").Tools;
 
-export type CodeEvaluatorEnvironment = {
+export type CodeEvaluatorEnvironment = CodeDiscovery & {
   tools: Readonly<Record<string, (input: unknown) => Promise<unknown>>>;
   toolDefinitions: readonly Record<string, unknown>[];
   text(value: unknown): void;

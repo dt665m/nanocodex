@@ -8,7 +8,9 @@ export function createCodeDiscovery(definitions = []) {
     }
     return value;
   };
-  const normalize = (name) => name.replace(/[^a-zA-Z0-9_$]/g, "_").replace(/^[0-9]/, "_");
+  const normalize = (name) => [...name].map((character, index) =>
+    (index === 0 ? /[A-Za-z_$]/ : /[A-Za-z0-9_$]/).test(character) ? character : "_"
+  ).join("") || "_";
   const catalog = freeze(clone(definitions).map((definition) => {
     const name = definition.tool_name ?? definition.name;
     return {
