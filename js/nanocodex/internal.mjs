@@ -33,6 +33,7 @@ export function defineRuntime(definition) {
     shutdown: definition.shutdown || ((agent) => agent.shutdown()),
     subscribe: definition.subscribe,
     adopt: definition.adopt,
+    fork: definition.fork,
     release: definition.release,
     decorate: definition.decorate,
     reserveSessions: definition.reserveSessions !== false,
@@ -185,12 +186,17 @@ export async function fork(agent, options) {
   const raw = at === undefined
     ? await state.raw.fork()
     : await state.raw.forkFrom(resultState(at).raw);
+  try { await state.runtime.fork?.(state.raw, raw, at); }
+  catch (error) { raw.free(); throw error; }
   return createAgent(raw, state.runtime);
 }
 
 export async function spawn(agent) {
   const state = agentState(agent);
-  return createAgent(await state.raw.spawn(), state.runtime);
+  const raw = await state.raw.spawn();
+  try { await state.runtime.fork?.(state.raw, raw); }
+  catch (error) { raw.free(); throw error; }
+  return createAgent(raw, state.runtime);
 }
 
 export async function spawnSubagent(agent, options) {

@@ -1577,3 +1577,81 @@ The SDK snapshots the configuration when the dialog is created and carries it
 in the `nanocodex_appearance` URL parameter to wallet and funding iframes or the
 account popup. The hosted dialog limits the JSON value to 1,024 characters and
 uses native defaults for malformed values. Omit `appearance` for native defaults.
+
+### Named request configuration and virtual routing
+
+`RequestPolicy` is exported by `nanocodex`, `nanocodex/node`, `nanocodex/host`,
+`nanocodex/browser`, `nanocodex/cloudflare`, and `nanocodex/worker`, with a direct
+`nanocodex/request-policy` entry. Create a policy with its own durable state ID
+and attach it using `requestPolicy` on a local Agent or its owning Cloudflare
+adapter. Browser agents with a policy run in the current isolate so callbacks
+remain local. Managed remote clients require configuration in their owning host.
+
+```js
+import { Agent, Transport, RequestPolicy } from 'nanocodex/node';
+import { createMemoryDurabilityStore } from 'nanocodex/durability';
+
+const policy = await RequestPolicy.create({
+  durability: createMemoryDurabilityStore('example-policy'),
+  durabilityId: 'example-policy',
+  selection: 'balanced',
+  models: [{
+    model: 'gpt-6-luna', family: 'codex',
+    contextTokens: 100_000, maxOutputTokens: 1_000,
+  }],
+  route: ({ state }) => ({ model: 'gpt-6-luna', state: state ?? null }),
+});
+await policy.configure([
+  { kind: 'set_section', section: { name: 'project', text: 'Use concise answers.' } },
+]);
+const agent = await Agent.create({
+  model: 'gpt-6-luna',
+  transport: Transport.openAi({ apiKey: process.env.OPENAI_API_KEY }),
+  requestPolicy: policy,
+});
+const result = await agent.turn.prompt({ input: 'Explain the project.' }).result();
+console.log(result.finalMessage);
+await agent.session.shutdown();
+```
+
+Named sections and native tool definitions apply at the next new request
+boundary. `set_section`, `remove_section`, `set_tool`, and `remove_tool` preserve
+ordering and record configuration history. A tool patch must exactly match a
+declaration in the current native request, including its schema and flags;
+retained configuration never grants a revoked tool. Provider requests use the
+flattened current configuration. This API does not claim a provider-native patch
+protocol. Claude signed blocks and native tool ordering remain intact.
+
+Policy agents use full-history HTTP Responses or native Claude Messages. Each
+receipt records `selected`, `dispatched`, immutable `original` parameters,
+rendered limits, router state, dispatch status, and observed response usage.
+Tool continuation retains its physical model. Transparent Codex history can
+switch only with an explicit shared `switchGroup` and a `switchSafe` callback;
+Claude and opaque native history reject physical switching. Physical context and
+output bounds are checked before dispatch. The default input estimate uses UTF-8
+request bytes conservatively; supply `estimateInputTokens` for provider-specific
+accounting, and always supply it for opaque or multimodal requests. Routing does
+not change the session's configured model; inspect receipts for dispatch identity.
+
+Use a persistent `DurabilityStore` for cold recovery. A memory store only survives
+within its host process. Recreate the policy with the same state ID and virtual
+selection to retain configuration and router state. `fork` copies policy state
+to a separate destination store/ID. Keep policies branch-local; give independent
+agents and alternate harnesses their own policy. The policy stops on an already
+dispatched request until its outcome is reconciled, preserving uncertain charge
+receipts. A custom `requestContext` can provide stable application request IDs.
+Reusing an ID with changed parameters fails. Current authentication stays in the
+transport closure, and `authorize` can recheck host authority before every
+normal or cache-warm dispatch. Hosted model pins and provider authorization still
+apply to the rendered native request.
+
+Claude cache warming requires explicit `cacheWarm.enabled: true`, an existing
+native cache breakpoint with matching 300- or 3600-second TTL, caller-supplied
+cost estimates and prices, a spend limit, and a reuse estimate whose expected
+savings exceed the write estimate. It sends a native nonstreaming request with
+one output token and records actual native usage and calculated spend. The
+attempt and estimated reservation are durable before HTTP; uncertain attempts
+are not sent again. Inspect `snapshot().warms` and `actualWarmUsd` for evidence.
+Warming rejects thinking requests. Normal policy requests record usage without
+an extra model request when warming is disabled. Native warming is currently
+available for Claude only.

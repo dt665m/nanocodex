@@ -3,7 +3,7 @@ import { freezeJson } from '../internal.mjs';
 const handles = new WeakSet();
 const encoder = new TextEncoder();
 const FORMAT = 'nanocodex-request-policy-v1';
-const MAX_REQUESTS = 256;
+const MAX_REQUESTS = 16;
 const MAX_CHECKPOINT_BYTES = 16 * 1024 * 1024;
 
 const copy = value => JSON.parse(JSON.stringify(value));
@@ -129,7 +129,7 @@ export async function create(options) {
   const owned = await store.acquire(stateId, { ownerId });
   let revision = owned.revision;
   let state = owned.payload === null ? { format: FORMAT, selection, configuration: { sections: [], tools: [] }, history: [], pending: [], routerState: options.initialState ?? null, requests: [], warms: [], reservedWarmUsd: 0, actualWarmUsd: 0 } : JSON.parse(owned.payload);
-  if (encoder.encode(JSON.stringify(state)).length > MAX_CHECKPOINT_BYTES || state.requests.length > MAX_REQUESTS || state.history.length > MAX_REQUESTS || state.warms.length > MAX_REQUESTS) throw new Error('request policy checkpoint exceeds branch limits');
+  if (encoder.encode(JSON.stringify(state)).length > MAX_CHECKPOINT_BYTES) throw new Error('request policy current checkpoint exceeds 16 MiB');
   if (state.format !== FORMAT || state.selection !== selection) throw new Error('incompatible request policy checkpoint');
   let chain = Promise.resolve();
   const serial = operation => {
@@ -137,11 +137,20 @@ export async function create(options) {
     chain = result.catch(() => {});
     return result;
   };
-  async function save(next) {
+  async function save(next, importedRecords = []) {
+    const changes = {};
+    for (const field of ['requests', 'history', 'warms']) {
+      changes[field] = next[field].filter(item => !state[field].some(old => JSON.stringify(old) === JSON.stringify(item)));
+    }
+    const key = 'request-policy/' + ownerId + '/' + revision;
+    const record = { parent: state.historyTip ?? null, changes,
+      configuration: next.configuration, pending: next.pending, routerState: next.routerState,
+      reservedWarmUsd: next.reservedWarmUsd, actualWarmUsd: next.actualWarmUsd };
+    next = { ...next, historyTip: { stateId, key },
+      requests: next.requests.slice(-MAX_REQUESTS), history: next.history.slice(-MAX_REQUESTS), warms: next.warms.slice(-MAX_REQUESTS) };
     const payload = JSON.stringify(next);
-    if (encoder.encode(payload).length > MAX_CHECKPOINT_BYTES) throw new Error('request policy checkpoint limit reached; fork a new branch');
-    if (next.requests.length > MAX_REQUESTS || next.history.length > MAX_REQUESTS || next.warms.length > MAX_REQUESTS) throw new Error('request policy branch receipt limit reached; fork a new branch');
-    const result = await store.replace(stateId, { ownerId, fence: owned.fence, expectedRevision: revision, payload, records: [] });
+    if (encoder.encode(payload).length > MAX_CHECKPOINT_BYTES) throw new Error('request policy current checkpoint exceeds 16 MiB');
+    const result = await store.replace(stateId, { ownerId, fence: owned.fence, expectedRevision: revision, payload, records: [...importedRecords, { key, value: JSON.stringify(record) }] });
     if (result.status !== 'replaced') throw new Error(`request policy checkpoint ${result.status}; dispatch stopped`);
     revision = result.revision;
     state = next;
@@ -165,6 +174,15 @@ export async function create(options) {
       });
     },
     snapshot() { return serial(() => frozen(state)); },
+    history(cursor) {
+      return serial(async () => {
+        const selected = cursor ?? state.historyTip;
+        if (!selected) return null;
+        const value = await store.readRecord(selected.stateId, selected.key);
+        if (value === null) throw new Error('request policy history record is unavailable');
+        return frozen({ cursor: selected, ...JSON.parse(value) });
+      });
+    },
     prepare(original, context) {
       const exact = copy(original);
       const inputs = copy(context);
@@ -178,7 +196,6 @@ export async function create(options) {
           limits(saved.request, physical, saved.inputTokens, saved.outputTokens);
           return frozen(saved);
         }
-        if (state.requests.length >= MAX_REQUESTS) throw new Error('request policy branch receipt limit reached; fork a new branch');
         const previous = state.requests.at(-1);
         if (continuation(exact, inputs.family) && previous && inputs.continuationOf === undefined) throw new Error('tool continuation requires continuationOf');
         const predecessor = inputs.continuationOf === undefined ? undefined : previous?.requestId === inputs.continuationOf ? previous : undefined;
@@ -227,18 +244,39 @@ export async function create(options) {
       });
     },
     async fork({ durability, durabilityId }) {
-      const source = await api.snapshot();
+      const source = copy(await api.snapshot());
+      const records = [];
+      if (durability !== store) {
+        let cursor = source.historyTip;
+        while (cursor) {
+          const record = await api.history(cursor);
+          records.push({ key: cursor.key, value: JSON.stringify({ ...record, cursor: undefined,
+            parent: record.parent ? { ...record.parent, stateId: durabilityId } : null }) });
+          cursor = record.parent;
+        }
+        if (source.historyTip) source.historyTip = { ...source.historyTip, stateId: durabilityId };
+      }
       const forked = await create({ ...options, durability, durabilityId });
-      await forked.importBranch(source);
+      await forked.importBranch(source, records);
       return forked;
     },
-    importBranch(source) {
+    importBranch(source, records = []) {
       const exact = copy(source);
       return serial(async () => {
         if (state.requests.length || state.history.length || state.pending.length) throw new Error('fork destination is not empty');
         if (exact.format !== FORMAT || exact.selection !== selection) throw new Error('incompatible fork source');
-        await save(exact);
+        await save(exact, records);
       });
+    },
+    async forkSession(sessionId) {
+      const durabilityId = stateId + "/fork/" + sessionId;
+      // Ephemeral native forks still get their own durable policy namespace.
+      // Portable memory stores require explicit initialization of a new state.
+      try { await store.load(durabilityId); } catch (error) {
+        if (typeof store.importState !== "function") throw error;
+        await store.importState(durabilityId, { revision: "0", payload: null });
+      }
+      return api.fork({ durability: store, durabilityId });
     },
     warm(requestId, send) {
       return serial(async () => {
@@ -249,7 +287,6 @@ export async function create(options) {
         const request = { ...copy(receipt.request), max_tokens: 1, stream: false };
         if (request.thinking && request.thinking.type !== 'disabled') throw new Error('cache warm does not support thinking requests');
         if (options.authorize) await options.authorize(frozen(receipt));
-        if (state.warms.length >= MAX_REQUESTS) throw new Error('cache warm receipt limit reached; fork a new branch');
         if (state.warms.some(item => item.requestId === requestId)) throw new Error('cache warm already admitted; reconcile its receipt');
         if (state.reservedWarmUsd + cacheWarm.estimatedWriteUsd > cacheWarm.maxSpendUsd) throw new Error('cache warm spend limit exceeded');
         const system = typeof receipt.request.system === 'string' ? [] : receipt.request.system ?? [];
@@ -267,22 +304,33 @@ export async function create(options) {
         return frozen(body.usage);
       });
     },
-    fetch(fetchImpl, family) {
+    fetch(fetchImpl, family, boundary) {
       if (!['claude', 'codex'].includes(family)) throw new TypeError('unsupported provider family');
       if (typeof fetchImpl !== 'function') throw new TypeError('fetch transport is required');
       return async (input, init) => {
         const incoming = new Request(input, init);
         if (incoming.method !== 'POST') throw new Error('request policy supports model POST requests only');
         const original = await incoming.json();
-        const supplied = options.requestContext ? copy(await options.requestContext(frozen(original), family)) : {};
-        // A new logical invocation gets a new identity; embedders provide a stable
-        // requestId explicitly when reconciling a crash/retry. Identical turns may recur.
-        const requestId = supplied.requestId ?? crypto.randomUUID();
+        const supplied = boundary ? copy(await boundary(frozen(original), family))
+          : options.requestContext ? copy(await options.requestContext(frozen(original), family)) : {};
+        // Public Agent hosts supply the native operation/model boundary automatically.
+        const requestId = nonempty(supplied.requestId, 'native request boundary requestId');
         const snapshot = await api.snapshot();
         const previous = snapshot.requests.at(-1);
         const isContinuation = continuation(original, family);
         const context = { ...supplied, family, requestId, ...(isContinuation && previous && supplied.continuationOf === undefined ? { continuationOf: previous.requestId } : {}), switchSafe: !isContinuation && options.switchSafe ? await options.switchSafe(frozen(original), family) === true : supplied.switchSafe === true };
         const receipt = await api.prepare(original, context);
+        if (cacheWarm && family === 'claude' && !isContinuation) {
+          const warmSnapshot = await api.snapshot();
+          if (!warmSnapshot.warms.some(item => item.requestId === requestId)) {
+            await api.warm(requestId, request => fetchImpl(new Request(incoming.url, {
+              method: incoming.method, headers: incoming.headers, signal: incoming.signal,
+              redirect: incoming.redirect, body: JSON.stringify(request),
+            })));
+          } else if (warmSnapshot.warms.find(item => item.requestId === requestId).status !== 'completed') {
+            throw new Error('cache warm charge is uncertain; reconcile before another dispatch');
+          }
+        }
         const response = await api.dispatch(receipt.requestId, request => fetchImpl(new Request(incoming.url, { method: incoming.method, headers: incoming.headers, signal: incoming.signal, redirect: incoming.redirect, body: JSON.stringify(request) })));
         if (!(response instanceof Response)) throw new TypeError('request policy transport must return Response');
         if (!response.ok) { await api.observe(requestId, null, 'failed'); return response; }
@@ -303,7 +351,7 @@ function observeResponse(response, family, observe) {
   if (!reader) throw new Error('model response omitted body');
   const sse = response.headers.get('content-type')?.includes('text/event-stream');
   const decoder = new TextDecoder();
-  let buffer = '', usage = null, terminal = false;
+  let buffer = '', usage = null, terminal = false, settled = false;
   function event(value) {
     if (family === 'claude') {
       if (value.type === 'message_start' && value.message?.usage) usage = { ...value.message.usage };
@@ -327,11 +375,12 @@ function observeResponse(response, family, observe) {
       try {
         const { done, value } = await reader.read();
         consume(decoder.decode(value, { stream: !done }), done);
-        if (done) { await observe(usage, terminal ? 'completed' : 'failed'); controller.close(); }
+        if ((terminal || done) && !settled) { await observe(usage, terminal ? 'completed' : 'failed'); settled = true; }
+        if (done) { controller.close(); }
         else controller.enqueue(value);
-      } catch (error) { controller.error(error); await reader.cancel().catch(() => {}); await observe(usage, 'failed').catch(() => {}); }
+      } catch (error) { controller.error(error); await reader.cancel().catch(() => {}); if (!settled) await observe(usage, 'failed').catch(() => {}); }
     },
-    async cancel(reason) { await reader.cancel(reason); await observe(usage, 'failed'); },
+    async cancel(reason) { await reader.cancel(reason); if (!settled) { await observe(usage, terminal ? 'completed' : 'failed'); settled = true; } },
   }), { status: response.status, statusText: response.statusText, headers: response.headers });
 }
 

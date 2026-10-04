@@ -77,6 +77,7 @@ export function create(options = {}) {
   } = resolveResponsesTransport(transport);
   const { tools: hostTools, subagents: subagentConfig } = resolveTools(tools);
   const events = createEventChannel();
+  if (options.requestPolicy !== undefined) events.subscribe(() => {});
   if (filesystem && workspace !== undefined && workspace !== filesystem.root) {
     throw new TypeError("workspace must match filesystem.root when both are provided");
   }
@@ -160,6 +161,7 @@ export function create(options = {}) {
         // Adopted child handles are ephemeral and do not own the root store.
         if (raw.sessionId === stableSessionId) durabilityOwner?.retain();
         bindHostSession(host, raw.sessionId);
+        host.bindRequestPolicy(raw.sessionId);
         events.addSource(raw);
       } catch (error) {
         events.removeSource(raw);
@@ -175,7 +177,8 @@ export function create(options = {}) {
       if (raw.sessionId === stableSessionId) durabilityOwner?.release();
       releaseHost(host);
     },
-    decorate: (agent) => agent.extend(agentActions()),
+    fork: (source, forked, at) => host.forkRequestPolicy(source.sessionId, forked.sessionId, at),
+    decorate: (agent, raw) => agent.extend(agentActions()).extend(() => ({ requestPolicy: host.requestPolicyFor(raw.sessionId) })),
   });
   return createAgentClient(runtime, {
     model,

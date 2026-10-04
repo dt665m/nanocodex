@@ -73,7 +73,8 @@ export async function createClaude(options, load, type, harnessDefaults) {
   config.sessionId ??= options.durabilityId ?? createSessionId();
   const { durability, durabilityId, module } = options;
   const events = createEventChannel();
-  const host = createClaudeHost({ auth: options.auth, tools: options.tools, onEvent: events.emit, fetch: options.fetch, endpoint: options.endpoint, requestPolicy: options.requestPolicy,
+  if (options.requestPolicy !== undefined) events.subscribe(() => {});
+  const host = createClaudeHost({ auth: options.auth, tools: options.tools, onEvent: events.emit, fetch: options.fetch, endpoint: options.endpoint, requestPolicy: options.requestPolicy, sessionId: config.sessionId,
     subagentSessions: internalRuntime?.subagentSessions, subagentRouting: internalRuntime?.subagentRouting });
   let harnesses;
   try { harnesses = await prepareHarnesses(options.harnesses, events.emit, { ...harnessDefaults,
@@ -161,7 +162,9 @@ export async function createClaude(options, load, type, harnessDefaults) {
     },
     async shutdown(raw) { host.cancelCodeTurn(raw.sessionId); await raw.shutdown(); },
     subscribe: events.subscribe,
+    fork: (source, forked, at) => host.forkRequestPolicy(source.sessionId, forked.sessionId, at),
     decorate: (agent, raw) => agent.extend(() => ({
+      requestPolicy: host.requestPolicyFor(raw.sessionId),
       events: { watch: (options) => watch(agent, options) },
       session: { document: (key) => track(document(agent, key)),
         compareExchangeDocuments: (writes) => track(compareExchangeDocuments(agent, writes)),

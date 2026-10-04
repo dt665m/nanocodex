@@ -122,6 +122,7 @@ export async function create(options = {}) {
     throw new TypeError("workspace must match filesystem.root when both are provided");
   }
   const events = createEventChannel();
+  if (options.requestPolicy !== undefined) events.subscribe(() => {});
   const tempoMcp = mpp?.[Symbol.for("nanocodex.tempo.mcp")];
   let hostDefinitionId;
   const host = createBrowserHost({
@@ -245,6 +246,7 @@ export async function create(options = {}) {
         // Adopted child handles are ephemeral and do not own the root store.
         if (raw.sessionId === stableSessionId) durabilityOwner?.retain();
         bindHostSession(host, raw.sessionId, cloudflareReservation);
+        host.bindRequestPolicy(raw.sessionId);
         events.addSource(raw);
       } catch (error) {
         events.removeSource(raw);
@@ -260,7 +262,8 @@ export async function create(options = {}) {
       if (raw.sessionId === stableSessionId) durabilityOwner?.release();
       releaseHost(host);
     },
-    decorate: (agent) => agent.extend(agentActions()),
+    fork: (source, forked, at) => host.forkRequestPolicy(source.sessionId, forked.sessionId, at),
+    decorate: (agent, raw) => agent.extend(agentActions()).extend(() => ({ requestPolicy: host.requestPolicyFor(raw.sessionId) })),
   });
   let agent;
   try {

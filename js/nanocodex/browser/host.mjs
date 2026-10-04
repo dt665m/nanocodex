@@ -1,3 +1,4 @@
+import { createRequestPolicyHost } from "../runtime/request-policy-host.mjs";
 import { createCodeEffectIdentity } from "../runtime/code-effect-identity.mjs";
 import { createBeforeCompaction } from "../runtime/before-compaction.mjs";
 import { createResponsesHttp, responsesHttpHeaders } from "../runtime/responses-http.mjs";
@@ -35,6 +36,7 @@ export function createBrowserHost(options = {}) {
     throw new TypeError("host socket timing hook must be a function");
   }
   const socketObservations = createSocketObservations(options.onSocketEvent);
+  const policyHost = createRequestPolicyHost(options.requestPolicy);
   const preservation = createBeforeCompaction(options.beforeCompaction);
   const toolMode = options.toolMode ?? "code";
   if (toolMode !== "code" && toolMode !== "direct") {
@@ -80,8 +82,7 @@ export function createBrowserHost(options = {}) {
       if (options.hostAuth) throw JSON.stringify({ kind: "transport", detail: "host-managed HTTPS requires createResponse", reconnectable: false });
       return fetch(incoming);
     };
-    const modelFetch = options.requestPolicy?.fetch(send, "codex") ?? send;
-    return modelFetch(endpoint, { method: "POST", headers: responsesHttpHeaders(apiKey, sessionId, metadata),
+    return policyHost.fetch(sessionId, send, "codex", endpoint, { method: "POST", headers: responsesHttpHeaders(apiKey, sessionId, metadata),
       body, signal, redirect: "error" });
   });
   const connections = new Map();
@@ -709,8 +710,11 @@ export function createBrowserHost(options = {}) {
     },
     toolMode: () => toolMode,
     toolDefinitions: code.toolDefinitions,
-    releaseSession: (sessionId) => { effectIdentity.release(sessionId); socketObservations?.release(sessionId); return code.releaseSession(sessionId); },
-    emitEvent: (event, ...args) => { effectIdentity.observe(event); socketObservations?.runtime(event); return onEvent(event, ...args); },
+    releaseSession: (sessionId) => { effectIdentity.release(sessionId); policyHost.release(sessionId); socketObservations?.release(sessionId); return code.releaseSession(sessionId); },
+    bindRequestPolicy: sessionId => policyHost.bind(sessionId),
+    forkRequestPolicy: (sourceId, sessionId, at) => policyHost.fork(sourceId, sessionId, at),
+    requestPolicyFor: sessionId => policyHost.policy(sessionId),
+    emitEvent: (event, ...args) => { effectIdentity.observe(event); policyHost.observe(event); socketObservations?.runtime(event); return onEvent(event, ...args); },
     reset: () => { effectIdentity.reset(); return code.reset(); },
     dispose,
   });
