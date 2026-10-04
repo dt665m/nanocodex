@@ -300,8 +300,8 @@ async fn code_discovery_callable_matches_native_dispatch() {
         .without_defaults()
         .inline_docs_token_budget(0)
         .tool(tool(
-            "3ledger.export-report",
-            "Punctuation named lookup.".into(),
+            "3🧭-naïve.$lookup",
+            "Unicode and punctuation named lookup.".into(),
             &effects,
         ))
         .build()
@@ -312,7 +312,7 @@ async fn code_discovery_callable_matches_native_dispatch() {
             r#"
         const found = searchTools('Punctuation')[0];
         const full = describeTool(found.name);
-        if (full.callableName !== '_ledger_export_report') throw new Error(full.callableName);
+        if (full.callableName !== '___na_ve_$lookup') throw new Error(full.callableName);
         text({name: full.name, callableName: full.callableName,
           receipt: await tools[full.callableName]({account: 'fixture-account'})});
     "#,
@@ -326,7 +326,7 @@ async fn code_discovery_callable_matches_native_dispatch() {
     );
     assert!(execution.success, "{:?}", execution.output);
     assert_eq!(execution.nested_calls.len(), 1);
-    assert_eq!(execution.nested_calls[0].name, "3ledger.export-report");
+    assert_eq!(execution.nested_calls[0].name, "3🧭-naïve.$lookup");
     assert_eq!(effects.load(Ordering::SeqCst), 1);
     runtime.control().cancel().await;
 }
