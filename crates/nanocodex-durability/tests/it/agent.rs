@@ -4611,6 +4611,25 @@ async fn completed_agent_history_forks_after_receipt_pruning_and_cold_reopen() -
         .durability(session.clone())
         .await?
         .build()?;
+    let document_writes = |version, value| {
+        [
+            DocumentForkPolicy::Initial,
+            DocumentForkPolicy::Current,
+            DocumentForkPolicy::AsOf,
+        ]
+        .into_iter()
+        .zip(["initial", "current", "asOf"])
+        .map(|(fork, key)| DocumentWrite {
+            key: key.into(),
+            expected_version: version,
+            value: json!(value),
+            fork,
+        })
+        .collect()
+    };
+    session
+        .compare_exchange_documents(document_writes(0, 1))
+        .await?;
     for index in 0..5 {
         let id = format!("historical-{index}");
         let result = agent
@@ -4619,6 +4638,11 @@ async fn completed_agent_history_forks_after_receipt_pruning_and_cold_reopen() -
             .result()
             .await?;
         assert_eq!(result.final_message(), "durably replayed");
+        if index == 0 {
+            session
+                .compare_exchange_documents(document_writes(1, 2))
+                .await?;
+        }
     }
     agent.shutdown().await?;
     drop((agent, events, session));
@@ -4631,6 +4655,10 @@ async fn completed_agent_history_forks_after_receipt_pruning_and_cold_reopen() -
     }
     assert_eq!(source.state().await?.revision(), revision);
     let (snapshot, seed) = source.agent_document_fork("historical-0").await?;
+    assert_eq!(
+        ["initial", "current", "asOf"].map(|key| seed.documents[key].value.clone()),
+        [json!(1), json!(2), json!(1)]
+    );
     let encoded = serde_json::to_string(&snapshot)?;
     assert!(encoded.contains("synthetic history 0"));
     assert!(!encoded.contains("synthetic history 4"));
@@ -4640,6 +4668,16 @@ async fn completed_agent_history_forks_after_receipt_pruning_and_cold_reopen() -
         .await?;
     drop(child);
     let child = DurableSession::open(SqliteStore::open(&db)?, "child").await?;
+    assert_eq!(child.document("asOf").await?.unwrap().value, json!(1));
+    child
+        .compare_exchange_documents(vec![DocumentWrite {
+            key: "asOf".into(),
+            expected_version: 1,
+            value: json!(42),
+            fork: DocumentForkPolicy::AsOf,
+        }])
+        .await?;
+    assert_eq!(source.document("asOf").await?.unwrap().value, json!(2));
     let (branch, branch_events) = Nanocodex::builder(openai()?)
         .workspace(&workspace)
         .durability(child.clone())

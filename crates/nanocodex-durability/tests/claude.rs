@@ -2234,3 +2234,126 @@ async fn interrupted_unsafe_tool_returns_unknown_over_messages_without_redispatc
     drop((agent, events));
     server.abort();
 }
+
+#[tokio::test]
+async fn historical_document_fork_restores_native_claude_checkpoint_after_receipt_pruning() {
+    use nanocodex_durability::{DocumentForkPolicy as Policy, DocumentWrite};
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("historical-documents.sqlite");
+    let (client, requests, server) =
+        server(|_, _| sse(text("document answer"), "end_turn", 12)).await;
+    let open = |id| {
+        DurableSession::open_with_terminal_receipt_limit(SqliteStore::open(&path).unwrap(), id, 1)
+    };
+    let writes = |version, value| {
+        [Policy::Initial, Policy::Current, Policy::AsOf]
+            .into_iter()
+            .zip(["initial", "current", "asOf"])
+            .map(|(fork, key)| DocumentWrite {
+                key: key.into(),
+                expected_version: version,
+                value: json!(value),
+                fork,
+            })
+            .collect()
+    };
+    let source = open("claude-parent").await.unwrap();
+    let (agent, events) = Nanocodex::builder(Claude::new(client.clone(), "test"))
+        .durability(source.clone())
+        .await
+        .unwrap()
+        .build()
+        .unwrap();
+    source
+        .compare_exchange_documents(writes(0, 1))
+        .await
+        .unwrap();
+    for index in 0..5 {
+        let id = format!("claude-historical-{index}");
+        agent
+            .prompt(PromptRequest::new(format!("CLAUDE_BOUNDARY_{index}")).request_id(id))
+            .await
+            .unwrap()
+            .result()
+            .await
+            .unwrap();
+        if index == 0 {
+            source
+                .compare_exchange_documents(writes(1, 2))
+                .await
+                .unwrap();
+        }
+    }
+    agent.shutdown().await.unwrap();
+    drop((agent, events, source));
+    let source = open("claude-parent").await.unwrap();
+    assert!(
+        source
+            .state()
+            .await
+            .unwrap()
+            .operation("claude-historical-0")
+            .is_none()
+    );
+    let (checkpoint, seed) = source.document_fork("claude-historical-0").await.unwrap();
+    assert_eq!(
+        ["initial", "current", "asOf"].map(|key| seed.documents[key].value.clone()),
+        [json!(1), json!(2), json!(1)]
+    );
+    let child = open("claude-child").await.unwrap();
+    child
+        .initialize_document_fork(seed, &checkpoint)
+        .await
+        .unwrap();
+    drop(child);
+    let child = open("claude-child").await.unwrap();
+    assert_eq!(
+        child.document("asOf").await.unwrap().unwrap().value,
+        json!(1)
+    );
+    child
+        .compare_exchange_documents(vec![DocumentWrite {
+            key: "asOf".into(),
+            expected_version: 1,
+            value: json!(42),
+            fork: Policy::AsOf,
+        }])
+        .await
+        .unwrap();
+    let (agent, events) = Nanocodex::builder(Claude::new(client, "test"))
+        .durability(child.clone())
+        .await
+        .unwrap()
+        .build()
+        .unwrap();
+    assert_eq!(
+        agent
+            .prompt(PromptRequest::new("CLAUDE_CHILD_ONLY").request_id("child-next"))
+            .await
+            .unwrap()
+            .result()
+            .await
+            .unwrap()
+            .final_message(),
+        "document answer"
+    );
+    let log = requests.lock().unwrap();
+    let last = serde_json::to_string(log.last().unwrap()).unwrap();
+    assert!(last.contains("CLAUDE_BOUNDARY_0") && last.contains("CLAUDE_CHILD_ONLY"));
+    assert!(!last.contains("CLAUDE_BOUNDARY_4"));
+    drop(log);
+    assert_eq!(
+        source.document("asOf").await.unwrap().unwrap().value,
+        json!(2)
+    );
+    assert_eq!(
+        child.document("asOf").await.unwrap().unwrap().value,
+        json!(42)
+    );
+    agent.shutdown().await.unwrap();
+    drop((agent, events));
+    println!(
+        "Native Claude HTTP + cold SQLite: five completions retention1, historical first checkpoint and policies [1,2,1], cold branch history excludes later turns; child value42 parent2"
+    );
+    server.abort();
+}
