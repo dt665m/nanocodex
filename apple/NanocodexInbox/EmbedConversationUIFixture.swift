@@ -64,7 +64,7 @@ struct EmbedConversationUIFixture: View {
                         }
                         Text("Submitted: \(sent.count)").accessibilityIdentifier("embed-submitted")
                     }.padding()
-                }).accessibilityIdentifier("embed-surface")
+                })
             }
         }
     }

@@ -14,7 +14,10 @@ final class InboxUITests: XCTestCase {
         app.launch()
         let tail = app.staticTexts["embed-history-39"]
         XCTAssertTrue(tail.waitForExistence(timeout: 10))
-        let surface = app.descendants(matching: .any)["embed-surface"].firstMatch
+        // Identify the scrolling control itself; an identifier on the composed
+        // SwiftUI parent overrides the host composer/accessory identifiers.
+        let surface = portable ? app.scrollViews.firstMatch : app.collectionViews.firstMatch
+        XCTAssertTrue(surface.waitForExistence(timeout: 5))
         let upper = surface.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.25))
         let lower = surface.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.6))
         upper.press(forDuration: 0.1, thenDragTo: lower)
