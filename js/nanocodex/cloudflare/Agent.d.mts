@@ -162,3 +162,6 @@ export function deliverCompletion(turn: import("../types.mjs").Turn, completion:
 
 /** Native Prompt fingerprint used to reconcile identified completion admission. */
 export function asyncCompletionInputKey(completion: AsyncCompletion): Promise<string>;
+
+/** Missing means pruned or absent, never proof that an input was not accepted. */
+export function operationReceiptStatus(owner: DurableObjectOwner, operationId: string): "missing" | "pending" | "terminal";

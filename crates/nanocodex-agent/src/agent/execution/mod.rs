@@ -642,9 +642,24 @@ impl Execution {
         kind: &str,
         request_id: Option<&str>,
     ) -> Result<()> {
-        // Completion receipts are host tool events, never accepted user messages.
-        // Their typed payload is retained by the execution journal and transcript.
+        // Idle completion starts a new native turn, so effect-journal routing
+        // needs its exact admission identity. This host event is not user input
+        // and must not invoke the platform's accepted-user-input callback.
         if prompt.async_completion().is_some() {
+            if kind == "prompt" {
+                let turn_id = events.turn_id().unwrap_or(events.request_id()).to_owned();
+                events.emit(
+                    nanocodex_oai_api::events::AgentEventKind::InputAccepted,
+                    &nanocodex_oai_api::events::AcceptedInput {
+                        session_id: events.request_id().to_owned(),
+                        item_id: format!("{turn_id}:completion"),
+                        turn_id,
+                        kind: "completion".to_owned(),
+                        request_id: request_id.map(str::to_owned),
+                        input: prompt.instruction.clone(),
+                    },
+                )?;
+            }
             return Ok(());
         }
         let turn_id = events.turn_id().unwrap_or(events.request_id()).to_owned();

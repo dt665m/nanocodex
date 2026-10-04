@@ -75,6 +75,7 @@ export function bindAgent(module, hostAgent = HostAgent) {
     resumeCompletion,
     deliverCompletion,
     steerReceipt,
+    operationReceiptStatus,
     steerInputKey,
     asyncCompletionInputKey,
     pruneDurableReceipts: (owner, options) => pruneDurableReceipts(module, owner, options),
@@ -1132,4 +1133,21 @@ export function steerReceipt(owner, operationId, messageId) {
     throw new Error("invalid durable steer receipt");
   }
   return Object.freeze(receipt);
+}
+
+/** Inspect whether the exact native operation and its steering receipts are still retained. */
+export function operationReceiptStatus(owner, operationId) {
+  const { storage } = resolveContext(owner);
+  const tables = storage.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('nanocodex_cloudflare_durability', 'nanocodex_durable_states')").toArray();
+  if (tables.length !== 2) return "missing";
+  const stateId = storedStateId(storage);
+  if (stateId === undefined) return "missing";
+  const path = `$.nanocodex_durable_state.operations.${JSON.stringify(operationId)}`;
+  const row = storage.sql.exec(`SELECT json_type(payload, ?) AS operation,
+    json_type(payload, ?) AS completed, json_type(payload, ?) AS failed,
+    json_type(payload, ?) AS cancelled
+    FROM nanocodex_durable_states WHERE state_id = ?`, path,
+    `${path}.status.completed`, `${path}.status.failed`, `${path}.status.cancelled`, stateId).toArray()[0];
+  if (row?.operation == null) return "missing";
+  return row.completed != null || row.failed != null || row.cancelled != null ? "terminal" : "pending";
 }

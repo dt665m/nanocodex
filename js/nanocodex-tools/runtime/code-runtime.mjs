@@ -339,6 +339,7 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
         // ignores abort. Reject before creating telemetry for a closed cell.
         controller.signal.throwIfAborted();
         if (finished) throw new Error(CANCELLATION_MESSAGE);
+        if (cell?.jobId) extras.asyncJobs?.authorize?.({ jobId: cell.jobId, sessionId, parentCallId, turnId });
         const callId = `${parentCallId}/code-${journal ? nextJournalCallId++ : nextCallId++}`;
         const toolStartedAt = performance.now();
         const startedAfterNs = Math.max(
@@ -462,11 +463,17 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
             signal: controller.signal,
             subagent,
           };
-          result = await (traceTool === undefined
+          // Unlike tracing, this trusted hook is an execution fence. Recheck
+          // after journal admission awaits and immediately before dispatch.
+          if (cell?.jobId) extras.asyncJobs?.authorize?.({ jobId: cell.jobId, sessionId, parentCallId, turnId });
+          const invoke = () => traceTool === undefined
             ? admission.invoke(name, input, context)
             : traceToolInvocation(traceTool, name, {
               sessionId, callId, parentCallId, ...(turnId == null ? {} : { turnId }),
-            }, () => admission.invoke(name, input, context)));
+            }, () => admission.invoke(name, input, context));
+          // Authority scoping is part of dispatch, never best-effort tracing.
+          result = await (cell?.asyncContext && extras.asyncJobs?.run
+            ? extras.asyncJobs.run(cell.asyncContext, invoke) : invoke());
         } catch (error) {
           if (error?.code === "host_interrupted") {
             execution.interruption = error;
@@ -714,8 +721,10 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
         cellId: cell.id, source, model, maxOutputTokens: cell.budget,
         ...(turnId == null ? {} : { turnId }) });
       if (extras.effectJournal) {
-        cell.effectIdentity = Promise.resolve(await extras.effectIdentity?.(
-          cell.sessionId, cell.parentCallId, turnId, cell.controller.signal) ?? {});
+        const identity = await extras.effectIdentity?.(
+          cell.sessionId, cell.parentCallId, turnId, cell.controller.signal) ?? {};
+        cell.effectIdentity = Promise.resolve(identity);
+        context = Object.freeze({ ...context, operationId: identity.operationId, modelCallIndex: identity.modelCallIndex });
       }
       cell.controller.signal.throwIfAborted();
       cell.admission = await admitTools(cell.controller.signal, cell.nativeTools);
@@ -727,6 +736,7 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
       }
       context = Object.freeze({ ...context, jobId: admitted.jobId });
       cell.jobId = admitted.jobId;
+      cell.asyncContext = context;
       if (admitted.status === "existing") {
         // A retained intent/receipt is never permission to dispatch again.
         cell.admission.release();

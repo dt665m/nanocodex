@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { createCodeRuntime, toolResult } from '../../nanocodex-tools/runtime/code-runtime.mjs';
 
@@ -79,6 +80,8 @@ for (const kind of ['native', 'quickjs', 'worker']) test(`${kind}: async exec re
   try {
     const admitted = JSON.parse(await runtime.executeCodeObserved('// @exec: {"yield_time_ms":120000}\ntext("before"); const result = await tools.write({operation:"once"}); text(result.actual); notify("done"); store("value", result.actual);', 'session', 'origin', 'model', 'turn-original'));
     assert.equal(admitted.job_id, 'synthetic-job-1');
+    assert.equal(jobs.trace[0].context.operationId, 'synthetic-origin');
+    assert.equal(jobs.trace[0].context.modelCallIndex, 3);
     assert.equal(admitted.cell.running, true);
     assert.equal(signal, undefined, 'receipt returns before even a fast guest dispatch');
     assert.equal(await runtime.nextCodeUpdate('session', 'origin'), null, 'exec observer already closed');
@@ -279,4 +282,38 @@ test('legacy yielded cell remains waitable across ordinary finish and a later tu
   const done = JSON.parse(await runtime.waitCodeObserved(JSON.stringify({ cell_id: id }), 'legacy', 'wait-final'));
   assert.equal(done.success, true);
   assert.match(textOf(done.output), /legacy-result/);
+});
+
+for (const kind of ['native', 'quickjs', 'worker']) test(`${kind}: authority scoping survives failed tracing and fences revoked dispatch`, { timeout: 5000 }, async () => {
+  const scope = new AsyncLocalStorage();
+  let revoked = false, calls = 0, modelCallIndex = 0, traces = 0;
+  const jobs = scheduler({ run(context, invoke) {
+    if (revoked) throw new Error('origin revoked');
+    return scope.run(context.jobId, invoke);
+  } });
+  const runtime = createCodeRuntime({ effect: { handler() {
+    calls++;
+    assert.equal(scope.getStore(), 'synthetic-job-1');
+    return 'scoped-effect';
+  } } }, {
+    asyncJobs: jobs.adapter, evaluate: await evaluator(kind),
+    traceTool() { traces++; throw new Error('diagnostic sink unavailable'); },
+    effectIdentity: async () => ({ operationId: 'same-origin', modelCallIndex: ++modelCallIndex }),
+    effectJournal: { begin: async () => ({ status: 'execute' }), complete: async () => {} },
+  });
+  try {
+    await runtime.executeCodeObserved('text(await tools.effect({}));', 'session', 'reused-call-id', 'model', 'turn');
+    await Promise.all(jobs.tasks);
+    revoked = true;
+    await runtime.executeCodeObserved('text(await tools.effect({}));', 'session', 'reused-call-id', 'model', 'turn');
+    await Promise.all(jobs.tasks);
+    const admissions = jobs.trace.filter(item => item.event === 'admitted');
+    assert.deepEqual(admissions.map(item => item.context.modelCallIndex), [1, 2]);
+    assert.equal(calls, 1);
+    assert.equal(traces, 1);
+    const terminals = jobs.trace.filter(item => item.event === 'terminal-persisted');
+    assert.equal(terminals[0].receipt.success, true);
+    assert.equal(terminals[1].receipt.success, false);
+    assert.match(textOf(terminals[1].receipt.output), /origin revoked/);
+  } finally { runtime.cancel('session'); }
 });

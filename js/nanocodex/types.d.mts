@@ -584,6 +584,9 @@ export type CodeAsyncJobContext = Readonly<{
   parentCallId: string;
   cellId: string;
   turnId?: string;
+  /** Trusted canonical effect identity when a durable effect journal is configured. */
+  operationId?: string;
+  modelCallIndex?: number;
   model: string;
   source: string;
   maxOutputTokens: number;
@@ -613,6 +616,10 @@ export type CodeAsyncJobReceipt = Readonly<{
  * must never be returned as execute; recovery must reconcile its original ID.
  * Explicit cancellation still aborts live cells. No guest polling is needed. */
 export type CodeAsyncJobAdapter = Readonly<{
+  /** Required authority/context scoping belongs here, outside best-effort tracing. */
+  run?<T>(context: CodeAsyncJobContext & Readonly<{ jobId: string }>, invoke: () => Promise<T>): Promise<T>;
+  /** Synchronous authority fence checked before each retained nested dispatch. */
+  authorize?(context: Pick<CodeAsyncJobContext, "sessionId" | "parentCallId" | "turnId"> & { jobId: string }): void;
   /** Read the immutable per-thread configuration; false preserves legacy exec. */
   enabled(sessionId: string): boolean;
   admit(context: CodeAsyncJobContext): Promise<{ jobId: string; status: "execute" | "existing" }>;
