@@ -3,6 +3,8 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 mod agent;
+mod child_journal;
+pub use child_journal::ChildJournal;
 #[cfg(feature = "claude")]
 mod claude;
 mod context;

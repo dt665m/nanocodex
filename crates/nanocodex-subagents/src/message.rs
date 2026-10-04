@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 pub(super) const MAX_MESSAGE_BYTES: usize = 2 * 1024;
 const MAX_RETAINED_MESSAGES: usize = 256;
 
-#[derive(Default)]
+#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct MessageThreads {
     next_message_id: u64,
     threads: HashMap<ThreadId, AgentThread>,

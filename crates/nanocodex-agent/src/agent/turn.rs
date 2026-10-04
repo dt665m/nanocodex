@@ -496,7 +496,7 @@ impl SpawnOptions {
 }
 
 /// Native in-memory checkpoint for residency eviction, without host credentials.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum ChildSnapshot {
     /// Existing Responses checkpoint, preserving its public representation.
     Codex(ChildRuntimeSnapshot),
