@@ -174,8 +174,9 @@ const child = await Claude.create({
 
 Document policies are `initial` (creation value), `current` (latest value),
 `asOf` (value at the selected completed operation) and `block` (refuse a fork
-when present at that boundary). Documents created after the selected operation
-are omitted. Historical boundaries survive terminal receipt pruning. Seeds
+when present in the source). An `asOf` document created after the selected
+operation is omitted; `initial` and `current` follow their explicit source-value
+policies. Historical boundaries survive terminal receipt pruning. Seeds
 contain session data; credentials, grants, schedules and account-shared stores
 must be supplied independently. Non-durable Codex `session.fork`, snapshot
 export, runtime model switches and other OpenAI-specific operations still fail

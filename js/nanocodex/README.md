@@ -1111,8 +1111,8 @@ limit. Use bounded JSON values.
 
 Fork policies are `initial`, `current`, `asOf` and `block`. They select the
 creation value, latest value, value at the completed operation, or refuse a fork
-when the blocked document exists at that boundary. Later-created keys are
-omitted. Every successful operation retains a historical boundary, including
+when the blocked document exists in the source. Later-created `asOf` keys are
+omitted; `initial` and `current` follow their explicit source-value policies. Every successful operation retains a historical boundary, including
 operations that write no documents and operations whose terminal receipts have
 been pruned. Fork seeds contain loaded model checkpoint data, so they can seed a
 pristine destination backed by a different durability store. Supply current
