@@ -4498,8 +4498,8 @@ final class InboxUITests: XCTestCase {
         if loading.exists {
             var visibleAnchor: (label: String, y: CGFloat)?
             let materialized = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
-                // Capture a stable label and finite coordinate in this same
-                // observation. Re-reading an index-bound element after the
+                // Bracket a stable label and finite coordinate with pending
+                // pagination. Re-reading an index-bound element after the
                 // wait can resolve a recycled cell during the prepend.
                 guard loading.exists,
                       let first = conversation.staticTexts.matching(
@@ -4510,7 +4510,7 @@ final class InboxUITests: XCTestCase {
                 let label = first.label
                 let anchored = conversation.staticTexts[label]
                 let frame = anchored.frame
-                guard frame.minY.isFinite, frame.height > 0, anchored.isHittable else { return false }
+                guard frame.minY.isFinite, frame.height > 0, anchored.isHittable, loading.exists else { return false }
                 visibleAnchor = (label, frame.minY)
                 return true
             }, object: nil)
