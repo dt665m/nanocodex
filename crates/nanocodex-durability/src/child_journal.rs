@@ -37,7 +37,7 @@ enum Node {
 /// commit migrates them atomically. Published record keys are retained by this
 /// owner so unchanged content is not sent again on subsequent commits.
 pub struct ChildJournal {
-    store: Box<dyn StateStore>,
+    store: Box<dyn StateStore + Send>,
     state_id: String,
     owner: OwnerToken,
     revision: u64,
@@ -48,7 +48,7 @@ pub struct ChildJournal {
 
 impl ChildJournal {
     /// Acquires the host's existing ownership/revision fence for this tree.
-    pub async fn open(store: impl StateStore + 'static, root: &str) -> crate::Result<Self> {
+    pub async fn open(store: impl StateStore + Send + 'static, root: &str) -> crate::Result<Self> {
         let mut store = Box::new(store);
         let state_id = format!("{root}/children");
         let acquired = store.acquire(&state_id, OwnerId::new()).await?;

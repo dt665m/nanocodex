@@ -743,8 +743,12 @@ impl Tool for SubmitResult {
         let args = input.decode_json::<Value>()?;
         let SubmitResultArgs { output } = serde_json::from_value(args.clone())?;
         let registry = self.registry.upgrade().ok_or_else(|| std::io::Error::other("subagent runtime is closed"))?;
-        let output = registry.submit_result_keyed(context.session_id(), context.instruction_revision(), output,
-            format!("{}:{}", context.session_id(), context.call_id()), args).await?;
+        let session = context.session_id().to_owned();
+        let revision = context.instruction_revision();
+        let key = format!("{}:{}", context.session_id(), context.call_id());
+        let output = platform_receipt(async move {
+            registry.submit_result_keyed(&session, revision, output, key, args).await
+        }).await?;
         Ok(ToolOutput::from_json(output, true))
     }
 }
@@ -1003,12 +1007,14 @@ impl Tool for ChangeAgentLifecycle {
             .registry
             .upgrade()
             .ok_or_else(|| std::io::Error::other("subagent runtime is closed"))?;
-        let agents = match self.operation {
-            LifecycleOperation::Interrupt => {
-                registry.interrupt(context.session_id(), agent_id).await?
+        let session = context.session_id().to_owned();
+        let operation = self.operation;
+        let agents = platform_receipt(async move {
+            match operation {
+                LifecycleOperation::Interrupt => registry.interrupt(&session, agent_id).await,
+                LifecycleOperation::Close => registry.close(&session, agent_id).await,
             }
-            LifecycleOperation::Close => registry.close(context.session_id(), agent_id).await?,
-        };
+        }).await?;
         json_output(&LifecycleReport { agents })
     }
 }
@@ -1372,4 +1378,20 @@ mod strict_spawn_tests {
                 .is_none()
         );
     }
+}
+
+// Store callbacks can be isolate-local on WASM; tools retain a Send receipt.
+// The abort guard ties local admission to cancellation of the calling tool.
+#[cfg(target_family = "wasm")]
+fn platform_receipt<T: Send + 'static>(future: impl std::future::Future<Output = std::io::Result<T>> + 'static) -> impl std::future::Future<Output = std::io::Result<T>> + Send {
+    let pending = super::platform::spawn(future);
+    let cancel = pending.abort_on_drop();
+    async move {
+        let _cancel = cancel;
+        pending.await.map_err(|_| std::io::Error::other("child operation cancelled"))?
+    }
+}
+#[cfg(not(target_family = "wasm"))]
+async fn platform_receipt<T>(future: impl std::future::Future<Output = std::io::Result<T>> + Send) -> std::io::Result<T> {
+    future.await
 }

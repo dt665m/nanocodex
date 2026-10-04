@@ -3875,6 +3875,7 @@ impl WasmSubagents {
                 role: task.role,
                 task: task.task,
                 output_schema: task.output_schema,
+                lifetime: task.lifetime,
             })
             .collect();
         let subagents = self;
