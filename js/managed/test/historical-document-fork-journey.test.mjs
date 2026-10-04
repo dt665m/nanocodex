@@ -103,7 +103,7 @@ function claudeText(text,id) {
 }
 test('historical managed forks retain typed checkpoints and isolated policy-selected documents beyond receipt retention', {timeout:1_200_000}, async t=>{
   await mkdir(evidence,{recursive:true});
-  const trace=[],upstream=[],failures=[],outcomes=[];let mf,token,restarts=0,modelCalls=0;
+  const trace=[],upstream=[],failures=[],outcomes=[],journalChecks=[];let mf,token,restarts=0,modelCalls=0;
   const provider=async request=>{
     try {
       const url=new URL(request.url);
@@ -116,8 +116,30 @@ test('historical managed forks retain typed checkpoints and isolated policy-sele
         if(child){assert.match(encoded,/SELECTED_BOUNDARY/);assert.doesNotMatch(encoded,/LATER_BOUNDARY|BLOCKED_BOUNDARY/);}
         if(encoded.includes('GRANDCHILD_ONLY')) {assert.match(encoded,/CHILD_ONLY/);assert.doesNotMatch(encoded,/PARENT_AFTER_FORK/);}
         upstream.push({family,model:body.model,child,bytes:encoded.length,input:child||encoded.includes('GRANDCHILD_ONLY')?body.messages??body.input:undefined});
+        let output=[{type:'message',role:'assistant',content:[{type:'output_text',text:'DOCUMENT_FORK_OK'}]}];
+        if(family==='codex') {
+          const lastUser=body.input.findLastIndex(row=>row.role==='user');
+          const prompt=JSON.stringify(body.input[lastUser]);
+          const cells=[
+            ['SELECTED_BOUNDARY','store("historicalMemo",{count:1}); text("JOURNAL_SELECTED_1");'],
+            ['LATER_BOUNDARY_0','store("historicalMemo",{count:2}); text("JOURNAL_LATER_2");'],
+            ['CHILD_ONLY','const memo=load("historicalMemo"); if(memo?.count!==1)throw new Error("historical journal leaked latest state: "+JSON.stringify(memo)); store("historicalMemo",{count:42}); text("JOURNAL_CHILD_1_TO_42");'],
+            ['CHILD_JOURNAL_READ','if(load("historicalMemo")?.count!==42)throw new Error("cold child journal lost branch write"); text("JOURNAL_CHILD_COLD_42");'],
+            ['PARENT_JOURNAL_READ','if(load("historicalMemo")?.count!==2)throw new Error("child journal mutated parent"); text("JOURNAL_PARENT_2");'],
+          ];
+          const cell=cells.find(([marker])=>prompt.includes('"'+marker+'"'));
+          if(cell) {
+            const callId='historical-journal-'+cell[0];
+            const result=body.input.slice(lastUser+1).find(row=>row.type==='custom_tool_call_output'&&row.call_id===callId);
+            if(result) {
+              assert.doesNotMatch(JSON.stringify(result),/historical journal leaked|cold child journal lost|child journal mutated|error_message/);
+              assert.match(JSON.stringify(result),/JOURNAL_/,'real Code Mode cell must return its validated state marker');
+              journalChecks.push(cell[0]);
+            } else output=[{type:'custom_tool_call',call_id:callId,name:'exec',input:cell[1]}];
+          }
+        }
         const answer='DOCUMENT_FORK_OK';
-        return family==='claude'?claudeText(answer,'message-'+modelCalls):new Response(`data: ${JSON.stringify({type:'response.completed',response:{id:'response-'+modelCalls,status:'completed',output:[{type:'message',role:'assistant',content:[{type:'output_text',text:answer}]}],usage:{input_tokens:1,output_tokens:1,total_tokens:2}}})}\n\n`,{headers:{'content-type':'text/event-stream'}});
+        return family==='claude'?claudeText(answer,'message-'+modelCalls):new Response(`data: ${JSON.stringify({type:'response.completed',response:{id:'response-'+modelCalls,status:'completed',output,usage:{input_tokens:1,output_tokens:1,total_tokens:2}}})}\n\n`,{headers:{'content-type':'text/event-stream'}});
       }
       const response=await claudeProvider(request);if(response)return response;
       return new Response('unavailable synthetic external dependency',{status:502});
@@ -195,19 +217,25 @@ test('historical managed forks retain typed checkpoints and isolated policy-sele
       await docs(child,[write('asOf',inherited.asOf.version,42)]);
       assert.equal((await docs(child)).documents.asOf.value,42,'cold branch value retained');
       assert.equal((await docs(parent)).documents.asOf.value,2,'branch writes leave parent unchanged');
+      if(family==='codex') {
+        await turn(child,'CHILD_JOURNAL_READ',family+'-child-journal-cold');
+        await restart();
+        await turn(parent,'PARENT_JOURNAL_READ',family+'-parent-journal-cold');
+        assert.deepEqual(journalChecks,['SELECTED_BOUNDARY','LATER_BOUNDARY_0','CHILD_ONLY','CHILD_JOURNAL_READ','PARENT_JOURNAL_READ']);
+      }
       await docs(parent,[write('block',0,'private','block')]);
       await turn(parent,'BLOCKED_BOUNDARY',family+'-blocked');await restart();
       await fork(parent,family+'-blocked-fork',family+'-blocked',409);
       await fork(parent,family+'-blocked-historical',selected,409);
       assert.equal((await fork(parent,family+'-historical',selected)).agent_id,child,'existing accepted fork replay remains stable after source is blocked');
-      outcomes.push({family,parent,child,selected,completedParentTurns:516,terminalReceiptRetention:512,selectedValues:[1,2,1],coldChildValue:42,parentValue:2,lateOmitted:true,blockRejected:true,coldReplay:true,authorizationFailClosed:true});
+      outcomes.push({family,parent,child,selected,completedParentTurns:family==='codex'?517:516,journalAtSelectedOperation:family==='codex'?{selected:1,later:2,coldChild:42,parent:2}:null,terminalReceiptRetention:512,selectedValues:[1,2,1],coldChildValue:42,parentValue:2,lateOmitted:true,blockRejected:true,coldReplay:true,authorizationFailClosed:true});
     }
-    assert.deepEqual(failures,[]);t.diagnostic(JSON.stringify({outcomes,restarts,modelCalls}));
+    assert.deepEqual(failures,[]);t.diagnostic(JSON.stringify({outcomes,restarts,modelCalls,journalChecks}));
   }finally {
     await mf?.dispose();
     await writeFile(resolve(evidence,'public-api-trace.json'),JSON.stringify(trace,null,2));
     await writeFile(resolve(evidence,'provider-trace.json'),JSON.stringify(upstream,null,2));
-    await writeFile(resolve(evidence,'result.json'),JSON.stringify({command,outcomes,restarts,modelCalls,failures,wasmSha256:createHash('sha256').update(await readFile(resolve(repo,'js/nanocodex/pkg-web/nanocodex_bg.wasm'))).digest('hex')},null,2));
+    await writeFile(resolve(evidence,'result.json'),JSON.stringify({command,outcomes,restarts,modelCalls,journalChecks,failures,wasmSha256:createHash('sha256').update(await readFile(resolve(repo,'js/nanocodex/pkg-web/nanocodex_bg.wasm'))).digest('hex')},null,2));
     await rm(persistence,{recursive:true,force:true});
   }
 });
