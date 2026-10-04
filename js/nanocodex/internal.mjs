@@ -280,7 +280,7 @@ function documentWritesConfig(writes) {
   }));
 }
 
-function documentForkConfig(seed) {
+export function documentForkConfig(seed) {
   return { ...seed, documents: { ...seed.documents, documents: Object.fromEntries(
     Object.entries(seed.documents.documents).map(([key, value]) => [key, {
       ...value, fork: value.fork === "asOf" ? "as_of" : value.fork,

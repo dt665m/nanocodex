@@ -1503,15 +1503,14 @@ impl WasmHarnessFactory {
             )
             .await
             .map(|(inner, events, _)| (inner, events)),
-            HarnessFamily::Claude => {
-                claude::build_claude(
-                    serde_json::from_value(recipe).map_err(|_| unavailable())?,
-                    Some(factory.clone()),
-                    snapshot,
-                    host_context,
-                )
-                .await
-            }
+            HarnessFamily::Claude => claude::build_claude(
+                serde_json::from_value(recipe).map_err(|_| unavailable())?,
+                Some(factory.clone()),
+                snapshot,
+                host_context,
+            )
+            .await
+            .map(|(inner, events, _)| (inner, events)),
         }
         .map_err(|_| NanocodexError::InvalidRequest("target harness construction failed".into()))?;
         factory

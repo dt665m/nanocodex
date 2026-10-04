@@ -500,12 +500,18 @@ async function createOwned(module, resolved, options, hostAgent, lifecycle, prep
   }
   const { sessionId, stateId } = durableIdentity(context.storage, durabilityId);
   if (internalConfiguration?.model?.startsWith("claude-")) {
-    if (forkResume !== undefined || internalRuntime?.workersAi || internalRuntime?.gateway) {
+    if (internalRuntime?.workersAi || internalRuntime?.gateway) {
       throw new Error("Claude requires its native checkpoint and subscription transport");
     }
     if (typeof internalRuntime?.claude?.create !== "function") {
       throw new Error("Claude subscription transport is unavailable; refusing Responses fallback");
     }
+    if (forkResume !== undefined && (!forkResume.checkpoint || !forkResume.documents)) {
+      throw new Error("Claude forks require native checkpoint and session documents");
+    }
+    if (resumeDigest !== undefined) context.storage.sql.exec(
+      "INSERT OR IGNORE INTO nanocodex_cloudflare_fork_resume(singleton,state_id,digest) VALUES (1,?,?)",
+      stateId, resumeDigest);
     // Claude owns canonical Messages state; never open or reinterpret it as Codex.
     // Its durable session identity is the state identity, not a separate transport ID.
     context.storage.sql.exec("UPDATE nanocodex_cloudflare_agent SET session_id = ? WHERE singleton = 1", stateId);
@@ -541,6 +547,7 @@ async function createOwned(module, resolved, options, hostAgent, lifecycle, prep
         requestPolicy: agentOptions.requestPolicy,
         tools: agentOptions.tools, module, durability, durabilityId: stateId,
         terminalReceiptRetention: agentOptions.terminalReceiptRetention,
+        ...(forkResume === undefined ? {} : { documentFork: forkResume }),
       });
       if (eventSocket) {
         const watcher = claude.events.watch();

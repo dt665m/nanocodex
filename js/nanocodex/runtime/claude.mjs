@@ -2,6 +2,7 @@ import {
   CLOUDFLARE_SESSION_RESERVATION, activateCloudflareAgentSession, activateHost, bindHostSession, createAgentClient, createEventChannel, createSessionId,
   defineRuntime, loadDurabilityRuntime, registerDefinitionHost, releaseDefinitionHost,
   releaseHostSession, prompt, compact, shutdown, getTurnHostId,
+  document, compareExchangeDocuments, stageDocumentWrites, documentFork, documentForkConfig,
 } from '../internal.mjs';
 import { watch } from '../actions/events.mjs';
 import { prepareHarnesses } from './harnesses.mjs';
@@ -11,7 +12,7 @@ const OPTION_KEYS = new Set([
   'requestPolicy', 'auth', 'fetch', 'endpoint', 'compatibilityProfile', 'subscriptionIdentity', 'model', 'instructions', 'sessionId', 'tools',
   'harness', 'harnesses', 'subagents', 'serverTools', 'durability', 'durabilityId', 'module', 'maxTokens', 'workspace',
   'cache', 'adaptiveThinking', 'keepThinking', 'thinking', 'parallelTools', 'clientToolSearch',
-  'contextWindowTokens', 'autoCompactWindowTokens', 'autoCompact', 'systemBlocks', 'terminalReceiptRetention',
+  'contextWindowTokens', 'autoCompactWindowTokens', 'autoCompact', 'systemBlocks', 'terminalReceiptRetention', 'documentFork',
 ]);
 
 export function toClaudeConfig(options = {}) {
@@ -40,6 +41,7 @@ export function toClaudeConfig(options = {}) {
   if (options.instructions !== undefined && options.systemBlocks !== undefined) throw new TypeError('instructions and systemBlocks are mutually exclusive');
   for (const key of ['systemBlocks', 'serverTools']) if (options[key] !== undefined && !Array.isArray(options[key])) throw new TypeError(`Claude ${key} must be an array`);
   if (options.terminalReceiptRetention !== undefined && (options.durability === undefined || !Number.isSafeInteger(options.terminalReceiptRetention) || options.terminalReceiptRetention < 0 || options.terminalReceiptRetention > 4096)) throw new TypeError('terminalReceiptRetention requires durability and must be 0..4096');
+  if (options.documentFork !== undefined && options.durability === undefined) throw new TypeError('documentFork requires durability');
   if (options.durabilityId !== undefined && options.sessionId !== undefined && options.durabilityId !== options.sessionId) throw new TypeError('durable Claude sessionId must equal durabilityId');
   if (options.subscriptionIdentity !== undefined) {
     const identity = options.subscriptionIdentity;
@@ -58,6 +60,7 @@ export function toClaudeConfig(options = {}) {
     if (typeof process?.arch === 'string') config.subscriptionIdentity.arch ??= process.arch;
     if (typeof process?.env?.PI_AI_CLAUDE_CODE_VERSION === 'string' && process.env.PI_AI_CLAUDE_CODE_VERSION) config.subscriptionIdentity.version ??= process.env.PI_AI_CLAUDE_CODE_VERSION;
   }
+  if (options.documentFork !== undefined) config.documentFork = documentForkConfig(options.documentFork);
   // Snapshot caller-owned nested native definitions before any asynchronous loading.
   return JSON.parse(JSON.stringify(config));
 }
@@ -160,7 +163,11 @@ export async function createClaude(options, load, type, harnessDefaults) {
     subscribe: events.subscribe,
     decorate: (agent, raw) => agent.extend(() => ({
       events: { watch: (options) => watch(agent, options) },
-      session: { compact: () => track(compact(agent)), cancel: () => { host.cancelCodeTurn(raw.sessionId); return raw.cancel(); }, shutdown: () => shutdown(agent) },
+      session: { document: (key) => track(document(agent, key)),
+        compareExchangeDocuments: (writes) => track(compareExchangeDocuments(agent, writes)),
+        stageDocumentWrites: (operationId, writes) => track(stageDocumentWrites(agent, operationId, writes)),
+        documentFork: (operationId) => track(documentFork(agent, operationId)),
+        compact: () => track(compact(agent)), cancel: () => { host.cancelCodeTurn(raw.sessionId); return raw.cancel(); }, shutdown: () => shutdown(agent) },
       turn: { prompt: (options) => {
         if (typeof options?.input !== 'string' || !options.input.trim()) throw new TypeError('Claude prompt requires non-empty text');
         const turn = prompt(agent, options);
