@@ -372,6 +372,93 @@ pub struct SteerState {
     pub model_call_index: Option<u32>,
 }
 
+const STEER_RECEIPT_PAGE_ENTRIES: usize = 32;
+
+// Only changed radix paths are staged. A page has at most 32 receipts or 16
+// child references; the operation checkpoint retains a single immutable root.
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(tag = "kind", content = "entries", deny_unknown_fields)]
+enum SteerReceiptPage {
+    Leaf(BTreeMap<String, IdentifiedSteerReceipt>),
+    Branch(BTreeMap<String, EncodedPayload>),
+}
+
+fn receipt_digit(id: &str, depth: usize) -> Result<String> {
+    record_key(id)
+        .get(depth..depth + 1)
+        .map(str::to_owned)
+        .ok_or_else(|| Error::InvalidState("steer receipt identity hash collision".into()))
+}
+
+fn stage_receipt_page(
+    page: &SteerReceiptPage,
+    records: &mut Vec<crate::StoreRecord>,
+) -> Result<EncodedPayload> {
+    let mut payload = EncodedPayload::encode(page)?;
+    payload.stage(records);
+    Ok(payload)
+}
+
+fn build_receipt_pages(
+    entries: BTreeMap<String, IdentifiedSteerReceipt>,
+    depth: usize,
+    records: &mut Vec<crate::StoreRecord>,
+) -> Result<EncodedPayload> {
+    if entries.len() <= STEER_RECEIPT_PAGE_ENTRIES {
+        return stage_receipt_page(&SteerReceiptPage::Leaf(entries), records);
+    }
+    let mut groups: BTreeMap<String, BTreeMap<String, IdentifiedSteerReceipt>> = BTreeMap::new();
+    for (id, receipt) in entries {
+        groups
+            .entry(receipt_digit(&id, depth)?)
+            .or_default()
+            .insert(id, receipt);
+    }
+    let mut children = BTreeMap::new();
+    for (digit, entries) in groups {
+        children.insert(digit, build_receipt_pages(entries, depth + 1, records)?);
+    }
+    stage_receipt_page(&SteerReceiptPage::Branch(children), records)
+}
+
+fn update_receipt_page<'a>(
+    root: Option<EncodedPayload>,
+    id: String,
+    receipt: IdentifiedSteerReceipt,
+    depth: usize,
+    store: &'a mut dyn crate::StateStore,
+    state_id: &'a str,
+    records: &'a mut Vec<crate::StoreRecord>,
+) -> crate::StoreFuture<'a, Result<EncodedPayload>> {
+    Box::pin(async move {
+        let page = match root {
+            Some(root) => root.load(store, state_id).await?.decode()?,
+            None => SteerReceiptPage::Leaf(BTreeMap::new()),
+        };
+        match page {
+            SteerReceiptPage::Leaf(mut entries) => {
+                entries.insert(id, receipt);
+                build_receipt_pages(entries, depth, records)
+            }
+            SteerReceiptPage::Branch(mut children) => {
+                let digit = receipt_digit(&id, depth)?;
+                let child = update_receipt_page(
+                    children.remove(&digit),
+                    id,
+                    receipt,
+                    depth + 1,
+                    store,
+                    state_id,
+                    records,
+                )
+                .await?;
+                children.insert(digit, child);
+                stage_receipt_page(&SteerReceiptPage::Branch(children), records)
+            }
+        }
+    })
+}
+
 /// A small durable caller receipt retained after consumption or withdrawal.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
@@ -388,7 +475,10 @@ pub struct IdentifiedSteerReceipt {
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OperationState {
-    /// Caller receipts survive retirement of live steering bodies.
+    /// Immutable paged index of caller receipts, including retired inputs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steer_receipt_root: Option<EncodedPayload>,
+    /// Unstaged caller receipts, including legacy inline checkpoints.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub steer_receipts: BTreeMap<String, IdentifiedSteerReceipt>,
     /// Current conversation and execution position; settled batches are retired atomically.
@@ -412,6 +502,68 @@ pub struct OperationState {
 }
 
 impl OperationState {
+    pub(crate) async fn steer_receipt(
+        &self,
+        id: &str,
+        store: &mut dyn crate::StateStore,
+        state_id: &str,
+    ) -> Result<Option<IdentifiedSteerReceipt>> {
+        if let Some(receipt) = self.steer_receipts.get(id) {
+            return Ok(Some(receipt.clone()));
+        }
+        let mut root = self.steer_receipt_root.clone();
+        let mut depth = 0;
+        while let Some(page) = root {
+            match page
+                .load(store, state_id)
+                .await?
+                .decode::<SteerReceiptPage>()?
+            {
+                SteerReceiptPage::Leaf(entries) => return Ok(entries.get(id).cloned()),
+                SteerReceiptPage::Branch(mut children) => {
+                    root = children.remove(&receipt_digit(id, depth)?);
+                    depth += 1;
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    async fn stage_steer_receipts(
+        &mut self,
+        store: &mut dyn crate::StateStore,
+        state_id: &str,
+    ) -> Result<()> {
+        let entries = std::mem::take(&mut self.steer_receipts);
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut records = Vec::new();
+        let root = if self.steer_receipt_root.is_none() {
+            // One-time migration from the legacy inline receipt map.
+            build_receipt_pages(entries, 0, &mut records)?
+        } else {
+            if entries.len() != 1 {
+                return Err(Error::InvalidState(
+                    "multiple unstaged steer receipt updates".into(),
+                ));
+            }
+            let (id, receipt) = entries.into_iter().next().expect("nonempty receipts");
+            update_receipt_page(
+                self.steer_receipt_root.clone(),
+                id,
+                receipt,
+                0,
+                store,
+                state_id,
+                &mut records,
+            )
+            .await?
+        };
+        self.steer_receipt_root = Some(root.with_records(records));
+        Ok(())
+    }
+
     pub(crate) fn cancellation_requires_checkpoint(&self) -> bool {
         self.continuation.is_some()
             || self.retired_model_calls != 0
@@ -485,6 +637,17 @@ struct RetainedCheckpointRef<'a> {
 }
 
 impl DurableState {
+    pub(crate) async fn stage_steer_receipts(
+        &mut self,
+        store: &mut dyn crate::StateStore,
+        state_id: &str,
+    ) -> Result<()> {
+        for operation in self.operations.values_mut() {
+            operation.stage_steer_receipts(store, state_id).await?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn stage_records(&mut self) -> Vec<crate::StoreRecord> {
         let mut records = Vec::new();
         for (id, mut boundary) in std::mem::take(&mut self.documents.boundaries) {
@@ -496,6 +659,9 @@ impl DurableState {
         }
         for operation in self.operations.values_mut() {
             operation.input.stage(&mut records);
+            if let Some(root) = &mut operation.steer_receipt_root {
+                root.stage(&mut records);
+            }
             if let Some(value) = &mut operation.continuation {
                 value.stage(&mut records);
             }
@@ -538,6 +704,10 @@ impl DurableState {
     #[must_use]
     pub const fn operations(&self) -> &BTreeMap<String, OperationState> {
         &self.operations
+    }
+
+    pub(crate) const fn operations_mut(&mut self) -> &mut BTreeMap<String, OperationState> {
+        &mut self.operations
     }
 
     /// Looks up one operation.
@@ -1075,6 +1245,7 @@ impl DurableState {
                 self.operations.insert(
                     operation_id,
                     OperationState {
+                        steer_receipt_root: None,
                         steer_receipts: BTreeMap::new(),
                         continuation: None,
                         retired_model_calls: 0,

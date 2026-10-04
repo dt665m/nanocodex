@@ -2232,7 +2232,28 @@ async fn exact_id_retry_replays_steer_at_its_original_model_boundary() -> Result
     while !started.load(Ordering::Acquire) {
         tokio::task::yield_now().await;
     }
-    first.steer("retain this routed steer").await?;
+    first
+        .steer_with_id("identified-steer".into(), "retain this routed steer")
+        .await?;
+    first
+        .steer_with_id("identified-steer".into(), "retain this routed steer")
+        .await?;
+    assert_eq!(
+        state
+            .state()
+            .await?
+            .operation("steered-turn")
+            .expect("running turn")
+            .steers
+            .len(),
+        1
+    );
+    assert!(
+        first
+            .steer_with_id("identified-steer".into(), "changed steering input")
+            .await
+            .is_err()
+    );
     release_first.notify_one();
     let error = first
         .result()
@@ -2259,6 +2280,17 @@ async fn exact_id_retry_replays_steer_at_its_original_model_boundary() -> Result
 
     agent.shutdown().await?;
     drop((agent, events));
+    let cold = self::DurableSession::open(store, "steered-exact-id-retry").await?;
+    let receipt = cold
+        .steer_receipt("steered-turn", "identified-steer")
+        .await?
+        .expect("terminal operation retains identified steering receipt");
+    assert_eq!(receipt.index, 1);
+    assert!(!receipt.withdrawn);
+    println!(
+        "native identified steering: duplicate replayed, conflict rejected, terminal commit retried without model effects; cold receipt index={}",
+        receipt.index
+    );
     std::fs::remove_dir_all(workspace)?;
     Ok(())
 }

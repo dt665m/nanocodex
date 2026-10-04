@@ -23,8 +23,8 @@ const MAX_DEPTH: usize = 128;
 #[serde(tag = "type", content = "value", deny_unknown_fields)]
 enum Node {
     Inline(Value),
-    Object(BTreeMap<String, Node>),
-    Array(Vec<Node>),
+    Object(BTreeMap<String, Self>),
+    Array(Vec<Self>),
     Record(String),
 }
 
@@ -48,7 +48,11 @@ pub struct ChildJournal {
 
 impl ChildJournal {
     /// Acquires the host's existing ownership/revision fence for this tree.
-    pub async fn open(store: impl StateStore + Send + 'static, root: &str) -> crate::Result<Self> {
+    pub async fn open(
+        #[cfg(not(target_family = "wasm"))] store: impl StateStore + 'static,
+        #[cfg(target_family = "wasm")] store: impl StateStore + Send + 'static,
+        root: &str,
+    ) -> crate::Result<Self> {
         let mut store = Box::new(store);
         let state_id = format!("{root}/children");
         let acquired = store.acquire(&state_id, OwnerId::new()).await?;

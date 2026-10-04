@@ -209,6 +209,11 @@ enum Command {
     State {
         result: oneshot::Sender<DurableState>,
     },
+    SteerReceipt {
+        operation_id: String,
+        message_id: String,
+        result: oneshot::Sender<Result<Option<crate::IdentifiedSteerReceipt>>>,
+    },
     LatestCheckpoint {
         result: oneshot::Sender<Result<Option<EncodedPayload>>>,
     },
@@ -665,6 +670,14 @@ impl Driver {
                     drop(result.send(outcome));
                 }
                 Command::State { result } => drop(result.send(self.state.clone())),
+                Command::SteerReceipt {
+                    operation_id,
+                    message_id,
+                    result,
+                } => {
+                    let outcome = self.steer_receipt(&operation_id, &message_id).await;
+                    drop(result.send(outcome));
+                }
                 Command::LatestCheckpoint { result } => {
                     let outcome = match self.state.latest_checkpoint() {
                         Some(value) => value.load(&mut *self.store, &self.state_id).await.map(Some),
@@ -1194,6 +1207,21 @@ impl Driver {
         Ok(())
     }
 
+    async fn steer_receipt(
+        &mut self,
+        operation_id: &str,
+        message_id: &str,
+    ) -> Result<Option<crate::IdentifiedSteerReceipt>> {
+        match self.state.operation(operation_id) {
+            Some(operation) => {
+                operation
+                    .steer_receipt(message_id, &mut *self.store, &self.state_id)
+                    .await
+            }
+            None => Ok(None),
+        }
+    }
+
     async fn accept_steer(
         &mut self,
         caller: &Caller,
@@ -1209,7 +1237,9 @@ impl Driver {
             Error::InvalidState(format!("operation `{operation_id}` was not accepted"))
         })?;
         if let Some(id) = &message_id
-            && let Some(receipt) = operation.steer_receipts.get(id)
+            && let Some(receipt) = operation
+                .steer_receipt(id, &mut *self.store, &self.state_id)
+                .await?
         {
             if receipt.input_key != input.key.as_ref() {
                 return Err(Error::SteerConflict {
@@ -1530,6 +1560,20 @@ impl Driver {
             }
             _ => {}
         }
+        if let Transition::SteerWithdrawn { operation_id, .. } = &entry
+            && let Some(id) = self
+                .state
+                .operation(operation_id)
+                .and_then(|operation| operation.steers.last())
+                .and_then(|steer| steer.message_id.clone())
+            && let Some(receipt) = self.steer_receipt(operation_id, &id).await?
+        {
+            next.operations_mut()
+                .get_mut(operation_id)
+                .expect("retained operation")
+                .steer_receipts
+                .insert(id, receipt);
+        }
         next.apply_transition(expected_revision, entry)?;
         if let Some(limit) = self.terminal_receipt_limit {
             let _ = next.retain_terminal_receipts(limit);
@@ -1567,6 +1611,8 @@ impl Driver {
                 next.revision()
             )));
         }
+        next.stage_steer_receipts(&mut *self.store, &self.state_id)
+            .await?;
         let records = next.stage_records();
         // Old checkpoints may migrate already published indexes. Only identical
         // records may reconcile; INSERT ... ON CONFLICT DO NOTHING cannot hide
@@ -1802,8 +1848,33 @@ impl DurableSession {
 
     /// Shares this session's store transport for independently fenced child journals.
     #[doc(hidden)]
+    #[cfg(not(target_family = "wasm"))]
+    pub fn child_store(&self) -> impl StateStore + Clone + 'static {
+        self.store.clone()
+    }
+
+    /// Shares this session's store transport for independently fenced child journals.
+    #[doc(hidden)]
+    #[cfg(target_family = "wasm")]
     pub fn child_store(&self) -> impl StateStore + Clone + Send + 'static {
         self.store.clone()
+    }
+
+    /// Looks up an identified steering receipt without hydrating other receipts.
+    /// Retained terminal operations keep consumed and withdrawn identities.
+    pub async fn steer_receipt(
+        &self,
+        operation_id: &str,
+        message_id: &str,
+    ) -> Result<Option<crate::IdentifiedSteerReceipt>> {
+        let (result, receiver) = oneshot::channel();
+        self.send(Command::SteerReceipt {
+            operation_id: operation_id.to_owned(),
+            message_id: message_id.to_owned(),
+            result,
+        })
+        .await?;
+        receive(receiver).await
     }
 
     /// Copies the current reduced state from the owning driver.
@@ -3097,9 +3168,14 @@ mod tests {
         let state = session.state().await.unwrap();
         let accepted = state.operation("turn").unwrap();
         assert_eq!(accepted.steers.len(), 1);
-        assert_eq!(accepted.steer_receipts.len(), 1);
+        assert!(accepted.steer_receipts.is_empty());
         assert_eq!(
-            accepted.steer_receipts["message"].input_key,
+            session
+                .steer_receipt("turn", "message")
+                .await
+                .unwrap()
+                .unwrap()
+                .input_key,
             accepted.steers[0].input.key.as_ref()
         );
         owner.shutdown().await.unwrap();
@@ -3179,8 +3255,252 @@ mod tests {
         let operation = state.operation("turn").unwrap();
         assert!(operation.status.is_terminal());
         assert!(operation.steers.is_empty());
-        assert!(operation.steer_receipts["message"].withdrawn);
-        assert!(!operation.steer_receipts["consumed"].withdrawn);
+        assert!(
+            terminal
+                .steer_receipt("turn", "message")
+                .await
+                .unwrap()
+                .unwrap()
+                .withdrawn
+        );
+        assert!(
+            !terminal
+                .steer_receipt("turn", "consumed")
+                .await
+                .unwrap()
+                .unwrap()
+                .withdrawn
+        );
+    }
+
+    // Identified steering admission and retirement are internal execution-policy
+    // boundaries. This protocol journey uses the real session driver and store;
+    // native prompt-routing recovery is covered by the agent integration suite.
+    #[tokio::test]
+    async fn long_steered_turn_stages_bounded_receipts_and_cold_replays_retired_ids() {
+        #[derive(Clone)]
+        struct MeasuredStore {
+            inner: MemoryStore,
+            maxima: std::sync::Arc<std::sync::Mutex<(usize, usize, usize)>>,
+        }
+        impl StateStore for MeasuredStore {
+            fn acquire<'a>(
+                &'a mut self,
+                id: &'a str,
+                owner: OwnerId,
+            ) -> crate::StoreFuture<'a, std::result::Result<crate::OwnedState, StoreError>>
+            {
+                self.inner.acquire(id, owner)
+            }
+            fn read_record<'a>(
+                &'a mut self,
+                id: &'a str,
+                key: &'a str,
+            ) -> crate::StoreFuture<'a, std::result::Result<Option<String>, StoreError>>
+            {
+                self.inner.read_record(id, key)
+            }
+            fn replace<'a>(
+                &'a mut self,
+                id: &'a str,
+                owner: &'a OwnerToken,
+                revision: u64,
+                payload: &'a str,
+                records: &'a [crate::StoreRecord],
+            ) -> crate::StoreFuture<'a, std::result::Result<u64, StoreError>> {
+                {
+                    let mut maxima = self.maxima.lock().unwrap();
+                    maxima.0 = maxima.0.max(payload.len());
+                    maxima.1 = maxima.1.max(records.len());
+                    maxima.2 = maxima.2.max(
+                        records
+                            .iter()
+                            .map(|record| record.value.len())
+                            .max()
+                            .unwrap_or(0),
+                    );
+                }
+                self.inner.replace(id, owner, revision, payload, records)
+            }
+        }
+        let maxima = std::sync::Arc::new(std::sync::Mutex::new((0, 0, 0)));
+        let store = MeasuredStore {
+            inner: MemoryStore::new().unwrap(),
+            maxima: maxima.clone(),
+        };
+        let session =
+            DurableSession::open_with_terminal_receipt_limit(store.clone(), "paged-steers", 64)
+                .await
+                .unwrap();
+        let (owner, _) = session.acquire_agent().await.unwrap();
+        owner
+            .admit_typed::<_, u32, String>("turn".into(), &"prompt")
+            .await
+            .unwrap();
+        owner.begin_attempt("turn".into()).await.unwrap();
+        for index in 1..=1024_u32 {
+            let id = format!("message-{index}");
+            assert_eq!(
+                owner
+                    .accept_steer("turn".into(), index, &id, Some(id.clone()), true)
+                    .await
+                    .unwrap(),
+                Some(index)
+            );
+            owner
+                .bind_steer("turn".into(), index, index + 1)
+                .await
+                .unwrap();
+            let model = format!("model-{}", index + 1);
+            owner
+                .begin_step(
+                    "turn".into(),
+                    model.clone(),
+                    "model_call".into(),
+                    &"request",
+                    crate::ReplaySafety::Safe,
+                )
+                .await
+                .unwrap();
+            owner
+                .complete_step("turn".into(), model, &"response")
+                .await
+                .unwrap();
+            owner
+                .advance("turn".into(), EncodedPayload::encode(&index).unwrap())
+                .await
+                .unwrap();
+        }
+        // Withdrawal must update an archived receipt atomically, not lose it
+        // when the live input is removed.
+        owner
+            .accept_steer(
+                "turn".into(),
+                1025,
+                &"withdrawn",
+                Some("withdrawn".into()),
+                true,
+            )
+            .await
+            .unwrap();
+        owner.withdraw_steer("turn".into(), 1025).await.unwrap();
+        owner.shutdown().await.unwrap();
+        drop((owner, session));
+        let reopened =
+            DurableSession::open_with_terminal_receipt_limit(store.clone(), "paged-steers", 64)
+                .await
+                .unwrap();
+        let (owner, _) = reopened.acquire_agent().await.unwrap();
+        owner
+            .admit_typed::<_, u32, String>("turn".into(), &"prompt")
+            .await
+            .unwrap();
+        owner.begin_attempt("turn".into()).await.unwrap();
+        let revision = reopened.state().await.unwrap().revision();
+        for index in [1, 32, 33, 512, 1024] {
+            let id = format!("message-{index}");
+            assert_eq!(
+                owner
+                    .accept_steer("turn".into(), 1025, &id, Some(id.clone()), false)
+                    .await
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                reopened
+                    .steer_receipt("turn", &id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .index,
+                index
+            );
+        }
+        assert_eq!(reopened.state().await.unwrap().revision(), revision);
+        assert!(
+            owner
+                .retained_steers("turn".into())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(matches!(
+            owner
+                .accept_steer(
+                    "turn".into(),
+                    1025,
+                    &"changed",
+                    Some("message-1".into()),
+                    true
+                )
+                .await,
+            Err(Error::SteerConflict { .. })
+        ));
+        assert!(matches!(
+            owner
+                .accept_steer(
+                    "turn".into(),
+                    1025,
+                    &"withdrawn",
+                    Some("withdrawn".into()),
+                    true
+                )
+                .await,
+            Err(Error::SteerWithdrawn { .. })
+        ));
+        owner
+            .complete(
+                "turn".into(),
+                EncodedPayload::encode(&1024_u32).unwrap(),
+                &"done",
+            )
+            .await
+            .unwrap();
+        owner.shutdown().await.unwrap();
+        drop((owner, reopened));
+        let terminal = DurableSession::open_with_terminal_receipt_limit(store, "paged-steers", 64)
+            .await
+            .unwrap();
+        assert!(
+            terminal
+                .steer_receipt("turn", "withdrawn")
+                .await
+                .unwrap()
+                .unwrap()
+                .withdrawn
+        );
+        assert_eq!(
+            terminal
+                .steer_receipt("turn", "message-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .index,
+            1
+        );
+        assert!(
+            terminal
+                .steer_receipt("turn", "absent")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let (head_bytes, records_per_write, record_bytes) = *maxima.lock().unwrap();
+        println!(
+            "1024 consumed + 1 withdrawn; cold replay and terminal lookup preserved: head <= {head_bytes} bytes, records/write <= {records_per_write}, record <= {record_bytes} bytes"
+        );
+        assert!(
+            head_bytes < 16 * 1024,
+            "head grew with retired receipts: {head_bytes}"
+        );
+        assert!(
+            records_per_write < 24,
+            "a commit rewrote the receipt archive: {records_per_write}"
+        );
+        assert!(
+            record_bytes < 16 * 1024,
+            "receipt page grew with archive: {record_bytes}"
+        );
     }
 
     #[tokio::test]
@@ -3638,6 +3958,7 @@ mod tests {
 
         fn operation(status: OperationStatus, steers: Vec<SteerState>) -> OperationState {
             OperationState {
+                steer_receipt_root: None,
                 steer_receipts: Default::default(),
                 continuation: None,
                 retired_model_calls: 0,
