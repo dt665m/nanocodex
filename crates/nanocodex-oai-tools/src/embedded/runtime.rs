@@ -274,9 +274,18 @@ impl EmbeddedToolRuntime {
         (model_definitions, code_mode_tool_names)
     }
 
+    /// Whether the embedding host durably reconciles interrupted Code Mode cells.
+    #[must_use]
+    pub fn code_replay_safe(&self) -> bool {
+        self.host.as_ref().is_some_and(|host| host.code_replay_safe())
+    }
+
     /// Whether a direct tool or its embedding host explicitly permits replay.
     #[must_use]
     pub fn is_replay_safe(&self, name: &str) -> bool {
+        if matches!(name, "exec" | "wait") {
+            return self.code_replay_safe();
+        }
         if let Some(local) = self.local.iter().find(|tool| tool.name.as_ref() == name) {
             return local.handler.is_replay_safe();
         }

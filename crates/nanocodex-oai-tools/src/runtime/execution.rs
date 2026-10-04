@@ -160,6 +160,23 @@ impl ToolRuntime {
         self
     }
 
+    /// Attaches a host-owned durable journal to a fresh native runtime.
+    ///
+    /// Use one journal per logical session, before executing any cells. The
+    /// embedding supplies durable admission, atomic state and terminal commits,
+    /// historical fork selection, and external-effect receipts.
+    #[must_use]
+    pub fn with_code_journal(mut self, journal: Arc<dyn code_mode::CodeModeJournal>) -> Self {
+        self.code_mode.set_journal(journal);
+        self
+    }
+
+    /// Whether Code Mode is backed by a durable admission and receipt journal.
+    #[must_use]
+    pub fn code_replay_safe(&self) -> bool {
+        self.code_mode.has_journal()
+    }
+
     /// Returns the shell name described to the model.
     #[must_use]
     pub fn default_shell_name(&self) -> &str {
@@ -253,6 +270,9 @@ impl ToolRuntime {
     /// Whether a direct tool explicitly permits repeating an interrupted call.
     #[must_use]
     pub fn is_replay_safe(&self, name: &str) -> bool {
+        if matches!(name, "exec" | "wait") {
+            return self.code_replay_safe();
+        }
         self.registry.is_replay_safe(name)
     }
 

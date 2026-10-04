@@ -128,6 +128,9 @@ extern "C" {
         subagent_id: Option<&str>,
     ) -> Result<(), JsValue>;
 
+    #[wasm_bindgen(catch, js_namespace = ["globalThis", "nanocodexHost"], js_name = codeReplaySafe)]
+    fn host_code_replay_safe(definition_host_id: u32) -> Result<bool, JsValue>;
+
     #[wasm_bindgen(catch, js_namespace = ["globalThis", "nanocodexHost"], js_name = executeCode)]
     fn host_execute_code(
         source: &str,
@@ -755,6 +758,10 @@ impl JavaScriptCodeModeHost {
 }
 
 impl CodeModeHost for JavaScriptCodeModeHost {
+    fn code_replay_safe(&self) -> bool {
+        host_code_replay_safe(self.definition_host_id).unwrap_or(false)
+    }
+
     fn supports_cells(&self) -> bool {
         true
     }

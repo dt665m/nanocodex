@@ -569,21 +569,32 @@ export type CodeEffectReceipt = Readonly<{
   thrown: boolean;
   failure?: unknown;
 }>;
+/** Exact terminal cell result retained with its successful state delta. */
+export type CodeCellReceipt = Readonly<{
+  output: unknown;
+  success: boolean;
+  nested_calls: readonly unknown[];
+  notifications?: readonly unknown[];
+}>;
 /** Admission must durably retain intent; completion must durably retain the exact receipt.
  * A recovered intent without an outcome is unknown, never permission to execute again.
  * Keys must scope [sessionId, operationId ?? "", modelCallIndex ?? 0, parentCallId, callId]; validate identity/input and fence concurrent runtime generations. */
 export type CodeEffectJournal = Readonly<{
-  /** Optional durable cell store protocol; provide both methods together.
-   * Context uses name="code-cell", callId=parentCallId, input=null. beginCell
-   * pins and returns immutable starting entries before evaluation. commitStore
-   * merges only writes, once per canonical cell identity (including failed scripts).
-   * Replaying an older committed cell must never overwrite newer session writes.
-   * Entries are JSON snapshots, bounded to 8 MiB/32,768 nodes. Missing legacy
-   * state must fail closed if prior effects make the starting state unprovable.
-   * Deterministic conflicts/corruption throw code="CODE_EFFECT_UNKNOWN";
-   * unclassified transport/storage exceptions remain retryable interruptions. */
-  beginCell?(context: CodeEffectContext): Promise<readonly (readonly [string, unknown])[]>;
-  commitStore?(context: CodeEffectContext, writes: readonly (readonly [string, unknown])[]): Promise<void>;
+  /** Successful store deltas and the exact cell receipt co-commit in one transaction.
+   * Provide beginCell and completeCell together. Pin immutable starting entries
+   * before evaluation; replay completed cells without evaluating guest source.
+   * Interrupted nested intents are unknown and must never redispatch. Failed or
+   * aborted cells commit no writes; external effects cannot be rolled back.
+   * Snapshots and receipts are bounded to 8 MiB/32,768 nodes. */
+  beginCell?(context: CodeEffectContext): Promise<
+    | { status: "execute"; entries: readonly (readonly [string, unknown])[] }
+    | { status: "replay"; receipt: CodeCellReceipt }
+    | { status: "unknown" }
+  >;
+  completeCell?(context: CodeEffectContext, writes: readonly (readonly [string, unknown])[], receipt: CodeCellReceipt): Promise<void>;
+  /** Bounded committed state for independent branch inheritance. Never includes pending writes. */
+  snapshotStore?(sessionId: string): Promise<readonly (readonly [string, unknown])[]>;
+  restoreStore?(sessionId: string, entries: readonly (readonly [string, unknown])[]): Promise<void>;
   begin(context: CodeEffectContext): Promise<
     | { status: "execute" }
     | { status: "replay"; receipt: CodeEffectReceipt }
