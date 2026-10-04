@@ -391,7 +391,10 @@ export const BROWSER_VAULT_CONTINUATION_FUNCTION = `function(origin, mode, snaps
     if (labels) return labels;
     if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
       const placeholder = el.getAttribute('placeholder') || '';
-      return placeholder.length <= 8192 ? placeholder : '';
+      if (placeholder && placeholder.length <= 8192) return placeholder;
+      // Submit inputs render their value as a caption, but input values stay
+      // private. A fixed role label still lets the agent choose the submit ref.
+      return el instanceof HTMLInputElement && el.type === 'submit' ? 'Submit form' : '';
     }
     return el instanceof HTMLSelectElement ? '' : readable(el);
   };

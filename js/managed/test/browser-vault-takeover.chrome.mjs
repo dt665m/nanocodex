@@ -288,18 +288,21 @@ try {
   assert.deepEqual(await loginPage.locator('input[name=LoginUserName],input[name=LoginPassword]').evaluateAll(es=>es.map(e=>e.value)),['','',...namecheapValues]);
   assert.deepEqual(namecheapFixture.counts,{passwordPosts:0,otpPosts:0,authenticatedVisits:0},'native fill never submits');
   const namecheapClickReceipts=[];
-  const clickNamecheap=async locator=>{
-    const box=await locator.boundingBox();assert.ok(box);
-    const view=await human({action:'observe',native_fields:true,native_field_hints:true});
-    // A POST navigation can destroy the observation context after the click.
-    // Do not retry; the caller verifies the resulting URL and server counters.
-    try{await browserTakeover(intake,{action:'click',x:(box.x+box.width/2)/view.width,y:(box.y+box.height/2)/view.height},requestPrivate);namecheapClickReceipts.push('received');}
-    catch(error){assert.equal(error.message,'Takeover unavailable');namecheapClickReceipts.push('navigation response uncertain');}
+  const clickNamecheap=async label=>{
+    assert.equal((await browserTakeover(intake,{action:'finish'},requestPrivate)).status,'finished');
+    const snapshot=await tool('browser_login_snapshot',{request_id:activeId});
+    const submit=snapshot.elements.find(el=>el.role==='button'&&el.text===label);
+    assert.ok(submit,'agent can identify the form submit from the redacted snapshot');
+    for(const value of Object.values(namecheapSynthetic))assert.ok(!JSON.stringify(snapshot).includes(value));
+    const action={request_id:activeId,operation_id:crypto.randomUUID(),action:'click',snapshot_id:snapshot.snapshot_id,ref:submit.ref};
+    const receipt=await tool('browser_login_action',action);
+    assert.ok(['action_requested','outcome_unknown'].includes(receipt.status));
+    assert.deepEqual(await tool('browser_login_action',action),receipt,'stable operation replay cannot submit twice');
+    namecheapClickReceipts.push(receipt.status);
   };
-  await clickNamecheap(loginPage.locator('input[type=submit]'));
+  await clickNamecheap('Submit form');
   await loginPage.waitForURL(origin+'/namecheap/otp');
   assert.equal(namecheapFixture.counts.passwordPosts,1);
-  await browserTakeover(intake,{action:'finish'},requestPrivate);
   assert.ok(JSON.stringify(await tool('browser_login_snapshot',{request_id:activeId})).includes('Synthetic second-factor code'));
   const namecheapState=structuredClone(durable.get('browser-login:fixture-agent'));
   const namecheapAllocations=allocations;
@@ -316,9 +319,8 @@ try {
   assert.deepEqual(namecheapOtp.native_form.fields.map(({ref,...field})=>field),[{label:'Verification code',type:'text',multiline:false,autocomplete:'one-time-code',inputmode:'numeric'}]);
   await browserTakeover(intake,batch(namecheapOtp,[namecheapSynthetic.otp]),requestPrivate);
   assert.equal(namecheapFixture.counts.otpPosts,0,'OTP native fill never submits');
-  await clickNamecheap(loginPage.getByRole('button',{name:'Verify'}));
+  await clickNamecheap('Verify');
   await loginPage.waitForURL(origin+'/namecheap/account');
-  await browserTakeover(intake,{action:'finish'},requestPrivate);
   const namecheapSnapshot=JSON.stringify(await tool('browser_login_snapshot',{request_id:activeId}));
   assert.ok(namecheapSnapshot.includes('Synthetic Namecheap-shaped account verified'));
   assert.deepEqual(namecheapFixture.counts,{passwordPosts:1,otpPosts:1,authenticatedVisits:1});
@@ -332,11 +334,11 @@ try {
     descriptors:namecheapFrame.native_form.fields.map(({ref,...field})=>field),
     otp_descriptors:namecheapOtp.native_form.fields.map(({ref,...field})=>field),
     merchant_counts:namecheapFixture.counts,click_receipts:namecheapClickReceipts,same_session:true,new_browser_allocations:allocations-namecheapAllocations,
-    checks:['duplicate hidden header credentials left empty','offscreen newsletter excluded','placeholder-only labels and generic autocomplete=on','native HTTPS fill does not submit','explicit login click reaches synthetic OTP','OTP reentry keeps target and pending session cookie','native code hints survive HTTPS','explicit OTP click reaches server-authenticated synthetic account','no synthetic inputs in snapshot or durable metadata'],
+    checks:['duplicate hidden header credentials left empty','offscreen newsletter excluded','placeholder-only labels and generic autocomplete=on','native HTTPS fill does not submit','native fill then Finish then redacted snapshot agent click reaches synthetic OTP','OTP reentry keeps target and pending session cookie','native code hints survive HTTPS','native OTP fill then Finish then redacted snapshot agent click reaches server-authenticated synthetic account','input submit has fixed label without exposing its value','stable action UUID replay submits each form once','no synthetic inputs in snapshot or durable metadata'],
     limitations:['OTP markup is synthetic, not inspected after a live Namecheap login','CAPTCHA/trusted-device challenges untested','no iOS system credential autofill or passkey assertion tested'],
   },null,2));
   await tool('browser_login_close',{});
-  console.log('PASS: Namecheap-shaped public form discovery/private fill -> retained-session synthetic OTP -> server-confirmed fixture account; no live Namecheap authentication or passkey claim');
+  console.log('PASS: Namecheap-shaped native fill/Finish -> agent snapshot submit -> retained-session native OTP/Finish -> agent verify -> server-confirmed fixture account; no live Namecheap authentication or passkey claim');
   // Vault Finish: actual runtime and CDP, with HTTP response loss simulated only
   // after the real finish completed. Retry cannot release a newer lease.
   const vaultData=new Map();
