@@ -284,7 +284,7 @@ export async function create(options) {
         const receipt = state.requests.find(item => item.requestId === requestId);
         if (!receipt || receipt.family !== 'claude') throw new Error('cache warming requires a prepared Claude request');
         if (typeof send !== 'function') throw new TypeError('cache warm transport is required');
-        const request = { ...copy(receipt.request), max_tokens: 1, stream: false };
+        const request = { ...copy(receipt.request), max_tokens: 1, stream: false, tool_choice: { type: 'none' } };
         if (request.thinking && request.thinking.type !== 'disabled') throw new Error('cache warm does not support thinking requests');
         if (options.authorize) await options.authorize(frozen(receipt));
         if (state.warms.some(item => item.requestId === requestId)) throw new Error('cache warm already admitted; reconcile its receipt');
@@ -292,7 +292,7 @@ export async function create(options) {
         const system = typeof receipt.request.system === 'string' ? [] : receipt.request.system ?? [];
         const blocks = [...system, ...nativeTools(receipt.request), ...(receipt.request.messages ?? []).flatMap(message => Array.isArray(message.content) ? message.content : [])];
         const ttl = cacheWarm.ttlSeconds === 3600 ? '1h' : '5m';
-        if (!blocks.some(block => block.cache_control?.type === 'ephemeral' && (block.cache_control.ttl ?? '5m') === ttl)) throw new Error('cache warm requires an existing native cache breakpoint with matching TTL');
+        if (![receipt.request, ...blocks].some(block => block.cache_control?.type === 'ephemeral' && (block.cache_control.ttl ?? '5m') === ttl)) throw new Error('cache warm requires an existing native cache breakpoint with matching TTL');
         const warm = { requestId, status: 'dispatched', ttlSeconds: cacheWarm.ttlSeconds, estimatedWriteUsd: cacheWarm.estimatedWriteUsd, usage: null, actualUsd: null };
         await save({ ...state, warms: [...state.warms, warm], reservedWarmUsd: state.reservedWarmUsd + cacheWarm.estimatedWriteUsd });
         const response = await send(frozen(request), frozen(warm));
