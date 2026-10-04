@@ -92,8 +92,20 @@ impl ClaudeToolReply {
 #[derive(Clone, Default)]
 pub struct ClaudeTools {
     tools: Vec<(ToolDefinition, Handler)>,
+    tool_replay_safety: HashMap<String, nanocodex_agent::ReplaySafety>,
 }
 impl ClaudeTools {
+    /// Sets explicit recovery permission for a named callback. Defaults to unsafe;
+    /// only opt in for idempotent or host-journaled execution, independent of parallelism.
+    pub fn tool_replay_safety(
+        mut self,
+        name: impl Into<String>,
+        safety: nanocodex_agent::ReplaySafety,
+    ) -> Self {
+        self.tool_replay_safety.insert(name.into(), safety);
+        self
+    }
+
     /// Creates an empty native function collection.
     pub fn new() -> Self {
         Self::default()
@@ -161,6 +173,7 @@ pub struct ClaudeBuilder {
     system_blocks: Option<Vec<Value>>,
     workspace: String,
     tools: Vec<(ToolDefinition, Handler)>,
+    tool_replay_safety: HashMap<String, nanocodex_agent::ReplaySafety>,
     tools_factory: Option<ClaudeToolsFactory>,
     spawn_factory: Option<Arc<dyn AgentFactory>>,
     host_context: Option<Arc<str>>,
@@ -173,6 +186,17 @@ pub struct ClaudeBuilder {
     task_board: Option<Arc<nanocodex_claude_tools::tasks::ClaudeTasks>>,
 }
 impl ClaudeBuilder {
+    /// Sets explicit recovery permission for a named callback. Defaults to unsafe;
+    /// only opt in for idempotent or host-journaled execution, independent of parallelism.
+    pub fn tool_replay_safety(
+        mut self,
+        name: impl Into<String>,
+        safety: nanocodex_agent::ReplaySafety,
+    ) -> Self {
+        self.tool_replay_safety.insert(name.into(), safety);
+        self
+    }
+
     fn new(claude: Claude) -> Self {
         let context_window_tokens = match claude.model.as_str() {
             "claude-opus-5-5" | "claude-fable-5-1" | "claude-sonnet-5-5" | "claude-sonnet-5" => {
@@ -197,6 +221,7 @@ impl ClaudeBuilder {
             system_blocks: None,
             workspace: String::new(),
             tools: Vec::new(),
+            tool_replay_safety: HashMap::new(),
             tools_factory: None,
             spawn_factory: None,
             host_context: None,
@@ -678,7 +703,9 @@ impl ClaudeBuilder {
             handle = handle.with_spawn_factory(factory.clone());
         }
         if let Some(factory) = &self.tools_factory {
-            self.tools.extend(factory(handle.clone())?.tools);
+            let tools = factory(handle.clone())?;
+            self.tools.extend(tools.tools);
+            self.tool_replay_safety.extend(tools.tool_replay_safety);
         }
 
         if self.claude.model.trim().is_empty()
@@ -894,6 +921,7 @@ impl ClaudeBuilder {
             tools: definitions,
             server_tools: self.server_tools,
             handlers,
+            tool_replay_safety: self.tool_replay_safety,
             discovered,
             client_tool_search: self.client_tool_search,
             parallel_tools: self.parallel_tools,
@@ -1608,6 +1636,7 @@ struct State {
     tools: Vec<ToolDefinition>,
     server_tools: Vec<ServerToolDefinition>,
     handlers: HashMap<String, Handler>,
+    tool_replay_safety: HashMap<String, nanocodex_agent::ReplaySafety>,
     discovered: Arc<Mutex<HashSet<String>>>,
     client_tool_search: bool,
     parallel_tools: bool,

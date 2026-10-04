@@ -71,12 +71,27 @@ pub(super) struct Effect<'a> {
 }
 impl Effect<'_> {
     pub(super) async fn begin(&self, kind: &str, input: Value) -> Result<Step> {
+        match self
+            .begin_with_replay(kind, input, nanocodex_agent::ReplaySafety::Safe)
+            .await?
+        {
+            Step::OutcomeUnknown => Err(recovery_error("unclassified interrupted model effect")),
+            admission => Ok(admission),
+        }
+    }
+    pub(super) async fn begin_with_replay(
+        &self,
+        kind: &str,
+        input: Value,
+        replay_safety: nanocodex_agent::ReplaySafety,
+    ) -> Result<Step> {
         self.policy
-            .begin_step(
+            .begin_step_with_replay(
                 self.operation.to_owned(),
                 self.step.clone(),
                 kind.to_owned(),
                 input,
+                replay_safety,
             )
             .await
     }
@@ -257,11 +272,22 @@ impl State {
         let index = cursor.index;
         let step = format!("tool-{index}-{id}");
         let effect = cursor.effect(self, &step);
-        if let Some(effect) = &effect
-            && let Step::Replay(value) = effect
-                .begin("tool", json!({"id":id,"name":name,"input":input}))
+        let admission = if let Some(effect) = &effect {
+            effect
+                .begin_with_replay(
+                    "tool",
+                    json!({"id":id,"name":name,"input":input}),
+                    self.tool_replay_safety
+                        .get(name)
+                        .copied()
+                        .unwrap_or_default(),
+                )
                 .await?
-        {
+        } else {
+            Step::Execute
+        };
+        let outcome_unknown = matches!(admission, Step::OutcomeUnknown);
+        if let Step::Replay(value) = admission {
             #[derive(Deserialize)]
             #[serde(deny_unknown_fields)]
             struct Receipt {
@@ -283,7 +309,7 @@ impl State {
         let unknown = || {
             ContentBlock::tool_result_content(id, ToolResultContent::Text("Tool execution interrupted; outcome unknown. Do not assume it did not run or automatically repeat it.".into()), true)
         };
-        let result = if cancel.flag.load(Ordering::SeqCst) {
+        let result = if outcome_unknown || cancel.flag.load(Ordering::SeqCst) {
             unknown()
         } else if let Some(handler) = handler {
             tokio::select! {

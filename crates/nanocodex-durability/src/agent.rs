@@ -410,13 +410,31 @@ impl ExecutionPolicy for DurableExecution {
         kind: String,
         input_json: String,
     ) -> ExecutionFuture<'a, AgentResult<ExecutionStepAdmission>> {
+        self.begin_step_with_replay(
+            operation_id,
+            step_id,
+            kind,
+            input_json,
+            crate::ReplaySafety::Unsafe,
+        )
+    }
+
+    fn begin_step_with_replay<'a>(
+        &'a self,
+        operation_id: String,
+        step_id: String,
+        kind: String,
+        input_json: String,
+        replay_safety: crate::ReplaySafety,
+    ) -> ExecutionFuture<'a, AgentResult<ExecutionStepAdmission>> {
         Box::pin(async move {
             let input = raw(input_json)?;
             match self
                 .owner
-                .begin_step(operation_id, step_id, kind, &input)
+                .begin_step(operation_id, step_id, kind, &input, replay_safety)
                 .await
             {
+                Ok(BeginStep::OutcomeUnknown) => Ok(ExecutionStepAdmission::OutcomeUnknown),
                 Ok(BeginStep::Execute) => Ok(ExecutionStepAdmission::Execute),
                 Ok(BeginStep::Replay(output)) => Ok(ExecutionStepAdmission::Replay(
                     output.json().map_err(agent_error)?.to_owned(),

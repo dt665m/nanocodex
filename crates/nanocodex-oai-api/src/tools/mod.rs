@@ -584,6 +584,12 @@ pub trait Tool: Send + Sync + 'static {
         false
     }
 
+    /// Whether repeating an interrupted invocation is safe. Independent from
+    /// parallel execution; defaults to false, including reads and shell tools.
+    fn is_replay_safe(&self) -> bool {
+        false
+    }
+
     /// Executes one invocation.
     async fn execute(&self, input: ToolInput, context: ToolContext<'_>) -> ToolResult;
 }

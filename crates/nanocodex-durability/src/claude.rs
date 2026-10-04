@@ -91,13 +91,25 @@ impl ClaudeExecutionPolicy for ClaudeExecution {
         kind: String,
         input: Value,
     ) -> PolicyFuture<'_, Step> {
+        self.begin_step_with_replay(id, step_id, kind, input, crate::ReplaySafety::Unsafe)
+    }
+
+    fn begin_step_with_replay(
+        &self,
+        id: String,
+        step_id: String,
+        kind: String,
+        input: Value,
+        replay_safety: crate::ReplaySafety,
+    ) -> PolicyFuture<'_, Step> {
         Box::pin(async move {
             match self
                 .owner
-                .begin_step(id, step_id, kind, &input)
+                .begin_step(id, step_id, kind, &input, replay_safety)
                 .await
                 .map_err(agent_error)?
             {
+                BeginStep::OutcomeUnknown => Ok(Step::OutcomeUnknown),
                 BeginStep::Execute => Ok(Step::Execute),
                 BeginStep::Replay(value) => Ok(Step::Replay(value.decode().map_err(agent_error)?)),
             }

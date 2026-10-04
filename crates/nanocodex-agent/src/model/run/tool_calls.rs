@@ -232,11 +232,27 @@ where
                 async move {
                     let started_at = active.started_at;
                     let step_id = format!("tool-{call_index}-{}", call.call_id);
+                    let mut outcome_unknown = false;
                     let recovered = if let Some(steps) = &execution_steps {
                         match steps
-                            .begin::<_, CompletedToolCall>(&step_id, "tool_call", &call)
+                            .begin_with_replay::<_, CompletedToolCall>(
+                                &step_id,
+                                "tool_call",
+                                &call,
+                                if matches!(call.kind, CodeCallKind::ToolSearch)
+                                    || tools.is_replay_safe(&qualified_tool_name(&call))
+                                {
+                                    crate::ReplaySafety::Safe
+                                } else {
+                                    crate::ReplaySafety::Unsafe
+                                },
+                            )
                             .await?
                         {
+                            crate::agent::ExecutionStep::OutcomeUnknown => {
+                                outcome_unknown = true;
+                                None
+                            }
                             crate::agent::ExecutionStep::Execute => None,
                             crate::agent::ExecutionStep::Replay(output) => Some(output),
                         }
@@ -251,6 +267,8 @@ where
                             &mut completed.response_items,
                         );
                         (Ok(completed), false)
+                    } else if outcome_unknown {
+                        (Ok(Self::unknown_tool_call(&active)), true)
                     } else {
                         let dispatch = async {
                             active
@@ -492,6 +510,30 @@ where
             },
         )?;
         Ok(output)
+    }
+
+    fn unknown_tool_call(active: &ActiveToolCall) -> CompletedToolCall {
+        let output = ToolOutputBody::Text("Tool execution interrupted; outcome unknown. The prior attempt may have run. Do not automatically repeat it; reconcile using its existing operation identity.".to_owned());
+        let structured_result = output.structured_result();
+        let duration_ns = elapsed_ns(active.started_at);
+        record_tool_span_terminal(&active.span, "failed", "ERROR", duration_ns, &output);
+        let response_item = match active.kind {
+            CodeCallKind::Custom => custom_tool_output(active.call_id.clone(), output.clone()),
+            CodeCallKind::Function => function_tool_output(active.call_id.clone(), output.clone()),
+            CodeCallKind::ToolSearch => tool_search_output(active.call_id.clone(), Vec::new()),
+        };
+        CompletedToolCall {
+            cell: None,
+            call_id: active.call_id.clone(),
+            tool: active.name.clone(),
+            success: false,
+            duration_ns,
+            work_duration_ns: Self::completed_tool_work_duration(active),
+            output,
+            structured_result,
+            metadata: None,
+            response_items: vec![response_item],
+        }
     }
 
     pub(super) fn panicked_tool_call(

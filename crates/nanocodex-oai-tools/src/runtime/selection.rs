@@ -93,11 +93,13 @@ pub trait DynamicToolProvider: Send + Sync {
             .any(|definition| definition.name() == name)
     }
 
-    /// Returns whether a callable deferred tool is safe to execute in parallel.
-    ///
-    /// Providers are conservative by default. Implementations must return
-    /// `true` only for a currently callable tool with explicit safety
-    /// metadata.
+    /// Whether an interrupted invocation may be repeated without duplicating effects.
+    /// This defaults to false and is independent from parallel execution safety.
+    fn is_replay_safe(&self, _name: &str) -> bool {
+        false
+    }
+
+    /// Whether a callable deferred tool explicitly permits parallel execution.
     fn supports_parallel_tool_calls(&self, _name: &str) -> bool {
         false
     }

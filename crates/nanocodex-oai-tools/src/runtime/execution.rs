@@ -246,6 +246,12 @@ impl ToolRuntime {
         )
     }
 
+    /// Whether a direct tool explicitly permits repeating an interrupted call.
+    #[must_use]
+    pub fn is_replay_safe(&self, name: &str) -> bool {
+        self.registry.is_replay_safe(name)
+    }
+
     /// Returns whether a model-visible tool explicitly permits parallel calls.
     ///
     /// Unknown tools and tools without an explicit opt-in return `false`.

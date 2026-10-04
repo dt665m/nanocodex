@@ -146,10 +146,11 @@ inside the Rust owner so preparing a replacement does not deep-copy every receip
 Managed sessions keep 16 inner terminal receipts; their managed inbox and archive
 continue to own public exact-ID replay beyond that tail.
 
-State format 4 uses the `nanocodex_durable_state` head envelope and SHA-256
+State format 5 uses the `nanocodex_durable_state` head envelope and SHA-256
 addressed payload records. Bodies over 256,000 UTF-8 bytes are split into records.
 Persistent 64-message context pages share prior records. Each boundary publishes
 only new messages and changed pages, with its head in one atomic transaction.
+Format 4 heads remain readable; missing tool replay permission is unsafe.
 The old inline/compressed storage formats are rejected.
 
 Cold acquisition reads the head only. Execution resolves current model context
@@ -291,20 +292,22 @@ Beginning a step returns exactly one value:
 
 | Admission | Durable evidence | Caller action |
 |---|---|---|
-| `Execute` | No committed output exists | Dispatch and commit output |
+| `Execute` | New intent, or both saved and current replay policies are safe | Dispatch and commit output |
 | `Replay(output)` | A completed output is durable | Reuse the exact output; do not dispatch |
+| `OutcomeUnknown` | Unsettled effect without both safe permissions | Reconcile or commit an explicit unknown-outcome result; do not redispatch |
 
-There is no durable uncertainty result and no retry-safety classification.
-An unfinished provider or tool step is submitted again with the same stable
-step identity and input. This deliberately provides at-least-once execution:
-the provider may bill twice and an external tool effect may happen twice.
+Tool effects default to unsafe. Parallel execution permission is independent.
+The policy is committed with intent, so an unsafe effect cannot become replayable
+merely because a later deployment changes its handler. Conversely, removing a
+safe permission suppresses replay. Completed receipts replay even when a handler
+is unavailable. Native and Claude agent adapters settle unknown outcomes as
+failed tool results so the model can continue with accurate evidence.
 
-Bounded transport retries still belong to the uninterrupted live Responses
-attempt. Durable recovery adds another submission only when no completed step
-output was committed. Successful dispatch settles in one replacement:
-`effect_pending -> completed(output)`. That replacement is the materialization
-boundary because the output and all operation state share one opaque total-state
-payload. Completed results always replay.
+Model requests, warmup, compaction, and the host's explicitly idempotent
+preservation barrier opt into replay. Provider usage may be billed again after
+interruption. Bounded transport retries belong to the live provider attempt.
+Effect settlement remains one atomic `effect_pending -> completed(output)`
+replacement under the current owner fence.
 
 Standalone compaction follows the same rule. A committed resulting checkpoint
 replays; otherwise a later request runs compaction again. It cannot run while an

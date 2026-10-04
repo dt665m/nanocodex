@@ -278,6 +278,17 @@ impl EmbeddedToolRuntime {
         (model_definitions, code_mode_tool_names)
     }
 
+    /// Whether a direct tool or its embedding host explicitly permits replay.
+    #[must_use]
+    pub fn is_replay_safe(&self, name: &str) -> bool {
+        if let Some(local) = self.local.iter().find(|tool| tool.name.as_ref() == name) {
+            return local.handler.is_replay_safe();
+        }
+        self.host
+            .as_ref()
+            .is_some_and(|host| host.is_replay_safe(name))
+    }
+
     /// Returns `false`; embedded definitions execute inside one Code Mode cell.
     ///
     /// The embedding host owns any concurrency policy below that cell.

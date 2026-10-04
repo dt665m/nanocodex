@@ -67,6 +67,9 @@ where
                 .begin::<_, RecordedModelResult>(&step_id, "model_call", &())
                 .await?
             {
+                crate::agent::ExecutionStep::OutcomeUnknown => {
+                    unreachable!("model helper rejects unknown effects")
+                }
                 crate::agent::ExecutionStep::Execute => None,
                 crate::agent::ExecutionStep::Replay(output) => Some(output),
             }

@@ -1385,22 +1385,23 @@ impl tower::Service<nanocodex_oai_api::tower::ResponsesAttempt> for DurableToolS
                         } if &**call_id == "call-count-once" => Some(output.as_ref()),
                         _ => None,
                     });
-                    assert!(
-                        recovered_output
-                            .expect("recovery must include the retried tool result")
-                            .contains("counted")
-                    );
+                    let recovered_output =
+                        recovered_output.expect("recovery must include the exact tool outcome");
+                    let final_message = if recovered_output.contains("outcome unknown") {
+                        "recovered with outcome unknown"
+                    } else {
+                        assert!(recovered_output.contains("counted"));
+                        "recovered after retrying the tool"
+                    };
                     ResponsesOutput::Generation(GenerationOutput {
                         id: "durable-tool-recovered-response".to_owned(),
                         reported_model: None,
                         status: "completed".to_owned(),
                         end_turn: Some(true),
-                        final_message: Some("recovered after retrying the tool".to_owned()),
+                        final_message: Some(final_message.to_owned()),
                         output_items: vec![ResponseItem::message(
                             MessageRole::Assistant,
-                            [ContentItem::output_text(
-                                "recovered after retrying the tool",
-                            )],
+                            [ContentItem::output_text(final_message)],
                         )],
                         code_calls: Vec::new(),
                         usage: None,
@@ -3650,7 +3651,7 @@ async fn exact_id_retry_reclaims_a_definitely_uncommitted_terminal_replace() -> 
 }
 
 #[tokio::test]
-async fn portable_state_retries_an_unfinished_tool() -> Result<()> {
+async fn portable_state_reports_unknown_without_repeating_unfinished_tool() -> Result<()> {
     let store = self::MemoryStore::new()?;
     let failing_store = FailReplaceOnce {
         inner: store.clone(),
@@ -3709,11 +3710,8 @@ async fn portable_state_retries_an_unfinished_tool() -> Result<()> {
         .await?;
     assert_eq!(recovered_turn.request_id(), Some("turn-1"));
     let recovered = recovered_turn.result().await?;
-    assert_eq!(
-        recovered.final_message(),
-        "recovered after retrying the tool"
-    );
-    assert_eq!(tool_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(recovered.final_message(), "recovered with outcome unknown");
+    assert_eq!(tool_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!(generations.load(std::sync::atomic::Ordering::SeqCst), 2);
     resumed.shutdown().await?;
     drop((resumed, resumed_events));
@@ -3731,18 +3729,15 @@ async fn portable_state_retries_an_unfinished_tool() -> Result<()> {
         .await?
         .result()
         .await?;
-    assert_eq!(
-        replayed.final_message(),
-        "recovered after retrying the tool"
-    );
+    assert_eq!(replayed.final_message(), "recovered with outcome unknown");
     assert_eq!(generations.load(std::sync::atomic::Ordering::SeqCst), 2);
     let next = reopened
         .prompt(PromptRequest::new("continue").request_id("turn-2"))
         .await?
         .result()
         .await?;
-    assert_eq!(next.final_message(), "recovered after retrying the tool");
-    assert_eq!(tool_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(next.final_message(), "recovered with outcome unknown");
+    assert_eq!(tool_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!(generations.load(std::sync::atomic::Ordering::SeqCst), 3);
     reopened.shutdown().await?;
     drop((reopened, reopened_events));

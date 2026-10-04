@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use crate::{Error, Result};
 use serde::{Serialize, de::DeserializeOwned};
 
-const STATE_FORMAT: u8 = 4;
+const STATE_FORMAT: u8 = 5;
 const RECORD_BYTES: usize = 256_000;
 
 /// An immutable payload reference. Content is loaded only for its consumer.
@@ -210,6 +210,9 @@ pub enum Transition {
         kind: String,
         /// Opaque typed step input.
         input: EncodedPayload,
+        /// Recovery permission captured before dispatch.
+        #[serde(default)]
+        replay_safety: crate::ReplaySafety,
     },
     /// An external step completed with a replayable output.
     StepCompleted {
@@ -342,6 +345,9 @@ pub struct StepState {
     pub kind: String,
     /// Original opaque step input.
     pub input: EncodedPayload,
+    /// Recovery permission captured before dispatch.
+    #[serde(default)]
+    pub replay_safety: crate::ReplaySafety,
     /// Current reduced status.
     pub status: StepStatus,
     /// Number of committed starts for this step.
@@ -609,17 +615,35 @@ impl DurableState {
         });
     }
 
-    pub(crate) fn from_checkpoint(revision: u64, checkpoint: DurableCheckpoint) -> Result<Self> {
+    pub(crate) fn from_checkpoint(
+        revision: u64,
+        mut checkpoint: DurableCheckpoint,
+    ) -> Result<Self> {
         if revision == 0 {
             return Err(Error::InvalidState(
                 "a compacted state checkpoint must have a positive revision".to_owned(),
             ));
         }
-        if checkpoint.format != STATE_FORMAT {
+        if !matches!(checkpoint.format, 4 | STATE_FORMAT) {
             return Err(Error::InvalidState(format!(
                 "unsupported state format {}",
                 checkpoint.format
             )));
+        }
+        // Format 4 already defined provider/compaction/preservation steps as
+        // repeatable. Preserve that contract during upgrade, while old tool
+        // intents remain unsafe. The current caller must still opt in too.
+        if checkpoint.format == 4 {
+            for operation in checkpoint.operations.values_mut() {
+                for step in operation.steps.values_mut() {
+                    if matches!(
+                        step.kind.as_str(),
+                        "model" | "model_call" | "warmup" | "compaction" | "before_compaction"
+                    ) {
+                        step.replay_safety = crate::ReplaySafety::Safe;
+                    }
+                }
+            }
         }
         let mut accepted_orders = std::collections::BTreeSet::new();
         for (operation_id, operation) in &checkpoint.operations {
@@ -801,6 +825,7 @@ impl DurableState {
                 step_id,
                 kind,
                 input,
+                replay_safety,
             } => {
                 ensure_nonempty(step_id, "step ID")?;
                 ensure_nonempty(kind, "step kind")?;
@@ -825,6 +850,13 @@ impl DurableState {
                     if matches!(step.status, StepStatus::Completed(_)) {
                         return Err(Error::InvalidState(format!(
                             "settled step `{step_id}` in operation `{operation_id}` restarted"
+                        )));
+                    }
+                    if step.replay_safety != crate::ReplaySafety::Safe
+                        || *replay_safety != crate::ReplaySafety::Safe
+                    {
+                        return Err(Error::InvalidState(format!(
+                            "unsettled step `{step_id}` in operation `{operation_id}` cannot safely restart"
                         )));
                     }
                     if step.attempts == u32::MAX {
@@ -1043,6 +1075,7 @@ impl DurableState {
                 step_id,
                 kind,
                 input,
+                replay_safety,
             } => {
                 let operation = self.pending_operation_mut(&operation_id)?;
                 if let Some(step) = operation.steps.get_mut(&step_id) {
@@ -1057,6 +1090,7 @@ impl DurableState {
                         StepState {
                             kind,
                             input,
+                            replay_safety,
                             status: StepStatus::EffectPending,
                             attempts: 1,
                         },
@@ -1290,6 +1324,7 @@ mod continuation_tests {
                 })?;
             }
             apply(Transition::StepStarted {
+                replay_safety: crate::ReplaySafety::Safe,
                 operation_id: id.clone(),
                 step_id: format!("model-{model_call}"),
                 kind: "model_call".into(),
@@ -1332,6 +1367,7 @@ mod continuation_tests {
             input: payload.clone(),
         })?;
         apply(Transition::StepStarted {
+            replay_safety: crate::ReplaySafety::Safe,
             operation_id: id.clone(),
             step_id: "model-1".into(),
             kind: "model_call".into(),
@@ -1359,6 +1395,7 @@ mod continuation_tests {
             model_call_index: 2,
         })?;
         apply(Transition::StepStarted {
+            replay_safety: crate::ReplaySafety::Safe,
             operation_id: id.clone(),
             step_id: "model-2".into(),
             kind: "model_call".into(),
@@ -1382,6 +1419,7 @@ mod continuation_tests {
         })?;
         assert!(
             apply(Transition::StepStarted {
+                replay_safety: crate::ReplaySafety::Safe,
                 operation_id: id.clone(),
                 step_id: "model-1".into(),
                 kind: "model_call".into(),
@@ -1492,6 +1530,7 @@ mod withdrawal_tests {
             model_call_index: 2,
         })?;
         apply(Transition::StepStarted {
+            replay_safety: crate::ReplaySafety::Safe,
             operation_id: "turn".into(),
             step_id: "model-2".into(),
             kind: "model_call".into(),
