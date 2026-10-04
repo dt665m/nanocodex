@@ -4584,3 +4584,106 @@ async fn deterministic_hosted_stream_failure_is_terminal_across_cold_reopen() ->
 async fn transient_hosted_stream_failure_remains_retryable_across_cold_reopen() -> Result<()> {
     assert_hosted_stream_failure_recovery(false).await
 }
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn completed_agent_history_forks_after_receipt_pruning_and_cold_reopen() -> Result<()> {
+    use nanocodex_durability::{DocumentForkPolicy, DocumentWrite, SqliteStore};
+    let directory = tempfile::tempdir()?;
+    let db = directory.path().join("agent-history.sqlite");
+    let workspace = temporary_workspace("document-agent-history")?;
+    let generations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let openai = || {
+        OpenAi::builder("synthetic-key")
+            .service({
+                let generations = Arc::clone(&generations);
+                move || DurableReplayService {
+                    generations: Arc::clone(&generations),
+                }
+            })
+            .build()
+    };
+    let session =
+        DurableSession::open_with_terminal_receipt_limit(SqliteStore::open(&db)?, "parent", 1)
+            .await?;
+    let (agent, events) = Nanocodex::builder(openai()?)
+        .workspace(&workspace)
+        .durability(session.clone())
+        .await?
+        .build()?;
+    for index in 0..5 {
+        let id = format!("historical-{index}");
+        let result = agent
+            .prompt(PromptRequest::new(format!("synthetic history {index}")).request_id(&id))
+            .await?
+            .result()
+            .await?;
+        assert_eq!(result.final_message(), "durably replayed");
+    }
+    agent.shutdown().await?;
+    drop((agent, events, session));
+    let source = DurableSession::open(SqliteStore::open(&db)?, "parent").await?;
+    assert!(source.state().await?.operation("historical-0").is_none());
+    let revision = source.state().await?.revision();
+    for input in ["synthetic history 0", "reused operation with changed input"] {
+        let error = source.admit("historical-0", &input).await.unwrap_err();
+        assert!(error.to_string().contains("terminal"), "{error}");
+    }
+    assert_eq!(source.state().await?.revision(), revision);
+    let (snapshot, seed) = source.agent_document_fork("historical-0").await?;
+    let encoded = serde_json::to_string(&snapshot)?;
+    assert!(encoded.contains("synthetic history 0"));
+    assert!(!encoded.contains("synthetic history 4"));
+    let child = DurableSession::open(SqliteStore::open(&db)?, "child").await?;
+    child
+        .initialize_agent_document_fork(seed, &snapshot)
+        .await?;
+    drop(child);
+    let child = DurableSession::open(SqliteStore::open(&db)?, "child").await?;
+    let (branch, branch_events) = Nanocodex::builder(openai()?)
+        .workspace(&workspace)
+        .durability(child.clone())
+        .await?
+        .build()?;
+    assert_eq!(
+        branch
+            .prompt(PromptRequest::new("branch history").request_id("branch-1"))
+            .await?
+            .result()
+            .await?
+            .final_message(),
+        "durably replayed"
+    );
+    branch.shutdown().await?;
+    drop((branch, branch_events));
+    let (branch_snapshot, _) = child.agent_document_fork("branch-1").await?;
+    let branch_encoded = serde_json::to_string(&branch_snapshot)?;
+    assert!(branch_encoded.contains("synthetic history 0"));
+    assert!(branch_encoded.contains("branch history"));
+    assert!(!branch_encoded.contains("synthetic history 4"));
+    // Direct transaction staging uses the same completion path as Agent success.
+    let writes = DurableSession::open(SqliteStore::open(&db)?, "staged").await?;
+    writes.admit("success", &"success").await?;
+    writes.begin_attempt("success").await?;
+    let mutation = DocumentWrite {
+        key: "result".into(),
+        expected_version: 0,
+        value: json!({"receipt": "saved"}),
+        fork: DocumentForkPolicy::AsOf,
+    };
+    writes
+        .stage_document_writes("success", vec![mutation.clone()])
+        .await?;
+    writes
+        .stage_document_writes("success", vec![mutation])
+        .await?;
+    assert!(writes.document("result").await?.is_none());
+    writes
+        .complete("success", &json!({"cursor":1}), &"success")
+        .await?;
+    assert_eq!(writes.document("result").await?.unwrap().version, 1);
+    println!(
+        "SQLite cold Agent fork: five completions, retention=1, historical-0 pruned receipt but retained transcript; child cold resume retains only selected history; staged CAS writes hidden until successful completion"
+    );
+    Ok(())
+}

@@ -146,6 +146,10 @@ struct AgentAcquisition {
 }
 
 enum Command {
+    CompareExchangeDocuments {
+        writes: Vec<crate::DocumentWrite>,
+        result: oneshot::Sender<Result<()>>,
+    },
     StageDocuments {
         caller: Caller,
         operation_id: String,
@@ -492,6 +496,18 @@ impl Driver {
                     });
                     drop(result.send(outcome));
                 }
+                Command::CompareExchangeDocuments { writes, result } => {
+                    let outcome = async {
+                        let mut next = self.state.clone();
+                        next.documents.write(writes)?;
+                        next.advance_revision(self.state.revision().checked_add(1).ok_or_else(
+                            || Error::InvalidState("state revision overflow".into()),
+                        )?)?;
+                        self.persist(next).await
+                    }
+                    .await;
+                    drop(result.send(outcome));
+                }
                 Command::StageDocuments {
                     caller,
                     operation_id,
@@ -602,6 +618,9 @@ impl Driver {
                             self.state.revision().checked_add(1).ok_or_else(|| {
                                 Error::InvalidState("state revision overflow".into())
                             })?;
+                        if terminal {
+                            self.require_new_boundary(&operation_id).await?;
+                        }
                         let mut next = self.state.clone();
                         match step_id {
                             Some(step_id) => {
@@ -1113,6 +1132,7 @@ impl Driver {
                 OperationStatus::Cancelled { .. } => Ok(StoredAdmission::Cancelled),
             };
         }
+        self.require_new_boundary(&operation_id).await?;
         self.apply(Transition::OperationAccepted {
             operation_id: operation_id.clone(),
             input,
@@ -1409,6 +1429,7 @@ impl Driver {
         self.require_claimed(caller, &operation_id)?;
         self.require_running(&operation_id)?;
         let outcome = async {
+            self.require_new_boundary(&operation_id).await?;
             let mut next = self.state.clone();
             let writes = next.documents.take_staged(&operation_id);
             next.apply_transition(
@@ -1516,6 +1537,26 @@ impl Driver {
         self.persist(next).await
     }
 
+    // Boundary identities outlive the bounded terminal receipt head. Reusing a
+    // pruned ID must never admit a new execution or alias its historical fork.
+    async fn require_new_boundary(&mut self, operation_id: &str) -> Result<()> {
+        if self.state.documents.boundaries.contains_key(operation_id)
+            || self
+                .store
+                .read_record(
+                    &self.state_id,
+                    &crate::documents::boundary_key(operation_id),
+                )
+                .await?
+                .is_some()
+        {
+            return Err(Error::OperationTerminal {
+                operation_id: operation_id.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     async fn persist(&mut self, mut next: DurableState) -> Result<()> {
         let expected_revision = self.state.revision().checked_add(1).ok_or_else(|| {
             Error::InvalidState("state revision exceeded the u64 range".to_owned())
@@ -1527,6 +1568,21 @@ impl Driver {
             )));
         }
         let records = next.stage_records();
+        // Old checkpoints may migrate already published indexes. Only identical
+        // records may reconcile; INSERT ... ON CONFLICT DO NOTHING cannot hide
+        // a conflicting immutable identity behind a successful head update.
+        for record in records
+            .iter()
+            .filter(|record| record.key.starts_with("document-boundary/"))
+        {
+            if let Some(existing) = self.store.read_record(&self.state_id, &record.key).await?
+                && existing != record.value
+            {
+                return Err(Error::InvalidState(
+                    "immutable document boundary conflict".into(),
+                ));
+            }
+        }
         let payload = next.checkpoint_payload()?;
         let revision = match self
             .store
@@ -2117,6 +2173,21 @@ impl DurableSession {
             result,
         })
         .await?;
+        receive(receiver).await
+    }
+
+    /// Atomically publishes conditional document writes through this session's
+    /// fenced store owner. A trusted retained handle can journal host work while
+    /// an attached model Agent owns the operation lane. This does not admit or
+    /// complete model operations; the next completed model boundary captures the
+    /// resulting documents according to their fork policies.
+    pub async fn compare_exchange_documents(
+        &self,
+        writes: Vec<crate::DocumentWrite>,
+    ) -> Result<()> {
+        let (result, receiver) = oneshot::channel();
+        self.send(Command::CompareExchangeDocuments { writes, result })
+            .await?;
         receive(receiver).await
     }
 
