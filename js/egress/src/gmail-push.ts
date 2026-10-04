@@ -6,7 +6,7 @@ export interface GmailPushEnv {
   GMAIL_PUSH_TOPIC: string;
 }
 
-type Config = { crm?: true; userId: string; connectionId: string; agentId: string; email: string };
+type Config = { archive_non_actionable?: true; crm?: true; userId: string; connectionId: string; agentId: string; email: string };
 type Event = { type: "gmail.history" | "gmail.resync"; startHistoryId: string; historyId: string; messageIds: string[]; truncated: boolean };
 type Pending = { eventId: string; event: Event; hydrate?: true; input?: string; snapshots?: (GmailMessageSnapshot | null)[] };
 type Page = { type: Event["type"]; historyId: string; chunks: number; index: number; nextPageToken?: string; commitCursor?: string };
@@ -42,7 +42,7 @@ export class GmailPushMailbox {
       let box = await this.state.storage.get<Mailbox>("mailbox");
       if (request.method === "GET" && (path === "/status" || path === "/configure")) {
         return Response.json(box ? { enabled: true, ...box.config, cursor: box.cursor, targetHistoryId: box.target,
-          pending: !!box.pending || !!box.page, renewAt: box.renewAt, expiration: box.expiration, lastError: box.lastError ?? null, renewalError: box.renewalError ?? null } : { enabled: false });
+          archive_non_actionable:box.config.archive_non_actionable === true, pending: !!box.pending || !!box.page, renewAt: box.renewAt, expiration: box.expiration, lastError: box.lastError ?? null, renewalError: box.renewalError ?? null } : { enabled: false });
       }
       if (path === "/configure" && request.method === "DELETE") {
         if (request.body !== null) {
@@ -88,17 +88,19 @@ export class GmailPushMailbox {
       }
       if (![body.userId, body.connectionId, body.agentId].every(v => typeof v === "string" && v.length > 0 && v.length <= 256)
         || typeof body.agentId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(body.agentId)
+        || (body.archive_non_actionable !== undefined && typeof body.archive_non_actionable !== "boolean")
         || (body.crm !== undefined && typeof body.crm !== "boolean")
         || !email(body.email)) return Response.json({ error: "invalid_config" }, { status: 400 });
       if (!/^projects\/[^/]+\/topics\/[^/]+$/.test(this.env.GMAIL_PUSH_TOPIC ?? "")) return Response.json({ error: "topic_unavailable" }, { status: 503 });
-      const config: Config = { userId: body.userId as string, connectionId: body.connectionId as string, agentId: body.agentId as string, email: body.email.toLowerCase(), ...(body.crm === true ? { crm: true as const } : {}) };
+      const config: Config = { userId: body.userId as string, connectionId: body.connectionId as string, agentId: body.agentId as string, email: body.email.toLowerCase(), ...((body.archive_non_actionable === true || body.archive_non_actionable === undefined && box?.config.archive_non_actionable === true) ? {archive_non_actionable:true as const} : {}), ...(body.crm === true ? { crm: true as const } : {}) };
       // Reconfiguration cannot silently discard another mailbox's pending outbox.
-      if (box && JSON.stringify(box.config) !== JSON.stringify(config)) return Response.json({ error: "disable_before_reconfigure" }, { status: 409 });
+      if (box && JSON.stringify({...box.config,archive_non_actionable:undefined}) !== JSON.stringify({...config,archive_non_actionable:undefined})) return Response.json({ error: "disable_before_reconfigure" }, { status: 409 });
       try {
         const profile = await this.profile(config);
         if (profile.emailAddress.toLowerCase() !== config.email) return Response.json({ error: "mailbox_mismatch" }, { status: 409 });
         const watch = await this.watch(config);
         box ??= { config, cursor: watch.historyId, target: watch.historyId, renewAt: 0, expiration: watch.expiration, retry: 0, checkAt: Date.now() + HOUR, reconcile: false, recentMessageIds: [] };
+        box.config = config;
         box.renewAt = Math.min(Date.now() + DAY, Number(watch.expiration) - 60_000); box.expiration = watch.expiration;
         delete box.renewalRetry; delete box.renewalError;
         if (newer(watch.historyId, box.target)) box.target = watch.historyId;
@@ -292,7 +294,7 @@ export class GmailPushMailbox {
   private async deliver(box: Mailbox): Promise<boolean> {
     const pending = box.pending!;
     if (!pending.input) {
-      const envelope = { connectionId: box.config.connectionId, email: box.config.email, ...(box.config.crm === true ? { crm: true } : {}), ...pending.event };
+      const envelope = { ...(box.config.archive_non_actionable === true ? {archive_non_actionable:true} : {}), connectionId: box.config.connectionId, email: box.config.email, ...(box.config.crm === true ? { crm: true } : {}), ...pending.event };
       if (pending.hydrate) {
         const messages = pending.snapshots ??= Array.from({length: pending.event.messageIds.length}, () => null);
         const budget = Math.min(16000, Math.floor((32000 - jsonBytes(envelope) - 32) / Math.max(1,messages.length)) - 1);

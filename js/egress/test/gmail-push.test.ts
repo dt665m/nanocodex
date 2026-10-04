@@ -437,3 +437,15 @@ it.each([false, true])("preserves a legacy durable outbox without relabeling or 
   expect(f.calls.filter(r => r.url.includes("/messages/"))).toHaveLength(0);
   expect(await (await f.request("/status")).json()).toMatchObject({ cursor: "12", pending: false });
 });
+
+it("changes explicit housekeeping opt-in without resetting history, preserving frozen deliveries",async()=>{
+ const f=fixture();await f.request("/configure","POST",config);
+ await f.request("/notify","POST",notify);f.wakeStatus(409);await f.alarmRun();
+ const frozen=f.wakes[0];
+ expect(JSON.parse(frozen.input as string).archive_non_actionable).toBeUndefined();
+ expect((await f.request("/configure","PUT",{...config,archive_non_actionable:true})).status).toBe(200);
+ expect(await (await f.request("/status")).json()).toMatchObject({cursor:"10",archive_non_actionable:true});
+ f.restart();f.wakeStatus(202);await f.alarmRun();expect(f.wakes[1]).toEqual(frozen);
+ await f.request("/configure","PUT",config);expect(await (await f.request("/status")).json()).toMatchObject({archive_non_actionable:true});
+ await f.request("/configure","PUT",{...config,archive_non_actionable:false});expect(await (await f.request("/status")).json()).toMatchObject({archive_non_actionable:false,cursor:"12"});
+});
