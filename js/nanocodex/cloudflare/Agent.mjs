@@ -1,5 +1,6 @@
-import { steerInputKey } from "../runtime/steer-receipt.mjs";
-export { steerInputKey };
+export { resumeCompletion, deliverCompletion } from "../internal.mjs";
+import { steerInputKey, asyncCompletionInputKey } from "../runtime/steer-receipt.mjs";
+export { steerInputKey, asyncCompletionInputKey };
 import { createGatewayResponses } from "./gateway-responses.mjs";
 import { createWorkersAiResponses } from "./workers-ai-responses.mjs";
 import { responseControlsBody, responseControlsSocket } from "../runtime/response-controls.mjs";
@@ -16,6 +17,8 @@ import {
   prepareCloudflareAgentSession,
   releaseAgentSession,
   routePrompt,
+  resumeCompletion,
+  deliverCompletion,
 } from "../internal.mjs";
 import { pruneDurableReceipts as pruneWasmDurableReceipts } from "../pkg-web/nanocodex.js";
 import * as Transport from "../browser/Transport.mjs";
@@ -69,8 +72,11 @@ const lifecycles = new WeakMap();
 /** @internal Binds the package-owned module to the public Cloudflare namespace. */
 export function bindAgent(module, hostAgent = HostAgent) {
   return Object.freeze({
+    resumeCompletion,
+    deliverCompletion,
     steerReceipt,
     steerInputKey,
+    asyncCompletionInputKey,
     pruneDurableReceipts: (owner, options) => pruneDurableReceipts(module, owner, options),
     create: (owner, options) => create(module, owner, options, hostAgent),
     createEphemeral: (owner, options) => createEphemeral(module, owner, options),
@@ -700,6 +706,7 @@ async function createOwned(module, resolved, options, hostAgent, lifecycle, prep
       [Symbol.for("nanocodex.browser.internalRuntime")]: {
         traceTool: internalRuntime?.traceTool,
         codeEffectJournal: internalRuntime?.codeEffectJournal,
+        codeAsyncJobs: internalRuntime?.codeAsyncJobs,
         toolProviders: internalRuntime?.toolProviders,
         subagentsEnabled: internalRuntime?.subagentsEnabled,
         subagentMaxConcurrency: internalRuntime?.subagentMaxConcurrency,
