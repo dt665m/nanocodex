@@ -1586,7 +1586,6 @@ impl AgentFactory for WasmHarnessFactory {
 struct WasmSubagents {
     host_definition_id: u32,
     registry: Arc<SubagentRegistry>,
-    control: SubagentControl,
     parents: Arc<Mutex<HashMap<String, AgentHandle>>>,
     hosts: Arc<Mutex<HashMap<String, u32>>>,
     sessions: Rc<RefCell<HashMap<(String, SubagentId), String>>>,
@@ -1636,7 +1635,7 @@ impl WasmSubagents {
     fn new(
         host_definition_id: u32,
         registry: Arc<SubagentRegistry>,
-        control: SubagentControl,
+        _control: SubagentControl,
         updates: tokio::sync::mpsc::UnboundedReceiver<ScopedAgentUpdate>,
         parents: Arc<Mutex<HashMap<String, AgentHandle>>>,
         hosts: Arc<Mutex<HashMap<String, u32>>>,
@@ -1656,7 +1655,6 @@ impl WasmSubagents {
             host_definition_id,
             hosts,
             registry,
-            control,
             parents,
             sessions,
             event_forwarders,
@@ -1734,18 +1732,7 @@ impl WasmSubagents {
         .map_err(js_error)
     }
 
-    async fn close_all(&self, root_session_id: &str) -> std::io::Result<()> {
-        self.control.close_all(root_session_id).await?;
-        release_subagent_scope(
-            self.host_definition_id,
-            &self.sessions,
-            &self.parents,
-            &self.hosts,
-            root_session_id,
-        );
-        self.remove_parent(root_session_id);
-        Ok(())
-    }
+
 }
 
 #[wasm_bindgen(js_class = Nanocodex)]
