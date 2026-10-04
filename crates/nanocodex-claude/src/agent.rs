@@ -1953,34 +1953,34 @@ impl State {
         // A durable cursor freezes original parameters, never current authority.
         // Recheck the actual prepared declarations before replay or dispatch.
         let authorized = self.available_tools();
-        if request.tools.iter().any(|tool| !authorized.contains(tool)) {
-            return Err(provider_error("prepared Claude request contains a declaration revoked by current host authorization").into());
-        }
+        let revoked_declaration = request.tools.iter().any(|tool| !authorized.contains(tool));
         request.cache_system_prefix().map_err(provider_error)?;
         client.prepare_request(&mut request);
         if cancel.flag.load(Ordering::SeqCst) && context.effect.is_none() {
             return Err(NanocodexError::TurnCancelled.into());
         }
-        if let Some(effect) = &context.effect
-            && let Step::Replay(value) = effect
-                .begin_with_replay(
-                    "model",
-                    client.durable_request(&request).map_err(provider_error)?,
-                    // Provider-hosted tools can mutate remote state. A missing
-                    // terminal receipt must not automatically repeat that charge
-                    // or side effect. Disabled tools make compaction text-only.
-                    if request.tool_choice.as_ref().is_some_and(|choice| choice["type"] == "none")
-                        || !request.tools.iter().any(|tool| matches!(tool, ClaudeToolSpec::Server(_))) {
-                        nanocodex_agent::ReplaySafety::Safe
-                    } else {
-                        nanocodex_agent::ReplaySafety::Unsafe
-                    },
-                )
-                .await?
-        {
-            let response = serde_json::from_value(value).map_err(durable::recovery_error)?;
-            completed(&response, 0, 0, None);
-            return Ok(response);
+        if let Some(effect) = &context.effect {
+            match effect.begin_with_replay(
+                "model", client.durable_request(&request).map_err(provider_error)?,
+                // Provider tools can mutate remote state. Missing settlement
+                // must not automatically repeat an effect or uncertain charge.
+                if request.tool_choice.as_ref().is_some_and(|choice| choice["type"] == "none")
+                    || !request.tools.iter().any(|tool| matches!(tool, ClaudeToolSpec::Server(_))) {
+                    nanocodex_agent::ReplaySafety::Safe
+                } else { nanocodex_agent::ReplaySafety::Unsafe },
+            ).await? {
+                Step::Replay(value) => {
+                    let response = serde_json::from_value(value).map_err(durable::recovery_error)?;
+                    completed(&response, 0, 0, None);
+                    return Ok(response);
+                }
+                Step::OutcomeUnknown => return Err(durable::recovery_error(
+                    "provider model effect outcome is unknown; reconcile before dispatch").into()),
+                Step::Execute => {}
+            }
+        }
+        if revoked_declaration {
+            return Err(provider_error("prepared Claude request contains a declaration revoked by current host authorization").into());
         }
         if cancel.flag.load(Ordering::SeqCst) {
             return Err(NanocodexError::TurnCancelled.into());

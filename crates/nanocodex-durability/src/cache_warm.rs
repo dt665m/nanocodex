@@ -85,6 +85,9 @@ pub(crate) async fn warm(owner: &crate::session::DurableOwner, operation: &str,
     -> Result<nanocodex_claude::execution::RequestPreparation> {
     policy.validate()?;
     let mut request: nanocodex_claude::MessagesRequest = serde_json::from_value(prepared.request.clone())?;
+    // Match the exact native generation prefix, including its terminal system
+    // breakpoint. This is the same prefix operation used by Claude dispatch.
+    request.cache_system_prefix().map_err(|error| invalid(&error.to_string()))?;
     request.validate_cache_control().map_err(|error| invalid(&error.to_string()))?;
     let ttl = if policy.ttl_seconds == 3600 { "1h" } else { "5m" };
     if !breakpoint(&prepared.request, ttl) {
