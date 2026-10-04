@@ -1,12 +1,12 @@
 import { createBrowserSession, deleteBrowserSession, type BrowserBinding } from "agents/browser";
 import type { NamedTool, ToolContext } from "nanocodex";
 import { parseBrowserLoginRequest, browserLoginIdentity } from "./browser-login";
-import { PrivateBrowserContinuationSession, snapshotBrowserVault, actBrowserVault, type BrowserVaultIdentity, type BrowserVaultAction } from "./browser-vault";
+import { PrivateBrowserContinuationSession, snapshotBrowserVault, actBrowserVault, selectBrowserVaultInput, sanitizeBrowserVaultText, type BrowserVaultInputSelection, type BrowserVaultIdentity, type BrowserVaultAction } from "./browser-vault";
 import { privateVaultTakeover, releasePrivateVaultTakeover, validateBrowserVaultTakeoverAction, rememberPrivateBrowserValues, type BrowserVaultTakeoverAction, type BrowserVaultTouchState } from "./browser-vault-takeover";
 import { privateBrowserOperation, parsePrivateBrowserAction } from "./browser-private-operations";
 
 type Login = { id: string; sessionId: string; targetId: string; origin: string; allowedOrigins: string[];
-  expiresAt: number; owner: string; phase: "review" | "human" | "finished" };
+  expiresAt: number; owner: string; phase: "prepared" | "review" | "human" | "finished" };
 const TTL = 10 * 60_000;
 /** A separate credential browser. No CDP transport or provider URL is exposed to the model.
  * Only metadata is durable; loss of private redaction memory requires a fresh login. */
@@ -27,7 +27,7 @@ export function createBrowserLoginRuntime(options: { storage: DurableObjectStora
       }
     }
     return {type:"browser_login",status:"input_required",request_id:l.id,challenge_id:l.id,agent_id:options.agentId,
-      origin:l.origin,allowed_origins:l.allowedOrigins,expires_at:l.expiresAt,approved:l.phase!=="review",...(loginUrl?{login_url:loginUrl}:{})};
+      origin:l.origin,allowed_origins:l.allowedOrigins,expires_at:l.expiresAt,approved:!["prepared","review"].includes(l.phase),...(loginUrl?{login_url:loginUrl}:{})};
   };
   const close = async () => {
     transport.close(); const login = await options.storage.get<Login>(key);
@@ -65,8 +65,8 @@ export function createBrowserLoginRuntime(options: { storage: DurableObjectStora
     return v;
   };
   const tools: NamedTool[] = [{name:"request_browser_login",supportsParallelToolCalls:false,
-    description:"Open a retained private browser and ask the user to sign in on their phone, without saving a Vault login. Supply one stable operation_id UUID, a public HTTPS URL, and the exact allowed_origins required for authentication redirects/frames. The user reviews the sites before typing. The native app automatically presents the secure input sheet. Use login_url only when the client cannot render native intake or the user explicitly asks for the browser fallback. Passwords, codes and private screenshots never enter chat or model tools. Wait for browser_login_receipt; finished is not proof of account access. Continue with browser_login_snapshot/action using request_id. Browser authentication does not authenticate a CLI or export cookies. Reuse the same operation ID after uncertainty; never silently retry login.",
-    parameters:{type:"object",additionalProperties:false,properties:{operation_id:{type:"string"},url:{type:"string"},allowed_origins:{type:"array",items:{type:"string"},minItems:1,maxItems:8}},required:["operation_id","url"]},
+    description:"Open a retained private browser and ask the user to sign in on their phone, without saving a Vault login. Supply one stable operation_id UUID, a public HTTPS URL, and the exact allowed_origins required for authentication redirects/frames. The user reviews the sites before typing. Prefer defer_input=true to inspect the page before asking for input: this returns page_ready without opening a sheet. Read browser_login_snapshot and choose native_input fields with request_browser_login_input, or omit selection for a browser fallback. The native app presents the secure input sheet when requested. Use login_url only when the client cannot render native intake or the user explicitly asks for the browser fallback. Passwords, codes and private screenshots never enter chat or model tools. Wait for browser_login_receipt; finished is not proof of account access. Continue with browser_login_snapshot/action using request_id. Browser authentication does not authenticate a CLI or export cookies. Reuse the same operation ID after uncertainty; never silently retry login.",
+    parameters:{type:"object",additionalProperties:false,properties:{operation_id:{type:"string"},url:{type:"string"},allowed_origins:{type:"array",items:{type:"string"},minItems:1,maxItems:8},defer_input:{type:"boolean"}},required:["operation_id","url"]},
     handler:(input,ctx)=>exclusive(async()=>{
       options.authorize(ctx);ctx.signal.throwIfAborted();const request=parseBrowserLoginRequest(input);
       return privateBrowserOperation({storage:options.storage,scope:key,operationId:request.operationId,input:request,run:async()=>{
@@ -76,7 +76,7 @@ export function createBrowserLoginRuntime(options: { storage: DurableObjectStora
         let sessionId:string|undefined;
         try{
           const opened=await createBrowserSession(options.browser,{keepAliveMs:TTL,recording:false});sessionId=opened.sessionId;
-          const provisional={id:request.operationId,sessionId,targetId:"pending",origin:new URL(request.url).origin,allowedOrigins:request.allowedOrigins,expiresAt:Date.now()+TTL,owner,phase:"review" as const};
+          const provisional={id:request.operationId,sessionId,targetId:"pending",origin:new URL(request.url).origin,allowedOrigins:request.allowedOrigins,expiresAt:Date.now()+TTL,owner,phase:request.deferInput ? "prepared" as const : "review" as const};
           await options.storage.put(key,provisional);
           return await transport.run(sessionId,identity(provisional),ctx.signal,async cdp=>{
             const {targetId}=await cdp.send("Target.createTarget",{url:"about:blank"});
@@ -84,33 +84,52 @@ export function createBrowserLoginRuntime(options: { storage: DurableObjectStora
             const login={...provisional,targetId};await options.storage.put(key,login);
             const attached=await cdp.attachTarget(targetId);
             const result=await cdp.send("Page.navigate",{url:request.url},attached.sessionId);if(result.errorText)throw new Error();
-            return metadata(login);
+            return request.deferInput ? {type:"browser_login",status:"page_ready",request_id:login.id,next_action:"read_snapshot_and_request_input"} : metadata(login);
           });
         }catch{transport.close();if(sessionId)try{await deleteBrowserSession(options.browser,sessionId);}catch{}throw new Error("Private login opening could not be confirmed");}
       }});
     })},
     {name:"request_browser_login_input",supportsParallelToolCalls:false,
-      description:"Ask for more private input in the same retained login browser, such as a later password or verification code. Requires the current request_id and one stable operation_id UUID. The native app automatically presents the secure input sheet; use login_url only when native intake is unavailable or the user requests the browser fallback. Returns a fresh request_id/challenge_id without navigating, creating a browser, or losing login state. Use the new request_id for subsequent snapshots/actions. Wait for browser_login_receipt, then inspect a snapshot. Reuse identical arguments after uncertainty; never repeat the browser action that prompted the input.",
-      parameters:{type:"object",additionalProperties:false,properties:{request_id:{type:"string"},operation_id:{type:"string"}},required:["request_id","operation_id"]},
+      description:"Ask for more private input in the same retained login browser, such as a later password or verification code. First read browser_login_snapshot, then supply snapshot_id and fields [{ref,label?}] to choose the native inputs from that page, optionally with a short reason explaining what the user should enter. All input types supported by native_input=true are eligible, including ordinary text, multiline notes, selects and checkboxes. Labels describe the existing fields; never supply input values or secrets. Browser-derived keyboard/autofill hints are preserved. A stale_page result leaves the current request intact: read a fresh snapshot and use a new operation_id. Requires the current request_id and one stable operation_id UUID. The native app automatically presents the secure input sheet; use login_url only when native intake is unavailable or the user requests the browser fallback. Returns a fresh request_id/challenge_id without navigating, creating a browser, or losing login state. Use the new request_id for subsequent snapshots/actions. Wait for browser_login_receipt, then inspect a snapshot. Reuse identical arguments after uncertainty; never repeat the browser action that prompted the input.",
+      parameters:{type:"object",additionalProperties:false,properties:{request_id:{type:"string"},operation_id:{type:"string"},snapshot_id:{type:"string"},fields:{type:"array",minItems:1,maxItems:32,items:{type:"object",additionalProperties:false,properties:{ref:{type:"string"},label:{type:"string",maxLength:160}},required:["ref"]}},reason:{type:"string",maxLength:500}},required:["request_id","operation_id"]},
       handler:(input,ctx)=>exclusive(async()=>{
-        options.authorize(ctx);ctx.signal.throwIfAborted();const v=requestId(input,["operation_id"]);
+        options.authorize(ctx);ctx.signal.throwIfAborted();const v=requestId(input,["operation_id","snapshot_id","fields","reason"]);
+        let selection: BrowserVaultInputSelection | undefined;
+        if (v.snapshot_id !== undefined || v.fields !== undefined || v.reason !== undefined) {
+          if (typeof v.snapshot_id !== "string" || !/^[0-9a-f-]{36}$/i.test(v.snapshot_id)
+            || !Array.isArray(v.fields) || !v.fields.length || v.fields.length > 32
+            || (v.reason !== undefined && (typeof v.reason !== "string" || !v.reason.trim() || v.reason.length > 500))) throw new Error("Provide a current snapshot_id and native input refs");
+          const refs = new Set<string>();
+          const fields = v.fields.map(field => {
+            if (!field || typeof field !== "object" || Array.isArray(field) || Object.keys(field).some(k => !["ref","label"].includes(k))
+              || typeof field.ref !== "string" || !/^e(?:[1-9][0-9]?|1[0-9]{2}|200)$/.test(field.ref) || refs.has(field.ref)
+              || (field.label !== undefined && (typeof field.label !== "string" || !field.label.trim() || field.label.length > 160))) throw new Error("Invalid native input field selection");
+            refs.add(field.ref);
+            return {ref:field.ref, ...(field.label !== undefined ? {label:sanitizeBrowserVaultText(field.label,secrets,160)} : {})};
+          });
+          selection = {fields, ...(typeof v.reason === "string" ? {reason:sanitizeBrowserVaultText(v.reason,secrets,500)} : {})};
+        }
         // Look up the operation before the current request: a successful request
         // rotates the identity, but an identical retry must return its same panel.
-        return privateBrowserOperation({storage:options.storage,scope:key,operationId:v.operation_id,input:{action:"request_input",request_id:v.request_id},run:async()=>{
-          const login=await current(v.request_id,"finished");
+        return privateBrowserOperation({storage:options.storage,scope:key,operationId:v.operation_id,input:{action:"request_input",request_id:v.request_id,...(selection ? {snapshot_id:v.snapshot_id,selection} : {})},run:async()=>{
+          const login=await current(v.request_id);
+          if (!["prepared","finished"].includes(login.phase)) throw new Error("Private login is under user control");
           return transport.run(login.sessionId,identity(login),ctx.signal,async cdp=>{
             const bound=await browserLoginIdentity(cdp,identity(login),login.allowedOrigins);
-            const next:Login={...login,id:crypto.randomUUID(),origin:bound.expected_origin,phase:"human",expiresAt:Date.now()+TTL};
+            const selected = selection ? await selectBrowserVaultInput(cdp,bound,v.snapshot_id as string,selection) : undefined;
+            if (selection && !selected) return {status:"stale_page",request_id:login.id,next_action:"read_snapshot_and_request_input"};
+            const next:Login={...login,id:crypto.randomUUID(),origin:bound.expected_origin,phase:login.phase === "prepared" ? "review" : "human",expiresAt:Date.now()+TTL};
             await options.storage.put(key,next);
-            touch={};segment=undefined;
+            touch=selected ? {nativeSelection:selected} : {};segment=undefined;
             return metadata(next);
           });
         }});
       })},
     {name:"browser_login_snapshot",supportsParallelToolCalls:false,
-      description:"Read a bounded redacted account view after the user finishes a one-time private login. Requires request_id. Finished is not proof of authentication; verify account content. No input values, cookies, raw DOM, screenshots or provider URLs. Unavailable during human control or after runtime recovery; close and request new login if private state is lost.",
+      description:"Read a bounded redacted page view after defer_input=true preparation or after the user finishes private input. Native-input eligibility and types let you choose a grounded native sheet with request_browser_login_input. Requires request_id. Finished is not proof of authentication; verify account content. No input values, cookies, raw DOM, screenshots or provider URLs. Unavailable during human control or after runtime recovery; close and request new login if private state is lost.",
       parameters:{type:"object",additionalProperties:false,properties:{request_id:{type:"string"}},required:["request_id"]},
-      handler:(input,ctx)=>exclusive(async()=>{options.authorize(ctx);const v=requestId(input),login=await current(v.request_id,"finished");
+      handler:(input,ctx)=>exclusive(async()=>{options.authorize(ctx);const v=requestId(input),login=await current(v.request_id);
+        if (!["prepared","finished"].includes(login.phase)) throw new Error("Private login is under user control");
         return transport.run(login.sessionId,identity(login),ctx.signal,async cdp=>{
           const bound=await browserLoginIdentity(cdp,identity(login),login.allowedOrigins);
           return snapshotBrowserVault(cdp,bound,secrets);

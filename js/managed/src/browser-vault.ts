@@ -347,7 +347,7 @@ export type BrowserVaultInspection = {
 export type BrowserVaultSnapshot = BrowserVaultInspection & {
   snapshot_id: string; title: string; text: string;
   elements: { ref: string; role: "link" | "button" | "input" | "textarea" | "select" | "checkbox" | "radio"; text: string;
-    options?: { index: number; label: string }[]; checked?: boolean }[];
+    options?: { index: number; label: string }[]; checked?: boolean; native_input: boolean; input_type?: string }[];
 };
 const USERNAME_SELECTOR = 'input:not([type]):not([autocomplete="one-time-code"]),input[type="text"]:not([autocomplete="one-time-code"]),input[type="email"]';
 const PASSWORD_SELECTOR = 'input[type="password"]';
@@ -440,6 +440,22 @@ export const BROWSER_VAULT_CONTINUATION_FUNCTION = `function(origin, mode, snaps
   const fieldState = el => [el.outerHTML, 'value' in el ? el.value : null,
     'checked' in el ? el.checked : null, el instanceof HTMLSelectElement ? [...el.options].map(o => o.selected) : null];
   const formState = form => form ? JSON.stringify([form.outerHTML, [...form.elements].map(fieldState)]) : null;
+  const nativeInput = el => !el.readOnly && (
+    el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement && !el.multiple && el.options.length <= 200
+    || el instanceof HTMLInputElement && ['text','search','email','url','tel','number','password','checkbox'].includes(el.type));
+  if (mode === 'request_input') {
+    const snapshot = globalThis.__nanocodexVaultSnapshot;
+    if (!snapshot || snapshot.id !== snapshotId || snapshot.document !== document || snapshot.href !== location.href) return false;
+    if (challenge) return false;
+    const entries = payload.fields.map(field => ({...snapshot.nodes.get(field.ref), requestedLabel:field.label}));
+    const valid = () => snapshot.document === document && snapshot.href === location.href && entries.every(entry => entry.el && safeControl(entry.el) && nativeInput(entry.el)
+      && label(entry.el) === entry.label && JSON.stringify(fieldState(entry.el)) === entry.state
+      && associatedForm(entry.el) === entry.form && formState(entry.form) === entry.formState);
+    if (!valid()) return false;
+    // Retain actual nodes only in this isolated world. Never expose selectors or values.
+    globalThis.__nanocodexNativeSelection = {id:ref, document, href:location.href, entries, reason:payload.reason, valid};
+    return true;
+  }
   if (['click','fill','select','check'].includes(mode)) {
     const snapshot = globalThis.__nanocodexVaultSnapshot;
     if (!snapshot) return 'snapshot_missing';
@@ -517,7 +533,7 @@ export const BROWSER_VAULT_CONTINUATION_FUNCTION = `function(origin, mode, snaps
     nodes.set(key, {el, label:text, state:JSON.stringify(fieldState(el)), form, formState:formState(form)});
     // Never read submit input values as labels; options expose indices and labels only.
     const options = kind === 'select' ? [...el.options].flatMap((option, index) => option.hidden || option.closest('optgroup[hidden]') ? [] : [{index, label:option.label.length <= 8192 ? option.label : ''}]) : undefined;
-    elements.push({ref:key, role:kind, text, ...(options ? {options} : {}), ...(['checkbox','radio'].includes(kind) ? {checked:el.checked} : {})});
+    elements.push({ref:key, role:kind, text, native_input:nativeInput(el), ...(nativeInput(el) ? {input_type:el instanceof HTMLTextAreaElement ? 'text' : el instanceof HTMLSelectElement ? 'select' : el.type} : {}), ...(options ? {options} : {}), ...(['checkbox','radio'].includes(kind) ? {checked:el.checked} : {})});
   }
   globalThis.__nanocodexVaultSnapshot = {id:snapshotId, document, href:location.href, nodes};
   return {status, flags, snapshot_id:snapshotId, title:document.title.length <= 8192 ? document.title : '', text:readable(document.body || document.documentElement), elements};
@@ -548,7 +564,7 @@ async function privateWorld(cdp: PrivateBrowserChannel, request: BrowserVaultIde
     || verifiedFrame.loaderId !== frame.loaderId || new URL(verifiedFrame.url).origin !== request.expected_origin) throw new Error();
   return { sessionId: attached.sessionId as string, executionContextId: world.executionContextId as number, loaderId: frame.loaderId as string };
 }
-async function continuation(cdp: PrivateBrowserChannel, request: BrowserVaultIdentity, mode: string, snapshotId = "", ref = "", url = "", payload?: string | number | boolean) {
+async function continuation(cdp: PrivateBrowserChannel, request: BrowserVaultIdentity, mode: string, snapshotId = "", ref = "", url = "", payload?: string | number | boolean | BrowserVaultInputSelection) {
   const world = await privateWorld(cdp, request);
   if (!world) return null;
   const result = await cdp.send("Runtime.callFunctionOn", {
@@ -653,12 +669,22 @@ export async function snapshotBrowserVault(cdp: PrivateBrowserChannel, request: 
         || typeof option.label !== "string" || option.label.length > 8192))) throw new Error();
       const checkable = el.role === "checkbox" || el.role === "radio";
       if (checkable && typeof el.checked !== "boolean") throw new Error();
-      return { ref: el.ref as string, role: el.role as BrowserVaultSnapshot["elements"][number]["role"], text: clean(el.text, 256),
+      return { ref: el.ref as string, role: el.role as BrowserVaultSnapshot["elements"][number]["role"], text: clean(el.text, 256), native_input:el.native_input === true,
+        ...(el.native_input === true && ["text","search","email","url","tel","number","password","select","checkbox"].includes(el.input_type) ? {input_type:el.input_type as string} : {}),
         ...(options ? { options: options.map((option: {index: number; label: string}) => ({index: option.index, label: clean(option.label, 256)})) } : {}),
         ...(checkable ? { checked: el.checked as boolean } : {}) };
     });
     return { ...status, snapshot_id: id, title: clean(value.title, 256), text: clean(value.text, 12000), elements };
   } catch { throw new Error("Private page snapshot is unavailable"); }
+}
+
+export type BrowserVaultInputSelection = { fields: {ref: string; label?: string}[]; reason?: string };
+/** Bind an agent's field choice to the exact redacted snapshot, without any input. */
+export async function selectBrowserVaultInput(cdp: PrivateBrowserChannel, request: BrowserVaultIdentity,
+  snapshotId: string, selection: BrowserVaultInputSelection): Promise<string | undefined> {
+  const id = crypto.randomUUID();
+  try { return await continuation(cdp, request, "request_input", snapshotId, id, "", selection) === true ? id : undefined; }
+  catch { return undefined; }
 }
 
 // Only these fixed host-owned categories may cross the private diagnostic boundary.

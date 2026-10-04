@@ -40,6 +40,10 @@ try {
     if (namecheapFixture.handler(req,res)) return;
     if (req.url.startsWith('/v1/agents/')) { handleControl(req,res); return; }
     res.setHeader('Content-Type','text/html');
+    if (req.url === '/profile') {
+      res.end('<meta name="viewport" content="width=device-width,initial-scale=1"><style>body{font:16px sans-serif}label,input,select,textarea{display:block;margin:8px;min-height:24px}</style><h1>Delivery preferences</h1><label>Contact email<input id="contact" type="email" autocomplete="email"></label><label>Delivery country<select id="country"><option value="">Choose country</option><option value="ca">Canada</option><option value="uk">United Kingdom</option><option disabled>Unavailable</option></select></label><label>Delivery notes<textarea id="notes"></textarea></label><label>Send status updates<input id="updates" type="checkbox"></label><label>Unrelated field<input id="unrelated"></label><button id="save">Save preferences</button><script>window.counts={input:0,change:0,click:0};document.addEventListener("input",()=>counts.input++);document.addEventListener("change",()=>counts.change++);document.addEventListener("click",()=>counts.click++);</script>');
+      return;
+    }
     if (req.url === '/otp') {
       res.end('<meta name="viewport" content="width=device-width,initial-scale=1"><style>input{display:block;height:40px;margin:12px}</style><span id="code-label">Verification code</span> <span id="delivery-label">from your device</span><input id="otp" aria-labelledby="code-label delivery-label" aria-label="Fallback label" autocomplete="section-login one-time-code" inputmode="numeric"><input id="account" aria-label="Account" autocomplete="username webauthn"><input id="unsupported" aria-label="Other" autocomplete="arbitrary-private-marker" inputmode="none"><iframe title="Embedded unsupported input" srcdoc="<input autocomplete=one-time-code>"></iframe>');
       return;
@@ -265,6 +269,87 @@ try {
   const snapshot=JSON.stringify(await tool('browser_login_snapshot',{request_id:activeId}));
   for(const value of [...privateValues,...normalized,...otpValues]){assert.ok(!snapshot.includes(value));assert.ok(!JSON.stringify([...durable]).includes(value));}
   await tool('browser_login_close',{});
+  // Agent chooses the sheet from a redacted page; all user input crosses the
+  // authenticated HTTPS boundary, never a model argument or remote click.
+  const nativeHuman=async action=>{
+    const response=await requestPrivate('/v1/agents/fixture-agent/browser-vault/takeover',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({challenge_id:activeId,...action})});
+    assert.equal(response.status,200);return response.json();
+  };
+  const prepared=await tool('request_browser_login',{operation_id:crypto.randomUUID(),url:origin+'/profile',allowed_origins:[origin],defer_input:true});
+  assert.equal(prepared.status,'page_ready');activeId=prepared.request_id;
+  assert.equal(decodeVaultIntake({name:'request_browser_login',status:'completed',output:JSON.stringify(prepared)}),undefined,'preparation does not present a premature sheet');
+  loginPage=loginBrowser.contexts().flatMap(c=>c.pages()).find(p=>p.url()===origin+'/profile');
+  for(let i=0;!loginPage&&i<100;i++){await new Promise(r=>setTimeout(r,30));loginPage=loginBrowser.contexts().flatMap(c=>c.pages()).find(p=>p.url()===origin+'/profile');}
+  await loginPage.locator('#country').waitFor();
+  await assert.rejects(human({action:'observe',native_fields:true}),'prepared browser cannot accept human input until requested/reviewed');
+  let profileSnapshot=await tool('browser_login_snapshot',{request_id:activeId});
+  const selectedFields=snapshot=>[
+    {ref:snapshot.elements.find(e=>e.text==='Delivery country').ref,label:'Country for this delivery'},
+    {ref:snapshot.elements.find(e=>e.text==='Contact email').ref},
+    {ref:snapshot.elements.find(e=>e.text==='Delivery notes').ref},
+    {ref:snapshot.elements.find(e=>e.text==='Send status updates').ref},
+  ];
+  assert.equal(profileSnapshot.elements.find(e=>e.role==='select').native_input,true);
+  assert.equal(profileSnapshot.elements.find(e=>e.role==='select').input_type,'select');
+  const reason='Choose where to deliver and add contact details and instructions.';
+  const requestSelection=snapshot=>({request_id:activeId,operation_id:crypto.randomUUID(),snapshot_id:snapshot.snapshot_id,fields:selectedFields(snapshot),reason});
+  const invalid=requestSelection(profileSnapshot);invalid.fields[0].value='must-not-accept';
+  await assert.rejects(tool('request_browser_login_input',invalid),'model cannot send field values');
+  const staleRequest=requestSelection(profileSnapshot);
+  await loginPage.locator('#country option').nth(1).evaluate(e=>e.textContent='Changed country');
+  const stale=await tool('request_browser_login_input',staleRequest);
+  assert.equal(stale.status,'stale_page');assert.equal(stale.request_id,activeId);
+  assert.deepEqual(await tool('request_browser_login_input',staleRequest),stale,'stale request retry is a stable receipt');
+  assert.equal(durable.get('browser-login:fixture-agent').phase,'prepared','stale request does not acquire user control');
+  await loginPage.locator('#country option').nth(1).evaluate(e=>e.textContent='Canada');
+  profileSnapshot=await tool('browser_login_snapshot',{request_id:activeId});
+  const selectionArgs=requestSelection(profileSnapshot), selectedPanel=await tool('request_browser_login_input',selectionArgs);
+  assert.equal(selectedPanel.status,'input_required');assert.equal(selectedPanel.approved,false);
+  assert.deepEqual(await tool('request_browser_login_input',selectionArgs),selectedPanel);
+  activeId=selectedPanel.request_id;
+  await nativeHuman({action:'approve'});
+  const controls={action:'observe',native_fields:true,native_field_hints:true,native_field_controls:true,viewport:{width:390,height:740,mobile:true}};
+  let selectedFrame=await nativeHuman(controls);
+  assert.equal(selectedFrame.native_form.reason,reason);
+  assert.deepEqual(selectedFrame.native_form.fields.map(f=>[f.label,f.type,f.multiline]),[
+    ['Country for this delivery','select',false],['Contact email','email',false],['Delivery notes','text',true],['Send status updates','checkbox',false],
+  ]);
+  assert.equal(selectedFrame.native_form.fields[1].autocomplete,'email');
+  assert.deepEqual(selectedFrame.native_form.fields[0].options,[{index:0,label:'Choose country'},{index:1,label:'Canada'},{index:2,label:'United Kingdom'}]);
+  assert.equal(selectedFrame.native_form.fields[3].checked,false);
+  assert.ok(!JSON.stringify(selectedFrame.native_form).includes('Unrelated field'));
+  // Page replacement while the sheet is open returns an explicit stale marker.
+  await loginPage.locator('#country').evaluate(e=>e.replaceWith(e.cloneNode(true)));
+  const staleSheet=await nativeHuman(controls);
+  assert.equal(staleSheet.native_form_status,'stale');assert.equal(staleSheet.native_form,undefined);
+  assert.equal((await nativeHuman(controls)).native_form_status,'stale','refresh must not silently switch the requested fields');
+  await nativeHuman({action:'finish'});
+  profileSnapshot=await tool('browser_login_snapshot',{request_id:activeId});
+  const recoveredPanel=await tool('request_browser_login_input',requestSelection(profileSnapshot));
+  assert.equal(recoveredPanel.approved,true);activeId=recoveredPanel.request_id;
+  selectedFrame=await nativeHuman(controls);
+  const chosenValues=['2','synthetic-profile@example.test','Leave by the side door.\nRing once.','true'];
+  const invalidOption=batch(selectedFrame,chosenValues);invalidOption.fields[0].value='3';
+  const denied=await requestPrivate('/v1/agents/fixture-agent/browser-vault/takeover',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({challenge_id:activeId,...invalidOption})});
+  assert.equal(denied.status,409,'disabled options fail before any input');
+  assert.equal(await loginPage.locator('#contact').inputValue(),'');
+  selectedFrame=await nativeHuman(controls);
+  await nativeHuman(batch(selectedFrame,chosenValues));
+  assert.equal(await loginPage.locator('#country').inputValue(),'uk');
+  assert.equal(await loginPage.locator('#contact').inputValue(),chosenValues[1]);
+  assert.equal(await loginPage.locator('#notes').inputValue(),chosenValues[2]);
+  assert.equal(await loginPage.locator('#updates').isChecked(),true);
+  assert.equal(await loginPage.locator('#unrelated').inputValue(),'');
+  assert.deepEqual(await loginPage.evaluate(()=>counts),{input:4,change:4,click:0},'native sheet fills all chosen controls without remote clicks or submitting');
+  await loginPage.evaluate(values=>{const p=document.createElement('p');p.textContent=values.join(' ');document.body.append(p);},chosenValues);
+  await nativeHuman({action:'finish'});
+  const profileAfter=await tool('browser_login_snapshot',{request_id:activeId});
+  for(const value of chosenValues.slice(1,3)){assert.ok(!JSON.stringify(profileAfter).includes(value));assert.ok(!JSON.stringify([...durable]).includes(value));}
+  const profileOutput=new URL('../../../output/private-native-fields/',import.meta.url);mkdirSync(profileOutput,{recursive:true});
+  writeFileSync(new URL('agent-selected-input-journey.json',profileOutput),JSON.stringify({prepared,selection:selectionArgs,stale_request:stale,selected_fields:selectedFrame.native_form.fields,reason,stale_sheet:staleSheet.native_form_status,event_counts:await loginPage.evaluate(()=>counts),recovery:'fresh snapshot and sheet in retained browser',redaction:'private values absent from model snapshot and durable storage'},null,2));
+  await loginPage.screenshot({path:new URL('agent-selected-profile.png',profileOutput).pathname});
+  await tool('browser_login_close',{});
+  console.log('PASS: page-aware native selection, grounded labels and reason, private select/checkbox/multiline fill with zero remote clicks, stale page handback and recovery');
   // Public Namecheap login structure, then a synthetic server-verified OTP.
   // No live Namecheap credentials, post-password markup or WebAuthn are used.
   await loginBrowser.close();loginBrowser=undefined;

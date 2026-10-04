@@ -128,13 +128,31 @@ actions, and verify the result; handback is not proof of sign-in or task complet
 An uncertain fill is never automatically retried. A confirmed fill followed by
 an uncertain handback offers handback recovery without sending the values again.
 
-For a later password or verification-code step in a one-time login, call
-`request_browser_login_input({request_id, operation_id})` after handback. It
+For page-aware input from the first step, open with
+`request_browser_login({operation_id, url, allowed_origins, defer_input: true})`.
+This returns `status: "page_ready"` and a `request_id` without presenting a sheet.
+Read `browser_login_snapshot` for the redacted page and its `native_input` eligibility
+and `input_type` metadata. Then call `request_browser_login_input` with that
+`snapshot_id`, `fields: [{ref, label?}]`, and an optional short `reason`. The agent
+chooses which existing fields to present and their order; keyboard and autofill
+hints still come from the browser. Neither tool accepts field values. The first
+sheet retains origin review before input is allowed.
+
+After any later handback, use the same snapshot/selection flow for text, multiline
+notes, selects, checkboxes, passwords, or verification codes. Omitting selection
+retains automatic field discovery and private browser fallback. The request
 retains the same browser and redaction state and returns a fresh
 `request_id == challenge_id`; use that new ID for subsequent operations. The
 fresh ID opens a new native sheet and invalidates controls from the earlier
 sheet. Repeating the identical operation returns the same request without
 replaying the website action. A finished receipt releases human control only.
+
+Selection is bound to the current snapshot's actual elements and page. A changed
+snapshot or field returns `status: "stale_page"` with the unchanged request ID;
+read a fresh snapshot and use a new operation ID. If a selected page changes while
+the sheet is open, a capable native client receives `native_form_status: "stale"`
+and no form. Refresh never silently replaces the agent's selection. The user can
+hand back to the agent for a new snapshot and sheet in the retained browser.
 
 The remote website is an explicit fallback for visual challenges or unsupported
 controls. Native clients do not switch to it after filling a form.
@@ -146,7 +164,19 @@ inside the viewport. Clients can additionally negotiate `native_field_hints: tru
 with `native_fields: true` to receive allowlisted `autocomplete` and `inputmode`
 metadata for native password, verification-code and keyboard behavior. Older
 clients retain their original strict field schema. A `webauthn` autocomplete token
-is not proof of passkey support. Custom controls, shadow DOM and iframes retain the viewport fallback. Each descriptor
+is not proof of passkey support.
+
+Clients can additionally opt into `native_field_controls: true` with
+`native_fields: true`. This extends discovery to single-select controls and
+checkboxes, and to rendered fields outside the viewport. On-screen covered fields
+remain ineligible. Select descriptors have `type: "select"` and bounded
+`options: [{index, label}]`, excluding disabled/hidden options; no selected value
+is copied. Checkbox descriptors have `type: "checkbox"` and `checked`. Private
+`fill_fields` values remain strings: the decimal option index for a select,
+`"true"` or `"false"` for a checkbox. An agent-selected form includes the optional
+`reason` and any requested labels. Old clients retain their original descriptor
+schema. Radio groups, custom controls, shadow DOM and iframes retain the viewport
+fallback. Each descriptor
 is bound to its document, origin and exact elements, and consumed once. A refresh
 or any other action issues fresh references. Batches are bounded to 32 fields,
 4096 UTF-16 code units per value and 32768 UTF-8 bytes in total. The batch HTTP
@@ -164,13 +194,17 @@ redacted even when the action response is lost.
 Run the synthetic Chromium journey with:
 
 ```sh
-CHROME_PATH=/path/to/chrome node --experimental-strip-types js/managed/test/browser-vault-takeover.chrome.mjs
+CHROME_PATH=/path/to/chrome node --experimental-transform-types js/managed/test/browser-vault-takeover.chrome.mjs
 ```
 
-It writes its timing and checked outcomes to ignored `output/private-native-fields/`.
+It exercises page preparation, grounded selection, mixed native input with zero
+remote clicks, stale-page handback/reselection, private redaction, and retained
+password/OTP continuation. It writes its timing, descriptors, outcomes, and a
+synthetic page screenshot to ignored `output/private-native-fields/`.
 
 Updated native clients retry an HTTP 400 capability observation without field
-hints first, then without native fields if the older server still rejects it.
+controls first, then without field hints, then without native fields if the older
+server still rejects it.
 These read-only capability choices persist for the sheet. A fill is never
 automatically retried; a confirmed fill with an uncertain handback retries only
 the handback receipt.
