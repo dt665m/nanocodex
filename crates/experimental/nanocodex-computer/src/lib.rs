@@ -60,10 +60,12 @@ const PROVIDER_ENVIRONMENT: &[&str] = &[
 /// computer-use and browser-use confirmation policy documentation.
 const CONFIRMATION_POLICIES_META_KEY: &str = "openai/confirmation_policies";
 
-/// Trusted embedding-host environment variable that overrides the upstream
-/// confirmation policy documentation without code changes. It is read by the
-/// discovery paths only and never inherited by the provider process: the
-/// override text travels as per-call `_meta`, not as process environment.
+/// Trusted embedding-host environment variable that overrides the default
+/// confirmation policy without code changes. A non-blank value other than
+/// `off`/`none`/`0` replaces the override text; `off`/`none`/`0` restores the
+/// upstream built-in policy; unset keeps the supercharged default. It is read
+/// by the discovery paths only and never inherited by the provider process:
+/// the override text travels as per-call `_meta`, not as process environment.
 const CONFIRMATION_POLICIES_ENV: &str = "NANOCODEX_COMPUTER_CONFIRMATION_POLICIES";
 
 /// Override text that replaces the upstream computer-use confirmation policy.
@@ -80,8 +82,9 @@ pub struct ComputerConfig {
     provider_catalog: Option<Vec<ProviderTool>>,
     #[cfg(unix)]
     catalog_cache: Option<startup_cache::CatalogCache>,
-    /// Per-call `_meta` override for the upstream confirmation policy
-    /// documentation. `None` sends no override and keeps upstream defaults.
+    /// Per-call `_meta` override for the confirmation policy documentation.
+    /// Defaults to [`NO_CONFIRMATION_POLICIES`]; `None` sends no override and
+    /// restores the upstream built-in policy.
     confirmation_policies: Option<String>,
 }
 
@@ -94,7 +97,10 @@ impl ComputerConfig {
             provider_catalog: None,
             #[cfg(unix)]
             catalog_cache: None,
-            confirmation_policies: None,
+            // The supercharged default: replace the upstream always-confirm
+            // computer-use policy with no policy, so the embedding host's own
+            // instructions are the only limit on computer use.
+            confirmation_policies: Some(NO_CONFIRMATION_POLICIES.to_string()),
         }
     }
 
@@ -103,33 +109,48 @@ impl ComputerConfig {
         Self::new(executable)
     }
 
-    /// Override the upstream computer-use confirmation policy documentation
-    /// sent with every provider call. The text replaces the provider's
-    /// built-in "Computer/Browser Use Confirmation Policy" docs, including the
+    /// Override the computer-use confirmation policy documentation sent
+    /// with every provider call. The text replaces the provider's built-in
+    /// "Computer/Browser Use Confirmation Policy" docs, including the
     /// always-confirm hand-off rules that normally require a human for
     /// send, delete, purchase and sign-in actions.
     ///
-    /// Blank text is ignored and no override is sent: upstream treats a blank
-    /// value as "use the defaults", so storing it would silently restore the
-    /// built-in policy. Use [`Self::confirmation_policies`] (or
-    /// [`NO_CONFIRMATION_POLICIES`]) with non-blank text to disable the layer.
+    /// The default is already [`NO_CONFIRMATION_POLICIES`]: supercharged
+    /// computer use with no upstream confirmation layer, leaving the
+    /// embedding host's instructions and AGENTS.md as the only limits. Pass
+    /// other non-blank text to substitute a custom policy.
+    ///
+    /// Blank text is ignored and keeps the current value: upstream treats a
+    /// blank value as "use the defaults", so sending it would silently
+    /// restore the built-in policy.
     pub fn confirmation_policies(mut self, text: impl Into<String>) -> Self {
         let text = text.into();
-        self.confirmation_policies = if text.trim().is_empty() {
-            None
-        } else {
-            Some(text)
-        };
+        if !text.trim().is_empty() {
+            self.confirmation_policies = Some(text);
+        }
         self
     }
 
-    /// Apply one trusted embedding-host confirmation-policy override value.
+    /// Restore the upstream built-in confirmation policy documentation. No
+    /// `openai/confirmation_policies` key is sent, so the provider's own
+    /// always-confirm and hand-off rules apply again.
+    pub fn upstream_confirmation_policies(mut self) -> Self {
+        self.confirmation_policies = None;
+        self
+    }
+
+    /// Apply one trusted embedding-host confirmation-policy value.
     /// Pure over `value` so discovery behavior stays testable without racing
     /// process-wide environment mutation in parallel tests.
     fn confirmation_policies_from(self, value: Option<std::ffi::OsString>) -> Self {
-        match value.filter(|value| !value.is_empty()) {
-            Some(text) => self.confirmation_policies(text.to_string_lossy().into_owned()),
-            None => self,
+        let Some(text) = value.filter(|value| !value.is_empty()) else {
+            return self;
+        };
+        let text = text.to_string_lossy();
+        if matches!(text.trim().to_ascii_lowercase().as_str(), "off" | "none" | "0") {
+            self.upstream_confirmation_policies()
+        } else {
+            self.confirmation_policies(text.into_owned())
         }
     }
 
@@ -737,7 +758,7 @@ mod confirmation_policy_tests {
     use super::*;
 
     #[test]
-    fn call_meta_omits_the_override_when_not_configured() {
+    fn call_meta_omits_the_override_when_upstream_policies_are_restored() {
         assert_eq!(
             call_meta("session", Some("session:7"), "call-a", "fixture", None),
             json!({"x-codex-turn-metadata": turn_metadata("session", Some("session:7"), "call-a", "fixture")})
@@ -768,16 +789,9 @@ mod confirmation_policy_tests {
     }
 
     #[test]
-    fn blank_override_text_is_ignored_because_upstream_treats_it_as_defaults() {
-        assert!(ComputerConfig::mcp("/fixture/cua-provider")
-            .confirmation_policies("   \n\t ")
-            .confirmation_policies.is_none());
-        assert!(ComputerConfig::mcp("/fixture/cua-provider")
-            .confirmation_policies("")
-            .confirmation_policies.is_none());
+    fn every_config_defaults_to_no_confirmation_policy() {
         assert_eq!(
             ComputerConfig::mcp("/fixture/cua-provider")
-                .confirmation_policies(NO_CONFIRMATION_POLICIES)
                 .confirmation_policies
                 .as_deref(),
             Some(NO_CONFIRMATION_POLICIES)
@@ -785,26 +799,73 @@ mod confirmation_policy_tests {
     }
 
     #[test]
-    fn trusted_env_override_is_applied_to_discovered_providers() {
-        // Blank discovery values never disable the upstream defaults.
-        assert!(ComputerConfig::mcp("/fixture/cua-provider")
-            .confirmation_policies_from(None)
-            .confirmation_policies
-            .is_none());
-        assert!(ComputerConfig::mcp("/fixture/cua-provider")
-            .confirmation_policies_from(Some("   ".into()))
-            .confirmation_policies
-            .is_none());
-        let configured = ComputerConfig::mcp("/fixture/cua-provider")
-            .confirmation_policies_from(Some("Custom policy.".into()));
-        assert_eq!(configured.confirmation_policies.as_deref(), Some("Custom policy."));
+    fn restoring_upstream_policies_omits_the_override_key() {
+        assert!(
+            ComputerConfig::mcp("/fixture/cua-provider")
+                .upstream_confirmation_policies()
+                .confirmation_policies
+                .is_none()
+        );
     }
 
     #[test]
-    fn explicit_provider_settings_never_inherit_a_policy_by_default() {
-        assert!(ComputerConfig::mcp("/fixture/cua-provider")
-            .confirmation_policies
-            .is_none());
+    fn blank_override_text_is_ignored_because_upstream_treats_it_as_defaults() {
+        // Blank must never replace a configured policy: upstream reads a blank
+        // value as "use the defaults" and would restore the built-in policy.
+        let configured = ComputerConfig::mcp("/fixture/cua-provider")
+            .confirmation_policies("Custom policy.");
+        assert_eq!(
+            configured
+                .clone()
+                .confirmation_policies(" \n\t ")
+                .confirmation_policies
+                .as_deref(),
+            Some("Custom policy.")
+        );
+        assert_eq!(
+            configured
+                .confirmation_policies("")
+                .confirmation_policies
+                .as_deref(),
+            Some("Custom policy.")
+        );
+    }
+
+    #[test]
+    fn trusted_env_value_replaces_the_default_or_restores_upstream_policies() {
+        // Unset or blank keeps the supercharged default.
+        assert_eq!(
+            ComputerConfig::mcp("/fixture/cua-provider")
+                .confirmation_policies_from(None)
+                .confirmation_policies
+                .as_deref(),
+            Some(NO_CONFIRMATION_POLICIES)
+        );
+        assert_eq!(
+            ComputerConfig::mcp("/fixture/cua-provider")
+                .confirmation_policies_from(Some("   ".into()))
+                .confirmation_policies
+                .as_deref(),
+            Some(NO_CONFIRMATION_POLICIES)
+        );
+        // Custom non-blank text replaces the default.
+        assert_eq!(
+            ComputerConfig::mcp("/fixture/cua-provider")
+                .confirmation_policies_from(Some("Custom policy.".into()))
+                .confirmation_policies
+                .as_deref(),
+            Some("Custom policy.")
+        );
+        // Explicit off/none/0 restores the upstream built-in policy.
+        for value in ["off", "none", "0", " Off "] {
+            assert!(
+                ComputerConfig::mcp("/fixture/cua-provider")
+                    .confirmation_policies_from(Some(value.into()))
+                    .confirmation_policies
+                    .is_none(),
+                "{value}"
+            );
+        }
     }
 }
 
