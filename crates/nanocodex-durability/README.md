@@ -102,11 +102,11 @@ contract through the Nanocodex WASM host bridge.
 
 Operations are durable accepted units of work. Steps cover every external
 effect inside an operation: model calls, warmup, automatic compaction, and
-tools. Beginning a step returns `Execute` when no output is committed or
-`Replay(output)` when one is. An unfinished step executes again after recovery.
-This deliberately permits duplicate provider billing and duplicate external
-tool effects. Standalone compaction follows the same rule: a committed
-checkpoint replays, while an unfinished transform runs again.
+tools. A new step returns `Execute`; a completed step returns its exact
+`Replay(output)`. An unfinished effect requires both its retained and current
+replay permissions to be safe. Otherwise it returns `OutcomeUnknown`. Model
+calls and compaction explicitly permit replay; ordinary tools do not. See the
+replay contract below before opting a tool into repeatable execution.
 
 An active turn retains one current conversation, its execution phase and counters,
 and only the effects in the current model/tool batch. Advancing to the next batch
@@ -115,21 +115,22 @@ starts at this position; it does not rerun earlier model/tool batches or retain
 copies of their requests. Warmup and pre-turn compaction have explicit phases so
 an interruption cannot repeat prompt preparation or lose its original context.
 The Rust adapter owns these boundaries; hosts do not manage pruning or recovery.
-Format 4 replaces inline payloads and compressed whole-state snapshots with immutable records.
+Format 5 retains replay permission alongside immutable payload records. Format 4
+heads remain readable, with legacy tool intents treated as unsafe.
 
 Completed tool outputs replay exactly without consulting the recovered runtime's
-current tool catalog. Tool availability matters only when an unfinished step
-must execute. Capabilities represented by a tool result, such as spawned-agent
-identity, own their persistence and reconnection semantics outside generic step
-replay. Core spawned descendants remain ephemeral; a host that needs durable
-children must build each child with its own `DurableSession`, stable state ID,
-fence, operation journal and checkpoint. Forking an attached durable checkpoint
-remains unsupported.
+current tool catalog. A receipt for a capability, such as a child agent, requires
+the capability's own durable identity and reconstruction path. The subagent
+registry uses `ChildJournal` on the same fenced store protocol for topology,
+mailboxes, assignments, and results. Each reconstructed child has a separate
+`DurableSession`; it never borrows the parent's execution owner. Hosted durable
+agents install this factory and registry automatically. Lower-level embeddings
+must configure their child factory and durable registry together.
 
-This persists agent execution, not a higher-level task-tree registry. An
-orchestrator that assigns separate tree-local IDs, mailboxes, roles, or status
-must persist that topology independently and map those IDs to agent session
-IDs when it needs cold tree reconstruction.
+Session documents select `Initial`, `Current`, `AsOf`, or `Block` fork behavior.
+The fork checkpoint and selected document values are initialized atomically in
+a fresh destination. Successful operation boundaries remain addressable after
+terminal receipt pruning; reusing one of those operation IDs is rejected.
 
 The execution head contains references, active phase, counters, and a bounded
 receipt tail. SHA-256 addressed records hold exact payloads in chunks of at most

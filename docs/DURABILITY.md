@@ -1,8 +1,10 @@
 # Durability model
 
-Nanocodex has one durability protocol. Rust owns it. Hosts store one opaque,
-complete current-state value, and application layers project those facts for
-their own APIs. Recovery loads one total state value.
+Nanocodex uses one fenced store protocol for durable execution. Rust owns each
+agent's execution head and immutable records; hosts persist them atomically.
+Child registries, session documents, and host effect journals retain their own
+facts at explicit admission and settlement boundaries. Application projections
+do not decide whether an interrupted effect may execute again.
 
 The protocol protects the entire execution lifecycle: prompt admission, model
 requests, warmup, compaction, tool effects, checkpoint commits, cancellation,
@@ -102,22 +104,41 @@ and running attempts in memory under its fenced owner capability. Losing the
 driver loses those claims; it does not require a state mutation to release
 them.
 
-## Agent identity and ephemeral children
+## Agent identity and child ownership
 
-Durability attaches only to the agent explicitly configured with it. Spawned
-children and their descendants do not inherit execution policies, storage owners,
-operation journals, checkpoints, or resumable rollout files.
+A child has a stable tree ID, native session ID, parent, assignment revision,
+and foreground or background lifetime. `ChildJournal` persists topology,
+mailboxes, execution admission, cancellation intent, and results using the
+existing fenced store. Large values use immutable records; the current head
+contains a bounded root reference.
 
-Subagent topology, routing pins, mailboxes, and conversation history live only in
-the running parent runtime. Idle child resources may be unloaded and rehydrated
-from memory within that runtime; this does not write persistent state. Closing or
-reconstructing the parent drops its children. Historical child identifiers are
-not restored as active agents; new work requires a fresh spawn. Parent history
-can retain task descriptions and results without retaining child execution state.
+Hosted agents with durability configure a separate native `DurableSession` for
+each child and reconstruct the registry before returning replayed capabilities.
+A completed spawn receipt therefore refers to the original child. Root and child
+owners remain separate, and reconstruction uses the current host's authorization.
+Saved tool context does not grant new authority. Embeddings that construct native
+agents directly must supply the durable child factory and registry; copying the
+parent's execution policy into a child is not supported.
 
-Root admission, effect recovery, and checkpoint behavior are unchanged. Durable
-replay of a root tool receipt does not recreate a subagent that belonged to a
-previous runtime.
+Background children require a durable parent. Managed recovery alarms reopen
+unfinished background work even after the parent turn has settled. Completed
+children remain addressable without keeping an idle recovery loop running.
+Explicit subtree close records cancellation before stopping native drivers.
+
+## Session documents and forks
+
+Session documents belong to an agent's execution state. Receipt/checkpoint and
+document mutations can commit in one replacement with expected document versions.
+A rejected transaction changes neither. Account-wide app and user-data stores
+remain separate shared records and do not implicitly join this transaction.
+
+Fork policies select the creation value (`Initial`), latest value (`Current`),
+value at the selected successful operation (`AsOf`), or refuse the fork (`Block`).
+The source boundary includes its checkpoint. Immutable operation lookup records
+survive terminal receipt pruning, and destination initialization rejects an
+already occupied state. Historical forks use the original boundary rather than
+reinterpreting the current transcript. Reusing a retained historical operation ID
+is rejected even after its ordinary terminal receipt has expired.
 
 ## Store contract
 
@@ -140,7 +161,9 @@ payloads are recovery scratch data and cannot be used after settlement. Pending
 agent operations retain one current conversation and execution phase, plus only
 the current batch of effect records. A single replacement saves the next
 conversation and retires settled effects; advancing past an unfinished effect is
-rejected. Recovery resumes this batch, with original request settings and token
+rejected unless it is explicitly retained background work. The immutable summary
+cutoff and its pending or completed receipt survive foreground advances. Recovery
+resumes this batch, with original request settings and token
 usage, without replaying earlier batches or storing historical request copies. Encoded payloads share immutable storage
 inside the Rust owner so preparing a replacement does not deep-copy every receipt.
 Managed sessions keep 16 inner terminal receipts; their managed inbox and archive
