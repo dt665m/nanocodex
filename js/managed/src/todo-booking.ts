@@ -45,9 +45,9 @@ export function bookingCalendarWindow(booking: Booking) {
 export function bookingProposal(booking: Booking, schedule: {events?:any[];partial?:boolean;errors?:unknown[];calendars_checked?:number}) {
   if(!schedule.calendars_checked || schedule.partial !== false || !Array.isArray(schedule.events) || !Array.isArray(schedule.errors) || schedule.errors.length) throw new Error("incomplete_calendar_coverage");
   const normalize=(s:string)=>s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu," ").trim();
-  const name=normalize(booking.property);
+  const names=[normalize(booking.property),normalize(booking.property.split(",")[0]!)].filter(name=>name.length>=4);
   const matches=schedule.events.filter(e=>typeof e.title === "string" && typeof e.start === "string" && typeof e.end === "string"
-    && normalize(e.title+" "+(e.location ?? "")).includes(name)
+    && names.some(name=>normalize(e.title+" "+(e.location ?? "")).includes(name))
     && e.start.slice(0,10)<booking.check_out && e.end.slice(0,10)>=booking.check_in);
   return {context:`Confirmed stay at ${booking.property}, ${booking.check_in} to ${booking.check_out}.`,
     recommendation:matches.length ? "A possible matching calendar event exists. Review it before adding another." : "Review this calendar proposal, then approve creation and any invitations.",

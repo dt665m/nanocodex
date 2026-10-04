@@ -37,7 +37,7 @@ export function validGmailDecisionTrace(input: GmailDecisionTrace): boolean {
   if (input.source_url !== undefined && input.source_url !== "" && (typeof input.source_url !== "string" || !/^https:\/\/mail\.google\.com\/mail\/u\/0\/#all\/[A-Za-z0-9_-]{1,128}$/.test(input.source_url))) return false;
   if (input.policy_version === "gmail-inbox-cleanup-v1") return input.decision_id === null && input.reply_probability === null
     && (input.outcome === "archived" ? input.reason.startsWith("archived_") && input.confidence !== null && input.confidence >= 0.98
-      : input.outcome === "unavailable" && ["archive_unknown","low_confidence"].includes(input.reason) || input.outcome === "no_reply" && input.reason === "no_reply");
+      : input.outcome === "unavailable" && ["archive_unknown","low_confidence","invalid_result"].includes(input.reason) || input.outcome === "no_reply" && input.reason === "no_reply");
   if(input.outcome === "archived" || input.reason.startsWith("archived_") || input.reason === "archive_unknown") return false;
   const affirmative = input.outcome === "reply" || input.outcome === "action_review";
   if (affirmative !== (input.decision_id !== null)) return false;

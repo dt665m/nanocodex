@@ -13,11 +13,12 @@ type Page = { type: Event["type"]; historyId: string; chunks: number; index: num
 type Mailbox = {
   config: Config; cursor: string; target: string; renewAt: number; expiration: string;
   pageToken?: string; page?: Page; pending?: Pending; retry: number; lastError?: string;
-  checkAt: number; reconcile: boolean; recentMessageIds: string[];
+  lastPushAt?: number; lastHistoryAt?: number; checkAt: number; reconcile: boolean; recentMessageIds: string[];
   renewalRetry?: number; renewalError?: string;
 };
 const DAY = 86_400_000;
 const HOUR = 3_600_000;
+const RECONCILE_INTERVAL = 5 * 60_000;
 const MAX_PAGES = 4;
 // Small durable chunks leave useful body space per message within the wake cap.
 const MAX_MESSAGES = 5;
@@ -42,7 +43,7 @@ export class GmailPushMailbox {
       let box = await this.state.storage.get<Mailbox>("mailbox");
       if (request.method === "GET" && (path === "/status" || path === "/configure")) {
         return Response.json(box ? { enabled: true, ...box.config, cursor: box.cursor, targetHistoryId: box.target,
-          archive_non_actionable:box.config.archive_non_actionable === true, pending: !!box.pending || !!box.page, renewAt: box.renewAt, expiration: box.expiration, lastError: box.lastError ?? null, renewalError: box.renewalError ?? null } : { enabled: false });
+          archive_non_actionable:box.config.archive_non_actionable === true, lastPushAt:box.lastPushAt ?? null, lastHistoryAt:box.lastHistoryAt ?? null, pending: !!box.pending || !!box.page, renewAt: box.renewAt, expiration: box.expiration, lastError: box.lastError ?? null, renewalError: box.renewalError ?? null } : { enabled: false });
       }
       if (path === "/configure" && request.method === "DELETE") {
         if (request.body !== null) {
@@ -79,6 +80,7 @@ export class GmailPushMailbox {
         // Authenticated stale watch deliveries are acknowledged, never retried forever.
         if (!box || body.emailAddress.toLowerCase() !== box.config.email) return new Response(null, { status: 204 });
         if (newer(body.historyId, box.target)) {
+          box.lastPushAt = Date.now();
           box.target = body.historyId;
           // Arm first: a crash between persistence operations must not strand work.
           await this.state.storage.setAlarm(Date.now() + 1000);
@@ -99,8 +101,9 @@ export class GmailPushMailbox {
         const profile = await this.profile(config);
         if (profile.emailAddress.toLowerCase() !== config.email) return Response.json({ error: "mailbox_mismatch" }, { status: 409 });
         const watch = await this.watch(config);
-        box ??= { config, cursor: watch.historyId, target: watch.historyId, renewAt: 0, expiration: watch.expiration, retry: 0, checkAt: Date.now() + HOUR, reconcile: false, recentMessageIds: [] };
+        box ??= { config, cursor: watch.historyId, target: watch.historyId, renewAt: 0, expiration: watch.expiration, retry: 0, checkAt: Date.now() + RECONCILE_INTERVAL, reconcile: false, recentMessageIds: [] };
         box.config = config;
+        box.checkAt = Math.min(box.checkAt,Date.now()+RECONCILE_INTERVAL);
         box.renewAt = Math.min(Date.now() + DAY, Number(watch.expiration) - 60_000); box.expiration = watch.expiration;
         delete box.renewalRetry; delete box.renewalError;
         if (newer(watch.historyId, box.target)) box.target = watch.historyId;
@@ -135,7 +138,7 @@ export class GmailPushMailbox {
         }
         if (box.checkAt <= Date.now()) {
           box.reconcile = true;
-          box.checkAt = Date.now() + HOUR;
+          box.checkAt = Date.now() + RECONCILE_INTERVAL;
           await this.save(box);
         }
         let delivered = false;
@@ -143,6 +146,7 @@ export class GmailPushMailbox {
           if (!box.page && !box.pending && !box.pageToken && !box.reconcile && !newer(box.target, box.cursor)) break;
           if (!box.page) {
             box.page = await this.readPage(box);
+            box.lastHistoryAt = Date.now();
             await this.save(box);
           }
           const page = box.page;

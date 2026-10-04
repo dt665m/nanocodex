@@ -16,9 +16,10 @@ export async function classifyInboxCleanup(ai:RoutingAi,messages:any[]) {
       criteria:{receipt:"Routine completed transaction, no remaining owner action",completed:"Conversation explicitly finished with no pending owner action",expired:"Dated time-sensitive notice is expired or event is past",waiting:"Other party explicitly owns next step; owner owes nothing now",keep:"Owner action or uncertainty remains"}}}},diagnostics);
     const raw=result as any,answer=(raw.state===undefined?raw:raw.state==="Completed"?raw.result:null)?.answers?.action;
     const probs=answer?.probabilities;
-    if(!answer||!choices.includes(answer.choice)||typeof answer.confidence!=="number"||!Number.isFinite(answer.confidence)||answer.confidence>1||answer.confidence<0.98
+    if(!answer||!choices.includes(answer.choice)||typeof answer.confidence!=="number"||!Number.isFinite(answer.confidence)||answer.confidence>1||answer.confidence<0
       ||!probs||Object.keys(probs).sort().join(",")!==[...choices].sort().join(",")||!choices.every(c=>typeof probs[c]==="number"&&Number.isFinite(probs[c])&&probs[c]>=0&&probs[c]<=1)
-      ||Math.abs(choices.reduce((s,c)=>s+probs[c],0)-1)>0.01||probs[answer.choice]<0.98)return {outcome:"unavailable" as const,choice:null,confidence:null};
+      ||Math.abs(choices.reduce((s,c)=>s+probs[c],0)-1)>0.01)return {outcome:"unavailable" as const,choice:null,confidence:null,reason:"invalid_result" as const};
+    if(answer.confidence<0.98 || probs[answer.choice]<0.98)return {outcome:"unavailable" as const,choice:answer.choice as typeof choices[number],confidence:answer.confidence as number,reason:"low_confidence" as const};
     return {outcome:answer.choice === "keep" ? "keep" as const : "archive" as const,choice:answer.choice as typeof choices[number],confidence:answer.confidence as number};
 }
 export async function cleanupGmailInbox(input:string, deps:{ownerID:string;storage:DurableObjectStorage;binding:Fetcher;ai:RoutingAi;
@@ -37,7 +38,7 @@ export async function cleanupGmailInbox(input:string, deps:{ownerID:string;stora
     if(deps.outcome(await gmailDecisionSourceKey(batch.connectionId,msg.id,previousPolicy))!=="no_reply" || !msg.threadId)continue;
     const key=await gmailDecisionSourceKey(batch.connectionId,msg.id,policy);
     let receipt=storage.sql.exec<{state:string;ids:string;reason:string;confidence:number}>("SELECT * FROM gmail_cleanup_receipts WHERE source_key=?",key).toArray()[0];
-    const observe=async(state:"archived"|"unavailable"|"no_reply",reason:"archived_receipt"|"archived_completed"|"archived_expired"|"archived_waiting"|"archive_unknown"|"no_reply"|"low_confidence",confidence:number|null)=>{
+    const observe=async(state:"archived"|"unavailable"|"no_reply",reason:"archived_receipt"|"archived_completed"|"archived_expired"|"archived_waiting"|"archive_unknown"|"no_reply"|"low_confidence"|"invalid_result",confidence:number|null)=>{
       deps.authorize();await deps.observe({source_key:key,policy_version:policy,outcome:state,reason,classifier_outcome:"success",confidence,reply_probability:null,duration_ms:0,decision_id:null,
         sender:(msg.headers?.from??"").replace(/[\u0000-\u001f\u007f]/g," ").slice(0,60),subject:(msg.headers?.subject??"").replace(/[\u0000-\u001f\u007f]/g," ").slice(0,60),source_url:`https://mail.google.com/mail/u/0/#all/${msg.id}`});
     };
@@ -61,7 +62,7 @@ export async function cleanupGmailInbox(input:string, deps:{ownerID:string;stora
     const fingerprint=await todoMailContextFingerprint(thread);
     const classification=await classifyInboxCleanup(deps.ai,thread.messages);
     deps.authorize();
-    if(classification.outcome === "unavailable"){await observe("unavailable","low_confidence",null);continue;}
+    if(classification.outcome === "unavailable"){await observe("unavailable",classification.reason,classification.confidence);continue;}
     const answer={choice:classification.choice!,confidence:classification.confidence!};
     if(answer.choice==="keep") {await observe("no_reply","no_reply",answer.confidence);storage.sql.exec("INSERT INTO gmail_cleanup_receipts VALUES(?,'kept','[]','no_reply',?)",key,answer.confidence);continue;}
     thread=await read();deps.authorize();

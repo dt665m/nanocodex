@@ -93,7 +93,7 @@ conversations do not block background mail processing.
 
 Work per alarm and the message IDs included in each event are bounded. Renewal
 catches up from the existing cursor; it never replaces an unprocessed cursor with
-the watch result. An hourly backend-only history check recovers missed pushes.
+the watch result. A five-minute backend-only history check recovers missed pushes.
 Each alarm delivers at most one event with up to five new message IDs; remaining
 chunks stay durable for subsequent processing. An expired history cursor produces
 an explicit resynchronization event rather than silently claiming all intervening
@@ -171,3 +171,7 @@ These workflows process new inbox deliveries. Enabling a watch does not replay
 historical inbox mail, and a notice becoming stale later does not itself generate
 a Gmail event. Watch registration proves neither Pub/Sub delivery nor a successful
 Jev decision: inspect cursor progress, retry state and traces separately.
+
+Source health reports the last observed push and successful history-read times
+separately. Backend history recovery runs every five minutes without starting
+chat turns or invoking Jev when there are no new messages.
