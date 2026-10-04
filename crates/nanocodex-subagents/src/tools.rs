@@ -891,11 +891,11 @@ impl Tool for ListAgents {
             .registry
             .upgrade()
             .ok_or_else(|| std::io::Error::other("subagent runtime is closed"))?;
-        json_output(&AgentDirectory {
-            agents: registry
-                .directory(context.session_id(), include_completed, include_self)
-                .await?,
-        })
+        let session = context.session_id().to_owned();
+        let agents = platform_receipt(async move {
+            registry.directory(&session, include_completed, include_self).await
+        }).await?;
+        json_output(&AgentDirectory { agents })
     }
 }
 
@@ -945,9 +945,10 @@ impl Tool for WaitAgent {
             .map(Duration::from_millis)
             .unwrap_or(DEFAULT_WAIT_TIMEOUT)
             .min(MAX_WAIT_TIMEOUT);
-        let (agents, timed_out) = registry
-            .wait(context.session_id(), &agent_ids, duration)
-            .await?;
+        let session = context.session_id().to_owned();
+        let (agents, timed_out) = platform_receipt(async move {
+            registry.wait(&session, &agent_ids, duration).await
+        }).await?;
         json_output(&WaitReport { agents, timed_out })
     }
 }
@@ -1263,7 +1264,8 @@ mod strict_spawn_tests {
                 "harness",
                 "model",
                 "thinking",
-                "output_contract"
+                "output_contract",
+                "lifetime"
             ])
         );
         for shape in ["object", "array", "string_enum", "scalar", "field"] {
@@ -1276,7 +1278,7 @@ mod strict_spawn_tests {
         }
         let validator = jsonschema::validator_for(parameters).unwrap();
         let valid = json!({
-            "role": "audit", "task": "check", "model": null, "thinking": null,
+            "role": "audit", "task": "check", "harness": null, "lifetime": null, "model": null, "thinking": null,
             "output_contract": { "kind": "object", "fields": [
                 { "name": "summary", "schema": { "kind": "string" }, "required": true },
                 { "name": "items", "schema": { "kind": "array", "items": { "kind": "integer" } }, "required": false }
@@ -1295,7 +1297,7 @@ mod strict_spawn_tests {
     #[test]
     fn typed_contract_compiles_nested_and_optional_results() {
         let parsed: SpawnAgentTask = serde_json::from_value(json!({
-            "role": "audit", "task": "check", "model": null, "thinking": null,
+            "role": "audit", "task": "check", "harness": null, "lifetime": null, "model": null, "thinking": null,
             "output_contract": { "kind": "object", "fields": [
                 { "name": "summary", "schema": { "kind": "string" }, "required": true },
                 { "name": "items", "schema": { "kind": "array", "items": { "kind": "integer" } }, "required": false }
@@ -1314,7 +1316,7 @@ mod strict_spawn_tests {
     #[test]
     fn typed_contract_enums_and_duplicate_fields_remain_valid_schemas() {
         let parsed: SpawnAgentTask = serde_json::from_value(json!({
-            "role": "audit", "task": "check", "model": null, "thinking": null,
+            "role": "audit", "task": "check", "harness": null, "lifetime": null, "model": null, "thinking": null,
             "output_contract": { "kind": "object", "fields": [
                 { "name": "status", "schema": { "kind": "integer" }, "required": true },
                 { "name": "status", "schema": { "kind": "string_enum", "values": ["ok", "fail"] }, "required": false }

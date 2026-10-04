@@ -2640,6 +2640,7 @@ mod tests {
                     registry.updates.clone(),
                 ),
                 contract,
+                None,
             )
             .await
             .unwrap_err();
@@ -2713,6 +2714,7 @@ mod tests {
                 agent,
                 event_task,
                 test_contract(),
+                None,
             )
             .await
             .unwrap();
@@ -2770,6 +2772,7 @@ mod tests {
 
     fn test_session(id: AgentId, session_id: &str, parent: Option<AgentId>) -> ChildSession {
         let descriptor = AgentDescriptor {
+            lifetime: Default::default(),
             id,
             session_id: session_id.to_owned(),
             role: format!("agent-{id}"),
@@ -2777,6 +2780,8 @@ mod tests {
             parent,
         };
         ChildSession {
+            execution: None,
+            interrupted: false,
             descriptor,
             host_context: None,
             event_task: Some(platform::spawn(async {})),

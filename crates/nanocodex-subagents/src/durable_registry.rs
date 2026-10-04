@@ -273,6 +273,7 @@ impl Registry {
             let execution = child.execution.as_ref().expect("admission retained");
             (execution.instruction_revision, execution.prompt.clone(), Some(execution.operation_id.clone()))
         } else {
+            child.interrupted = false;
             let revision = child.next_instruction_revision.checked_add(1).ok_or_else(|| std::io::Error::other("child instruction revision exhausted"))?;
             child.next_instruction_revision = revision;
             child.submitted_output = None;
