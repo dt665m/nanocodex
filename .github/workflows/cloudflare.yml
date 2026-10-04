@@ -72,6 +72,10 @@ on:
         default: preview
         type: choice
         options: [preview, production, enroll-cloudflare, verify-cloudflare]
+      enrollment_account_id:
+        description: Cloudflare account ID for account-owned enrollment tokens; omit for user tokens
+        type: string
+        required: false
       enrollment_owner:
         description: Explicit account owner UUID (enrollment only)
         type: string
@@ -140,18 +144,20 @@ jobs:
           cache-dependency-path: pnpm-lock.yaml
       - name: Validate explicit enrollment inputs
         env:
+          ENROLLMENT_ACCOUNT_ID: ${{ inputs.enrollment_account_id }}
           ENROLLMENT_OWNER: ${{ inputs.enrollment_owner }}
           ENROLLMENT_OPERATION: ${{ inputs.enrollment_operation }}
         run: |
           node --input-type=module -e '
             import { validateEnrollment } from "./scripts/cloudflare/enroll-credential.mjs";
-            try { validateEnrollment({owner:process.env.ENROLLMENT_OWNER,operation:process.env.ENROLLMENT_OPERATION,token:"validation-only"}, true); }
+            try { validateEnrollment({owner:process.env.ENROLLMENT_OWNER,operation:process.env.ENROLLMENT_OPERATION,token:"validation-only",accountId:process.env.ENROLLMENT_ACCOUNT_ID || undefined}, true); }
             catch { console.error("Invalid enrollment inputs"); process.exit(1); }
           '
       - name: Install enrollment tooling
         run: pnpm install --frozen-lockfile --filter nanocodex-egress-service...
       - name: Enroll through private broker binding
         env:
+          ENROLLMENT_ACCOUNT_ID: ${{ inputs.enrollment_account_id }}
           ENROLLMENT_OWNER: ${{ inputs.enrollment_owner }}
           ENROLLMENT_OPERATION: ${{ inputs.enrollment_operation }}
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
