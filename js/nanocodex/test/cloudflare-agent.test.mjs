@@ -527,6 +527,7 @@ test("Cloudflare root takeover restores children and stale cleanup preserves the
   };
   const first = await create(module, durableOwner(storage), options);
   let replacement;
+  let successor;
   try {
     await Subagents.spawn(first, { role: "old-child", task: "Wait until restart.", outputSchema: { type: "object" } });
     const oldBind = lifecycles.find(({ type }) => type === "bind");
@@ -538,6 +539,8 @@ test("Cloudflare root takeover restores children and stale cleanup preserves the
     const recovered = (await Subagents.list(replacement, { includeCompleted: true })).agents;
     assert.equal(recovered.length, 1);
     assert.equal(recovered[0].role, "old-child");
+    assert.equal(lifecycles.filter(({ type, sessionId }) => type === "bind" && sessionId === oldBind.sessionId).length, 2,
+      "native recovery rebinds the retained child to the replacement host");
     const child = await Subagents.spawn(replacement, { role: "new-child", task: "Use only live authority.", outputSchema: { type: "object" } });
     const newBind = lifecycles.find(({ type, descriptor }) => type === "bind" && descriptor.role === "new-child");
     assert.ok(newBind);
@@ -549,11 +552,18 @@ test("Cloudflare root takeover restores children and stale cleanup preserves the
     assert.equal(restored.structured_result.role, "old-child");
     assert.equal(lifecycles.some(({ type }) => type === "reconstruct"), false);
     await Subagents.close(replacement, child.agent_id);
+    successor = await create(module, durableOwner(storage), options);
+    await assert.rejects(replacement.session.shutdown(), /fenced/);
+    const retainedAgain = JSON.parse(await globalThis.nanocodexHost.executeTool("identity", "{}", oldBind.sessionId, "second-takeover"));
+    assert.equal(retainedAgain.structured_result.role, "old-child");
+    assert.equal(lifecycles.filter(({ type, sessionId }) => type === "bind" && sessionId === oldBind.sessionId).length, 3,
+      "each generation acquires the same child binding exactly once");
     assert.equal(storage.subagents.size, 0);
     assert.equal(storage.subagentCheckpoints.size, 0);
   } finally {
     await first.session.shutdown().catch(error => assert.match(String(error), /fenced/));
-    await replacement?.session.shutdown();
+    await replacement?.session.shutdown().catch(error => assert.match(String(error), /fenced/));
+    await successor?.session.shutdown();
   }
 });
 
@@ -673,16 +683,25 @@ test("Cloudflare Agent reconstruction rejects a different durable owner before f
   const module = await readFile(new URL("../pkg-web/nanocodex_bg.wasm", import.meta.url));
   const storage = new MemoryStorage();
   const binding = egressBinding();
-  const first = await create(module, durableOwner(storage, binding, FIRST_OBJECT_ID));
-  const retainedOwner = { ...storage.owners.get(storage.stateId) };
-
-  await assert.rejects(
-    create(module, durableOwner(storage, binding, SECOND_OBJECT_ID)),
-    /session ID is already active/,
-  );
-  assert.deepEqual(storage.owners.get(storage.stateId), retainedOwner);
-
-  await first.session.shutdown();
+  const lifecycles = [];
+  const first = await create(module, durableOwner(storage, binding, FIRST_OBJECT_ID), {
+    tools: { identity: { parameters: { type: "object" }, handler: (_input, context) => context.subagent } },
+    [Symbol.for("nanocodex.cloudflare.internalRuntime")]: { subagentLifecycle: event => lifecycles.push(event) },
+  });
+  try {
+    await Subagents.spawn(first, { role: "owner-bound-child", task: "Keep this owner's authority.", outputSchema: { type: "object" } });
+    const childBind = lifecycles.find(({ type }) => type === "bind");
+    assert.ok(childBind);
+    const retainedOwner = { ...storage.owners.get(storage.stateId) };
+    await assert.rejects(
+      create(module, durableOwner(storage, binding, SECOND_OBJECT_ID)),
+      /session ID is already active/,
+    );
+    assert.deepEqual(storage.owners.get(storage.stateId), retainedOwner);
+    const retained = JSON.parse(await globalThis.nanocodexHost.executeTool("identity", "{}", childBind.sessionId, "rejected-takeover"));
+    assert.equal(retained.structured_result.role, "owner-bound-child");
+    assert.equal(lifecycles.filter(({ type }) => type === "bind").length, 1);
+  } finally { await first.session.shutdown(); }
 });
 
 test("failed reconstruction keeps the prior same-owner reservation fail closed", async () => {

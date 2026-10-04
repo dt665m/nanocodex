@@ -647,7 +647,7 @@ const hostBridge = Object.freeze({
     }
     if (!cloudflareHostMayBindSubagent(host)) return;
     const existing = hostSessions.get(sessionId);
-    if (existing && existing !== host) {
+    if (existing && existing !== host && !cloudflareHostMayReplaceSubagent(host, existing)) {
       throw new Error(`Nanocodex subagent session ID is already active: ${sessionId}`);
     }
     host.bindSubagentSession(sessionId, JSON.parse(contextJson), hostContextRef);
@@ -968,6 +968,25 @@ export function mayReleaseCloudflareSubagentSession(reservation) {
 function cloudflareHostMayBindSubagent(host) {
   const reservation = cloudflareHostReservations.get(host);
   return reservation === undefined || mayBindCloudflareSubagentSession(reservation);
+}
+
+function cloudflareHostMayReplaceSubagent(host, existingHost) {
+  const reservation = cloudflareHostReservations.get(host);
+  const existing = cloudflareHostReservations.get(existingHost);
+  if (reservation === undefined || existing === undefined
+    || !mayBindCloudflareSubagentSession(reservation)
+    || reservation.ownerId !== existing.ownerId
+    || reservation.sessionId !== existing.sessionId) return false;
+  // Native recovery binds children after acquiring the durable fence, while
+  // raw construction still holds the pending reservation. Only that successor
+  // may replace the active predecessor; the predecessor cannot bind back over it.
+  const pending = pendingCloudflareAgentSessions.get(reservation.sessionId);
+  if (pending !== undefined) {
+    return pending === reservation
+      && activeAgentSessions.get(reservation.sessionId) === existing;
+  }
+  return activeAgentSessions.get(reservation.sessionId) === reservation
+    && !mayBindCloudflareSubagentSession(existing);
 }
 
 /** Internal Cloudflare seam: activates a prepared owner after raw construction acquires its durable fence. */
