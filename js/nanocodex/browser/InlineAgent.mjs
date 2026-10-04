@@ -40,7 +40,7 @@ export async function create(options = {}) {
     throw new TypeError('managed request policy must be configured by its owning host');
   }
   if (options.harness === 'claude') return createClaude(options);
-  if (options.harness !== undefined && options.harness !== 'codex') throw new TypeError('unsupported harness family');
+  if (options.harness !== undefined && options.harness !== false && options.harness !== 'codex') throw new TypeError('unsupported harness family');
   if (managedTransportOptions(options?.transport)) {
     return createManagedAgent(options);
   }
