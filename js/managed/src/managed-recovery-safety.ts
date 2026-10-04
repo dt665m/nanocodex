@@ -382,10 +382,15 @@ export function createManagedCodeEffectJournal(storage: DurableObjectStorage, op
       });
     },
     async restoreStore(sessionId, entries) {
-      encodeEntries(entries);
+      const encoded = encodeEntries(entries);
       storage.transactionSync(() => {
         assertOwner();
-        if (storage.sql.exec("SELECT 1 FROM managed_code_cells WHERE session_id = ? LIMIT 1", sessionId).toArray().length
+        const cells = storage.sql.exec("SELECT 1 FROM managed_code_cells WHERE session_id = ? LIMIT 1", sessionId).toArray().length;
+        const version = storage.sql.exec<{ version: number }>("SELECT version FROM managed_code_store_versions WHERE session_id = ?", sessionId).toArray()[0]?.version;
+        // Cold construction can lose the acknowledgement after restoring the
+        // seed but before the Rust head exists. Repeat only that same seed.
+        if (!cells && version === 1 && encodeEntries(readEntries("session:" + sessionId, false)) === encoded) return;
+        if (cells
           || storage.sql.exec("SELECT 1 FROM managed_code_store_blobs WHERE blob_key = ? LIMIT 1", "session:" + sessionId).toArray().length
           || storage.sql.exec("SELECT 1 FROM managed_code_store_chunks WHERE blob_key = ? LIMIT 1", "session:" + sessionId).toArray().length
           || storage.sql.exec("SELECT 1 FROM managed_code_store_versions WHERE session_id = ? LIMIT 1", sessionId).toArray().length) {

@@ -411,6 +411,7 @@ const INITIAL_ACCOUNT_CONTEXT_KEY = "nanocodex:initial-account-context";
 const CREDENTIAL_BINDING_KEY = "nanocodex:credential-binding";
 const CLEANUP_RETRY_ATTEMPT_KEY = "nanocodex:cleanup-retry-attempt";
 const DURABILITY_EXPORTED_KEY = "nanocodex:durability-exported";
+const CODE_STORE_DOCUMENT = "nanocodex.managed.code-store";
 const DURABILITY_IMPORT_STATE_KEY = "nanocodex:durability-import-state";
 const DURABILITY_IMPORT_RECEIPT_KEY = "nanocodex:durability-import-receipt";
 const CREDENTIAL_BINDING_PREPARE_TIMEOUT_MS = 60_000;
@@ -3991,7 +3992,9 @@ export class DurableAgentSession extends DurableComputerObject {
       generation INTEGER NOT NULL, pending INTEGER NOT NULL
     )`);
     this.#eventLog = new DurableEventLog<StreamMessage>(this.ctx.storage, event => this.#operations.record(event, this.#sessionId()));
-    this.#codeEffectJournal = createManagedCodeEffectJournal(this.ctx.storage);
+    this.#codeEffectJournal = createManagedCodeEffectJournal(this.ctx.storage, {
+      onStoreCommitted: (context, entries) => this.#publishCodeStore(context.sessionId, entries),
+    });
     this.#eventArchive = new ManagedEventArchive<StreamMessage>(
       this.ctx.storage,
       this.env.NANOCODEX_HISTORY,
@@ -4825,6 +4828,7 @@ export class DurableAgentSession extends DurableComputerObject {
         if (!operationId) return json({ error: "checkpoint_unavailable" }, { status: 409 });
         const agent = await this.#ensureAgent();
         const seed = await agent.session.documentFork(operationId);
+        await this.#codeStoreForkEntries(seed);
         return json({ seed, settings: this.#settings() }, { headers: { "cache-control": "no-store" } });
       } catch (error) {
         return json({ error: "checkpoint_unavailable", message: errorMessage(error) }, { status: 409 });
@@ -8931,6 +8935,57 @@ export class DurableAgentSession extends DurableComputerObject {
     } finally { await this.#scheduleNextAlarm(); }
   }
 
+  async #publishCodeStore(sessionId: string, entries: readonly (readonly [string, unknown])[]): Promise<void> {
+    // Each child keeps its own journal namespace. Root forks inherit the root's
+    // store; the task-tree fork policy separately governs child ownership.
+    if (sessionId !== this.#sessionId()) return;
+    const agent = this.#agent;
+    const owner = this.#session()?.owner_id;
+    const generation = this.#runtimeOwnershipGeneration;
+    if (!agent || !owner || this.#deleting || this.#deleted) throw new Error("Code Mode document owner is unavailable");
+    const encoded = JSON.stringify(entries);
+    const bytes = new TextEncoder().encode(encoded).byteLength;
+    if (bytes > 4 * 1024 * 1024) throw new Error("Code Mode document exceeds its journal bound");
+    const hash = createHash("sha256").update(encoded).digest("hex");
+    // The account-derived namespace is never read from guest data or a seed.
+    await this.env.NANOCODEX_HISTORY.put(`code-store/${owner}/${hash}`, encoded);
+    if (this.#agent !== agent || this.#runtimeOwnershipGeneration !== generation
+      || this.#deleting || this.#deleted) throw new Error("Code Mode document owner changed");
+    const value = { format: 1, hash, bytes };
+    const current = await agent.session.document(CODE_STORE_DOCUMENT);
+    if (current && JSON.stringify(current.value) === JSON.stringify(value)) return;
+    await agent.session.compareExchangeDocuments([{
+      key: CODE_STORE_DOCUMENT, expectedVersion: current?.version ?? 0, value, fork: "asOf",
+    }]);
+  }
+
+  async #codeStoreForkEntries(seed: unknown): Promise<readonly (readonly [string, unknown])[] | undefined> {
+    if (!isRecord(seed) || !isRecord(seed.documents) || !isRecord(seed.documents.documents)) return undefined;
+    const document = seed.documents.documents[CODE_STORE_DOCUMENT];
+    if (document === undefined) return undefined;
+    if (!isRecord(document) || !isRecord(document.value)) throw new Error("Invalid Code Mode fork document");
+    const value = document.value;
+    if (value.format !== 1 || typeof value.hash !== "string" || !/^[a-f0-9]{64}$/.test(value.hash)
+      || typeof value.bytes !== "number" || !Number.isSafeInteger(value.bytes)
+      || value.bytes < 2 || value.bytes > 4 * 1024 * 1024) throw new Error("Invalid Code Mode fork reference");
+    const owner = this.#session()?.owner_id;
+    if (!owner) throw new Error("Code Mode fork owner is unavailable");
+    const object = await this.env.NANOCODEX_HISTORY.get(`code-store/${owner}/${value.hash}`);
+    if (!object || object.size !== value.bytes) throw new Error("Code Mode fork data is unavailable");
+    const encoded = await object.text();
+    if (new TextEncoder().encode(encoded).byteLength !== value.bytes
+      || createHash("sha256").update(encoded).digest("hex") !== value.hash) throw new Error("Code Mode fork data is corrupt");
+    const entries: unknown = JSON.parse(encoded);
+    if (!Array.isArray(entries) || entries.some(entry => !Array.isArray(entry) || entry.length !== 2 || typeof entry[0] !== "string"))
+      throw new Error("Invalid Code Mode fork entries");
+    return entries as [string, unknown][];
+  }
+
+  async #restoreForkCodeStore(seed: unknown): Promise<void> {
+    const entries = await this.#codeStoreForkEntries(seed);
+    if (entries !== undefined) await this.#codeEffectJournal.restoreStore!(this.#sessionId()!, entries);
+  }
+
   #backgroundChildrenPending(): boolean {
     return this.ctx.storage.sql.exec<{ pending: number }>(
       "SELECT pending FROM managed_child_recovery WHERE singleton = 1",
@@ -9394,9 +9449,11 @@ export class DurableAgentSession extends DurableComputerObject {
       ).toArray().length > 0 && this.ctx.storage.sql.exec<{ revision: string; payload: string | null }>(
         "SELECT revision, payload FROM nanocodex_durable_states WHERE state_id = ?", durabilityId,
       ).toArray().some(row => row.revision !== "0" || row.payload !== null);
-      if (forkSeed && !hasHead) Object.defineProperty(options,
-        Symbol.for("nanocodex.cloudflare.internalForkResume"),
-        { value: JSON.parse(forkSeed.snapshot_json) });
+      if (forkSeed && !hasHead) {
+        const seed: unknown = JSON.parse(forkSeed.snapshot_json);
+        await this.#restoreForkCodeStore(seed);
+        Object.defineProperty(options, Symbol.for("nanocodex.cloudflare.internalForkResume"), { value: seed });
+      }
       Object.defineProperty(options, Symbol.for("nanocodex.cloudflare.internalConfiguration"), { value: this.#settings() });
       Object.defineProperty(options, Symbol.for("nanocodex.cloudflare.internalRuntime"), {
         value: { prepare: complete, preparationSignal: signal },
@@ -10320,9 +10377,11 @@ export class DurableAgentSession extends DurableComputerObject {
         "SELECT revision, payload FROM nanocodex_durable_states WHERE state_id = ?",
         durabilityId,
       ).toArray().some(row => row.revision !== "0" || row.payload !== null);
-      if (forkSeed && !hasHead) Object.defineProperty(agentOptions,
-        Symbol.for("nanocodex.cloudflare.internalForkResume"),
-        { value: JSON.parse(forkSeed.snapshot_json) });
+      if (forkSeed && !hasHead) {
+        const seed: unknown = JSON.parse(forkSeed.snapshot_json);
+        await this.#restoreForkCodeStore(seed);
+        Object.defineProperty(agentOptions, Symbol.for("nanocodex.cloudflare.internalForkResume"), { value: seed });
+      }
       Object.defineProperty(agentOptions, internalConfiguration, { value: this.#settings() });
       phaseStartedAt = performance.now();
       const owner = this.#credentialBinding?.strategy === "session_v1" || configuration.chatgpt_account_id ? {
