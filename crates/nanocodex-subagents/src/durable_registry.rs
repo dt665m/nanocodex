@@ -181,14 +181,24 @@ impl Registry {
         scope.persist().await
     }
 
-    /// Whether releasing this parent leaves a durable background tree to schedule.
+    /// Whether the background tree has unfinished execution or queued delivery.
+    /// Terminal reusable children retain identity without retaining an alarm.
     pub async fn has_background(&self, session: &str) -> bool {
         let state = self.state.lock().await;
         let root = state.root_session_id(session);
-        state.scopes.get(root).is_some_and(|scope| scope.sessions.values().any(|child| {
-            child.descriptor.lifetime == AgentLifetime::Background
-                && !matches!(child.status, AgentStatus::Closing | AgentStatus::Closed)
-        }))
+        state.scopes.get(root).is_some_and(|scope| {
+            scope.sessions.iter().any(|(&id, child)| {
+                !matches!(child.status, AgentStatus::Closing | AgentStatus::Closed)
+                    && ((!child.interrupted && (child.execution.is_some()
+                        || matches!(child.status, AgentStatus::Pending | AgentStatus::Running)))
+                        || scope.messages.has_pending_for(id))
+                    && scope.sessions.iter().any(|(&bg, ancestor)| {
+                        ancestor.descriptor.lifetime == AgentLifetime::Background
+                            && !matches!(ancestor.status, AgentStatus::Closing | AgentStatus::Closed)
+                            && (id == bg || scope.topology.is_descendant(id, bg))
+                    })
+            })
+        })
     }
 
     pub async fn summaries_all(&self, session: &str) -> std::io::Result<Vec<AgentSummary>> {
@@ -241,7 +251,7 @@ impl Registry {
 
     pub(super) async fn admit_child_turn(
         &self, root: &str, id: AgentId, prompt: String, message_id: Option<MessageId>,
-    ) -> std::io::Result<(u64, String, Option<String>)> {
+    ) -> std::io::Result<(u64, String, Option<String>, bool)> {
         let mut state = self.state.lock().await;
         let last_used = state.next_access();
         let scope = state.scopes.get_mut(root).ok_or_else(|| std::io::Error::other("child scope unavailable"))?;
@@ -266,6 +276,7 @@ impl Registry {
             child.submitted_output = None;
             (revision, prompt, None)
         };
+        let cancel_on_admission = child.interrupted;
         child.active_instruction_revision = Some(revision);
         child.active = true;
         child.status = AgentStatus::Running;
@@ -276,6 +287,6 @@ impl Registry {
         drop(state);
         self.send(root, AgentUpdate::Status { id, status: AgentStatus::Running });
         self.changed();
-        Ok((revision, prompt, operation_id))
+        Ok((revision, prompt, operation_id, cancel_on_admission))
     }
 }

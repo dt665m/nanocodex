@@ -1,0 +1,193 @@
+// Reproduce after pnpm --filter nanocodex-vite build:wasm:
+// node --test js/nanocodex/test/durable-children-wasm.test.mjs
+// Only external model Responses are synthetic. Every child operation runs in
+// the shipped public SDK, generated Rust WASM, and a real SQLite state store.
+import assert from 'node:assert/strict';
+import { test } from 'node:test';
+import { createServer } from 'node:http';
+import { Worker } from 'node:worker_threads';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+const schema = { type: 'object', properties: { stage: { type: 'string' } }, required: ['stage'], additionalProperties: false };
+const task = (marker, lifetime = 'foreground') => ({ role: marker, task: marker + ': perform proof once and submit the typed result.', outputSchema: schema, lifetime });
+function deferred() { let resolve, reject; const promise = new Promise((a, b) => { resolve = a; reject = b; }); return { promise, resolve, reject }; }
+async function within(promise, label, timeout = 15_000) {
+  let timer;
+  try { return await Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(Error('Timed out: ' + label)), timeout); })]); }
+  finally { clearTimeout(timer); }
+}
+
+async function fixture(t, label) {
+  const directory = await mkdtemp(join(tmpdir(), 'nanocodex-durable-children-'));
+  const trace = [], owners = [], requests = [], effects = [], waiting = [], held = [];
+  let phase = 'prepare', serial = 0, cleaned = false;
+  const server = createServer(async (request, response) => {
+    try {
+      const chunks = []; for await (const chunk of request) chunks.push(chunk);
+      const body = JSON.parse(Buffer.concat(chunks));
+      const history = body.input.filter(item => item.type !== 'additional_tools');
+      const encoded = JSON.stringify(history);
+      const marker = ['ROOT_SPAWN', 'COMPLETED', 'RUNNING', 'INTERRUPTED', 'CLOSED', 'FOREGROUND', 'BACKGROUND', 'DEDUP_CHILD'].find(value => encoded.includes(value));
+      const definitions = [...(body.tools ?? []), ...body.input.filter(item => item.type === 'additional_tools').flatMap(item => item.tools)];
+      const submissions = history.filter(item => item.type === 'function_call' && item.name === 'submit_result');
+      const submitted = submissions.length > 0;
+      const mailboxSubmitted = submissions.some(item => JSON.parse(item.arguments).output?.stage === 'mailbox');
+      const row = { type: 'model-request', phase, auth: request.headers.authorization, marker, body };
+      trace.push(row); requests.push(row); wake();
+      assert.ok(marker, 'model request belongs to a declared synthetic task');
+      let tool, args;
+      if (marker === 'ROOT_SPAWN') {
+        const spawned = history.some(item => item.type === 'function_call_output' && item.call_id === 'spawn-once');
+        if (!spawned) {
+          tool = 'spawn_agent';
+          args = { role: 'DEDUP_CHILD', task: 'DEDUP_CHILD: perform proof once and submit the typed result.', harness: null, model: null, thinking: null, lifetime: 'foreground', output_contract: { kind: 'object', fields: [{ name: 'stage', schema: { kind: 'string' }, required: true }] } };
+        }
+      } else if (!encoded.includes('DURABLE_CHILD_EFFECT_RECEIPT')) {
+        tool = 'proof'; args = {};
+      } else if (phase === 'prepare' && ['RUNNING', 'INTERRUPTED', 'CLOSED', 'FOREGROUND', 'BACKGROUND'].includes(marker)) {
+        held.push(response); return;
+      } else if (!submitted || encoded.includes('MAILBOX_AFTER_RESTART') && !mailboxSubmitted) {
+        tool = 'submit_result'; args = { output: { stage: encoded.includes('MAILBOX_AFTER_RESTART') ? 'mailbox' : marker.toLowerCase() } };
+      }
+      response.writeHead(200, { 'content-type': 'text/event-stream' });
+      const definition = tool && definitions.find(item => item.name === tool || item.description?.startsWith(tool + '\n'));
+      if (tool) assert.ok(definition, tool + ' is exposed by the actual runtime');
+      const callId = tool === 'spawn_agent' ? 'spawn-once' : `${tool}-${++serial}`;
+      const output = tool ? [{ type: 'function_call', call_id: callId, name: definition.name, arguments: JSON.stringify(args) }]
+        : [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: marker === 'ROOT_SPAWN' ? 'ROOT_COMPLETE' : 'CHILD_COMPLETE' }] }];
+      response.end(`data: ${JSON.stringify({ type: 'response.completed', response: { id: `fixture-${++serial}`, status: 'completed', output, usage: { input_tokens: 10, output_tokens: 1, total_tokens: 11 } } })}\n\n`);
+    } catch (error) { trace.push({ type: 'fixture-error', error: String(error) }); response.destroy(error); wake(); }
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  function wake() { for (const item of [...waiting]) if (item.predicate()) { waiting.splice(waiting.indexOf(item), 1); item.resolve(); } }
+  async function until(predicate, description) {
+    if (predicate()) return;
+    const gate = deferred(); waiting.push({ predicate, resolve: gate.resolve });
+    await within(gate.promise, description);
+  }
+  async function start(options = {}) {
+    const owner = owners.length + 1, ready = deferred(), pending = new Map(); let next = 0;
+    const worker = new Worker(new URL('./support/durable-children.worker.mjs', import.meta.url), { workerData: {
+      databasePath: join(directory, 'durability.sqlite'), baseUrl: `http://127.0.0.1:${server.address().port}/v1`, auth: `synthetic-owner-${owner}`, ...options,
+    } });
+    const api = { owner, worker, call(action, args = {}) {
+      const id = ++next, gate = deferred(); pending.set(id, gate);
+      worker.postMessage({ id, action, args }); return within(gate.promise, `${action} owner ${owner}`);
+    }, async kill() { await worker.terminate(); trace.push({ type: 'abrupt-owner-loss', owner }); for (const gate of pending.values()) gate.reject(Error('owner terminated')); pending.clear(); } };
+    owners.push(api);
+    worker.on('error', error => { ready.reject(error); for (const gate of pending.values()) gate.reject(error); });
+    worker.on('message', message => {
+      trace.push({ owner, ...message });
+      if (message.type === 'ready') ready.resolve(message);
+      if (message.type === 'startup-failed') ready.reject(Error(message.error.message));
+      if (message.type === 'effect') effects.push({ owner, ...message.effect });
+      if (message.type === 'reply') { const gate = pending.get(message.id); pending.delete(message.id); if (message.error) gate.reject(Object.assign(Error(message.error.message), message.error)); else gate.resolve(message.result); }
+      wake();
+    });
+    await within(ready.promise, `fresh owner ${owner} startup`);
+    return api;
+  }
+  async function cleanup() {
+    if (cleaned) return; cleaned = true;
+    for (const owner of owners) await owner.worker.terminate();
+    server.closeAllConnections(); await new Promise(resolve => server.close(resolve));
+    const output = new URL('../../../output/durable-children-wasm/', import.meta.url);
+    await mkdir(output, { recursive: true });
+    await writeFile(new URL(label + '.json', output), JSON.stringify({ command: 'node --test js/nanocodex/test/durable-children-wasm.test.mjs', label, trace, effects }, null, 2));
+    await rm(directory, { recursive: true, force: true });
+  }
+  t.after(cleanup);
+  return { start, until, trace, effects, requests, phase(value) { phase = value; }, cleanup };
+}
+
+async function completed(owner, id, stage) {
+  const report = await owner.call('wait', { agentIds: [id], timeoutMs: 10_000 });
+  assert.equal(report.timed_out, false, JSON.stringify(report));
+  assert.equal(report.agents[0].status.state, 'completed', JSON.stringify(report));
+  assert.deepEqual(report.agents[0].status.output, { stage });
+  return report;
+}
+
+test('public WASM cold restart preserves child IDs, results, mailbox, cancellation and committed effects', { timeout: 90_000 }, async t => {
+  const f = await fixture(t, 'cold-tree');
+  let owner = await f.start();
+  const done = await owner.call('spawn', task('COMPLETED'));
+  await completed(owner, done.agent_id, 'completed');
+  const running = await owner.call('spawn', task('RUNNING'));
+  const interrupted = await owner.call('spawn', task('INTERRUPTED'));
+  const closed = await owner.call('spawn', task('CLOSED'));
+  await f.until(() => ['RUNNING', 'INTERRUPTED', 'CLOSED'].every(marker => f.requests.some(row => row.marker === marker && JSON.stringify(row.body).includes('DURABLE_CHILD_EFFECT_RECEIPT'))), 'all held children checkpoint their effect');
+  const mailbox = await owner.call('send', { agentId: running.agent_id, message: 'MAILBOX_AFTER_RESTART', purpose: 'coordinate', priority: 'deferred' });
+  assert.equal(mailbox.disposition, 'queued');
+  const interruptedReport = await owner.call('interrupt', { agentId: interrupted.agent_id });
+  assert.equal(interruptedReport.agents[0].status.state, 'interrupted');
+  const closedReport = await owner.call('close', { agentId: closed.agent_id });
+  assert.equal(closedReport.agents[0].status.state, 'closed');
+  const before = await owner.call('list', { includeCompleted: true });
+  const identities = f.effects.map(effect => ({ agentId: effect.subagent.agentId, sessionId: effect.sessionId }));
+  assert.equal(new Set(identities.map(row => row.sessionId)).size, 4);
+  await owner.kill();
+  f.phase('resume');
+  owner = await f.start();
+  await owner.call('recover');
+  await owner.call('recover');
+  const recovered = await owner.call('list', { includeCompleted: true });
+  assert.deepEqual(recovered.agents.map(row => row.agent_id).sort(), before.agents.map(row => row.agent_id).sort());
+  assert.deepEqual(recovered.agents.find(row => row.agent_id === done.agent_id).status, { state: 'completed', output: { stage: 'completed' } });
+  assert.equal(recovered.agents.find(row => row.agent_id === closed.agent_id).status.state, 'closed');
+  assert.equal(recovered.agents.find(row => row.agent_id === interrupted.agent_id).status.state, 'interrupted');
+  await f.until(() => f.trace.some(row => row.type === 'event' && row.owner === 2 && JSON.stringify(row.event).includes('mailbox')), 'recovered mailbox result');
+  await completed(owner, running.agent_id, 'mailbox');
+  assert.equal(f.effects.length, 4, 'each committed external child effect dispatches once across owner loss');
+  assert.ok(f.requests.filter(row => row.phase === 'resume' && row.marker === 'RUNNING').every(row => row.auth === 'Bearer synthetic-owner-2'), 'resumed child uses current host authentication');
+  assert.equal(f.requests.filter(row => row.phase === 'resume' && row.marker === 'CLOSED').length, 0, 'closed child never resumes inference');
+  await owner.kill();
+  owner = await f.start();
+  const durableMailbox = await owner.call('list', { includeCompleted: true });
+  assert.deepEqual(durableMailbox.agents.find(row => row.agent_id === running.agent_id).status, { state: 'completed', output: { stage: 'mailbox' } });
+  assert.equal(f.effects.length, 4);
+  t.diagnostic(JSON.stringify({ coldOwners: 3, stableIds: identities, mailbox, effectDispatches: f.effects.length, interrupted: interrupted.agent_id, closed: closed.agent_id }));
+});
+
+test('public WASM replay of lost spawn admission acknowledgement returns the same child without duplicate effects', { timeout: 60_000 }, async t => {
+  const f = await fixture(t, 'spawn-lost-ack');
+  let owner = await f.start({ loseSpawnAcknowledgement: true });
+  const root = owner.call('prompt', { id: 'root-spawn-once', input: 'ROOT_SPAWN: delegate to DEDUP_CHILD then finish.' });
+  await f.until(() => f.trace.some(row => row.type === 'lost-spawn-ack'), 'persisted spawn admission with lost acknowledgement');
+  await assert.rejects(root, /lost child admission acknowledgement|fenced|reopen/i);
+  await owner.kill(); f.phase('resume');
+  owner = await f.start();
+  const result = await owner.call('prompt', { id: 'root-spawn-once', input: 'ROOT_SPAWN: delegate to DEDUP_CHILD then finish.' });
+  assert.equal(result.finalMessage, 'ROOT_COMPLETE');
+  const directory = await owner.call('list', { includeCompleted: true });
+  assert.equal(directory.agents.length, 1, JSON.stringify(directory));
+  await completed(owner, directory.agents[0].agent_id, 'dedup_child');
+  assert.equal(f.effects.length, 1);
+  t.diagnostic(JSON.stringify({ replayedOperation: 'root-spawn-once', stableChild: directory.agents[0].agent_id, childCount: 1, effectDispatches: 1 }));
+});
+
+test('public WASM requires durability for background children and releases foreground only', { timeout: 60_000 }, async t => {
+  const f = await fixture(t, 'lifetimes');
+  const ephemeral = await f.start({ nonDurable: true });
+  await assert.rejects(ephemeral.call('spawn', task('BACKGROUND', 'background')), /durab|background/i);
+  assert.equal(f.requests.length, 0, 'invalid lifetime fails before inference');
+  await ephemeral.kill();
+  let owner = await f.start();
+  const foreground = await owner.call('spawn', task('FOREGROUND'));
+  const background = await owner.call('spawn', task('BACKGROUND', 'background'));
+  await f.until(() => ['FOREGROUND', 'BACKGROUND'].every(marker => f.requests.some(row => row.marker === marker && JSON.stringify(row.body).includes('DURABLE_CHILD_EFFECT_RECEIPT'))), 'both lifetimes checkpoint effects');
+  await owner.call('shutdown');
+  await owner.kill(); f.phase('resume');
+  owner = await f.start();
+  await owner.call('recover');
+  const directory = await owner.call('list', { includeCompleted: true });
+  assert.equal(directory.agents.find(row => row.agent_id === foreground.agent_id).status.state, 'closed');
+  assert.equal(directory.agents.find(row => row.agent_id === background.agent_id).lifetime, 'background');
+  await completed(owner, background.agent_id, 'background');
+  assert.equal(f.effects.length, 2);
+  assert.equal(f.requests.filter(row => row.phase === 'resume' && row.marker === 'FOREGROUND').length, 0);
+  assert.ok(f.requests.filter(row => row.phase === 'resume' && row.marker === 'BACKGROUND').every(row => row.auth === 'Bearer synthetic-owner-3'));
+  t.diagnostic(JSON.stringify({ foregroundClosed: foreground.agent_id, backgroundRecovered: background.agent_id, effectDispatches: 2, currentAuthOwner: 3 }));
+});

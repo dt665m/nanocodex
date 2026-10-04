@@ -555,10 +555,11 @@ impl Harness {
             "{prompt}\n\n{}",
             completion_instructions(&self.output_schema)
         );
-        let (instruction_revision, prompt, operation_id) = registry
+        let (instruction_revision, prompt, operation_id, cancel_on_admission) = registry
             .admit_child_turn(&self.root_session_id, self.id, prompt, message_id).await?;
         let mut request = PromptRequest::new(Prompt::new(prompt).with_instruction_revision(instruction_revision));
         if let Some(operation_id) = operation_id { request = request.request_id(operation_id); }
+        if cancel_on_admission { request = request.cancel_on_admission(); }
         let turn = match agent.prompt(request).await {
             Ok(turn) => turn,
             Err(error) => {

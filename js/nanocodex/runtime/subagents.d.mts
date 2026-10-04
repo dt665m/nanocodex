@@ -118,7 +118,8 @@ export function list(agent: SubagentOwner, options?: DirectoryOptions): Promise<
  * The caller owns the parent and keeps its runtime alive while children execute.
  * Rejects when the parent is not durable or subagents are disabled.
  */
-export function recover(agent: SubagentOwner): Promise<LifecycleReport>;
+export type RecoveryReport = LifecycleReport & Readonly<{ backgroundPending: boolean }>;
+export function recover(agent: SubagentOwner): Promise<RecoveryReport>;
 /** Directly invokes the canonical Rust send_agent_message handler. */
 export function send(agent: SubagentOwner, options: SendOptions): Promise<MessageReceipt>;
 /** Directly invokes the canonical Rust interrupt_agent handler. */

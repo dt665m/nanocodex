@@ -1712,7 +1712,8 @@ impl WasmSubagents {
     async fn recover_report(&self, session_id: &str) -> Result<String, JsValue> {
         self.registry.recover(self.parent(session_id)?).await.map_err(js_error)?;
         let agents = self.registry.summaries_all(session_id).await.map_err(js_error)?;
-        serde_json::to_string(&serde_json::json!({ "agents": agents })).map_err(js_error)
+        let background_pending = self.registry.has_background(session_id).await;
+        serde_json::to_string(&serde_json::json!({ "agents": agents, "backgroundPending": background_pending })).map_err(js_error)
     }
 
     async fn close_all(&self, root_session_id: &str) -> std::io::Result<()> {
