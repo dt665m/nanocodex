@@ -35,9 +35,24 @@ pub enum Step {
     /// An interrupted effect may have run and must not be repeated automatically.
     OutcomeUnknown,
 }
+/// Prepared native request plus opaque branch-local policy state.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct RequestPreparation {
+    /// Provider-native request; signed transcript blocks stay unmodified.
+    pub request: Value,
+    /// Policy history and routing receipt retained in the native checkpoint.
+    pub state: Value,
+}
 /// Host-owned durable execution, sharing Nanocodex's store and fencing rules.
 pub trait ClaudeExecutionPolicy: Send + Sync {
     fn state_id(&self) -> &str;
+    /// Prepare and persist deterministic configuration/routing before dispatch.
+    /// Defaults to the original native request for existing policy consumers.
+    fn prepare_request(&self, _operation: String, _request_id: String,
+        _continuation: bool, _state: Value, _request: Value)
+        -> PolicyFuture<'_, Option<RequestPreparation>> {
+        Box::pin(async { Ok(None) })
+    }
     fn admit(
         &self,
         id: String,

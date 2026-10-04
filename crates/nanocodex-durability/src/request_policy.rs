@@ -301,3 +301,89 @@ fn nonempty(value: &str) -> Result<()> {
     if value.is_empty() { Err(invalid("configuration and request identities must be nonempty")) } else { Ok(()) }
 }
 fn invalid(message: &str) -> Error { Error::InvalidState(message.into()) }
+
+/// Host-selected virtual route and named changes for the next native turn.
+/// Router state and exact decisions are persisted in the native checkpoint.
+#[derive(Clone)]
+pub struct RequestPolicySettings {
+    /// Public selection, distinct from the dispatched native model.
+    pub selection: String,
+    /// Changes admitted at a completed turn boundary.
+    pub patches: Vec<ConfigurationPatch>,
+    /// Host-approved physical identities and measured protocol limits.
+    pub models: Vec<PhysicalModel>,
+    /// Deterministic router evaluated once for each new turn.
+    pub router: std::sync::Arc<dyn VirtualModelRouter + Send + Sync>,
+}
+
+impl RequestPolicySettings {
+    /// Render a Claude request without positional patch support. Only `system`,
+    /// `tools`, and `model` are edited; messages, signatures and order are retained.
+    #[cfg(feature = "claude")]
+    pub(crate) fn prepare_claude(&self, id: String, continuation: bool,
+        state: Value, request: Value) -> Result<nanocodex_claude::execution::RequestPreparation> {
+        let mut state: RequestPolicyState = if state.is_null() { RequestPolicyState::default() }
+            else { serde_json::from_value(state)? };
+        let catalog: Vec<ToolDeclaration> = request["tools"].as_array().into_iter().flatten()
+            .map(|definition| Ok(ToolDeclaration {
+                name: definition["name"].as_str().ok_or_else(|| invalid("native declaration lacks name"))?.into(),
+                definition: definition.clone(),
+            })).collect::<Result<_>>()?;
+        if let Some(saved) = state.requests.iter().find(|entry| entry.request.request_id == id) {
+            saved.configuration.authorize(&catalog)?;
+            let mut limits = saved.request.clone();
+            limits.input_tokens = saved.request_json.len() as u64;
+            validate_limits(&limits, saved.route.dispatched, &self.models)?;
+            return Ok(nanocodex_claude::execution::RequestPreparation {
+                request: serde_json::from_str(&saved.request_json)?, state: serde_json::to_value(&state)?,
+            });
+        }
+        let mut patches = if continuation { Vec::new() } else { self.patches.clone() };
+        if state.requests.is_empty() {
+            // Install the exact host catalog first, then explicit changes.
+            let mut initial = catalog.iter().cloned().map(|tool| ConfigurationPatch::SetTool { tool }).collect::<Vec<_>>();
+            initial.append(&mut patches);
+            patches = initial;
+        }
+        let predecessor = state.requests.last().map(|p| p.request.request_id.clone());
+        let original = request.clone();
+        let output = request["max_tokens"].as_u64().ok_or_else(|| invalid("native request lacks output limit"))?;
+        // UTF-8 JSON byte count is a conservative estimate for text/native schemas;
+        // provider usage remains the actual measured accounting after dispatch.
+        let input = serde_json::to_vec(&request)?.len() as u64;
+        let route_request = RouteRequest { request_id: id, selection: self.selection.clone(),
+            continuation_of: continuation.then_some(predecessor).flatten(),
+            input_tokens: input, output_tokens: output, switch_safe: false };
+        let prepared = state.prepare(route_request, patches, &self.models, &catalog,
+            &|input: RoutingInput<'_>| self.router.route(input), |configuration, model| {
+                if model.family() != HarnessFamily::Claude { return Err(invalid("Claude transport requires a Claude physical model")); }
+                let mut rendered = original;
+                let mut system = match rendered.get("system") {
+                    None | Some(Value::Null) => Vec::new(),
+                    Some(Value::String(text)) => vec![serde_json::json!({"type":"text", "text":text})],
+                    Some(Value::Array(blocks)) => blocks.clone(),
+                    _ => return Err(invalid("unsupported native system blocks")),
+                };
+                system.extend(configuration.sections.iter().map(|section| serde_json::json!({"type":"text", "text":section.text})));
+                if !system.is_empty() { rendered["system"] = Value::Array(system); }
+                rendered["tools"] = Value::Array(configuration.tools.iter().map(|tool| tool.definition.clone()).collect());
+                rendered["model"] = model.as_str().into();
+                Ok(serde_json::to_string(&rendered)?)
+            })?;
+        // Revalidate the final body, including appended instructions/declarations.
+        let mut limits = prepared.request.clone();
+        limits.input_tokens = prepared.request_json.len() as u64;
+        validate_limits(&limits, prepared.route.dispatched, &self.models)?;
+        Ok(nanocodex_claude::execution::RequestPreparation {
+            request: serde_json::from_str(&prepared.request_json)?, state: serde_json::to_value(state)?,
+        })
+    }
+}
+
+/// Optional request policy installed on the Claude-native durable builder.
+#[cfg(feature = "claude")]
+pub trait DurableClaudeRequestExt: Sized {
+    /// Acquire the native durable owner and install persisted request decisions.
+    fn durability_with_request_policy(self, state: crate::DurableSession, settings: RequestPolicySettings)
+        -> impl std::future::Future<Output = nanocodex_agent::Result<Self>>;
+}

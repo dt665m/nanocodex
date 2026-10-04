@@ -104,6 +104,26 @@ impl Effect<'_> {
     }
 }
 impl State {
+    pub(super) async fn prepare_policy_request(&self, conversation: &mut Conversation,
+        cursor: &mut Cursor, messages: &[Message], index: u32) -> Result<MessagesRequest> {
+        let mut template = cursor.template.clone();
+        let (Some(policy), Some(operation)) = (&self.policy, &cursor.operation) else {
+            return Ok(template);
+        };
+        template.messages = messages.to_vec();
+        template.container = conversation.container.clone();
+        let id = format!("{operation}/model-{index}");
+        if let Some(prepared) = policy.prepare_request(operation.clone(), id, index > 0,
+            conversation.request_policy.clone(), serde_json::to_value(&template).map_err(provider_error)?).await? {
+            template = serde_json::from_value(prepared.request).map_err(recovery_error)?;
+            if conversation.request_policy != prepared.state {
+                conversation.request_policy = prepared.state;
+                self.advance_cursor(cursor, conversation).await?;
+            }
+        }
+        Ok(template)
+    }
+
     #[cfg_attr(
         not(all(feature = "tools", not(target_family = "wasm"))),
         allow(clippy::missing_const_for_fn)

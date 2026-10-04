@@ -5,7 +5,7 @@ use std::sync::Arc;
 use nanocodex_agent::Result as AgentResult;
 use nanocodex_claude::{
     ClaudeBuilder,
-    execution::{Admission as ClaudeAdmission, ClaudeExecutionPolicy, PolicyFuture, Step},
+    execution::{Admission as ClaudeAdmission, ClaudeExecutionPolicy, PolicyFuture, Step, RequestPreparation},
 };
 use serde_json::Value;
 
@@ -21,16 +21,49 @@ impl DurableAgentExt for ClaudeBuilder {
         let checkpoint = checkpoint
             .map(|value| value.decode::<Value>().map_err(agent_error))
             .transpose()?;
-        self.execution_policy(Arc::new(ClaudeExecution { state_id, owner }), checkpoint)
+        self.execution_policy(Arc::new(ClaudeExecution { state_id, owner, settings: None }), checkpoint)
     }
 }
 
 struct ClaudeExecution {
     state_id: String,
     owner: DurableOwner,
+    settings: Option<crate::request_policy::RequestPolicySettings>,
+}
+
+impl crate::request_policy::DurableClaudeRequestExt for ClaudeBuilder {
+    async fn durability_with_request_policy(self, state: DurableSession,
+        settings: crate::request_policy::RequestPolicySettings) -> AgentResult<Self> {
+        let state_id = state.state_id().to_owned();
+        let (owner, checkpoint) = state.acquire_agent().await.map_err(agent_error)?;
+        let checkpoint = checkpoint.map(|value| value.decode::<Value>().map_err(agent_error)).transpose()?;
+        self.execution_policy(Arc::new(ClaudeExecution { state_id, owner, settings: Some(settings) }), checkpoint)
+    }
 }
 
 impl ClaudeExecutionPolicy for ClaudeExecution {
+    fn prepare_request(&self, operation: String, request_id: String, continuation: bool,
+        state: Value, request: Value) -> PolicyFuture<'_, Option<RequestPreparation>> {
+        Box::pin(async move {
+            let Some(settings) = &self.settings else { return Ok(None); };
+            if state["requests"].as_array().is_some_and(|requests| requests.iter().any(|entry| entry["request"]["request_id"] == request_id)) {
+                return settings.prepare_claude(request_id, continuation, state, request).map(Some).map_err(agent_error);
+            }
+            let step = format!("prepare/{request_id}");
+            // Configuration and virtual selection are frozen in the receipt. A
+            // recovered turn consumes that receipt even if host settings changed.
+            let input = serde_json::json!({"request":request, "state":state, "continuation":continuation});
+            match self.owner.begin_step(operation.clone(), step.clone(), "request_policy".into(), &input).await.map_err(agent_error)? {
+                BeginStep::Replay(value) => Ok(Some(value.decode().map_err(agent_error)?)),
+                BeginStep::Execute => {
+                    let prepared = settings.prepare_claude(request_id, continuation, state, request).map_err(agent_error)?;
+                    self.owner.complete_step(operation, step, &prepared).await.map_err(agent_error)?;
+                    Ok(Some(prepared))
+                }
+            }
+        })
+    }
+
     fn state_id(&self) -> &str {
         &self.state_id
     }

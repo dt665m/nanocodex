@@ -1307,6 +1307,8 @@ async fn web_fetch_with_source<P: nanocodex_claude_tools::web::ApprovedWebFetchS
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct Conversation {
+    #[serde(default)]
+    request_policy: Value,
     // Session-local effect identity survives history compaction.
     admitted_tool_ids: HashSet<String>,
     #[serde(default)]
@@ -2495,12 +2497,14 @@ impl State {
                 cursor.usage = usage.clone();
                 self.advance_cursor(&mut cursor, conversation).await?;
             }
+            let prepared_template = self.prepare_policy_request(
+                conversation, &mut cursor, &pending, index).await?;
             let discovered = self.discovered.lock().await.clone();
             let response = {
             let foreground = self
                 .response(
                     pending.clone(),
-                    cursor.template.tools.clone(),
+                    prepared_template.tools.clone(),
                     cancel,
                     Some(&request.events),
                     index,
@@ -2508,7 +2512,7 @@ impl State {
                         disable_tools: false,
                         container: conversation.container.as_deref(),
                         previous_message_id: previous_message_id.as_deref(),
-                        template: Some(&cursor.template),
+                        template: Some(&prepared_template),
                         wire_profile: cursor.wire_profile.as_ref(),
                         effect: cursor.effect(self, &format!("model-{index}")),
                     },
