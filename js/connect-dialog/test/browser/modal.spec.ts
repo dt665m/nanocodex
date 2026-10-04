@@ -184,7 +184,7 @@ for (const variant of [
   });
 }
 
-test("SDK popup presents centered compact authorization", async ({ page }) => {
+test("SDK popup presents centered two-column authorization", async ({ page }) => {
   await page.goto("/launcher.html");
   const opened = page.waitForEvent("popup");
   await page.getByRole("button", { name: "Connect account" }).click();
@@ -196,13 +196,13 @@ test("SDK popup presents centered compact authorization", async ({ page }) => {
   await expect(popup.getByRole("heading", { name: "Connect to Atlas Workspace" })).toBeFocused();
   const intro = await popup.locator(".wizard-review-page > .wizard-intro").boundingBox();
   const access = await popup.locator(".wizard-review-page > .wizard-sections").boundingBox();
-  expect(Math.abs(access!.x - intro!.x)).toBeLessThan(1);
+  expect(access!.x).toBeGreaterThan(intro!.x + intro!.width);
   expect(access!.width).toBeLessThanOrEqual(372);
-  expect(access!.y).toBeGreaterThan(intro!.y);
+  expect(Math.abs(access!.y - intro!.y)).toBeLessThan(1);
   const actions = await popup.locator(".dialog-actions").boundingBox();
   const viewport = popup.viewportSize() ?? await popup.evaluate(() => ({width:innerWidth,height:innerHeight}));
-  expect(Math.abs((intro!.x + intro!.width / 2) - viewport.width / 2)).toBeLessThan(2);
-  expect(Math.abs((intro!.y + actions!.y + actions!.height) / 2 - viewport.height / 2)).toBeLessThan(2);
+  expect(Math.abs((intro!.x + access!.x + access!.width) / 2 - viewport.width / 2)).toBeLessThan(2);
+  expect(Math.abs((intro!.y + actions!.y + actions!.height - 24) / 2 - viewport.height / 2)).toBeLessThan(2);
   await popup.getByRole("button", {name:/Run agents:/}).focus();
   await expect(popup.getByRole("tooltip")).toContainText("Run agents");
   await expect(popup.getByText("Access details", {exact:true})).toHaveCount(0);

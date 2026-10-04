@@ -180,3 +180,21 @@
   }
   @media (prefers-reduced-motion: reduce) { button { transition: none; } }
 }
+
+@scope (.connect-onboarding) {
+  @media (min-width: 760px) {
+    :scope.dialog-shell[data-request="walletConnect"] { display: grid; grid-template-columns: minmax(0, 1fr); align-content: center; }
+    .dialog-content { overflow-y: auto; max-height: calc(100dvh - 116px); }
+    .wizard-review-page { width: min(880px, 100%); grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); column-gap: 64px; padding: 24px 40px 0; }
+    .wizard-review-page > .wizard-intro { align-items: flex-start; text-align: left; justify-content: center; }
+    .wizard-review-page .request-identity { justify-items: start; }
+    .wizard-review-page h1 { font-size: 28px; }
+    .dialog-actions { width: min(880px, 100%); padding: 20px 40px 24px calc(min(880px, 100vw) / 2 + 32px); }
+    .sms-auth-panel { width: min(880px, 100%); display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); column-gap: 64px; padding: 24px 40px; }
+    .sms-auth-panel .wizard-intro { grid-column: 1; grid-row: 1 / span 4; text-align: left; align-content: center; margin: 0; }
+    .sms-auth-panel .request-identity { justify-items: start; }
+    .sms-auth-panel h1 { font-size: 28px; }
+    .sms-auth-panel > :not(.wizard-intro) { grid-column: 2; }
+    .sms-auth-panel .auth-close { margin-top: 8px; }
+  }
+}
