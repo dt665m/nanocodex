@@ -135,7 +135,7 @@ try {
   const resumeOwner=await enroll(), resume=await request(resumeOwner, ["data:read"], "<img src=x onerror=alert(1)> requester text");
   ({page,context}=await pageFor());
   await page.clock.install();
-  await page.goto(resume.approval_url); await page.getByRole("heading",{name:"Enter your phone number"}).waitFor();
+  await page.goto(resume.approval_url); await page.getByRole("textbox",{name:"Mobile number",exact:true}).waitFor();
   assert.equal(page.url(),resume.approval_url);
   await context.addCookies([{name:"nanocodex_account",value:resumeOwner.cookie,url:origin,httpOnly:true,sameSite:"Lax"}]);
   await page.reload(); await page.getByRole("button",{name:"Approve permissions",exact:true}).waitFor();
