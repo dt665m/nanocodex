@@ -39,6 +39,8 @@ export type CompactionReceipt = Readonly<{
 }>;
 
 export type AgentOptions = {
+  /** Persisted named configuration and physical routing at each full-history HTTP boundary. */
+  requestPolicy?: import("./runtime/request-policy.mjs").RequestPolicy | undefined;
   harness?: "codex" | undefined;
   /** Explicit alternate-family credentials and native tools; children remain in the shared task tree. */
   harnesses?: Readonly<{ claude?: ClaudeOptions }> | undefined;

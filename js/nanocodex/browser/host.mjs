@@ -69,14 +69,19 @@ export function createBrowserHost(options = {}) {
   const http = createResponsesHttp((endpoint, apiKey, sessionId, metadata, body, signal) => {
     if (disposal) throw new Error("Nanocodex host is already disposed");
     if (options.mpp) throw JSON.stringify({ kind: "transport", detail: "MPP HTTPS transport is unavailable", reconnectable: false });
-    if (options.createResponse) {
-      const authorization = options.hostAuth
-        ? { authorization: "host_managed" }
-        : { authorization: "bearer", bearerToken: apiKey };
-      return options.createResponse(endpoint, sessionId, { ...metadata, ...authorization, body, signal });
-    }
-    if (options.hostAuth) throw JSON.stringify({ kind: "transport", detail: "host-managed HTTPS requires createResponse", reconnectable: false });
-    return fetch(endpoint, { method: "POST", headers: responsesHttpHeaders(apiKey, sessionId, metadata),
+    const send = async (input, init) => {
+      const incoming = new Request(input, init);
+      if (options.createResponse) {
+        const authorization = options.hostAuth
+          ? { authorization: "host_managed" }
+          : { authorization: "bearer", bearerToken: apiKey };
+        return options.createResponse(endpoint, sessionId, { ...metadata, ...authorization, body: await incoming.text(), signal: incoming.signal });
+      }
+      if (options.hostAuth) throw JSON.stringify({ kind: "transport", detail: "host-managed HTTPS requires createResponse", reconnectable: false });
+      return fetch(incoming);
+    };
+    const modelFetch = options.requestPolicy?.fetch(send, "codex") ?? send;
+    return modelFetch(endpoint, { method: "POST", headers: responsesHttpHeaders(apiKey, sessionId, metadata),
       body, signal, redirect: "error" });
   });
   const connections = new Map();

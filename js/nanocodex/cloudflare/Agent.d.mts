@@ -109,6 +109,7 @@ export declare namespace create {
      * event retention to the embedding Durable Object and disables connect().
      */
     eventPersistence?: "durable" | "caller" | undefined;
+    requestPolicy?: import("../runtime/request-policy.mjs").RequestPolicy | undefined;
     instructions?: string | undefined;
     /** Appends host instructions while retaining the selected model's prompt. */
     additionalInstructions?: string | undefined;

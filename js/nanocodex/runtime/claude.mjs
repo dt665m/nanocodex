@@ -8,7 +8,7 @@ import { prepareHarnesses } from './harnesses.mjs';
 import { createClaudeHost } from './claude-host.mjs';
 
 const OPTION_KEYS = new Set([
-  'auth', 'fetch', 'endpoint', 'compatibilityProfile', 'subscriptionIdentity', 'model', 'instructions', 'sessionId', 'tools',
+  'requestPolicy', 'auth', 'fetch', 'endpoint', 'compatibilityProfile', 'subscriptionIdentity', 'model', 'instructions', 'sessionId', 'tools',
   'harness', 'harnesses', 'subagents', 'serverTools', 'durability', 'durabilityId', 'module', 'maxTokens', 'workspace',
   'cache', 'adaptiveThinking', 'keepThinking', 'thinking', 'parallelTools', 'clientToolSearch',
   'contextWindowTokens', 'autoCompactWindowTokens', 'autoCompact', 'systemBlocks', 'terminalReceiptRetention',
@@ -49,7 +49,7 @@ export function toClaudeConfig(options = {}) {
     }
   }
   const config = {};
-  for (const key of OPTION_KEYS) if (!['auth', 'fetch', 'tools', 'module', 'durability', 'compatibilityProfile', 'harness', 'harnesses', 'subagents'].includes(key) && options[key] !== undefined) config[key] = options[key];
+  for (const key of OPTION_KEYS) if (!['requestPolicy', 'auth', 'fetch', 'tools', 'module', 'durability', 'compatibilityProfile', 'harness', 'harnesses', 'subagents'].includes(key) && options[key] !== undefined) config[key] = options[key];
   if (options.compatibilityProfile !== undefined) {
     config.subscriptionCompatibility = true;
     config.subscriptionIdentity = { ...config.subscriptionIdentity };
@@ -70,7 +70,7 @@ export async function createClaude(options, load, type, harnessDefaults) {
   config.sessionId ??= options.durabilityId ?? createSessionId();
   const { durability, durabilityId, module } = options;
   const events = createEventChannel();
-  const host = createClaudeHost({ auth: options.auth, tools: options.tools, onEvent: events.emit, fetch: options.fetch, endpoint: options.endpoint,
+  const host = createClaudeHost({ auth: options.auth, tools: options.tools, onEvent: events.emit, fetch: options.fetch, endpoint: options.endpoint, requestPolicy: options.requestPolicy,
     subagentSessions: internalRuntime?.subagentSessions, subagentRouting: internalRuntime?.subagentRouting });
   let harnesses;
   try { harnesses = await prepareHarnesses(options.harnesses, events.emit, { ...harnessDefaults,

@@ -1,3 +1,4 @@
+import { assertRequestPolicy } from "../runtime/request-policy.mjs";
 import { prepareHarnesses } from '../runtime/harnesses.mjs';
 import { create as createClaude } from './Claude.mjs';
 import { applyBrowserPatch, Nanocodex } from "../pkg-web/nanocodex.js";
@@ -37,12 +38,16 @@ import {
 export async function create(options = {}) {
   if (options.harness === 'claude') return createClaude(options);
   if (options.harness !== undefined && options.harness !== 'codex') throw new TypeError('unsupported harness family');
-  if (managedTransportOptions(options?.transport)) return createManagedAgent(options);
+  if (managedTransportOptions(options?.transport)) {
+    if (options.requestPolicy !== undefined) throw new TypeError("managed request policy must be configured by its owning host");
+    return createManagedAgent(options);
+  }
   const internalRuntime = options[Symbol.for("nanocodex.browser.internalRuntime")];
   if (internalRuntime !== undefined
     && (!internalRuntime || typeof internalRuntime !== "object" || Array.isArray(internalRuntime))) {
     throw new TypeError("browser Agent internal runtime options must be an object");
   }
+  const requestPolicy = options.requestPolicy === undefined ? undefined : assertRequestPolicy(options.requestPolicy);
   const {
     transport,
     module,
@@ -124,6 +129,7 @@ export async function create(options = {}) {
     WebSocketImpl,
     createWebSocket,
     createResponse,
+    requestPolicy,
     hostAuth: hostAuth === true
       || (apiKey === undefined && mpp === undefined && subscription === undefined),
     hostManagedProtocol,
@@ -184,8 +190,8 @@ export async function create(options = {}) {
             ? undefined
             : "wss://openai.mpp.tempo.xyz/v1/responses"),
           apiBaseUrl,
-          websocketWarmup,
-          stateless,
+          websocketWarmup: requestPolicy === undefined ? websocketWarmup : false,
+          stateless: requestPolicy === undefined ? stateless : true,
           subagents: subagentConfig,
           claudeHarness: harnesses?.claude,
           subagentRouting: internalRuntime?.subagentRouting !== undefined,
@@ -280,7 +286,7 @@ export async function create(options = {}) {
     if (!creationStarted) await host.dispose();
     throw error;
   }
-  if (websocketPreconnect && websocketUrl) {
+  if (requestPolicy === undefined && websocketPreconnect && websocketUrl) {
     // Preconnect is speculative. A normal turn reconnects through the owned
     // transport path, while adapters that require startup validation (such as
     // Cloudflare) observe the same attempt at their createWebSocket boundary.

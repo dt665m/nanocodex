@@ -52,6 +52,7 @@ export type Options = Readonly<{
   /** Explicit alternate-family capability; no credentials are inferred. */
   harnesses?: Readonly<{ codex?: CodexHarnessOptions }>;
   auth: Auth;
+  requestPolicy?: import("./request-policy.mjs").RequestPolicy;
   model: string;
   endpoint?: string;
   /** Explicit host Messages fetch; never serialized into model/session state. */

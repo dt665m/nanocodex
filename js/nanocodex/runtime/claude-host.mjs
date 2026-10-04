@@ -1,3 +1,4 @@
+import { assertRequestPolicy } from "./request-policy.mjs";
 import { freezeJson } from '../internal.mjs';
 
 const TOOL_RESULT = Symbol.for('nanocodex.toolResult');
@@ -66,7 +67,7 @@ function ownMessagesFetch(fetchImpl, endpoint) {
   messagesFetches.set(id, { fetch: fetchImpl, endpoint });
   return { id, release() { messagesFetches.delete(id); } };
 }
-export function createClaudeHost({ auth, tools = [], onEvent = () => {}, fetch, endpoint, subagentSessions, subagentRouting }) {
+export function createClaudeHost({ auth, tools = [], onEvent = () => {}, fetch, endpoint, subagentSessions, subagentRouting, requestPolicy }) {
   if (!auth || typeof auth !== 'object' || Array.isArray(auth)
     || Object.keys(auth).some((key) => !['apiKey', 'headers'].includes(key))
     || (auth.headers !== undefined && typeof auth.headers !== 'function')
@@ -92,7 +93,9 @@ export function createClaudeHost({ auth, tools = [], onEvent = () => {}, fetch, 
     if (turnId !== undefined) turns?.get(turnId)?.abort();
     else for (const value of turns?.values() ?? []) value.abort();
   };
-  const messagesFetch = fetch === undefined ? undefined : ownMessagesFetch(fetch, endpoint);
+  const governedFetch = requestPolicy === undefined ? fetch
+    : assertRequestPolicy(requestPolicy).fetch(fetch ?? globalThis.fetch.bind(globalThis), "claude");
+  const messagesFetch = governedFetch === undefined ? undefined : ownMessagesFetch(governedFetch, endpoint ?? "https://api.anthropic.com/v1/messages");
   const host = {
     connect() { throw new Error('Claude uses Messages HTTP only'); },
     async claudeAuthHeaders() {

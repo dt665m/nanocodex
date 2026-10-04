@@ -41,6 +41,7 @@ const INTERNAL_RUNTIME = Symbol.for("nanocodex.cloudflare.internalRuntime");
 const INTERNAL_CONFIGURATION = Symbol.for("nanocodex.cloudflare.internalConfiguration");
 const INTERNAL_FORK_RESUME = Symbol.for("nanocodex.cloudflare.internalForkResume");
 const EPHEMERAL_APPLICATION_OPTIONS = new Set([
+  "requestPolicy",
   "instantToolSteering",
   "inlineDocsTokenBudget",
   "beforeCompaction",
@@ -56,6 +57,7 @@ const EPHEMERAL_APPLICATION_OPTIONS = new Set([
   "workspace",
 ]);
 const APPLICATION_OPTIONS = new Set([
+  "requestPolicy",
   "instantToolSteering",
   "inlineDocsTokenBudget",
   "beforeCompaction",
@@ -536,6 +538,7 @@ async function createOwned(module, resolved, options, hostAgent, lifecycle, prep
         harnesses,
         model: internalConfiguration.model, thinking: internalConfiguration.thinking,
         instructions: agentOptions.instructions ?? agentOptions.additionalInstructions,
+        requestPolicy: agentOptions.requestPolicy,
         tools: agentOptions.tools, module, durability, durabilityId: stateId,
         terminalReceiptRetention: agentOptions.terminalReceiptRetention,
       });
@@ -591,8 +594,8 @@ async function createOwned(module, resolved, options, hostAgent, lifecycle, prep
   const startup = deferred();
   const transport = Transport.hostManaged({
     ...endpoint,
-    stateless: directInference,
-    websocketPreconnect: !directInference,
+    stateless: directInference || agentOptions.requestPolicy !== undefined,
+    websocketPreconnect: !directInference && agentOptions.requestPolicy === undefined,
     async createResponse(url, id, request) {
       let selected = endpoint;
       const body = responseControlsBody(request.body, internalRuntime?.responseControls);
@@ -722,7 +725,7 @@ async function createOwned(module, resolved, options, hostAgent, lifecycle, prep
     // Managed voice needs the durable session before the separate Responses
     // relay is ready. Its preconnection remains owned by the host and a later
     // text turn consumes it through the same credential-checked transport.
-    if (!directInference && internalRuntime?.waitForPreconnect !== false) {
+    if (!directInference && agentOptions.requestPolicy === undefined && internalRuntime?.waitForPreconnect !== false) {
       await withTimeout(
         startup.promise,
         STARTUP_TIMEOUT_MS,
@@ -809,7 +812,8 @@ export async function createEphemeral(module, owner, options = {}) {
   const startup = deferred();
   const transport = Transport.hostManaged({
     ...endpoint,
-    websocketPreconnect: true,
+    stateless: agentOptions.requestPolicy !== undefined,
+    websocketPreconnect: agentOptions.requestPolicy === undefined,
     async createWebSocket(url, id, request) {
       try {
         const opened = await endpoint.createWebSocket(url, id, request);
@@ -830,7 +834,7 @@ export async function createEphemeral(module, owner, options = {}) {
       toolMode: "direct",
       transport,
     });
-    await withTimeout(
+    if (agentOptions.requestPolicy === undefined) await withTimeout(
       startup.promise,
       STARTUP_TIMEOUT_MS,
       "Cloudflare ephemeral Agent EGRESS startup validation timed out",
@@ -875,7 +879,7 @@ function applicationOptions(options) {
   for (const name of Object.keys(options)) {
     if (!APPLICATION_OPTIONS.has(name)) {
       throw new TypeError(
-        `Cloudflare Agent.create does not accept ${name}; only durabilityId, eventPersistence, instructions, additionalInstructions, terminalReceiptRetention, and tools are configurable`,
+        `Cloudflare Agent.create does not accept ${name}; only durabilityId, eventPersistence, instructions, additionalInstructions, terminalReceiptRetention, requestPolicy, and tools are configurable`,
       );
     }
   }

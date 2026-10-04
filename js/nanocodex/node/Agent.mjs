@@ -1,3 +1,4 @@
+import { assertRequestPolicy } from "../runtime/request-policy.mjs";
 import { prepareHarnesses } from '../runtime/harnesses.mjs';
 import { create as createClaude } from './Claude.mjs';
 import { createRequire } from "node:module";
@@ -33,7 +34,11 @@ let NodeNanocodex;
 export function create(options = {}) {
   if (options.harness === 'claude') return createClaude(options);
   if (options.harness !== undefined && options.harness !== 'codex') throw new TypeError('unsupported harness family');
-  if (managedTransportOptions(options?.transport)) return createManagedAgent(options);
+  if (managedTransportOptions(options?.transport)) {
+    if (options.requestPolicy !== undefined) throw new TypeError("managed request policy must be configured by its owning host");
+    return createManagedAgent(options);
+  }
+  const requestPolicy = options.requestPolicy === undefined ? undefined : assertRequestPolicy(options.requestPolicy);
   const {
     model,
     thinking,
@@ -79,6 +84,7 @@ export function create(options = {}) {
   let hostDefinitionId;
   const host = createNodeHost({
     mpp,
+    requestPolicy,
     mcpServers: mcp === false
       ? undefined
       : tempoMcp ? { ...tempoMcp, ...mcp } : mcp,
@@ -126,7 +132,8 @@ export function create(options = {}) {
             ? undefined
             : "wss://openai.mpp.tempo.xyz/v1/responses"),
           apiBaseUrl,
-          websocketWarmup,
+          websocketWarmup: requestPolicy === undefined ? websocketWarmup : false,
+          stateless: requestPolicy !== undefined,
           subagents: subagentConfig,
           claudeHarness: harnesses?.claude,
           hostDefinitionId,

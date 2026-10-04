@@ -78,3 +78,5 @@ export type {
 } from "./host.mjs";
 
 export * as Claude from "./Claude.mjs";
+
+export * as RequestPolicy from "../runtime/request-policy.mjs";
