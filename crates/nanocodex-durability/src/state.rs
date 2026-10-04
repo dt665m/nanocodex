@@ -1423,7 +1423,8 @@ mod continuation_tests {
         assert!(
             apply(Transition::ExecutionAdvanced {
                 operation_id: id.clone(),
-                continuation: payload.clone()
+                continuation: payload.clone(),
+                retained_steps: Vec::new(),
             })
             .is_err()
         );
