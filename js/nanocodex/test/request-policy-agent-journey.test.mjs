@@ -121,7 +121,10 @@ test('public Claude Agent preserves signed tool history and accounts for opt-in 
   const signed = { type: 'thinking', thinking: 'synthetic', signature: 'opaque-signature/+==' };
   let effects = 0; let modelCalls = 0; let headers = 0;
   const fixture = await server(t, ({ body }) => {
-    if (body.stream === false) return Response.json({ usage: { input_tokens: 2, output_tokens: 1, cache_creation_input_tokens: 100, cache_read_input_tokens: 0 } });
+    if (body.stream === false) {
+      assert.deepEqual(body.tool_choice, { type: 'none' });
+      return Response.json({ usage: { input_tokens: 2, output_tokens: 1, cache_creation_input_tokens: 100, cache_read_input_tokens: 0 } });
+    }
     modelCalls++;
     if (modelCalls === 1) return claude([signed, { type: 'tool_use', id: 'read-once', name: 'Read', input: {} }], 'tool_use');
     assert.deepEqual(body.messages.find(m => m.role === 'assistant').content[0], signed);
@@ -145,8 +148,8 @@ test('public Claude Agent preserves signed tool history and accounts for opt-in 
     assert.equal(effects, 1); assert.equal(snapshot.requests.length, 2);
     assert.equal(snapshot.requests[1].context.continuationOf, snapshot.requests[0].requestId);
     assert.equal(snapshot.warms.length, 1);
-    assert.ok(snapshot.warms.every(w => w.status === 'completed' && w.actualUsd === .000207));
-    assert.equal(snapshot.actualWarmUsd, .000207);
+    assert.ok(snapshot.warms.every(w => w.status === 'completed' && Math.abs(w.actualUsd - .000207) < 1e-12));
+    assert.ok(Math.abs(snapshot.actualWarmUsd - .000207) < 1e-12);
     assert.ok(fixture.requests[0].body.system.some(block => block.text === 'CLAUDE_PROJECT'));
     assert.deepEqual(snapshot.requests.map(r => r.usage.output_tokens), [3, 3]);
     assert.equal(JSON.stringify(snapshot).includes('x-api-key'), false);

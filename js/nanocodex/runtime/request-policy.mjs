@@ -370,7 +370,7 @@ function observeResponse(response, family, observe) {
     buffer = done ? '' : lines.pop();
     for (const line of lines) if (line.startsWith('data:') && line.slice(5).trim() !== '[DONE]') { const data = line.slice(5).trim(); if (data) event(JSON.parse(data)); }
   }
-  return new Response(new ReadableStream({
+  const observed = new Response(new ReadableStream({
     async pull(controller) {
       try {
         const { done, value } = await reader.read();
@@ -382,6 +382,9 @@ function observeResponse(response, family, observe) {
     },
     async cancel(reason) { await reader.cancel(reason); if (!settled) { await observe(usage, terminal ? 'completed' : 'failed'); settled = true; } },
   }), { status: response.status, statusText: response.statusText, headers: response.headers });
+  // reqwest WASM reads the fetch response URL when constructing its response.
+  Object.defineProperty(observed, 'url', { value: response.url });
+  return observed;
 }
 
 function warmCost(usage, prices) {
