@@ -642,6 +642,11 @@ impl Execution {
         kind: &str,
         request_id: Option<&str>,
     ) -> Result<()> {
+        // Completion receipts are host tool events, never accepted user messages.
+        // Their typed payload is retained by the execution journal and transcript.
+        if prompt.async_completion().is_some() {
+            return Ok(());
+        }
         let turn_id = events.turn_id().unwrap_or(events.request_id()).to_owned();
         let item_id = if kind == "prompt" {
             format!("{turn_id}:prompt")
