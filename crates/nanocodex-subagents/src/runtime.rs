@@ -103,6 +103,8 @@ pub struct Registry {
     max_resident: AtomicUsize,
     residency_lock: tokio::sync::Mutex<()>,
     message_lock: tokio::sync::Mutex<()>,
+    pub(super) spawn_lock: tokio::sync::Mutex<()>,
+    durable_required: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Default)]
@@ -119,6 +121,7 @@ struct AgentScope {
     messages: MessageThreads,
     closing: bool,
     journal: Option<ChildJournal>,
+    calls: HashMap<String, ChildCall>,
 }
 
 /// Exact admission retained until child execution and registry settlement agree.
@@ -131,6 +134,8 @@ pub(super) struct ChildExecution {
 
 #[derive(Serialize, Deserialize)]
 struct ChildTreeRecord {
+    #[serde(default)]
+    calls: HashMap<String, ChildCall>,
     version: u32,
     topology: TaskTree,
     messages: MessageThreads,
@@ -157,6 +162,7 @@ impl AgentScope {
     async fn persist(&mut self) -> std::io::Result<()> {
         if self.journal.is_none() { return Ok(()); }
         let record = ChildTreeRecord {
+            calls: self.calls.clone(),
             version: 1, topology: self.topology.clone(), messages: self.messages.clone(),
             closing: self.closing,
             sessions: self.sessions.iter().map(|(&id, child)| (id, ChildRecord {
@@ -252,7 +258,7 @@ pub struct AgentDirectoryEntry {
     pub can_manage: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MessageReceipt {
     pub message_id: MessageId,
     pub thread_id: ThreadId,
@@ -855,7 +861,7 @@ impl RegistryState {
                 .sessions
                 .get_mut(id)
                 .ok_or_else(|| std::io::Error::other(format!("unknown agent_id {id}")))?;
-            if session.active {
+            if session.active || session.execution.is_some() {
                 return Err(std::io::Error::other(format!(
                     "agent {id} is still running"
                 )));
@@ -886,7 +892,7 @@ impl RegistryState {
             scope
                 .sessions
                 .get(id)
-                .is_some_and(|session| !session.active)
+                .is_some_and(|session| !session.active && session.execution.is_none())
         }))
     }
 
@@ -909,7 +915,7 @@ impl RegistryState {
             .sessions
             .iter()
             .filter(|(_, session)| {
-                !session.active && session.status.can_start_turn() && session.harness.is_some()
+                !session.active && session.execution.is_none() && session.status.can_start_turn() && session.harness.is_some()
             })
             .filter(|(id, _)| !scope.messages.has_pending_for(**id))
             .filter(|(id, _)| {
@@ -982,6 +988,8 @@ impl Registry {
             max_resident: AtomicUsize::new(crate::DEFAULT_MAX_RESIDENT_SUBAGENTS),
             residency_lock: tokio::sync::Mutex::new(()),
             message_lock: tokio::sync::Mutex::new(()),
+            spawn_lock: tokio::sync::Mutex::new(()),
+            durable_required: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1121,11 +1129,13 @@ impl Registry {
         agent: Nanocodex,
         event_task: Task<()>,
         contract: OutputContract,
+        call: Option<(String, Value)>,
     ) -> std::io::Result<()> {
         let OutputContract { validator, schema } = contract;
         let durable = self.state.lock().await.scopes.get(&root_session_id).is_some_and(|scope| scope.journal.is_some());
         let snapshot = if durable { Some(agent.runtime_snapshot().await.map_err(std::io::Error::other)?) } else { None };
         let mut state = self.state.lock().await;
+        let descriptor_id = descriptor.id;
         state.validate_insert(&root_session_id, &descriptor)?;
         let (harness, harness_task) = harness::spawn(
             root_session_id.clone(),
@@ -1162,6 +1172,9 @@ impl Registry {
                 evicted: false,
             },
         )?;
+        if let Some((key, input)) = call {
+            state.scope_mut(&root_session_id).calls.insert(key, ChildCall::Spawn { input, id: descriptor_id });
+        }
         state.scope_mut(&root_session_id).persist().await?;
         drop(state);
         self.changed();
@@ -1184,120 +1197,88 @@ impl Registry {
     }
 
     pub(super) async fn harness_turn_started(
-        &self,
-        root_session_id: &str,
-        id: AgentId,
-    ) -> Option<u64> {
-        let revision = {
-            let mut state = self.state.lock().await;
-            let last_used = state.next_access();
-            let session = state
-                .scopes
-                .get_mut(root_session_id)
-                .and_then(|scope| scope.sessions.get_mut(&id))?;
-            if !session.status.can_start_turn() || session.active {
-                None
-            } else {
-                let revision = session.next_instruction_revision.checked_add(1)?;
-                session.next_instruction_revision = revision;
-                session.active_instruction_revision = Some(revision);
-                session.active = true;
-                session.steering = false;
-                session.submitted_output = None;
-                session.last_used = last_used;
-                session.status = AgentStatus::Running;
-                Some(revision)
-            }
-        };
-        if revision.is_some() {
-            self.send(
-                root_session_id,
-                AgentUpdate::Status {
-                    id,
-                    status: AgentStatus::Running,
-                },
-            );
-            self.changed();
-        }
-        revision
+        &self, root_session_id: &str, id: AgentId,
+    ) -> std::io::Result<Option<u64>> {
+        let mut state = self.state.lock().await;
+        let last_used = state.next_access();
+        let scope = state.scope_mut(root_session_id);
+        let Some(session) = scope.sessions.get_mut(&id) else { return Ok(None); };
+        if !session.status.can_start_turn() || session.active { return Ok(None); }
+        let revision = session.next_instruction_revision.checked_add(1)
+            .ok_or_else(|| std::io::Error::other("child instruction revision exhausted"))?;
+        session.next_instruction_revision = revision;
+        session.active_instruction_revision = Some(revision);
+        session.active = true;
+        session.steering = false;
+        session.submitted_output = None;
+        session.last_used = last_used;
+        session.status = AgentStatus::Running;
+        scope.persist().await?;
+        drop(state);
+        self.send(root_session_id, AgentUpdate::Status { id, status: AgentStatus::Running });
+        self.changed();
+        Ok(Some(revision))
     }
 
     pub(super) async fn harness_turn_start_failed(
-        &self,
-        root_session_id: &str,
-        id: AgentId,
-        error: String,
-    ) {
-        let status = {
-            let mut state = self.state.lock().await;
-            let Some(session) = state
-                .scopes
-                .get_mut(root_session_id)
-                .and_then(|scope| scope.sessions.get_mut(&id))
-            else {
-                return;
-            };
-            session.active = false;
+        &self, root_session_id: &str, id: AgentId, error: String,
+    ) -> std::io::Result<()> {
+        let mut state = self.state.lock().await;
+        let scope = state.scope_mut(root_session_id);
+        let Some(session) = scope.sessions.get_mut(&id) else { return Ok(()); };
+        // Durable admission may have succeeded in the native driver before its
+        // receipt failed. Keep that operation and its output for reconstruction.
+        session.active = false;
+        session.steering = false;
+        if scope.journal.is_none() {
             session.active_instruction_revision = None;
-            session.steering = false;
             session.submitted_output = None;
-            if !matches!(session.status, AgentStatus::Closing | AgentStatus::Closed) {
-                session.status = AgentStatus::Failed { error };
-            }
-            session.status.clone()
-        };
+        }
+        if !matches!(session.status, AgentStatus::Closing | AgentStatus::Closed) {
+            session.status = AgentStatus::Failed { error };
+        }
+        let status = session.status.clone();
+        scope.persist().await?;
+        drop(state);
         self.send(root_session_id, AgentUpdate::Status { id, status });
         self.changed();
+        Ok(())
     }
 
     pub(super) async fn harness_turn_finished(
-        self: &Arc<Self>,
-        root_session_id: &str,
-        id: AgentId,
-        result: AgentResult<TurnResult>,
-    ) {
-        let status = {
-            let mut state = self.state.lock().await;
-            let Some(session) = state
-                .scopes
-                .get_mut(root_session_id)
-                .and_then(|scope| scope.sessions.get_mut(&id))
-            else {
-                return;
+        self: &Arc<Self>, root_session_id: &str, id: AgentId,
+        result: AgentResult<TurnResult>, snapshot: Option<ChildSnapshot>,
+    ) -> std::io::Result<()> {
+        let mut state = self.state.lock().await;
+        let scope = state.scope_mut(root_session_id);
+        let Some(session) = scope.sessions.get_mut(&id) else { return Ok(()); };
+        if !session.active { return Ok(()); }
+        if scope.journal.is_some() && snapshot.is_none() {
+            return Err(std::io::Error::other("durable child settlement requires a native snapshot"));
+        }
+        session.stored_runtime = snapshot.or_else(|| session.stored_runtime.take());
+        session.active = false;
+        session.execution = None;
+        session.active_instruction_revision = None;
+        session.steering = false;
+        let submitted_output = session.submitted_output.take();
+        if let Some(output) = &submitted_output { session.last_output = Some(output.clone()); }
+        if !matches!(session.status, AgentStatus::Closing | AgentStatus::Closed) {
+            session.status = match result {
+                Ok(_) => complete_session(session, submitted_output),
+                Err(NanocodexError::TurnCancelled) => AgentStatus::Interrupted,
+                Err(error) => AgentStatus::Failed { error: error.to_string() },
             };
-            if !session.active {
-                return;
-            }
-            session.active = false;
-            session.active_instruction_revision = None;
-            session.steering = false;
-            let submitted_output = session.submitted_output.take();
-            // Acceptance belongs to this turn even if cancellation/close wins settlement.
-            // Keep its evidence, without claiming the interrupted execution completed.
-            if let Some(output) = &submitted_output {
-                session.last_output = Some(output.clone());
-            }
-            if matches!(session.status, AgentStatus::Closing | AgentStatus::Closed) {
-                session.status.clone()
-            } else {
-                match result {
-                    Ok(_) => complete_session(session, submitted_output),
-                    Err(NanocodexError::TurnCancelled) => AgentStatus::Interrupted,
-                    Err(error) => AgentStatus::Failed {
-                        error: error.to_string(),
-                    },
-                }
-            }
-            .clone_into(&mut session.status);
-            session.status.clone()
-        };
+        }
+        let status = session.status.clone();
+        scope.persist().await?;
+        drop(state);
         self.send(root_session_id, AgentUpdate::Status { id, status });
         self.changed();
         let registry = Arc::clone(self);
         let root_session_id = root_session_id.to_owned();
-        drop(platform::spawn(async move {
-            registry.enforce_resident_limit(&root_session_id).await;
-        }));
+        drop(platform::spawn(async move { registry.enforce_resident_limit(&root_session_id).await; }));
+        Ok(())
     }
 
     async fn enforce_resident_limit(&self, root_session_id: &str) {
@@ -1368,37 +1349,29 @@ impl Registry {
         }
     }
 
-    pub(super) async fn harness_closed(&self, root_session_id: &str, id: AgentId) {
-        let status_update = {
-            let mut state = self.state.lock().await;
-            let Some(session) = state
-                .scopes
-                .get_mut(root_session_id)
-                .and_then(|scope| scope.sessions.get_mut(&id))
-            else {
-                return;
-            };
-            if matches!(session.status, AgentStatus::Closed) {
-                None
-            } else {
-                session.harness = None;
-                session.active = false;
-                session.active_instruction_revision = None;
-                session.steering = false;
-                session.submitted_output = None;
-                if session.evicted && !matches!(session.status, AgentStatus::Closing) {
-                    None
-                } else {
-                    session.evicted = false;
-                    session.status = AgentStatus::Closed;
-                    Some(AgentStatus::Closed)
-                }
-            }
-        };
-        if let Some(status) = status_update {
-            self.send(root_session_id, AgentUpdate::Status { id, status });
+    pub(super) async fn harness_closed(&self, root_session_id: &str, id: AgentId) -> std::io::Result<()> {
+        let mut state = self.state.lock().await;
+        let scope = state.scope_mut(root_session_id);
+        let Some(session) = scope.sessions.get_mut(&id) else { return Ok(()); };
+        if session.active || session.execution.is_some() {
+            return Err(std::io::Error::other("child execution has not settled"));
         }
+        session.harness = None;
+        session.active_instruction_revision = None;
+        session.steering = false;
+        session.submitted_output = None;
+        let status = if session.evicted && !matches!(session.status, AgentStatus::Closing) {
+            None
+        } else {
+            session.evicted = false;
+            session.status = AgentStatus::Closed;
+            Some(AgentStatus::Closed)
+        };
+        scope.persist().await?;
+        drop(state);
+        if let Some(status) = status { self.send(root_session_id, AgentUpdate::Status { id, status }); }
         self.changed();
+        Ok(())
     }
 
     async fn runtime_closed(&self, root_session_id: &str, id: AgentId) {
@@ -1566,8 +1539,29 @@ impl Registry {
         in_reply_to: Option<MessageId>,
         body: String,
     ) -> std::io::Result<MessageReceipt> {
+        self.send_message_keyed(session_id, to, priority, purpose, in_reply_to, body, None).await
+    }
+
+    pub(super) async fn send_message_keyed(
+        self: &Arc<Self>, session_id: &str, to: AgentId, priority: MessagePriority,
+        purpose: MessagePurpose, in_reply_to: Option<MessageId>, body: String,
+        call: Option<(String, Value)>,
+    ) -> std::io::Result<MessageReceipt> {
         let _residency_guard = self.residency_lock.lock().await;
         let _message_guard = self.message_lock.lock().await;
+        if let Some((key, input)) = &call {
+            let mut state = self.state.lock().await;
+            let root = state.root_session_id(session_id).to_owned();
+            let scope = state.scope_mut(&root);
+            if self.durable_replay() && scope.journal.is_none() { return Err(std::io::Error::other("durable child journal is not ready")); }
+            scope.persist().await?;
+            if let Some(previous) = scope.calls.get(key) {
+                return match previous {
+                    ChildCall::Message { input: previous, receipt } if previous == input => Ok(receipt.clone()),
+                    _ => Err(std::io::Error::other("child tool call identity reused with different arguments")),
+                };
+            }
+        }
         self.rehydrate(session_id, to, purpose).await?;
         let prepared = self.state.lock().await.prepare_message(
             session_id,
@@ -1583,24 +1577,44 @@ impl Registry {
         {
             let mut state = self.state.lock().await;
             state.commit_message(&prepared.root_session_id, prepared.message.clone())?;
-            state.scope_mut(&prepared.root_session_id).persist().await?;
+            let scope = state.scope_mut(&prepared.root_session_id);
+            if let Some((key, input)) = &call {
+                // A queued receipt is the stable durable mailbox admission. Delivery
+                // may happen after the caller loses its transport or restarts.
+                scope.calls.insert(key.clone(), ChildCall::Message { input: input.clone(), receipt: MessageReceipt {
+                    message_id: prepared.message.id, thread_id: prepared.message.thread_id,
+                    from: prepared.message.from, to_agent_id: prepared.message.to,
+                    disposition: MessageDisposition::Queued,
+                }});
+            }
+            scope.persist().await?;
         }
         let disposition = match delivery.release().await {
             Ok(disposition) => disposition,
             Err(error) => {
                 let mut state = self.state.lock().await;
-                state.rollback_message(&prepared.root_session_id, prepared.message.id);
+                // Retain durable mailbox admission on an ambiguous driver failure.
+                if state.scope_mut(&prepared.root_session_id).journal.is_none() {
+                    state.rollback_message(&prepared.root_session_id, prepared.message.id);
+                }
                 state.scope_mut(&prepared.root_session_id).persist().await?;
                 return Err(error);
             }
         };
-        Ok(MessageReceipt {
+        let receipt = MessageReceipt {
             message_id: prepared.message.id,
             thread_id: prepared.message.thread_id,
             from: prepared.message.from,
             to_agent_id: prepared.message.to,
             disposition,
-        })
+        };
+        if let Some((key, input)) = call {
+            let mut state = self.state.lock().await;
+            let scope = state.scope_mut(&prepared.root_session_id);
+            if scope.journal.is_some() { scope.calls.insert(key, ChildCall::Message { input, receipt: receipt.clone() }); }
+            scope.persist().await?;
+        }
+        Ok(receipt)
     }
 
     pub(super) async fn message_admitted(
@@ -1608,16 +1622,15 @@ impl Registry {
         root_session_id: &str,
         id: MessageId,
         disposition: MessageDisposition,
-    ) {
+    ) -> std::io::Result<()> {
         let thread = {
             let mut state = self.state.lock().await;
             let thread = state.thread_for_message(root_session_id, id);
             state.mark_message_admitted(root_session_id, id, disposition);
+            state.scope_mut(root_session_id).persist().await?;
             thread
         };
-        let Some(thread) = thread else {
-            return;
-        };
+        let Some(thread) = thread else { return Ok(()); };
         self.send(
             root_session_id,
             AgentUpdate::Message(AgentMessageUpdate {
@@ -1627,13 +1640,13 @@ impl Registry {
             }),
         );
         self.changed();
+        Ok(())
     }
 
-    pub(super) async fn message_rejected(&self, root_session_id: &str, id: MessageId) {
-        self.state
-            .lock()
-            .await
-            .rollback_message(root_session_id, id);
+    pub(super) async fn message_rejected(&self, root_session_id: &str, id: MessageId) -> std::io::Result<()> {
+        let mut state = self.state.lock().await;
+        state.rollback_message(root_session_id, id);
+        state.scope_mut(root_session_id).persist().await
     }
 
     pub(super) async fn message_delivered(
@@ -1641,13 +1654,13 @@ impl Registry {
         root_session_id: &str,
         id: MessageId,
         disposition: MessageDisposition,
-    ) {
+    ) -> std::io::Result<()> {
         self.publish_message_state(
             root_session_id,
             id,
             MessageDeliveryState::Delivered { disposition },
         )
-        .await;
+        .await
     }
 
     pub(super) async fn begin_message_delivery(
@@ -1681,38 +1694,24 @@ impl Registry {
         }
     }
 
-    pub(super) async fn message_failed(&self, root_session_id: &str, id: MessageId, error: String) {
+    pub(super) async fn message_failed(&self, root_session_id: &str, id: MessageId, error: String) -> std::io::Result<()> {
         self.publish_message_state(root_session_id, id, MessageDeliveryState::Failed { error })
-            .await;
+            .await
     }
 
     async fn publish_message_state(
-        &self,
-        root_session_id: &str,
-        message_id: MessageId,
-        delivery: MessageDeliveryState,
-    ) {
-        let thread = self
-            .state
-            .lock()
-            .await
-            .thread_for_message(root_session_id, message_id);
-        let Some(thread) = thread else {
-            return;
-        };
-        self.send(
-            root_session_id,
-            AgentUpdate::Message(AgentMessageUpdate {
-                message_id,
-                thread,
-                delivery,
-            }),
-        );
-        self.changed();
-        self.state
-            .lock()
-            .await
-            .mark_message_terminal(root_session_id, message_id);
+        &self, root_session_id: &str, message_id: MessageId, delivery: MessageDeliveryState,
+    ) -> std::io::Result<()> {
+        let mut state = self.state.lock().await;
+        let thread = state.thread_for_message(root_session_id, message_id);
+        state.mark_message_terminal(root_session_id, message_id);
+        state.scope_mut(root_session_id).persist().await?;
+        drop(state);
+        if let Some(thread) = thread {
+            self.send(root_session_id, AgentUpdate::Message(AgentMessageUpdate { message_id, thread, delivery }));
+            self.changed();
+        }
+        Ok(())
     }
 
     pub async fn wait(
@@ -1749,7 +1748,11 @@ impl Registry {
         let _message_guard = self.message_lock.lock().await;
         let (root_session_id, ids, harnesses) = {
             let mut state = self.state.lock().await;
-            state.request_interrupt(session_id, id)?
+            let request = state.request_interrupt(session_id, id)?;
+            let scope = state.scope_mut(&request.0);
+            for id in &request.1 { scope.sessions.get_mut(id).expect("child").interrupted = true; }
+            scope.persist().await?;
+            request
         };
         self.changed();
         let deadline = Instant::now() + AGENT_STOP_TIMEOUT;
@@ -1770,7 +1773,11 @@ impl Registry {
             status_updates,
         } = {
             let mut state = self.state.lock().await;
-            state.request_close(session_id, id)?
+            let request = state.request_close(session_id, id)?;
+            let scope = state.scope_mut(&request.root_session_id);
+            for id in &request.ids { scope.sessions.get_mut(id).expect("child").interrupted = true; }
+            scope.persist().await?;
+            request
         };
         for (id, status) in status_updates {
             self.send(&root_session_id, AgentUpdate::Status { id, status });
@@ -1794,7 +1801,11 @@ impl Registry {
             status_updates,
         } = {
             let mut state = self.state.lock().await;
-            state.request_close_all(session_id)?
+            let request = state.request_close_all(session_id)?;
+            let scope = state.scope_mut(&request.root_session_id);
+            for id in &request.ids { scope.sessions.get_mut(id).expect("child").interrupted = true; }
+            scope.persist().await?;
+            request
         };
         for (id, status) in status_updates {
             self.send(&root_session_id, AgentUpdate::Status { id, status });
@@ -1830,16 +1841,17 @@ impl Registry {
         // Closing an already-finished driver can race with its natural shutdown.
         // Once every harness reports inactive, command errors no longer identify
         // a live resource and must not prevent task handles from being joined.
-        drop(closing_result);
+        closing_result?;
         let ClosedSessions {
             summaries,
             harness_tasks,
             event_tasks,
-        } = self
-            .state
-            .lock()
-            .await
-            .finish_close(&root_session_id, &ids)?;
+        } = {
+            let mut state = self.state.lock().await;
+            let closed = state.finish_close(&root_session_id, &ids)?;
+            state.scope_mut(&root_session_id).persist().await?;
+            closed
+        };
         for summary in &summaries {
             self.send(
                 &root_session_id,
@@ -1883,18 +1895,19 @@ impl Registry {
         Ok(summaries)
     }
 
-    async fn cancel_all(&self, session_id: &str) {
+    async fn cancel_all(&self, session_id: &str) -> std::io::Result<()> {
         let _message_guard = self.message_lock.lock().await;
         let (root_session_id, ids, harnesses) = {
             let mut state = self.state.lock().await;
-            state.request_interrupt_all(session_id)
+            let request = state.request_interrupt_all(session_id);
+            let scope = state.scope_mut(&request.0);
+            for id in &request.1 { scope.sessions.get_mut(id).expect("child").interrupted = true; }
+            scope.persist().await?;
+            request
         };
         self.changed();
         let deadline = Instant::now() + AGENT_STOP_TIMEOUT;
-        drop(
-            self.interrupt_harnesses(&root_session_id, &ids, harnesses, deadline)
-                .await,
-        );
+        self.interrupt_harnesses(&root_session_id, &ids, harnesses, deadline).await
     }
 
     async fn interrupt_harnesses(
@@ -1921,7 +1934,7 @@ impl Registry {
         })?;
         self.wait_until_inactive(root_session_id, ids, deadline)
             .await?;
-        drop(interruption_result);
+        interruption_result?;
         Ok(())
     }
 
@@ -2112,8 +2125,8 @@ impl SubagentControl {
         self.registry.set_max_resident(limit);
     }
 
-    pub async fn cancel_all(&self, root_session_id: &str) {
-        self.registry.cancel_all(root_session_id).await;
+    pub async fn cancel_all(&self, root_session_id: &str) -> std::io::Result<()> {
+        self.registry.cancel_all(root_session_id).await
     }
 
     pub async fn close_all(&self, root_session_id: &str) -> std::io::Result<()> {

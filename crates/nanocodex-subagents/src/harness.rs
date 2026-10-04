@@ -509,10 +509,8 @@ impl Harness {
             )));
             return;
         };
-        registry
-            .message_admitted(&self.root_session_id, id, disposition)
-            .await;
-        let _ = response.send(Ok(disposition));
+        let result = registry.message_admitted(&self.root_session_id, id, disposition).await.map(|()| disposition);
+        let _ = response.send(result);
     }
 
     async fn begin_delegation(&self, id: MessageId) -> Option<DelegationChange> {
@@ -567,7 +565,7 @@ impl Harness {
                 let error = format!("could not start agent {}: {error}", self.id);
                 registry
                     .harness_turn_start_failed(&self.root_session_id, self.id, error.clone())
-                    .await;
+                    .await?;
                 return Err(std::io::Error::other(error));
             }
         };
@@ -620,14 +618,16 @@ impl Harness {
             )))
         });
         if let Some(registry) = self.registry.upgrade() {
-            registry
-                .harness_turn_finished(&self.root_session_id, self.id, result)
-                .await;
+            let snapshot = match &self.agent { Some(agent) => agent.runtime_snapshot().await.ok(), None => None };
+            if let Err(error) = registry.harness_turn_finished(&self.root_session_id, self.id, result, snapshot).await {
+                tracing::error!(%error, "durable child settlement failed; cold recovery required");
+            }
         }
     }
 
     async fn close(&mut self) -> std::io::Result<()> {
-        let shutdown_result = match self.agent.take() {
+        self.stop_active().await?;
+        let shutdown_result = match self.agent.as_ref() {
             Some(agent) => agent.shutdown().await.map_err(|error| {
                 std::io::Error::other(format!("could not close agent {}: {error}", self.id))
             }),
@@ -637,7 +637,7 @@ impl Harness {
         if let Some(registry) = self.registry.upgrade() {
             registry
                 .harness_closed(&self.root_session_id, self.id)
-                .await;
+                .await?;
         }
         shutdown_result
     }

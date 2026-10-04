@@ -364,6 +364,7 @@ pub async fn start_agents_observed(
                 child,
                 event_task,
                 contract,
+                None,
             )
             .await
         {
@@ -427,7 +428,7 @@ pub async fn start_agent_with(
     options: SpawnOptions,
 ) -> AgentToolResult<AgentStartReport> {
     let host_context = registry.host_context_for_session(session_id).await;
-    start_agent_with_host_context(parent, registry, session_id, task, options, host_context).await
+    start_agent_with_host_context(parent, registry, session_id, task, options, host_context, None).await
 }
 
 async fn start_agent_with_host_context(
@@ -437,7 +438,12 @@ async fn start_agent_with_host_context(
     task: AgentTask,
     options: SpawnOptions,
     host_context: Option<Arc<str>>,
+    call: Option<(String, Value)>,
 ) -> AgentToolResult<AgentStartReport> {
+    let _spawn = registry.spawn_lock.lock().await;
+    if let Some((key, input)) = &call {
+        if let Some(report) = registry.replay_spawn(session_id, key, input).await? { return Ok(report); }
+    }
     registry.register_handle(parent.clone());
     let AgentTask {
         role,
@@ -506,6 +512,7 @@ async fn start_agent_with_host_context(
             child,
             event_task,
             contract,
+            call,
         )
         .await?;
     registry.send(&reservation.root_session_id, AgentUpdate::Added(descriptor));
@@ -533,10 +540,11 @@ struct SpawnAgent {
 
 #[async_trait]
 impl Tool for SpawnAgent {
+    fn is_replay_safe(&self) -> bool { self.registry.upgrade().is_some_and(|r| r.durable_replay()) }
     fn definition(&self) -> ToolDefinition {
         ToolDefinition::function(
             SPAWN_AGENT_TOOL,
-            "Starts an ephemeral, reusable clean-room subagent without inherited conversation history and immediately returns its ID. Children and in-memory idle snapshots are dropped when the parent runtime restarts; historical IDs do not identify recovered agents.",
+            "Starts a reusable clean-room subagent without inherited conversation history and immediately returns its stable ID. With a durable parent, child identities, messages, results and native execution survive cold recovery.",
             spawn_agent_parameters(),
         )
         .with_strict_parameters()
@@ -544,7 +552,9 @@ impl Tool for SpawnAgent {
     }
 
     async fn execute(&self, input: ToolInput, context: ToolContext<'_>) -> ToolResult {
-        let (task, options) = input.decode_json::<SpawnAgentTask>()?.into_parts()?;
+        let args = input.decode_json::<Value>()?;
+        let call = Some((format!("{}:{}", context.session_id(), context.call_id()), args.clone()));
+        let (task, options) = serde_json::from_value::<SpawnAgentTask>(args)?.into_parts()?;
         let host_context = context.host_context().map(Arc::<str>::from);
         let registry = self
             .registry
@@ -558,6 +568,7 @@ impl Tool for SpawnAgent {
             task,
             options,
             host_context,
+            call,
         )
         .await?;
         // Tool futures are Send, while host JS routing and shutdown futures are
@@ -575,6 +586,7 @@ impl Tool for SpawnAgent {
                     task,
                     options,
                     host_context,
+                    call,
                 )
                 .await
             });
@@ -682,6 +694,7 @@ struct SubmitResult {
 
 #[async_trait]
 impl Tool for SubmitResult {
+    fn is_replay_safe(&self) -> bool { self.registry.upgrade().is_some_and(|r| r.durable_replay()) }
     fn definition(&self) -> ToolDefinition {
         ToolDefinition::function(
             SUBMIT_RESULT_TOOL,
@@ -716,24 +729,11 @@ impl Tool for SubmitResult {
     }
 
     async fn execute(&self, input: ToolInput, context: ToolContext<'_>) -> ToolResult {
-        let SubmitResultArgs { output } = input.decode_json()?;
-        let registry = self
-            .registry
-            .upgrade()
-            .ok_or_else(|| std::io::Error::other("subagent runtime is closed"))?;
-        let outcome = registry
-            .submit_result(context.session_id(), context.instruction_revision(), output)
-            .await?;
-        let output = match outcome {
-            SubmissionOutcome::Accepted { decoded_json_text } => {
-                let mut receipt = json!({ "accepted": true, "status": "accepted" });
-                if decoded_json_text {
-                    receipt["decoded_json_text"] = json!(true);
-                }
-                receipt
-            }
-            SubmissionOutcome::Superseded => json!({ "accepted": false, "status": "superseded" }),
-        };
+        let args = input.decode_json::<Value>()?;
+        let SubmitResultArgs { output } = serde_json::from_value(args.clone())?;
+        let registry = self.registry.upgrade().ok_or_else(|| std::io::Error::other("subagent runtime is closed"))?;
+        let output = registry.submit_result_keyed(context.session_id(), context.instruction_revision(), output,
+            format!("{}:{}", context.session_id(), context.call_id()), args).await?;
         Ok(ToolOutput::from_json(output, true))
     }
 }
@@ -744,6 +744,7 @@ struct SendAgentMessage {
 
 #[async_trait]
 impl Tool for SendAgentMessage {
+    fn is_replay_safe(&self) -> bool { self.registry.upgrade().is_some_and(|r| r.durable_replay()) }
     fn definition(&self) -> ToolDefinition {
         ToolDefinition::function(
             SEND_AGENT_MESSAGE_TOOL,
@@ -787,26 +788,29 @@ impl Tool for SendAgentMessage {
     }
 
     async fn execute(&self, input: ToolInput, context: ToolContext<'_>) -> ToolResult {
+        let args = input.decode_json::<Value>()?;
+        let call = Some((format!("{}:{}", context.session_id(), context.call_id()), args.clone()));
         let SendMessageTask {
             agent_id,
             message,
             priority,
             purpose,
             in_reply_to,
-        } = input.decode_json()?;
+        } = serde_json::from_value(args)?;
         let registry = self
             .registry
             .upgrade()
             .ok_or_else(|| std::io::Error::other("subagent runtime is closed"))?;
         #[cfg(not(target_family = "wasm"))]
         let receipt = registry
-            .send_message(
+            .send_message_keyed(
                 context.session_id(),
                 agent_id,
                 priority,
                 purpose,
                 in_reply_to,
                 message,
+                call,
             )
             .await?;
         #[cfg(target_family = "wasm")]
@@ -814,13 +818,14 @@ impl Tool for SendAgentMessage {
             let session_id = context.session_id().to_owned();
             let pending = super::platform::spawn(async move {
                 registry
-                    .send_message(
+                    .send_message_keyed(
                         &session_id,
                         agent_id,
                         priority,
                         purpose,
                         in_reply_to,
                         message,
+                        call,
                     )
                     .await
             });

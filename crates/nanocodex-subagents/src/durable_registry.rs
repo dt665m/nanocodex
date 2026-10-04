@@ -1,7 +1,65 @@
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+enum ChildCall {
+    Spawn { input: Value, id: AgentId },
+    Message { input: Value, receipt: MessageReceipt },
+    Submit { input: Value, receipt: Value },
+}
+
 // Durable registry transitions run under the same registry lock as their live
 // counterpart. A failed store write poisons the journal, preventing another
 // receipt or inference admission until authoritative cold reconstruction.
 impl Registry {
+    /// Declares that this registry must acquire its durable tree before tools run.
+    /// Hosted factories call this before installing native Claude callbacks.
+    pub fn require_durability(&self) {
+        self.durable_required.store(true, Ordering::Release);
+    }
+
+    pub(super) fn durable_replay(&self) -> bool {
+        self.durable_required.load(Ordering::Acquire)
+    }
+
+    pub(super) async fn replay_spawn(&self, session: &str, key: &str, input: &Value) -> std::io::Result<Option<super::tools::AgentStartReport>> {
+        let mut state = self.state.lock().await;
+        let root = state.root_session_id(session).to_owned();
+        let scope = state.scope_mut(&root);
+        if self.durable_replay() && scope.journal.is_none() { return Err(std::io::Error::other("durable child journal is not ready")); }
+        // A poisoned or superseded journal must never issue a replay receipt.
+        scope.persist().await?;
+        match scope.calls.get(key) {
+            Some(ChildCall::Spawn { input: previous, id }) if previous == input => {
+                let child = &scope.sessions[id];
+                Ok(Some(super::tools::AgentStartReport { agent_id: *id, role: child.descriptor.role.clone(), status: AgentStatus::Running }))
+            }
+            Some(_) => Err(std::io::Error::other("child tool call identity reused with different arguments")),
+            None => Ok(None),
+        }
+    }
+
+    pub(super) async fn submit_result_keyed(&self, session: &str, revision: Option<u64>, output: Value, key: String, input: Value) -> std::io::Result<Value> {
+        let mut state = self.state.lock().await;
+        let root = state.root_session_id(session).to_owned();
+        if self.durable_replay() && state.scope_mut(&root).journal.is_none() { return Err(std::io::Error::other("durable child journal is not ready")); }
+        if let Some(call) = state.scope_mut(&root).calls.get(&key).cloned() {
+            state.scope_mut(&root).persist().await?;
+            return match call { ChildCall::Submit { input: old, receipt } if old == input => Ok(receipt), _ => Err(std::io::Error::other("child tool call identity reused with different arguments")) };
+        }
+        let outcome = state.submit_result(session, revision, output)?;
+        let receipt = match outcome {
+            SubmissionOutcome::Accepted { decoded_json_text } => {
+                let mut receipt = serde_json::json!({ "accepted": true, "status": "accepted" });
+                if decoded_json_text { receipt["decoded_json_text"] = true.into(); }
+                receipt
+            }
+            SubmissionOutcome::Superseded => serde_json::json!({ "accepted": false, "status": "superseded" }),
+        };
+        let scope = state.scope_mut(&root);
+        if scope.journal.is_some() { scope.calls.insert(key, ChildCall::Submit { input, receipt: receipt.clone() }); }
+        scope.persist().await?;
+        Ok(receipt)
+    }
+
     /// Reopens one child tree on the host's existing fenced durability store.
     /// Configure a per-child durable native factory before calling `recover`.
     pub async fn enable_durability(
@@ -9,6 +67,7 @@ impl Registry {
         store: impl StateStore + 'static,
         root_session_id: &str,
     ) -> std::io::Result<()> {
+        self.require_durability();
         let mut state = self.state.lock().await;
         if state.scopes.get(root_session_id).is_some_and(|scope| scope.journal.is_some() || !scope.sessions.is_empty()) {
             return Err(std::io::Error::other("child durability must be enabled before spawning or recovery"));
@@ -17,6 +76,7 @@ impl Registry {
         let mut scope = AgentScope::default();
         if let Some(record) = journal.load::<ChildTreeRecord>().map_err(std::io::Error::other)? {
             if record.version != 1 { return Err(std::io::Error::other("unsupported child tree journal version")); }
+            scope.calls = record.calls;
             scope.topology = record.topology;
             scope.messages = record.messages;
             scope.closing = record.closing;
