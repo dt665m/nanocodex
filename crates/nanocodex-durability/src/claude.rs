@@ -53,8 +53,13 @@ impl ClaudeExecutionPolicy for ClaudeExecution {
             // Configuration and virtual selection are frozen in the receipt. A
             // recovered turn consumes that receipt even if host settings changed.
             let input = serde_json::json!({"request":request, "state":state, "continuation":continuation});
-            match self.owner.begin_step(operation.clone(), step.clone(), "request_policy".into(), &input).await.map_err(agent_error)? {
-                BeginStep::Replay(value) => Ok(Some(value.decode().map_err(agent_error)?)),
+            match self.owner.begin_step(operation.clone(), step.clone(), "request_policy".into(), &input, crate::ReplaySafety::Safe).await.map_err(agent_error)? {
+                BeginStep::OutcomeUnknown => Err(agent_error(crate::Error::InvalidState("request preparation outcome is unknown".into()))),
+                BeginStep::Replay(value) => {
+                    let prepared: RequestPreparation = value.decode().map_err(agent_error)?;
+                    // Current host authorization and limits still constrain a frozen receipt.
+                    settings.prepare_claude(request_id, continuation, prepared.state.clone(), request).map(Some).map_err(agent_error)
+                },
                 BeginStep::Execute => {
                     let prepared = settings.prepare_claude(request_id, continuation, state, request).map_err(agent_error)?;
                     self.owner.complete_step(operation, step, &prepared).await.map_err(agent_error)?;

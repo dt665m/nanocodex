@@ -207,6 +207,10 @@ pub struct PreparedRequest {
     pub request_json: String,
     /// Configuration rendered into this request.
     pub configuration: EffectiveConfiguration,
+    /// Original provider request before configuration/routing; native adapters
+    /// compare it on retry to reject reuse of an identity with changed input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_request: Option<Value>,
 }
 
 /// One branch's configuration, physical selections, and exact request checkpoints.
@@ -278,7 +282,7 @@ impl RequestPolicyState {
         configuration.authorize(authorized_tools)?;
         let request_json = render(&configuration, choice.dispatched)?;
         serde_json::from_str::<Value>(&request_json)?;
-        let prepared = PreparedRequest { request, route: choice, request_json, configuration };
+        let prepared = PreparedRequest { request, route: choice, request_json, configuration, original_request: None };
         self.configuration = history;
         self.requests.push(prepared.clone());
         Ok(prepared)
@@ -316,68 +320,138 @@ pub struct RequestPolicySettings {
     pub router: std::sync::Arc<dyn VirtualModelRouter + Send + Sync>,
 }
 
+/// Exact native preparation retained before external transport dispatch.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct PreparedNativeRequest {
+    /// Provider-native JSON with only supported configuration fields edited.
+    pub request: Value,
+    /// Persisted branch-local configuration history and routing receipts.
+    pub state: Value,
+}
+
 impl RequestPolicySettings {
-    /// Render a Claude request without positional patch support. Only `system`,
-    /// `tools`, and `model` are edited; messages, signatures and order are retained.
-    #[cfg(feature = "claude")]
-    pub(crate) fn prepare_claude(&self, id: String, continuation: bool,
-        state: Value, request: Value) -> Result<nanocodex_claude::execution::RequestPreparation> {
+    /// Prepare supported native JSON without changing original transcript items.
+    /// Retries replay the exact receipt, irrespective of a changed host router.
+    pub fn prepare_native(&self, id: String, continuation: bool, switch_safe: bool,
+        state: Value, request: Value, family: HarnessFamily) -> Result<PreparedNativeRequest> {
         let mut state: RequestPolicyState = if state.is_null() { RequestPolicyState::default() }
             else { serde_json::from_value(state)? };
         let catalog: Vec<ToolDeclaration> = request["tools"].as_array().into_iter().flatten()
             .map(|definition| Ok(ToolDeclaration {
-                name: definition["name"].as_str().ok_or_else(|| invalid("native declaration lacks name"))?.into(),
+                name: definition["name"].as_str().or_else(|| definition["type"].as_str())
+                    .ok_or_else(|| invalid("native declaration lacks name"))?.into(),
                 definition: definition.clone(),
             })).collect::<Result<_>>()?;
         if let Some(saved) = state.requests.iter().find(|entry| entry.request.request_id == id) {
+            if saved.original_request.as_ref() != Some(&request)
+                || saved.request.continuation_of.is_some() != continuation {
+                return Err(invalid("request identity reused with different original native input"));
+            }
             saved.configuration.authorize(&catalog)?;
             let mut limits = saved.request.clone();
             limits.input_tokens = saved.request_json.len() as u64;
             validate_limits(&limits, saved.route.dispatched, &self.models)?;
-            return Ok(nanocodex_claude::execution::RequestPreparation {
+            return Ok(PreparedNativeRequest {
                 request: serde_json::from_str(&saved.request_json)?, state: serde_json::to_value(&state)?,
             });
         }
         let mut patches = if continuation { Vec::new() } else { self.patches.clone() };
         if state.requests.is_empty() {
-            // Install the exact host catalog first, then explicit changes.
             let mut initial = catalog.iter().cloned().map(|tool| ConfigurationPatch::SetTool { tool }).collect::<Vec<_>>();
             initial.append(&mut patches);
             patches = initial;
         }
         let predecessor = state.requests.last().map(|p| p.request.request_id.clone());
+        if continuation && predecessor.is_none() {
+            return Err(invalid("continuation requires a persisted predecessor"));
+        }
         let original = request.clone();
-        let output = request["max_tokens"].as_u64().ok_or_else(|| invalid("native request lacks output limit"))?;
-        // UTF-8 JSON byte count is a conservative estimate for text/native schemas;
-        // provider usage remains the actual measured accounting after dispatch.
+        let output = request[if family == HarnessFamily::Claude { "max_tokens" } else { "max_output_tokens" }]
+            .as_u64().ok_or_else(|| invalid("native request lacks output limit"))?;
+        // A byte bound is conservative for inline textual requests. External
+        // media has unknown token cost and needs a native measured estimator.
+        reject_external_media(&request)?;
         let input = serde_json::to_vec(&request)?.len() as u64;
         let route_request = RouteRequest { request_id: id, selection: self.selection.clone(),
-            continuation_of: continuation.then_some(predecessor).flatten(),
-            input_tokens: input, output_tokens: output, switch_safe: false };
-        let prepared = state.prepare(route_request, patches, &self.models, &catalog,
+            continuation_of: if continuation { predecessor } else { None },
+            input_tokens: input, output_tokens: output, switch_safe };
+        let mut prepared = state.prepare(route_request, patches, &self.models, &catalog,
             &|input: RoutingInput<'_>| self.router.route(input), |configuration, model| {
-                if model.family() != HarnessFamily::Claude { return Err(invalid("Claude transport requires a Claude physical model")); }
-                let mut rendered = original;
-                let mut system = match rendered.get("system") {
-                    None | Some(Value::Null) => Vec::new(),
-                    Some(Value::String(text)) => vec![serde_json::json!({"type":"text", "text":text})],
-                    Some(Value::Array(blocks)) => blocks.clone(),
-                    _ => return Err(invalid("unsupported native system blocks")),
-                };
-                system.extend(configuration.sections.iter().map(|section| serde_json::json!({"type":"text", "text":section.text})));
-                if !system.is_empty() { rendered["system"] = Value::Array(system); }
-                rendered["tools"] = Value::Array(configuration.tools.iter().map(|tool| tool.definition.clone()).collect());
+                if model.family() != family { return Err(invalid("native transport and dispatched model family differ")); }
+                let mut rendered = original.clone();
+                if family == HarnessFamily::Claude {
+                    let mut system = match rendered.get("system") {
+                        None | Some(Value::Null) => Vec::new(),
+                        Some(Value::String(text)) => vec![serde_json::json!({"type":"text", "text":text})],
+                        Some(Value::Array(blocks)) => blocks.clone(),
+                        _ => return Err(invalid("unsupported native system blocks")),
+                    };
+                    system.extend(configuration.sections.iter().map(|section| serde_json::json!({"type":"text", "text":section.text})));
+                    if !system.is_empty() { rendered["system"] = Value::Array(system); }
+                } else {
+                    let base = rendered["instructions"].as_str().unwrap_or("");
+                    let additional = configuration.instructions();
+                    if !additional.is_empty() {
+                        rendered["instructions"] = if base.is_empty() { additional } else { format!("{base}\n\n{additional}") }.into();
+                    }
+                }
+                if rendered.get("tools").is_some() || !configuration.tools.is_empty() {
+                    rendered["tools"] = Value::Array(configuration.tools.iter().map(|tool| tool.definition.clone()).collect());
+                }
                 rendered["model"] = model.as_str().into();
+                validate_native_controls(&rendered, model)?;
                 Ok(serde_json::to_string(&rendered)?)
             })?;
-        // Revalidate the final body, including appended instructions/declarations.
         let mut limits = prepared.request.clone();
         limits.input_tokens = prepared.request_json.len() as u64;
         validate_limits(&limits, prepared.route.dispatched, &self.models)?;
-        Ok(nanocodex_claude::execution::RequestPreparation {
+        prepared.original_request = Some(original);
+        *state.requests.last_mut().expect("new receipt") = prepared.clone();
+        Ok(PreparedNativeRequest {
             request: serde_json::from_str(&prepared.request_json)?, state: serde_json::to_value(state)?,
         })
     }
+
+    #[cfg(feature = "claude")]
+    pub(crate) fn prepare_claude(&self, id: String, continuation: bool,
+        state: Value, request: Value) -> Result<nanocodex_claude::execution::RequestPreparation> {
+        let prepared = self.prepare_native(id, continuation, false, state, request, HarnessFamily::Claude)?;
+        Ok(nanocodex_claude::execution::RequestPreparation { request: prepared.request, state: prepared.state })
+    }
+}
+
+fn reject_external_media(value: &Value) -> Result<()> {
+    match value {
+        Value::Object(object) => {
+            if object.get("type").and_then(Value::as_str).is_some_and(|kind|
+                matches!(kind, "image" | "document" | "input_image" | "input_audio" | "input_file" | "audio")) {
+                return Err(invalid("media requests require native measured token limits"));
+            }
+            for value in object.values() { reject_external_media(value)?; }
+        }
+        Value::Array(values) => for value in values { reject_external_media(value)?; },
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_native_controls(request: &Value, model: HarnessModel) -> Result<()> {
+    // A model rewrite must never silently reinterpret adaptive thinking or speed.
+    if request["speed"] == "fast" && !model.supports_fast_mode() {
+        return Err(invalid("dispatched model does not support requested fast mode"));
+    }
+    let effort = request["output_config"]["effort"].as_str().or_else(|| request["reasoning"]["effort"].as_str());
+    if let Some(effort) = effort {
+        let thinking = serde_json::from_value::<nanocodex_agent::Thinking>(Value::String(effort.into()))?;
+        if !model.supports_thinking(thinking) {
+            return Err(invalid("dispatched model does not support requested thinking effort"));
+        }
+    }
+    if model == HarnessModel::Claude(nanocodex_agent::ClaudeModel::Haiku45)
+        && request["thinking"]["type"].as_str().is_some_and(|kind| kind != "disabled") {
+        return Err(invalid("dispatched model does not support adaptive thinking"));
+    }
+    Ok(())
 }
 
 /// Optional request policy installed on the Claude-native durable builder.
