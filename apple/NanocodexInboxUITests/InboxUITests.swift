@@ -18,14 +18,14 @@ final class InboxUITests: XCTestCase {
         let observationCount = app.staticTexts["native-fixture-observations"]
         let observed = expectation(for: NSPredicate(format: "label BEGINSWITH 'Observations: ' AND label != 'Observations: 0'"), evaluatedWith: observationCount)
         wait(for: [observed], timeout: 5)
-        XCTAssertEqual(app.staticTexts["native-fixture-probes"].label, "Capability probes: 2")
+        XCTAssertEqual(app.staticTexts["native-fixture-probes"].label, "Capability probes: 3")
         XCTAssertFalse(app.textFields["Email"].exists)
         let observations = app.staticTexts["native-fixture-observations"]
         let before = observations.label
         app.buttons["Refresh"].tap()
         let refreshed = expectation(for: NSPredicate(format: "label != %@", before), evaluatedWith: observations)
         wait(for: [refreshed], timeout: 5)
-        XCTAssertEqual(app.staticTexts["native-fixture-probes"].label, "Capability probes: 2", "Legacy mode must survive refresh and polling")
+        XCTAssertEqual(app.staticTexts["native-fixture-probes"].label, "Capability probes: 3", "Legacy mode must survive refresh and polling")
         XCTAssertEqual(app.staticTexts["native-fixture-actions"].label, "Fills: 0 · Site submits: 0 · Handoffs: 0")
         XCTAssertFalse(app.staticTexts["Couldn’t confirm the action. Refresh before continuing."].exists)
         let attachment = XCTAttachment(screenshot: app.screenshot())
@@ -53,13 +53,105 @@ final class InboxUITests: XCTestCase {
     }
 
     func testNativeBrowserFormKeepsNativeFieldsWhenOnlyHintsAreUnsupported() {
-        let app = launchNativeBrowserForm(arguments: ["--browser-native-form-no-hints"])
-        XCTAssertEqual(app.staticTexts["native-fixture-probes"].label, "Capability probes: 2")
+        for (argument, probes) in [("--browser-native-form-no-hints", 3), ("--browser-native-form-no-controls", 2)] {
+            let app = launchNativeBrowserForm(arguments: [argument])
+            XCTAssertEqual(app.staticTexts["native-fixture-probes"].label, "Capability probes: \(probes)")
+            XCTAssertFalse(app.descendants(matching: .any)["browser-private-viewport"].firstMatch.exists)
+            enterNativeBrowserFields(app)
+            revealNativeFill(app).tap()
+            XCTAssertTrue(app.buttons["Open native browser form"].waitForExistence(timeout: 5))
+            XCTAssertEqual(app.staticTexts["native-fixture-sequence"].label, "fill_fields → finish")
+            app.terminate()
+        }
+    }
+
+    func testAgentSelectedNativeChoicesNotesAndCheckboxFillTogether() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--browser-native-form-ui-fixture", "--browser-native-form-mixed"]
+        app.launch()
+        let open = app.buttons["Open native browser form"]
+        XCTAssertTrue(open.waitForExistence(timeout: 10)); open.tap()
+        XCTAssertTrue(app.staticTexts["Complete the profile fields on this page."].waitForExistence(timeout: 5))
+        let choice = app.buttons["browser-native-choice:Country"]
+        for _ in 0..<5 {
+            if choice.isHittable { break }
+            app.collectionViews.firstMatch.swipeUp()
+        }
+        choice.tap()
+        app.buttons["Greece"].tap()
+        let toggle = app.switches["browser-native-check:Send updates"]
+        for _ in 0..<5 {
+            if toggle.isHittable { break }
+            app.collectionViews.firstMatch.swipeUp()
+        }
+        toggle.tap()
+        let notes = app.textViews["Notes"]
+        for _ in 0..<5 {
+            if notes.isHittable { break }
+            app.collectionViews.firstMatch.swipeDown()
+        }
+        notes.tap(); notes.typeText("Line one\nLine two")
         XCTAssertFalse(app.descendants(matching: .any)["browser-private-viewport"].firstMatch.exists)
-        enterNativeBrowserFields(app)
         revealNativeFill(app).tap()
-        XCTAssertTrue(app.buttons["Open native browser form"].waitForExistence(timeout: 5))
+        XCTAssertTrue(open.waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["native-fixture-filled"].exists)
+        XCTAssertEqual(app.staticTexts["native-fixture-actions"].label, "Fills: 1 · Site submits: 0 · Handoffs: 1")
         XCTAssertEqual(app.staticTexts["native-fixture-sequence"].label, "fill_fields → finish")
+        let attachment = XCTAttachment(screenshot: app.screenshot())
+        attachment.name = "agent-selected-native-profile-handed-back"; attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
+    func testNativeCheckboxOnlyConfirmsDisplayedStateWithoutToggling() {
+        for rerenders in [false, true] {
+            let app = XCUIApplication()
+            app.launchArguments = ["--browser-native-form-ui-fixture", "--browser-native-form-checkbox"]
+                + (rerenders ? ["--browser-native-form-after-fill-stale"] : [])
+            app.launch()
+            let open = app.buttons["Open native browser form"]
+            XCTAssertTrue(open.waitForExistence(timeout: 10)); open.tap()
+            XCTAssertTrue(app.switches["browser-native-check:Keep preference"].waitForExistence(timeout: 5))
+            XCTAssertEqual(app.switches["browser-native-check:Keep preference"].value as? String, "1")
+            revealNativeFill(app).tap()
+            XCTAssertTrue(open.waitForExistence(timeout: 5))
+            XCTAssertTrue(app.staticTexts["native-fixture-filled"].exists)
+            XCTAssertEqual(app.staticTexts["native-fixture-sequence"].label, "fill_fields → finish")
+            XCTAssertEqual(app.staticTexts["native-fixture-outcome"].label, "Input outcome: finished")
+            app.terminate()
+        }
+    }
+
+    func testStaleNativeSelectionHandsBackWithoutFillAndRetriesOnlyHandoff() {
+        for failsOnce in [false, true] {
+            let app = XCUIApplication()
+            app.launchArguments = ["--browser-native-form-ui-fixture", "--browser-native-form-stale"]
+                + (failsOnce ? ["--browser-native-form-finish-fails"] : [])
+            app.launch()
+            let open = app.buttons["Open native browser form"]
+            XCTAssertTrue(open.waitForExistence(timeout: 10)); open.tap()
+            if failsOnce {
+                let retry = app.buttons["browser-stale-handback"]
+                XCTAssertTrue(retry.waitForExistence(timeout: 5))
+                let enabled = expectation(for: NSPredicate(format: "enabled == true"), evaluatedWith: retry)
+                wait(for: [enabled], timeout: 5)
+                XCTAssertEqual(app.staticTexts["native-fixture-outcome"].label, "Input outcome: none")
+                XCTAssertEqual(app.staticTexts["native-fixture-actions"].label, "Fills: 0 · Site submits: 0 · Handoffs: 1")
+                let sequence = app.staticTexts["native-fixture-sequence"]
+                let automaticRetry = expectation(for: NSPredicate(format: "label != %@", sequence.label), evaluatedWith: sequence)
+                automaticRetry.isInverted = true
+                wait(for: [automaticRetry], timeout: 2)
+                retry.tap()
+            }
+            XCTAssertTrue(open.waitForExistence(timeout: 5))
+            XCTAssertEqual(app.staticTexts["native-fixture-outcome"].label, "Input outcome: page_changed")
+            XCTAssertEqual(app.staticTexts["native-fixture-actions"].label, "Fills: 0 · Site submits: 0 · Handoffs: \(failsOnce ? 2 : 1)")
+            XCTAssertEqual(app.staticTexts["native-fixture-sequence"].label, failsOnce ? "finish → finish" : "finish")
+            XCTAssertFalse(app.descendants(matching: .any)["browser-private-viewport"].firstMatch.exists)
+            let attachment = XCTAttachment(screenshot: app.screenshot())
+            attachment.name = failsOnce ? "stale-native-selection-retry" : "stale-native-selection-auto-handoff"
+            attachment.lifetime = .keepAlways; add(attachment)
+            app.terminate()
+        }
     }
 
     func testNativeBrowserFormFillsOnceAndHandsBackWithoutWebsiteSubmit() {

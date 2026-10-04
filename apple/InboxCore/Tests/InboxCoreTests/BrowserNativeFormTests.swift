@@ -11,12 +11,17 @@ final class BrowserNativeFormTests: XCTestCase {
     private let notesRef = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
     private let codeRef = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
 
+    private let countryRef = "ffffffff-ffff-4fff-8fff-ffffffffffff"
+    private let updatesRef = "11111111-1111-4111-8111-111111111111"
+
     private var nativeForm: [String: Any] {
-        ["document_id": documentID, "fields": [
+        ["document_id": documentID, "reason": "Complete this profile", "fields": [
             ["ref": usernameRef, "label": "Email", "type": "email", "multiline": false, "autocomplete": "username", "inputmode": "email"],
             ["ref": passwordRef, "label": "Password", "type": "password", "multiline": false, "autocomplete": "current-password"],
             ["ref": notesRef, "label": "Notes", "type": "text", "multiline": true],
-            ["ref": codeRef, "label": "Code", "type": "text", "multiline": false, "autocomplete": "one-time-code", "inputmode": "numeric"]
+            ["ref": codeRef, "label": "Code", "type": "text", "multiline": false, "autocomplete": "one-time-code", "inputmode": "numeric"],
+            ["ref": countryRef, "label": "Country", "type": "select", "multiline": false, "options": [["index": 0, "label": "Canada"], ["index": 2, "label": "Greece"]]],
+            ["ref": updatesRef, "label": "Updates", "type": "checkbox", "multiline": false, "checked": true]
         ]]
     }
     private func response(form: [String: Any]?, login: Bool) throws -> String {
@@ -46,6 +51,7 @@ final class BrowserNativeFormTests: XCTestCase {
                 case "observe":
                     XCTAssertEqual(request.json["native_fields"] as? Bool, true)
                     XCTAssertEqual(request.json["native_field_hints"] as? Bool, true)
+                    XCTAssertEqual(request.json["native_field_controls"] as? Bool, true)
                     return FixtureReply(body: discovery)
                 case "fill_fields":
                     XCTAssertEqual(Set(request.json.keys), Set(["action", "challenge_id", "document_id", "fields"]))
@@ -58,7 +64,9 @@ final class BrowserNativeFormTests: XCTestCase {
                         ["ref": self.usernameRef, "value": "synthetic@example.com"],
                         ["ref": self.passwordRef, "value": "synthetic-password"],
                         ["ref": self.notesRef, "value": "Synthetic line one\nLine two"],
-                        ["ref": self.codeRef, "value": "123456"]
+                        ["ref": self.codeRef, "value": "123456"],
+                        ["ref": self.countryRef, "value": "2"],
+                        ["ref": self.updatesRef, "value": "false"]
                     ])
                     // The server remains active after fill: signing in requires another action.
                     return FixtureReply(body: viewport)
@@ -77,17 +85,22 @@ final class BrowserNativeFormTests: XCTestCase {
             defer { client.close() }
             let intake = intake(login: login)
             guard case .activeWithForm(_, _, _, let form, let origin) = try await client.browserTakeover(
-                intake: intake, action: ["action": .string("observe"), "native_fields": .bool(true), "native_field_hints": .bool(true)], configuration: fixture.configuration)
+                intake: intake, action: ["action": .string("observe"), "native_fields": .bool(true), "native_field_hints": .bool(true), "native_field_controls": .bool(true)], configuration: fixture.configuration)
             else { return XCTFail("Expected native form discovery") }
             XCTAssertEqual(origin, login ? "https://example.com" : nil)
-            XCTAssertEqual(form.fields.map(\.label), ["Email", "Password", "Notes", "Code"])
-            XCTAssertEqual(form.fields.map(\.type), ["email", "password", "text", "text"])
-            XCTAssertEqual(form.fields.map(\.multiline), [false, false, true, false])
-            XCTAssertEqual(form.fields.map(\.autocomplete), ["username", "current-password", nil, "one-time-code"])
-            XCTAssertEqual(form.fields.map(\.inputmode), ["email", nil, nil, "numeric"])
+            XCTAssertEqual(form.fields.map(\.label), ["Email", "Password", "Notes", "Code", "Country", "Updates"])
+            XCTAssertEqual(form.fields.map(\.type), ["email", "password", "text", "text", "select", "checkbox"])
+            XCTAssertEqual(form.fields.map(\.multiline), [false, false, true, false, false, false])
+            XCTAssertEqual(form.fields.map(\.autocomplete), ["username", "current-password", nil, "one-time-code", nil, nil])
+            XCTAssertEqual(form.fields.map(\.inputmode), ["email", nil, nil, "numeric", nil, nil])
+            XCTAssertEqual(form.reason, "Complete this profile")
+            XCTAssertEqual(form.fields[4].options.map(\.index), [0, 2])
+            XCTAssertEqual(form.fields[5].checked, true)
+            XCTAssertThrowsError(try form.fillAction(values: [countryRef: "1"]))
+            XCTAssertThrowsError(try form.fillAction(values: [updatesRef: "yes"]))
             XCTAssertThrowsError(try form.fillAction(values: ["unknown-reference": "synthetic"]))
             XCTAssertThrowsError(try form.fillAction(values: [passwordRef: String(repeating: "x", count: 4097)]))
-            let fill = try form.fillAction(values: [usernameRef: "synthetic@example.com", passwordRef: "synthetic-password", notesRef: "Synthetic line one\nLine two", codeRef: "123456"])
+            let fill = try form.fillAction(values: [usernameRef: "synthetic@example.com", passwordRef: "synthetic-password", notesRef: "Synthetic line one\nLine two", codeRef: "123456", countryRef: "2", updatesRef: "false"])
             let filled = try await client.browserTakeover(intake: intake, action: fill, configuration: fixture.configuration)
             switch filled {
             case .active, .loginActive: break

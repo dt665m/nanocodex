@@ -3812,7 +3812,9 @@ private struct BrowserTakeoverSheet: View {
     @State private var prefersViewport = false
     @State private var detent: PresentationDetent = .medium
     @State private var fieldsFilled = false
+    @State private var nativeFieldControlsEnabled = true
     @State private var nativeFieldHintsEnabled = true
+    @State private var staleForm = false
     @State private var nativeFieldsEnabled = true
     @State private var nativeFieldsConfirmed = false
     @State private var failure: String?
@@ -3865,13 +3867,22 @@ private struct BrowserTakeoverSheet: View {
         Binding(get: { drafts[field.id] ?? "" }, set: { value in
             guard editingFields, !busy, scenePhase == .active,
                   account == model.vaultIntakeAccount, nativeForm?.fields.contains(field) == true else { return }
-            drafts[field.id] = value
+            if field.type == "select" && value.isEmpty { drafts.removeValue(forKey: field.id) }
+            else { drafts[field.id] = value }
         })
+    }
+    private func submissionValues(_ form: BrowserNativeForm) -> [String: String] {
+        var values = drafts
+        // The fill button explicitly confirms the displayed checkbox state, even unchanged.
+        for field in form.fields where field.type == "checkbox" && values[field.id] == nil {
+            values[field.id] = field.checked == true ? "true" : "false"
+        }
+        return values
     }
     private func fillFields() {
         guard !busy, !fieldsFilled, let form = nativeForm, editingFields else { return }
         do {
-            let action = try form.fillAction(values: drafts)
+            let action = try form.fillAction(values: submissionValues(form))
             drafts.removeAll()
             enqueue(action)
         } catch {
@@ -3884,12 +3895,13 @@ private struct BrowserTakeoverSheet: View {
         detent = .large
     }
     private func observe(configureViewport: Bool = false) {
-        guard !editingFields, !fieldsFilled else { return }
+        guard !editingFields, !fieldsFilled, !staleForm else { return }
         // Poll pixels without resizing the remote page as the native keyboard opens.
         var action: [String: JSON] = ["action": .string("observe")]
         if nativeFieldsEnabled {
             action["native_fields"] = .bool(true)
             if nativeFieldHintsEnabled { action["native_field_hints"] = .bool(true) }
+            if nativeFieldControlsEnabled { action["native_field_controls"] = .bool(true) }
         }
         if configureViewport {
             action["viewport"] = .object([
@@ -3926,6 +3938,12 @@ private struct BrowserTakeoverSheet: View {
                       account == model.vaultIntakeAccount else { return }
                 if action["action"] == .string("observe"), action["native_fields"] == .bool(true) { nativeFieldsConfirmed = true }
                 switch frame {
+                case .staleForm(let origin):
+                    clear(); currentOrigin = origin
+                    if action["action"] == .string("fill_fields") { fieldsFilled = true }
+                    else { staleForm = true }
+                    enqueue(["action": .string("finish")])
+                    return
                 case .approved:
                     guard login, action["action"] == .string("approve") else { throw APIError.invalidResponse }
                     reviewed = true; failure = nil; submission = nil; observe(configureViewport: true); return
@@ -3944,7 +3962,7 @@ private struct BrowserTakeoverSheet: View {
                     if hint != nil { keyboardVisible = true }
                 case .finished:
                     guard action["action"] == .string("finish") else { throw APIError.invalidResponse }
-                    model.publishBrowserVerificationReceipt(intake: intake, agentID: intake.agentID ?? "", account: account)
+                    model.publishBrowserVerificationReceipt(intake: intake, agentID: intake.agentID ?? "", account: account, inputOutcome: staleForm ? "page_changed" : nil)
                     clear(); dismiss(); return
                 case .active(let data, _, _):
                     guard let image = UIImage(data: data) else { throw APIError.invalidResponse }
@@ -3966,13 +3984,16 @@ private struct BrowserTakeoverSheet: View {
             } catch {
                 guard generation == token, !Task.isCancelled else { return }
                 // Old workers reject the new observation key before taking any action.
-                // Downgrade only the read-only probe: hints first, then native fields.
+                // Downgrade only the read-only probe: controls, hints, then native fields.
                 // Capability choices survive refresh for the lifetime of this sheet.
                 if nativeFieldsEnabled, !nativeFieldsConfirmed,
                    action["action"] == .string("observe"), action["native_fields"] == .bool(true),
                    (error as? APIError) == .http(400) {
                     var legacy = action
-                    if action["native_field_hints"] == .bool(true) {
+                    if action["native_field_controls"] == .bool(true) {
+                        nativeFieldControlsEnabled = false
+                        legacy.removeValue(forKey: "native_field_controls")
+                    } else if action["native_field_hints"] == .bool(true) {
                         nativeFieldHintsEnabled = false
                         legacy.removeValue(forKey: "native_field_hints")
                     } else {
@@ -3984,7 +4005,7 @@ private struct BrowserTakeoverSheet: View {
                     return
                 }
                 clear()
-                failure = fieldsFilled
+                failure = staleForm ? "The website changed, but handoff wasn’t confirmed. Hand back again so the agent can refresh the request." : fieldsFilled
                     ? "Fields were filled, but handoff wasn’t confirmed. Hand back again to continue without refilling."
                     : "Couldn’t confirm the action. Refresh before continuing."
             }
@@ -4055,17 +4076,45 @@ private struct BrowserTakeoverSheet: View {
                                 .accessibilityIdentifier("browser-native-handback")
                         }
                     }
+                } else if staleForm {
+                    Form {
+                        Section {
+                            Label("The website changed", systemImage: "arrow.triangle.2.circlepath")
+                            Text(busy ? "Handing back so the agent can check the current page…" : "Hand back so the agent can check the current page and request the right fields.")
+                                .foregroundStyle(.secondary)
+                            Button("Hand back to agent") { enqueue(["action": .string("finish")]) }
+                                .disabled(busy || scenePhase != .active)
+                                .accessibilityIdentifier("browser-stale-handback")
+                        }
+                    }
                 } else if editingFields, let form = nativeForm {
                     Form {
                         Section {
                             Label(currentOrigin ?? intake.origin ?? "Private browser", systemImage: "lock.shield")
                                 .font(.subheadline).textSelection(.enabled)
                         } header: { Text("Website") }
+                        if let reason = form.reason {
+                            Section("Agent request") { Text(reason).fixedSize(horizontal: false, vertical: true) }
+                        }
                         Section {
                             ForEach(form.fields) { field in
                                 VStack(alignment: .leading, spacing: 6) {
-                                    Text(field.label).font(.subheadline)
-                                    if field.type == "password" {
+                                    if field.type != "select" && field.type != "checkbox" { Text(field.label).font(.subheadline) }
+                                    if field.type == "select" {
+                                        Picker(field.label, selection: fieldBinding(field)) {
+                                            Text("Choose…").tag("")
+                                            ForEach(field.options) { option in
+                                                Text(option.label.isEmpty ? "Option \(option.index + 1)" : option.label).tag(String(option.index))
+                                            }
+                                        }
+                                        .pickerStyle(.menu)
+                                        .accessibilityIdentifier("browser-native-choice:" + field.label)
+                                    } else if field.type == "checkbox" {
+                                        Toggle(field.label, isOn: Binding(
+                                            get: { drafts[field.id].map { $0 == "true" } ?? field.checked ?? false },
+                                            set: { fieldBinding(field).wrappedValue = $0 ? "true" : "false" }))
+                                            .accessibilityIdentifier("browser-native-check:" + field.label)
+                                    } else if field.type == "password" {
                                         SecureField(field.label, text: fieldBinding(field))
                                             .textContentType(nativeContentType(field))
                                             .keyboardType(nativeKeyboardType(field))
@@ -4088,7 +4137,7 @@ private struct BrowserTakeoverSheet: View {
                         }
                         Section {
                             Button("Fill & hand back", action: fillFields)
-                                .disabled(drafts.isEmpty)
+                                .disabled((try? form.fillAction(values: submissionValues(form))) == nil)
                                 .accessibilityIdentifier("browser-native-fill")
                             Button("Show website", action: showViewport)
                                 .accessibilityIdentifier("browser-show-website")
@@ -4137,7 +4186,7 @@ private struct BrowserTakeoverSheet: View {
                 ToolbarItemGroup(placement: .bottomBar) {
                     if !login || reviewed {
                     if login { Button("Cancel") { enqueue(["action": .string("cancel")]) }.disabled(busy) }
-                    if !fieldsFilled {
+                    if !fieldsFilled && !staleForm {
                         Button { guard submission == nil else { return }; failure = nil; observe(configureViewport: true) } label: {
                             Label("Refresh", systemImage: "arrow.clockwise")
                         }.disabled(busy || touching || editingFields)
@@ -4843,6 +4892,7 @@ struct BrowserNativeFormUIFixture: View {
     ]))!
     private var evidence: some View {
         VStack {
+            Text("Input outcome: \(transport.inputOutcome)").accessibilityIdentifier("native-fixture-outcome")
             Text("Observations: \(transport.observations)").accessibilityIdentifier("native-fixture-observations")
             Text("Capability probes: \(transport.probes)").accessibilityIdentifier("native-fixture-probes")
             Text("Fills: \(transport.fills) · Site submits: \(transport.submits) · Handoffs: \(transport.finishes)")
@@ -4869,6 +4919,10 @@ struct BrowserNativeFormUIFixture: View {
     @Published private(set) var probes = 0
     private var legacy: Bool { ProcessInfo.processInfo.arguments.contains("--browser-native-form-legacy") }
     private var hints = false
+    private var controls = false
+    private var mixed: Bool { ProcessInfo.processInfo.arguments.contains("--browser-native-form-mixed") }
+    private var checkboxOnly: Bool { ProcessInfo.processInfo.arguments.contains("--browser-native-form-checkbox") }
+    @Published var inputOutcome = "none"
     private var otp: Bool { ProcessInfo.processInfo.arguments.contains("--browser-native-form-otp") }
     @Published private(set) var fills = 0
     @Published private(set) var finishes = 0
@@ -4876,7 +4930,7 @@ struct BrowserNativeFormUIFixture: View {
     @Published private(set) var submits = 0
     @Published private(set) var filled = false
     private var documentID = UUID().uuidString.lowercased()
-    private var refs = (0..<2).map { _ in UUID().uuidString.lowercased() }
+    private var refs = (0..<4).map { _ in UUID().uuidString.lowercased() }
     private let client = ManagedClient(credential: try! AccountCredential(
         origin: "https://native-form-fixture.invalid", apiKey: "ncx_live_abcdefgh1234_" + String(repeating: "x", count: 43)))
 
@@ -4893,6 +4947,8 @@ struct BrowserNativeFormUIFixture: View {
             if action["native_fields"] == .bool(true) {
                 probes += 1
                 if legacy || (action["native_field_hints"] == .bool(true) && ProcessInfo.processInfo.arguments.contains("--browser-native-form-no-hints")) { return (400, .object([:])) }
+                if action["native_field_controls"] == .bool(true), ProcessInfo.processInfo.arguments.contains("--browser-native-form-no-controls") { return (400, .object([:])) }
+                controls = action["native_field_controls"] == .bool(true)
                 hints = action["native_field_hints"] == .bool(true)
             } else if !legacy { return (400, .object([:])) }
             observations += 1
@@ -4900,7 +4956,12 @@ struct BrowserNativeFormUIFixture: View {
             fills += 1
             guard !ProcessInfo.processInfo.arguments.contains("--browser-native-form-fill-fails"),
                   action["document_id"].string == documentID,
-                  action["fields"] == .array(otp
+                  action["fields"] == .array(checkboxOnly
+                    ? [.object(["ref": .string(refs[0]), "value": .string("true")])]
+                    : mixed ? [.object(["ref": .string(refs[0]), "value": .string("2")]),
+                               .object(["ref": .string(refs[1]), "value": .string("Line one\nLine two")]),
+                               .object(["ref": .string(refs[2]), "value": .string("true")])]
+                    : otp
                     ? [.object(["ref": .string(refs[0]), "value": .string("123456")])]
                     : [.object(["ref": .string(refs[0]), "value": .string("synthetic@example.com")]),
                        .object(["ref": .string(refs[1]), "value": .string("synthetic-password")])])
@@ -4918,7 +4979,7 @@ struct BrowserNativeFormUIFixture: View {
         }
         // Like the service, every observation/action invalidates the previous refs.
         documentID = UUID().uuidString.lowercased()
-        refs = (0..<2).map { _ in UUID().uuidString.lowercased() }
+        refs = (0..<4).map { _ in UUID().uuidString.lowercased() }
         let renderer = UIGraphicsImageRenderer(size: CGSize(width: 390, height: 700))
         let image = renderer.pngData { context in
             UIColor.systemBackground.setFill(); context.fill(CGRect(x: 0, y: 0, width: 390, height: 700))
@@ -4926,7 +4987,7 @@ struct BrowserNativeFormUIFixture: View {
             (title as NSString).draw(at: CGPoint(x: 30, y: 300), withAttributes: [.font: UIFont.systemFont(ofSize: 20), .foregroundColor: UIColor.label])
         }
         let descriptions = otp ? [("Verification code", "text")] : [("Email", "email"), ("Password", "password")]
-        let fields: [JSON] = descriptions.enumerated().map { index, field in
+        var fields: [JSON] = descriptions.enumerated().map { index, field in
             var metadata: [String: JSON] = ["ref": .string(refs[index]), "label": .string(field.0), "type": .string(field.1), "multiline": .bool(false)]
             if hints {
                 metadata["autocomplete"] = .string(otp ? "one-time-code" : index == 0 ? "username" : "current-password")
@@ -4934,9 +4995,21 @@ struct BrowserNativeFormUIFixture: View {
             }
             return .object(metadata)
         }
+        if controls && (mixed || checkboxOnly) {
+            fields = checkboxOnly ? [.object(["ref": .string(refs[0]), "label": .string("Keep preference"), "type": .string("checkbox"), "multiline": .bool(false), "checked": .bool(true)])] : [
+                .object(["ref": .string(refs[0]), "label": .string("Country"), "type": .string("select"), "multiline": .bool(false), "options": .array([
+                    .object(["index": .number(0), "label": .string("Canada")]), .object(["index": .number(2), "label": .string("Greece")])])]),
+                .object(["ref": .string(refs[1]), "label": .string("Notes"), "type": .string("text"), "multiline": .bool(true)]),
+                .object(["ref": .string(refs[2]), "label": .string("Send updates"), "type": .string("checkbox"), "multiline": .bool(false), "checked": .bool(false)])]
+        }
         var response: [String: JSON] = ["status": .string("active"), "image": .string("data:image/png;base64," + image.base64EncodedString()),
             "width": .number(390), "height": .number(700)]
-        if !legacy { response["native_form"] = .object(["document_id": .string(documentID), "fields": .array(fields)]) }
+        if !legacy {
+            var form: [String: JSON] = ["document_id": .string(documentID), "fields": .array(fields)]
+            if controls && mixed { form["reason"] = .string("Complete the profile fields on this page.") }
+            if controls && (ProcessInfo.processInfo.arguments.contains("--browser-native-form-stale") || (filled && ProcessInfo.processInfo.arguments.contains("--browser-native-form-after-fill-stale"))) { response["native_form_status"] = .string("stale") }
+            else { response["native_form"] = .object(form) }
+        }
         return (200, .object(response))
     }
 }
