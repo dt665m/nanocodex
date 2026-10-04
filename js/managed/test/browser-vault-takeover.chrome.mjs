@@ -6,7 +6,7 @@ import { readFileSync, mkdtempSync, rmSync, readdirSync, mkdirSync, writeFileSyn
 import { execFileSync, spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { registerHooks } from 'node:module';
+import { registerHooks, createRequire } from 'node:module';
 // Cloudflare allocation/storage and the unused public browser factory are local
 // adapters; the private runtime, HTTPS route, CDP and DOM all execute unchanged.
 const browserAdapter = `export const createBrowserSession=(b,o)=>b.create(o);
@@ -33,15 +33,38 @@ const entry = readdirSync(packages).find(name => /^playwright-core@/.test(name))
 const { chromium } = await import(new URL(`${entry}/node_modules/playwright-core/index.mjs`, packages));
 const temp = mkdtempSync(join(tmpdir(), 'private-touch-'));
 const namecheapFixture=createNamecheapFixture();
+const requireAccount=createRequire(new URL('../../account/package.json',import.meta.url));
+const requireManaged=createRequire(new URL('../package.json',import.meta.url));
+const reactBundle=requireManaged('esbuild').buildSync({stdin:{resolveDir:new URL('../../../',import.meta.url).pathname,contents:`
+  import React from ${JSON.stringify(requireAccount.resolve('react'))};
+  import {createRoot} from ${JSON.stringify(requireAccount.resolve('react-dom/client'))};
+  function App(){const [checked,setChecked]=React.useState(false);
+    return React.createElement('form',{onSubmit:e=>{e.preventDefault();fetch('/react-submit',{method:'POST',body:JSON.stringify({checked})});}},
+      React.createElement('label',{},'Agreement',React.createElement('input',{id:'agreement',type:'checkbox',checked,onChange:e=>{window.reactChanges=(window.reactChanges||0)+1;setChecked(e.target.checked);}})),
+      React.createElement('output',{id:'react-state'},String(checked)),
+      React.createElement('button',{type:'submit'},'Save checkbox choice'));
+  }
+  createRoot(document.getElementById('root')).render(React.createElement(App));
+`},bundle:true,write:false,format:'iife'}).outputFiles[0].text;
+const reactPosts=[];
+
 let browser, server, chrome, privateCdp, loginRuntime, vaultRuntime, handleControl, loginBrowser, runtimeChrome;
 try {
   execFileSync('openssl', ['req','-x509','-newkey','rsa:2048','-nodes','-keyout',join(temp,'key'),'-out',join(temp,'cert'),'-days','1','-subj','/CN=localhost'],{stdio:'ignore'});
   server = https.createServer({key:readFileSync(join(temp,'key')),cert:readFileSync(join(temp,'cert'))}, (req,res) => {
     if (namecheapFixture.handler(req,res)) return;
+    if (req.url === '/react-checkbox.js') {res.setHeader('content-type','application/javascript');res.end(reactBundle);return;}
+    if (req.url === '/react-checkbox') {res.setHeader('content-type','text/html');res.end('<meta name="viewport" content="width=device-width,initial-scale=1"><div id="root"></div><script src="/react-checkbox.js"></script>');return;}
+    if (req.url === '/react-submit') {let body='';req.on('data',c=>body+=c);req.on('end',()=>{reactPosts.push(JSON.parse(body));res.end('Saved');});return;}
+
     if (req.url.startsWith('/v1/agents/')) { handleControl(req,res); return; }
     res.setHeader('Content-Type','text/html');
+    if (req.url === '/profile-start') {
+      res.end('<button id="open-profile" onclick="location.href=\'/profile\'">Open delivery preferences</button>');
+      return;
+    }
     if (req.url === '/profile') {
-      res.end('<meta name="viewport" content="width=device-width,initial-scale=1"><style>body{font:16px sans-serif}label,input,select,textarea{display:block;margin:8px;min-height:24px}</style><h1>Delivery preferences</h1><label>Contact email<input id="contact" type="email" autocomplete="email"></label><label>Delivery country<select id="country"><option value="">Choose country</option><option value="ca">Canada</option><option value="uk">United Kingdom</option><option disabled>Unavailable</option></select></label><label>Delivery notes<textarea id="notes"></textarea></label><label>Send status updates<input id="updates" type="checkbox"></label><label>Unrelated field<input id="unrelated"></label><button id="save">Save preferences</button><script>window.counts={input:0,change:0,click:0};document.addEventListener("input",()=>counts.input++);document.addEventListener("change",()=>counts.change++);document.addEventListener("click",()=>counts.click++);</script>');
+      res.end('<meta name="viewport" content="width=device-width,initial-scale=1"><style>body{font:16px sans-serif}label,input,select,textarea{display:block;margin:8px;min-height:24px}</style><h1>Delivery preferences</h1><label>Contact email<input id="contact" type="email" autocomplete="email"></label><label>Delivery country<select id="country"><option value="">Choose country</option><option value="ca">Canada</option><option value="uk" label="United&#10;Kingdom">United Kingdom</option><option disabled>Unavailable</option></select></label><label>Delivery notes<textarea id="notes"></textarea></label><label>Send status updates<input id="updates" type="checkbox"></label><label>Unrelated field<input id="unrelated"></label><label>Unavailable choices<select id="unavailable"><option disabled>Unavailable</option><option hidden>Hidden</option><optgroup disabled><option>Disabled group</option></optgroup></select></label><button id="save">Save preferences</button><script>window.counts={input:0,change:0,click:0,remoteClick:0};document.addEventListener("input",()=>counts.input++);document.addEventListener("change",()=>counts.change++);document.addEventListener("click",e=>{counts.click++;if(e.isTrusted)counts.remoteClick++});</script>');
       return;
     }
     if (req.url === '/otp') {
@@ -275,11 +298,18 @@ try {
     const response=await requestPrivate('/v1/agents/fixture-agent/browser-vault/takeover',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({challenge_id:activeId,...action})});
     assert.equal(response.status,200);return response.json();
   };
-  const prepared=await tool('request_browser_login',{operation_id:crypto.randomUUID(),url:origin+'/profile',allowed_origins:[origin],defer_input:true});
+  const prepared=await tool('request_browser_login',{operation_id:crypto.randomUUID(),url:origin+'/profile-start',allowed_origins:[origin],defer_input:true});
   assert.equal(prepared.status,'page_ready');activeId=prepared.request_id;
   assert.equal(decodeVaultIntake({name:'request_browser_login',status:'completed',output:JSON.stringify(prepared)}),undefined,'preparation does not present a premature sheet');
-  loginPage=loginBrowser.contexts().flatMap(c=>c.pages()).find(p=>p.url()===origin+'/profile');
-  for(let i=0;!loginPage&&i<100;i++){await new Promise(r=>setTimeout(r,30));loginPage=loginBrowser.contexts().flatMap(c=>c.pages()).find(p=>p.url()===origin+'/profile');}
+  loginPage=loginBrowser.contexts().flatMap(c=>c.pages()).find(p=>p.url()===origin+'/profile-start');
+  for(let i=0;!loginPage&&i<100;i++){await new Promise(r=>setTimeout(r,30));loginPage=loginBrowser.contexts().flatMap(c=>c.pages()).find(p=>p.url()===origin+'/profile-start');}
+  await loginPage.locator('#open-profile').waitFor();
+  const preparedSnapshot=await tool('browser_login_snapshot',{request_id:activeId});
+  const preparedAction={request_id:activeId,operation_id:crypto.randomUUID(),action:'click',snapshot_id:preparedSnapshot.snapshot_id,ref:preparedSnapshot.elements.find(e=>e.text==='Open delivery preferences').ref};
+  const preparedClick=await tool('browser_login_action',preparedAction);
+  assert.equal(preparedClick.status,'action_requested','agent may open the form before asking for input');
+  assert.deepEqual(await tool('browser_login_action',preparedAction),preparedClick);
+  await loginPage.waitForURL(origin+'/profile');
   await loginPage.locator('#country').waitFor();
   await assert.rejects(human({action:'observe',native_fields:true}),'prepared browser cannot accept human input until requested/reviewed');
   let profileSnapshot=await tool('browser_login_snapshot',{request_id:activeId});
@@ -291,6 +321,7 @@ try {
   ];
   assert.equal(profileSnapshot.elements.find(e=>e.role==='select').native_input,true);
   assert.equal(profileSnapshot.elements.find(e=>e.role==='select').input_type,'select');
+  assert.equal(profileSnapshot.elements.find(e=>e.text==='Unavailable choices').native_input,false,'no-selectable-option controls cannot be requested as native');
   const reason='Choose where to deliver and add contact details and instructions.';
   const requestSelection=snapshot=>({request_id:activeId,operation_id:crypto.randomUUID(),snapshot_id:snapshot.snapshot_id,fields:selectedFields(snapshot),reason});
   const invalid=requestSelection(profileSnapshot);invalid.fields[0].value='must-not-accept';
@@ -340,7 +371,7 @@ try {
   assert.equal(await loginPage.locator('#notes').inputValue(),chosenValues[2]);
   assert.equal(await loginPage.locator('#updates').isChecked(),true);
   assert.equal(await loginPage.locator('#unrelated').inputValue(),'');
-  assert.deepEqual(await loginPage.evaluate(()=>counts),{input:4,change:4,click:0},'native sheet fills all chosen controls without remote clicks or submitting');
+  assert.deepEqual(await loginPage.evaluate(()=>counts),{input:4,change:4,click:1,remoteClick:0},'native sheet fills all chosen controls without remote clicks or submitting');
   await loginPage.evaluate(values=>{const p=document.createElement('p');p.textContent=values.join(' ');document.body.append(p);},chosenValues);
   await nativeHuman({action:'finish'});
   const profileAfter=await tool('browser_login_snapshot',{request_id:activeId});
@@ -436,13 +467,79 @@ try {
     resolveVaultLogin:async()=>({username:'synthetic-vault-user',password:'synthetic-vault-password'}),authorizeVaultAccess:()=>{},
     createRuntime:()=>({connector:{sessionInfo:async()=>({sessionId:'vault-session'}),closeSession:async()=>{}},tools:{},runtime:{expirePaused:async()=>{}}})});
   vaultRuntime=await makeVaultRuntime();
-  const vaultTool=name=>vaultRuntime.tools.find(t=>t.name===name).handler(identity,ctx);
-  const lease=await vaultTool('browser_vault_request_takeover');
-  const vaultIntake={operation:'browser_takeover',kind:'login',agent_id:'vault-fixture',challenge_id:lease.challenge_id};
+  const vaultTool=(name,args={})=>vaultRuntime.tools.find(t=>t.name===name).handler({...identity,...args},ctx);
   handleControl=(req,res)=>{let body='';req.on('data',c=>body+=c);req.on('end',async()=>{
     res.setHeader('content-type','application/json');res.setHeader('cache-control','no-store');
     try{res.end(JSON.stringify(await vaultRuntime.submitVaultTakeover(JSON.parse(body),ctx.signal)));}catch{res.statusCode=409;res.end('{}');}
   });};
+  await page.goto(origin+'/profile');
+  const availableNative=await act({...controls});
+  assert.ok(!availableNative.native_form.fields.some(f=>f.label==='Unavailable choices'));
+  let vaultSnapshot=await vaultTool('browser_vault_snapshot');
+  const vaultSelection={operation_id:crypto.randomUUID(),snapshot_id:vaultSnapshot.snapshot_id,fields:selectedFields(vaultSnapshot),reason:'Complete the delivery preferences for this account.'};
+  await page.locator('#country option').nth(1).evaluate(e=>e.textContent='Changed country');
+  const staleVault=await vaultTool('browser_vault_request_takeover',vaultSelection);
+  assert.equal(staleVault.status,'stale_page');
+  assert.deepEqual(await vaultTool('browser_vault_request_takeover',vaultSelection),staleVault);
+  assert.equal(vaultData.has('browser-vault-takeover:private:cloudflare:vault-fixture'),false,'stale named Vault selection does not acquire human control');
+  await page.locator('#country option').nth(1).evaluate(e=>e.textContent='Canada');
+  vaultSnapshot=await vaultTool('browser_vault_snapshot');
+  const namedArgs={...vaultSelection,operation_id:crypto.randomUUID(),snapshot_id:vaultSnapshot.snapshot_id,fields:selectedFields(vaultSnapshot)};
+  const namedPanel=await vaultTool('browser_vault_request_takeover',namedArgs);
+  assert.equal(namedPanel.status,'input_required');
+  assert.deepEqual(await vaultTool('browser_vault_request_takeover',namedArgs),namedPanel,'named Vault selected sheet replay retains its lease');
+  const vaultHuman=async action=>{
+    const response=await requestPrivate('/v1/agents/vault-fixture/browser-vault/takeover',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({challenge_id:namedPanel.challenge_id,...action})});
+    assert.equal(response.status,200);return response.json();
+  };
+  const namedFrame=await vaultHuman(controls);
+  assert.equal(namedFrame.native_form.reason,namedArgs.reason);
+  assert.deepEqual(namedFrame.native_form.fields.map(f=>f.label),['Country for this delivery','Contact email','Delivery notes','Send status updates']);
+  const namedValues=['1','synthetic-named@example.test','Deliver upstairs','true'];
+  await vaultHuman(batch(namedFrame,namedValues));
+  assert.equal(await page.locator('#country').inputValue(),'ca');
+  assert.equal(await page.locator('#contact').inputValue(),namedValues[1]);
+  assert.equal(await page.locator('#updates').isChecked(),true);
+  assert.deepEqual(await page.evaluate(()=>counts),{input:4,change:4,click:1,remoteClick:0});
+  await page.evaluate(values=>{const p=document.createElement('p');p.textContent=values.join(' ');document.body.append(p);},namedValues);
+  await vaultHuman({action:'finish'});
+  const namedAfter=await vaultTool('browser_vault_snapshot');
+  for(const value of namedValues.slice(1,3))assert.ok(!JSON.stringify(namedAfter).includes(value));
+  writeFileSync(new URL('named-vault-selected-input-journey.json',profileOutput),JSON.stringify({request:namedArgs,stale_request:staleVault,fields:namedFrame.native_form.fields,event_counts:await page.evaluate(()=>counts),redaction:'user values absent from model snapshot'},null,2));
+  console.log('PASS: named Vault page-aware selection/reason, stable lease replay, stale snapshot recovery, mixed private HTTPS fill with zero remote clicks and redacted snapshot');
+  await vaultTool('browser_vault_action',{operation_id:crypto.randomUUID(),action:'navigate',url:origin+'/react-checkbox'});
+  await page.waitForURL(origin+'/react-checkbox');await page.locator('#agreement').waitFor();
+  const reactSnapshot=await vaultTool('browser_vault_snapshot');
+  let reactPanel=await vaultTool('browser_vault_request_takeover',{operation_id:crypto.randomUUID(),snapshot_id:reactSnapshot.snapshot_id,
+    fields:[{ref:reactSnapshot.elements.find(e=>e.role==='checkbox').ref}]});
+  const reactHuman=async action=>{
+    const response=await requestPrivate('/v1/agents/vault-fixture/browser-vault/takeover',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({challenge_id:reactPanel.challenge_id,...action})});
+    assert.equal(response.status,200);return response.json();
+  };
+  let reactFrame=await reactHuman(controls);
+  const reactFilled=await reactHuman(batch(reactFrame,['true']));
+  assert.equal(reactFilled.native_form_status,undefined,'successful React rerender is not a stale input failure');
+  assert.equal(await page.locator('#agreement').isChecked(),true);
+  assert.equal(await page.locator('#react-state').textContent(),'true','controlled React state follows native checkbox activation');
+  assert.equal(await page.evaluate(()=>window.reactChanges),1);
+  assert.equal(reactPosts.length,0,'native checkbox fill does not submit the form');
+  await reactHuman({action:'finish'});
+  const sameStateSnapshot=await vaultTool('browser_vault_snapshot');
+  reactPanel=await vaultTool('browser_vault_request_takeover',{operation_id:crypto.randomUUID(),snapshot_id:sameStateSnapshot.snapshot_id,
+    fields:[{ref:sameStateSnapshot.elements.find(e=>e.role==='checkbox').ref}]});
+  reactFrame=await reactHuman(controls);
+  await reactHuman(batch(reactFrame,['true']));
+  assert.equal(await page.evaluate(()=>window.reactChanges),1,'already matching checkbox state is not activated again');
+  await reactHuman({action:'finish'});
+  const reactSubmitSnapshot=await vaultTool('browser_vault_snapshot');
+  await vaultTool('browser_vault_action',{operation_id:crypto.randomUUID(),action:'click',snapshot_id:reactSubmitSnapshot.snapshot_id,
+    ref:reactSubmitSnapshot.elements.find(e=>e.text==='Save checkbox choice').ref});
+  for(let i=0;reactPosts.length===0&&i<100;i++)await new Promise(r=>setTimeout(r,10));
+  assert.deepEqual(reactPosts,[{checked:true}],'authorized agent submit sends the updated React state');
+  writeFileSync(new URL('react-checkbox-journey.json',profileOutput),JSON.stringify({checked:true,react_state:'true',change_calls:1,native_fill_submissions:0,agent_submit_posts:reactPosts},null,2));
+  console.log('PASS: controlled React checkbox native activation updates state once; native fill does not submit; agent submit sends checked:true');
+  const lease=await vaultTool('browser_vault_request_takeover');
+  const vaultIntake={operation:'browser_takeover',kind:'login',agent_id:'vault-fixture',challenge_id:lease.challenge_id};
   const lostFinish=async(url,init)=>{const response=await requestPrivate(url,init);assert.equal(response.status,200);await response.body.cancel();throw Error('Synthetic lost Finish response');};
   await assert.rejects(browserTakeover(vaultIntake,{action:'finish'},lostFinish));
   assert.equal((await browserTakeover(vaultIntake,{action:'finish'},requestPrivate)).status,'finished');

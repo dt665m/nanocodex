@@ -442,6 +442,7 @@ export const BROWSER_VAULT_CONTINUATION_FUNCTION = `function(origin, mode, snaps
   const formState = form => form ? JSON.stringify([form.outerHTML, [...form.elements].map(fieldState)]) : null;
   const nativeInput = el => !el.readOnly && (
     el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement && !el.multiple && el.options.length <= 200
+      && [...el.options].some(o => !o.disabled && !o.hidden && !o.closest('optgroup[disabled],optgroup[hidden]'))
     || el instanceof HTMLInputElement && ['text','search','email','url','tel','number','password','checkbox'].includes(el.type));
   if (mode === 'request_input') {
     const snapshot = globalThis.__nanocodexVaultSnapshot;
@@ -679,6 +680,27 @@ export async function snapshotBrowserVault(cdp: PrivateBrowserChannel, request: 
 }
 
 export type BrowserVaultInputSelection = { fields: {ref: string; label?: string}[]; reason?: string };
+export const browserVaultInputSelectionProperties = {
+  snapshot_id:{type:"string"},
+  fields:{type:"array",minItems:1,maxItems:32,items:{type:"object",additionalProperties:false,
+    properties:{ref:{type:"string"},label:{type:"string",maxLength:160}},required:["ref"]}},
+  reason:{type:"string",maxLength:500},
+};
+export function parseBrowserVaultInputSelection(v: Record<string,unknown>, secrets: readonly string[]): BrowserVaultInputSelection | undefined {
+  if (v.snapshot_id === undefined && v.fields === undefined && v.reason === undefined) return undefined;
+  if (typeof v.snapshot_id !== "string" || !/^[0-9a-f-]{36}$/i.test(v.snapshot_id)
+    || !Array.isArray(v.fields) || !v.fields.length || v.fields.length > 32
+    || (v.reason !== undefined && (typeof v.reason !== "string" || !v.reason.trim() || v.reason.length > 500))) throw new Error("Provide a current snapshot_id and native input refs");
+  const refs = new Set<string>();
+  const fields = v.fields.map(field => {
+    if (!field || typeof field !== "object" || Array.isArray(field) || Object.keys(field).some(k => !["ref","label"].includes(k))
+      || typeof field.ref !== "string" || !/^e(?:[1-9][0-9]?|1[0-9]{2}|200)$/.test(field.ref) || refs.has(field.ref)
+      || (field.label !== undefined && (typeof field.label !== "string" || !field.label.trim() || field.label.length > 160))) throw new Error("Invalid native input field selection");
+    refs.add(field.ref);
+    return {ref:field.ref, ...(field.label !== undefined ? {label:sanitizeBrowserVaultText(field.label,secrets,160)} : {})};
+  });
+  return {fields, ...(typeof v.reason === "string" ? {reason:sanitizeBrowserVaultText(v.reason,secrets,500)} : {})};
+}
 /** Bind an agent's field choice to the exact redacted snapshot, without any input. */
 export async function selectBrowserVaultInput(cdp: PrivateBrowserChannel, request: BrowserVaultIdentity,
   snapshotId: string, selection: BrowserVaultInputSelection): Promise<string | undefined> {

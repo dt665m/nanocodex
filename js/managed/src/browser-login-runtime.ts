@@ -1,7 +1,7 @@
 import { createBrowserSession, deleteBrowserSession, type BrowserBinding } from "agents/browser";
 import type { NamedTool, ToolContext } from "nanocodex";
 import { parseBrowserLoginRequest, browserLoginIdentity } from "./browser-login";
-import { PrivateBrowserContinuationSession, snapshotBrowserVault, actBrowserVault, selectBrowserVaultInput, sanitizeBrowserVaultText, type BrowserVaultInputSelection, type BrowserVaultIdentity, type BrowserVaultAction } from "./browser-vault";
+import { PrivateBrowserContinuationSession, snapshotBrowserVault, actBrowserVault, selectBrowserVaultInput, parseBrowserVaultInputSelection, browserVaultInputSelectionProperties, type BrowserVaultIdentity, type BrowserVaultAction } from "./browser-vault";
 import { privateVaultTakeover, releasePrivateVaultTakeover, validateBrowserVaultTakeoverAction, rememberPrivateBrowserValues, type BrowserVaultTakeoverAction, type BrowserVaultTouchState } from "./browser-vault-takeover";
 import { privateBrowserOperation, parsePrivateBrowserAction } from "./browser-private-operations";
 
@@ -91,24 +91,10 @@ export function createBrowserLoginRuntime(options: { storage: DurableObjectStora
     })},
     {name:"request_browser_login_input",supportsParallelToolCalls:false,
       description:"Ask for more private input in the same retained login browser, such as a later password or verification code. First read browser_login_snapshot, then supply snapshot_id and fields [{ref,label?}] to choose the native inputs from that page, optionally with a short reason explaining what the user should enter. All input types supported by native_input=true are eligible, including ordinary text, multiline notes, selects and checkboxes. Labels describe the existing fields; never supply input values or secrets. Browser-derived keyboard/autofill hints are preserved. A stale_page result leaves the current request intact: read a fresh snapshot and use a new operation_id. Requires the current request_id and one stable operation_id UUID. The native app automatically presents the secure input sheet; use login_url only when native intake is unavailable or the user requests the browser fallback. Returns a fresh request_id/challenge_id without navigating, creating a browser, or losing login state. Use the new request_id for subsequent snapshots/actions. Wait for browser_login_receipt, then inspect a snapshot. Reuse identical arguments after uncertainty; never repeat the browser action that prompted the input.",
-      parameters:{type:"object",additionalProperties:false,properties:{request_id:{type:"string"},operation_id:{type:"string"},snapshot_id:{type:"string"},fields:{type:"array",minItems:1,maxItems:32,items:{type:"object",additionalProperties:false,properties:{ref:{type:"string"},label:{type:"string",maxLength:160}},required:["ref"]}},reason:{type:"string",maxLength:500}},required:["request_id","operation_id"]},
+      parameters:{type:"object",additionalProperties:false,properties:{request_id:{type:"string"},operation_id:{type:"string"},...browserVaultInputSelectionProperties},required:["request_id","operation_id"]},
       handler:(input,ctx)=>exclusive(async()=>{
         options.authorize(ctx);ctx.signal.throwIfAborted();const v=requestId(input,["operation_id","snapshot_id","fields","reason"]);
-        let selection: BrowserVaultInputSelection | undefined;
-        if (v.snapshot_id !== undefined || v.fields !== undefined || v.reason !== undefined) {
-          if (typeof v.snapshot_id !== "string" || !/^[0-9a-f-]{36}$/i.test(v.snapshot_id)
-            || !Array.isArray(v.fields) || !v.fields.length || v.fields.length > 32
-            || (v.reason !== undefined && (typeof v.reason !== "string" || !v.reason.trim() || v.reason.length > 500))) throw new Error("Provide a current snapshot_id and native input refs");
-          const refs = new Set<string>();
-          const fields = v.fields.map(field => {
-            if (!field || typeof field !== "object" || Array.isArray(field) || Object.keys(field).some(k => !["ref","label"].includes(k))
-              || typeof field.ref !== "string" || !/^e(?:[1-9][0-9]?|1[0-9]{2}|200)$/.test(field.ref) || refs.has(field.ref)
-              || (field.label !== undefined && (typeof field.label !== "string" || !field.label.trim() || field.label.length > 160))) throw new Error("Invalid native input field selection");
-            refs.add(field.ref);
-            return {ref:field.ref, ...(field.label !== undefined ? {label:sanitizeBrowserVaultText(field.label,secrets,160)} : {})};
-          });
-          selection = {fields, ...(typeof v.reason === "string" ? {reason:sanitizeBrowserVaultText(v.reason,secrets,500)} : {})};
-        }
+        const selection = parseBrowserVaultInputSelection(v,secrets);
         // Look up the operation before the current request: a successful request
         // rotates the identity, but an identical retry must return its same panel.
         return privateBrowserOperation({storage:options.storage,scope:key,operationId:v.operation_id,input:{action:"request_input",request_id:v.request_id,...(selection ? {snapshot_id:v.snapshot_id,selection} : {})},run:async()=>{
@@ -135,10 +121,11 @@ export function createBrowserLoginRuntime(options: { storage: DurableObjectStora
           return snapshotBrowserVault(cdp,bound,secrets);
         });})},
     {name:"browser_login_action",supportsParallelToolCalls:false,
-      description:"Continue a one-time private browser after user login using request_id and a stable operation_id. Use refs from browser_login_snapshot. Only perform actions authorized by the user. Passwords and verification codes must be entered through the private phone panel, never text arguments. Navigation remains on the current approved origin. Inspect a new snapshot after every action; action_requested is not confirmation. No CLI credential export.",
+      description:"Continue a prepared page before requesting input, or a one-time private browser after user handback, using request_id and a stable operation_id. Use refs from browser_login_snapshot. Only perform actions authorized by the user. Passwords and verification codes must be entered through the private phone panel, never text arguments. Navigation remains on the current approved origin. Inspect a new snapshot after every action; action_requested is not confirmation. No CLI credential export.",
       parameters:{type:"object",additionalProperties:false,properties:{request_id:{type:"string"},operation_id:{type:"string"},action:{type:"string",enum:["navigate","click","fill","select","check"]},url:{type:"string"},snapshot_id:{type:"string"},ref:{type:"string"},text:{type:"string"},option_index:{type:"integer"},checked:{type:"boolean"}},required:["request_id","operation_id","action"]},
       handler:(input,ctx)=>exclusive(async()=>{options.authorize(ctx);const v=requestId(input,["operation_id","action","url","snapshot_id","ref","text","option_index","checked"]);
-        const login=await current(v.request_id,"finished"),action=parsePrivateBrowserAction(v) as BrowserVaultAction;
+        const login=await current(v.request_id),action=parsePrivateBrowserAction(v) as BrowserVaultAction;
+        if (!["prepared","finished"].includes(login.phase)) throw new Error("Private login is under user control");
         return privateBrowserOperation({storage:options.storage,scope:key,operationId:v.operation_id,input:{request_id:v.request_id,action},run:()=>transport.run(login.sessionId,identity(login),ctx.signal,async cdp=>{
           const bound=await browserLoginIdentity(cdp,identity(login),login.allowedOrigins);return actBrowserVault(cdp,bound,action);
         })});})},

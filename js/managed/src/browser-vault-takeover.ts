@@ -299,7 +299,9 @@ export async function privateVaultTakeover(
         }
       }
     } catch { /* Never forward provider errors. */ }
-    const nativeFormStale = touch.nativeFields === true && !!touch.nativeSelection && !nativeForm;
+    // A confirmed fill may legitimately rerender the form. Its success receipt
+    // must not be mistaken for a stale request that still needs user input.
+    const nativeFormStale = action.action !== "fill_fields" && touch.nativeFields === true && !!touch.nativeSelection && !nativeForm;
     await check();
     const screenshot = await cdp.send("Page.captureScreenshot", { format: "png", fromSurface: true, captureBeyondViewport: false }, sid);
     await check();
@@ -342,7 +344,7 @@ export async function releasePrivateVaultTakeover(cdp: Pick<PrivateBrowserCdp, "
 
 // Kept entirely in an isolated world. Neither DOM handles nor field values leave
 // this world during discovery. The host remembers only a document/context binding.
-const NATIVE_FORM_VISIBLE = `e => (e instanceof HTMLInputElement || e instanceof HTMLTextAreaElement || controls && e instanceof HTMLSelectElement && !e.multiple && e.options.length <= 200)
+const NATIVE_FORM_VISIBLE = `e => (e instanceof HTMLInputElement || e instanceof HTMLTextAreaElement || controls && e instanceof HTMLSelectElement && !e.multiple && e.options.length <= 200 && [...e.options].some(o => !o.disabled && !o.hidden && !o.closest('optgroup[disabled],optgroup[hidden]')))
   && e.ownerDocument === document && e.getRootNode() === document && e.isConnected
   && !e.disabled && !e.matches(':disabled') && !e.readOnly
   && (e instanceof HTMLTextAreaElement || controls && e instanceof HTMLSelectElement || ["text","search","email","url","tel","number","password",...(controls ? ["checkbox"] : [])].includes(e.type))
@@ -385,7 +387,7 @@ const NATIVE_FORM_DISCOVER = `function(documentId, origin, refs, hints, controls
     entries.push({ref,element:e,type:e.type,form:e.form,name:e.name,autocomplete:e.autocomplete,inputmode:e.inputMode,
       markup:e.outerHTML,state:JSON.stringify(fieldState(e)),formState:formState(e.form)});
     fields.push({ref,label,type,multiline,
-      ...(type === 'select' ? {options:[...e.options].flatMap((o,index) => o.disabled || o.hidden || o.closest('optgroup[disabled],optgroup[hidden]') ? [] : [{index,label:o.label.slice(0,160)}])} : {}),
+      ...(type === 'select' ? {options:[...e.options].flatMap((o,index) => o.disabled || o.hidden || o.closest('optgroup[disabled],optgroup[hidden]') ? [] : [{index,label:o.label.replace(/[\\u0000-\\u001f\\u007f]/g, ' ').slice(0,160)}])} : {}),
       ...(type === 'checkbox' ? {checked:e.checked} : {}),
       ...(hints && ${JSON.stringify(NATIVE_AUTOCOMPLETE)}.includes(autocomplete) ? {autocomplete} : {}),
       ...(hints && ${JSON.stringify(NATIVE_INPUTMODES)}.includes(inputmode) ? {inputmode} : {})});
@@ -419,9 +421,18 @@ const NATIVE_FORM_FILL = `function(documentId, origin, fields) {
   for (const {field,binding} of selected) {
     if (!valid(binding) || controls && binding.element.outerHTML !== binding.markup) return false;
     const e = binding.element;
+    if (e.type === 'checkbox') {
+      const checked = field.value === 'true';
+      // Frameworks such as React derive controlled checkbox changes from click.
+      // Native activation dispatches the matching input/change events once;
+      // this is a field operation, never a coordinate click or form submission.
+      if (e.checked !== checked) HTMLElement.prototype.click.call(e);
+      if (!valid(binding) || e.checked !== checked) return false;
+      continue;
+    }
     const prototype = e instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : e instanceof HTMLSelectElement ? HTMLSelectElement.prototype : HTMLInputElement.prototype;
-    const property = e instanceof HTMLSelectElement ? 'selectedIndex' : e.type === 'checkbox' ? 'checked' : 'value';
-    const value = e instanceof HTMLSelectElement ? Number(field.value) : e.type === 'checkbox' ? field.value === 'true' : field.value;
+    const property = e instanceof HTMLSelectElement ? 'selectedIndex' : 'value';
+    const value = e instanceof HTMLSelectElement ? Number(field.value) : field.value;
     Object.getOwnPropertyDescriptor(prototype, property).set.call(e, value);
     e.dispatchEvent(new Event('input', {bubbles:true,composed:true}));
     if (!valid(binding)) return false;

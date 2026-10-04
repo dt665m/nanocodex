@@ -131,7 +131,9 @@ an uncertain handback offers handback recovery without sending the values again.
 For page-aware input from the first step, open with
 `request_browser_login({operation_id, url, allowed_origins, defer_input: true})`.
 This returns `status: "page_ready"` and a `request_id` without presenting a sheet.
-Read `browser_login_snapshot` for the redacted page and its `native_input` eligibility
+The agent may use authorized `browser_login_action` navigation or clicks in this
+prepared phase to open a form or dismiss a modal. Read `browser_login_snapshot`
+for the redacted page and its `native_input` eligibility
 and `input_type` metadata. Then call `request_browser_login_input` with that
 `snapshot_id`, `fields: [{ref, label?}]`, and an optional short `reason`. The agent
 chooses which existing fields to present and their order; keyboard and autofill
@@ -151,8 +153,18 @@ Selection is bound to the current snapshot's actual elements and page. A changed
 snapshot or field returns `status: "stale_page"` with the unchanged request ID;
 read a fresh snapshot and use a new operation ID. If a selected page changes while
 the sheet is open, a capable native client receives `native_form_status: "stale"`
-and no form. Refresh never silently replaces the agent's selection. The user can
-hand back to the agent for a new snapshot and sheet in the retained browser.
+and no form. Refresh never silently replaces the agent's selection. The native client automatically hands back without filling and publishes
+`input_outcome: "page_changed"` in its conversation receipt. The agent must read a
+fresh snapshot and request a new sheet in the retained browser; this receipt is
+not evidence that input was provided. An uncertain handback offers retry of
+handback only.
+
+Named Vault browsers use the same selection contract on
+`browser_vault_request_takeover`: supply the identity plus `operation_id`,
+`snapshot_id`, `fields` and optional `reason` from `browser_vault_snapshot`. The
+operation ID is required with selection, and identical retries return the same
+lease. Stale selection does not acquire human control. Legacy requests without
+selection retain their existing behavior.
 
 The remote website is an explicit fallback for visual challenges or unsupported
 controls. Native clients do not switch to it after filling a form.
@@ -182,7 +194,12 @@ or any other action issues fresh references. Batches are bounded to 32 fields,
 4096 UTF-16 code units per value and 32768 UTF-8 bytes in total. The batch HTTP
 envelope is limited to 256 KiB to accommodate JSON escaping; other takeover
 actions retain their 2 KiB limit. Filling uses
-native setters and bubbling input/change events; it does not click or submit.
+native setters and bubbling input/change events for text and select fields. A
+checkbox whose state differs uses native checkbox activation and verifies the
+result, preserving controlled framework state (including React). A matching
+checkbox is unchanged. No coordinate clicks or submit control are issued; page
+input/change/click handlers can still produce their normal side effects. Nothing
+automatically retries an uncertain input operation.
 A stale, replaced, disabled or read-only element rejects the batch before its
 first mutation. Event-driven changes can interrupt a batch after earlier fields
 were filled, so uncertain actions require explicit refresh and are never replayed.
