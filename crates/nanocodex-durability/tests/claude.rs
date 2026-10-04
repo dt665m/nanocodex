@@ -565,6 +565,9 @@ async fn transaction_recovery(
             .iter()
             .flat_map(|message| message["content"].as_array().unwrap())
             .any(|block| block["type"] == "tool_result");
+        let summarized_receipt = request["messages"]
+            .to_string()
+            .contains("Retain the synthetic task and committed receipt.");
         if context_exhaustion
             && has_receipt
             && !request["messages"].to_string().contains("signed-exhaustion")
@@ -577,7 +580,7 @@ async fn transaction_recovery(
                 "model_context_window_exceeded",
                 10,
             )
-        } else if has_receipt {
+        } else if has_receipt || summarized_receipt {
             sse(
                 text("completed exactly once"),
                 if repeated_exhaustion { "model_context_window_exceeded" } else { "end_turn" },
@@ -751,8 +754,7 @@ async fn transaction_recovery(
     if context_exhaustion {
         let log = requests.lock().unwrap();
         let continuation = log.last().unwrap()["messages"].to_string();
-        assert!(continuation.contains("signed-exhaustion"));
-        assert!(continuation.contains("partial answer"));
+        assert!(continuation.contains("Retain the synthetic task and committed receipt."));
         if after_commit || fail_at.is_none() {
             assert_eq!(log.len(), 4, "committed model responses must not repeat");
         }
