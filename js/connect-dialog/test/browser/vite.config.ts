@@ -8,6 +8,8 @@ export default defineConfig({
   plugins: [react(), {
     name: "synthetic-account-transport",
     configureServer(server) {
+      let granted: string[] = [];
+      const connectors = () => ({ github: { connected: true, label: "atlas-demo" }, gmail: { connected: granted.includes("gmail"), label: granted.includes("gmail") ? "alex@example.com" : undefined }, gcalendar: { connected: granted.includes("gcalendar") } });
       server.middlewares.use(async (req, res, next) => {
         if (!req.url?.startsWith("/v1/")) return next();
         let raw = "";
@@ -29,12 +31,12 @@ export default defineConfig({
             result = status === 200 ? { user: { id: "synthetic-user", address } } : { error: "invalid_or_expired_otp" };
             break;
           case "/v1/connect/hosted-authorization/authorize": result = { code: "s".repeat(43) }; break;
-          case "/v1/hosted-authorizations": result = {
+          case "/v1/connectors/google": result = { authorization_url: "http://modal.nanocodex.localhost:4198/provider.html" }; break;
+          case "/v1/connectors": result = { connectors: connectors() }; break;
+          case "/v1/fixture/google-complete": granted = body.capabilities; result = { ok: true }; break;
+          case "/v1/hosted-authorizations": granted = []; result = {
             account_address: address, approval_id: "a".repeat(43), token: "synthetic-token",
-            connectors: body.resources?.includes("urn:nanocodex:connectors:github,gmail,gcalendar") ? {
-              github: { connected: true, label: "atlas-demo" },
-              gmail: { connected: false }, gcalendar: { connected: false },
-            } : {}, mcp_connections: [], profile: { linked: true },
+            connectors: body.resources?.includes("urn:nanocodex:connectors:github,gmail,gcalendar") ? connectors() : {}, mcp_connections: [], profile: { linked: true },
           }; break;
           default: status = 404; result = { error: "unexpected_fixture_endpoint" };
         }

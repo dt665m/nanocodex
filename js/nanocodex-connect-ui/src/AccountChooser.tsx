@@ -31,7 +31,7 @@ export function AccountChooser({
   confirmationCode,
   appName,
   appOrigin,
-  description = "Sign in with the code sent to your phone.",
+  description,
   disabled,
   failure,
   requestContext,
@@ -154,8 +154,8 @@ export function AccountChooser({
         <header className="wizard-intro">
           <RequestIdentity name={appName ?? "Nanocodex"} origin={appOrigin} />
           <div className="wizard-app">
-            <h1 id={`${phoneId}-heading`}>{challenge ? "Check your messages" : "Sign in to continue"}</h1>
-            <p>{challenge ? `Enter the code sent to ${maskedPhone(challenge.phone)}.` : description}</p>
+            <h1 id={`${phoneId}-heading`}>{challenge ? "Check your messages" : `Sign in to ${appName ?? "Nanocodex"}`}</h1>
+            {challenge ? <p>Enter the code sent to {maskedPhone(challenge.phone)}.</p> : description ? <p>{description}</p> : null}
           </div>
           {confirmationCode ? (
             <div className="wizard-terminal-code" role="status">
@@ -176,7 +176,6 @@ export function AccountChooser({
           void sendCode();
         }}>
           <label htmlFor={phoneId}>Mobile number</label>
-          <p id={phoneHintId}>We’ll send you a one-time code.</p>
           <div className="sms-otp-input-row">
             <input
               aria-describedby={`${phoneHintId}${visibleFailure ? ` ${failureId}` : ""}`}
@@ -199,7 +198,7 @@ export function AccountChooser({
               {operation === "send" ? "Sending…" : "Text me a code"}
             </button>
           </div>
-          <p className="auth-terms">Continuing sends an automated sign-in text. Message and data rates may apply.</p>
+          <p id={phoneHintId} className="auth-terms">Continuing sends an automated sign-in text. Message and data rates may apply.</p>
         </form>
       ) : (
         <form key="code" className="sms-otp-form" aria-busy={operation === "verify"} noValidate onSubmit={(event) => {
@@ -243,9 +242,7 @@ export function AccountChooser({
           >Use a different number</button>
         </form>
       )}
-        {appName ? <p className="auth-boundary">You’ll review access before connecting.</p> : null}
         {onCancel ? <button className="auth-close" aria-label="Cancel" disabled={unavailable} onClick={onCancel} type="button">Cancel</button> : null}
-        <div className="auth-brand">Nanocodex <span>Connect</span></div>
       </section>
     </div>
   );

@@ -332,7 +332,9 @@ export function ConnectOnboarding({
         if (finishConnectorAttempt(attempt)) {
           setFailure({
             id: attempt.requestId,
-            message: completion.error ?? completion.message ?? "The account provider did not complete the connection.",
+            message: completion.error === "access_denied"
+              ? "Connection cancelled. You can try again."
+              : completion.message ?? "The account provider did not complete the connection.",
           });
         }
         return;
@@ -1616,8 +1618,8 @@ function ConnectionWizard({
         appName={requester}
         appOrigin={request.app.origin}
         description={reauthenticationRequired
-          ? `Your session expired. Sign in to continue to ${requester}. You’ll review its requested access next.`
-          : `Connect your Nanocodex account to ${requester}.`}
+          ? "Your session expired. Sign in again."
+          : undefined}
         disabled={disabled}
         onCancel={onCancel}
         onChooseAccount={onChooseAccount}
@@ -1667,6 +1669,7 @@ function ConnectionWizard({
         >
           <p className="section-description">Let this app and its agents read and make changes within each account’s granted permissions.</p>
           <WizardConnectorList connectorAction={connectorAction} connectorStatuses={connectorStatuses} disabled={disabled} onConnectConnector={onConnectConnector} request={request} />
+          {connectorAction ? <p className="section-description" role="status">{connectorAction === "spotify" || connectorAction === "soundcloud" ? `Finish connecting ${connectorProviderLabel(connectorAction)} in the Nanocodex app.` : `Finish connecting ${connectorProviderLabel(connectorAction)} in the opened window.`}</p> : null}
           {deviceCode ? (
             <a className="wizard-device-code" href={deviceCode.url} rel="noreferrer" target="_blank">
               <span>Continue in ChatGPT with code</span>

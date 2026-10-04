@@ -166,8 +166,21 @@ for (const variant of [
     await expect(connection).toBeFocused();
     expect(await connection.evaluate(el => getComputedStyle(el).outlineOffset)).toBe("-3px");
     expect(await page.evaluate(() => (window as any).__hostReceipt)).toBeUndefined();
-    await page.getByRole("button", { name: "Cancel", exact: true }).click();
-    await expect(page.getByRole("status")).toHaveText("Request cancelled");
+    const opened = page.waitForEvent("popup");
+    await connection.click();
+    const provider = await opened;
+    await expect(page.getByRole("status")).toContainText("Finish connecting Google Workspace");
+    await screenshot(page, info, "provider-pending");
+    await provider.getByRole("button", { name: "Approve Gmail and Calendar" }).click();
+    await expect(page.getByRole("button", { name: /Google Workspace.*Connected/ })).toBeDisabled();
+    const approve = page.getByRole("button", { name: "Allow access", exact: true });
+    await expect(approve).toBeEnabled();
+    expect(await page.evaluate(() => (window as any).__hostReceipt)).toBeUndefined();
+    await contained(page);
+    await screenshot(page, info, "approval-ready");
+    await approve.click();
+    await expect(page.getByRole("status")).toHaveText("Request approved");
+    expect(await page.evaluate(() => (window as any).__hostReceipt.kind)).toBe("approved");
   });
 }
 
@@ -188,4 +201,26 @@ test("SDK popup presents the desktop authorization layout", async ({ page }) => 
   await popup.getByRole("button", { name: "Cancel", exact: true }).click();
   await expect(popup.getByRole("status")).toHaveText("Request cancelled");
   await popup.close();
+});
+
+test("provider cancellation and partial grants do not authorize the app", async ({ page }) => {
+  await page.goto("/?connections=1");
+  await page.getByRole("textbox", {name:"Mobile number"}).fill("+12025550100");
+  await page.getByRole("button", {name:"Text me a code"}).click();
+  await page.getByRole("textbox", {name:"6-digit code"}).fill("123456");
+  await page.getByRole("button", {name:"Continue",exact:true}).click();
+  for (const action of ["Cancel", "Approve Gmail only", "Approve Gmail and Calendar"]) {
+    const opened = page.waitForEvent("popup");
+    await page.getByRole("button", {name:/Google Workspace.*Connect/}).click();
+    const provider = await opened;
+    await provider.getByRole("button", {name:action,exact:true}).click();
+    if (action !== "Approve Gmail and Calendar") {
+      if (action === "Cancel") await expect(page.getByRole("alert")).toContainText("cancelled");
+      else await expect(page.getByRole("button", {name:/Google Workspace.*Gmail connected.*Calendar requested/})).toBeEnabled();
+      await expect(page.getByRole("button", {name:"Allow access",exact:true})).toBeDisabled();
+    } else await expect(page.getByRole("button", {name:"Allow access",exact:true})).toBeEnabled();
+    expect(await page.evaluate(() => (window as any).__hostReceipt)).toBeUndefined();
+  }
+  await page.getByRole("button", {name:"Cancel",exact:true}).click();
+  await expect(page.getByRole("status")).toHaveText("Request cancelled");
 });
