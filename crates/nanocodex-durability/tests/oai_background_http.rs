@@ -1,0 +1,128 @@
+//! Real HTTP Responses and SQLite exercise owned summary overlap and recovery.
+#![cfg(feature = "sqlite")]
+use axum::{Json, Router, response::IntoResponse, routing::post};
+use nanocodex_agent::{Nanocodex, OpenAi, PromptRequest, transport::ResponsesTransport};
+use nanocodex_durability::{DurableAgentExt, DurableSession, SqliteStore};
+use serde_json::{Value, json};
+use std::{sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}}, time::Duration};
+use tokio::{net::TcpListener, sync::{Notify, mpsc}, time::timeout};
+
+#[derive(Clone)]
+struct Provider {
+    requests: Arc<Mutex<Vec<Value>>>,
+    generations: Arc<AtomicUsize>,
+    summaries: Arc<AtomicUsize>,
+    arrived: mpsc::UnboundedSender<(bool, usize)>,
+    release_summary: Arc<Notify>,
+    release_final: Arc<Notify>,
+    hard: bool,
+}
+fn completed(id: &str, text: &str, end_turn: bool, tokens: u64) -> String {
+    let event = json!({"type":"response.completed","response":{
+        "id":id,"status":"completed","end_turn":end_turn,
+        "output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]}],
+        "usage":{"input_tokens":tokens-2,"output_tokens":2,"total_tokens":tokens}
+    }});
+    format!("data: {event}\n\ndata: [DONE]\n\n")
+}
+fn compacted() -> String {
+    let item = json!({"type":"response.output_item.done","output_index":0,"item":{
+        "id":"cmp-http-exact","type":"compaction","encrypted_content":"opaque-http-summary"}});
+    let done = json!({"type":"response.completed","response":{"id":"resp-summary-exact","status":"completed","output":[],"usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}});
+    format!("data: {item}\n\ndata: {done}\n\ndata: [DONE]\n\n")
+}
+async fn serve(provider: Provider, Json(body): Json<Value>) -> axum::response::Response {
+    let summary = body["input"].as_array().is_some_and(|items| items.iter().any(|item| item["type"] == "compaction_trigger"));
+    provider.requests.lock().unwrap().push(body);
+    if summary {
+        let n = provider.summaries.fetch_add(1, Ordering::SeqCst) + 1;
+        provider.arrived.send((true,n)).ok();
+        provider.release_summary.notified().await;
+        return ([("content-type","text/event-stream")], compacted()).into_response();
+    }
+    let n = provider.generations.fetch_add(1, Ordering::SeqCst) + 1;
+    provider.arrived.send((false,n)).ok();
+    let (text, end, tokens) = match n {
+        1 => ("SEED-CUTOFF", false, 750),
+        2 => ("TAIL-ONE", false, if provider.hard { 920 } else { 800 }),
+        _ => {
+            provider.release_final.notified().await;
+            ("TAIL-FINAL", true, 100)
+        }
+    };
+    ([("content-type","text/event-stream")], completed(&format!("resp-http-{n}"), text, end, tokens)).into_response()
+}
+async fn fixture(hard: bool) -> eyre::Result<(Provider, mpsc::UnboundedReceiver<(bool,usize)>, String, tokio::task::JoinHandle<()>)> {
+    let (arrived, receiver) = mpsc::unbounded_channel();
+    let provider = Provider { requests: Default::default(), generations: Default::default(), summaries: Default::default(), arrived,
+        release_summary: Default::default(), release_final: Default::default(), hard };
+    let copy = provider.clone();
+    let router = Router::new().route("/responses", post(move |body| serve(copy.clone(), body)));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let url = format!("http://{}", listener.local_addr()?);
+    let server = tokio::spawn(async move { axum::serve(listener,router).await.unwrap(); });
+    Ok((provider, receiver, url, server))
+}
+fn openai(url: &str) -> eyre::Result<OpenAi> {
+    Ok(OpenAi::builder("synthetic-key").transport(ResponsesTransport::Https).store(false).api_base_url(url).build()?)
+}
+async fn arrivals(receiver: &mut mpsc::UnboundedReceiver<(bool,usize)>, wanted: &[(bool,usize)]) {
+    let mut seen = Vec::new();
+    timeout(Duration::from_secs(10), async {
+        while !wanted.iter().all(|event| seen.contains(event)) { seen.push(receiver.recv().await.unwrap()); }
+    }).await.expect("HTTP provider requests did not overlap");
+}
+
+#[tokio::test(flavor="multi_thread", worker_threads=2)]
+async fn http_background_overlaps_and_preserves_immutable_cutoff_and_tail() -> eyre::Result<()> {
+    let (provider, mut receiver, url, server) = fixture(false).await?;
+    let dir = tempfile::tempdir()?;
+    let state = DurableSession::open(SqliteStore::open(dir.path().join("state.sqlite"))?, "http-overlap").await?;
+    let (agent, events) = Nanocodex::builder(openai(&url)?).workspace(dir.path()).context_window_tokens(1000).durability(state.clone()).await?.build()?;
+    let request = || PromptRequest::new("compact while continuing").request_id("overlap");
+    let turn = agent.prompt(request()).await?;
+    arrivals(&mut receiver, &[(false,1),(true,1),(false,2),(false,3)]).await;
+    let requests = provider.requests.lock().unwrap().clone();
+    let summary = requests.iter().find(|body| body.to_string().contains("compaction_trigger")).unwrap();
+    assert!(summary.to_string().contains("SEED-CUTOFF"));
+    assert!(!summary.to_string().contains("TAIL-ONE"));
+    assert!(!requests.last().unwrap().to_string().contains("opaque-http-summary"));
+    provider.release_summary.notify_one();
+    provider.release_final.notify_one();
+    assert_eq!(timeout(Duration::from_secs(10),turn.result()).await??.final_message(),"TAIL-FINAL");
+    let snapshot = serde_json::to_value(agent.snapshot().await?)?;
+    let history = snapshot["history"].to_string();
+    assert!(history.contains("opaque-http-summary"),"{history}");
+    assert!(history.contains("TAIL-ONE"),"{history}");
+    assert!(history.contains("TAIL-FINAL"),"{history}");
+    assert_eq!(provider.summaries.load(Ordering::SeqCst),1);
+    let before = provider.requests.lock().unwrap().len();
+    agent.shutdown().await?; drop((agent,events));
+    let reopened = DurableSession::open(SqliteStore::open(dir.path().join("state.sqlite"))?, "http-overlap").await?;
+    let (agent,events) = Nanocodex::builder(openai(&url)?).workspace(dir.path()).context_window_tokens(1000).durability(reopened).await?.build()?;
+    assert_eq!(agent.prompt(request()).await?.result().await?.final_message(),"TAIL-FINAL");
+    assert_eq!(provider.requests.lock().unwrap().len(),before);
+    println!("overlap=true immutable_cutoff=true complete_tail=true SQLite_reopen_terminal_replay=true requests={before}");
+    agent.shutdown().await?; drop((agent,events)); server.abort();
+    Ok(())
+}
+
+#[tokio::test(flavor="multi_thread", worker_threads=2)]
+async fn http_hard_limit_waits_for_owned_summary_before_next_generation() -> eyre::Result<()> {
+    let (provider, mut receiver, url, server) = fixture(true).await?;
+    let dir = tempfile::tempdir()?;
+    let state = DurableSession::open(SqliteStore::open(dir.path().join("state.sqlite"))?,"http-hard").await?;
+    let (agent, events) = Nanocodex::builder(openai(&url)?).workspace(dir.path()).context_window_tokens(1000).durability(state).await?.build()?;
+    let turn = agent.prompt("wait at the hard context boundary").await?;
+    arrivals(&mut receiver,&[(false,1),(true,1),(false,2)]).await;
+    assert!(timeout(Duration::from_millis(200),receiver.recv()).await.is_err(),"generation crossed hard limit before summary settled");
+    provider.release_summary.notify_one();
+    arrivals(&mut receiver,&[(false,3)]).await;
+    let third = provider.requests.lock().unwrap().last().unwrap().to_string();
+    assert!(third.contains("opaque-http-summary"),"{third}");
+    assert!(third.contains("TAIL-ONE"),"{third}");
+    provider.release_final.notify_one();
+    assert_eq!(timeout(Duration::from_secs(10),turn.result()).await??.final_message(),"TAIL-FINAL");
+    println!("hard_limit_wait=true next_generation_has_summary_and_complete_tail=true");
+    agent.shutdown().await?; drop((agent,events)); server.abort(); Ok(())
+}
