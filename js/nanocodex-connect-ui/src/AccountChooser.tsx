@@ -244,7 +244,7 @@ export function AccountChooser({
         </form>
       )}
         {appName ? <p className="auth-boundary">You’ll review access before connecting.</p> : null}
-        {onCancel ? <button className="auth-close" aria-label="Cancel" disabled={unavailable} onClick={onCancel} type="button">×</button> : null}
+        {onCancel ? <button className="auth-close" aria-label="Cancel" disabled={unavailable} onClick={onCancel} type="button">Cancel</button> : null}
         <div className="auth-brand">Nanocodex <span>Connect</span></div>
       </section>
     </div>

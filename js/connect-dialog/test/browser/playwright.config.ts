@@ -4,8 +4,8 @@ import { fileURLToPath } from "node:url";
 export default defineConfig({
   testDir: ".",
   testMatch: "modal.spec.ts",
-  outputDir: "../../../../output/connect-modal-v2/results",
-  reporter: [["list"], ["json", { outputFile: fileURLToPath(new URL("../../../../output/connect-modal-v2/report.json", import.meta.url)) }]],
+  outputDir: "../../../../output/connect-full-page/results",
+  reporter: [["list"], ["json", { outputFile: fileURLToPath(new URL("../../../../output/connect-full-page/report.json", import.meta.url)) }]],
   fullyParallel: false,
   workers: 1,
   timeout: 30_000,

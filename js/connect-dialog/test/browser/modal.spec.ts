@@ -2,7 +2,7 @@ import { expect, test, type Page, type TestInfo } from "@playwright/test";
 import { mkdir, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
-const evidence = resolve(process.cwd(), "../../output/connect-modal-v2");
+const evidence = resolve(process.cwd(), "../../output/connect-full-page");
 const sizes = [
   { name: "desktop", width: 1280, height: 900 },
   { name: "mobile", width: 390, height: 844 },
@@ -26,10 +26,10 @@ async function contained(page: Page) {
   });
   expect(geometry.documentWidth).toBeLessThanOrEqual(geometry.width);
   expect(geometry.documentHeight).toBeLessThanOrEqual(geometry.height);
-  expect(geometry.left).toBeGreaterThanOrEqual(0);
-  expect(geometry.top).toBeGreaterThanOrEqual(0);
-  expect(geometry.right).toBeLessThanOrEqual(geometry.width);
-  expect(geometry.bottom).toBeLessThanOrEqual(geometry.height);
+  expect(geometry.left).toBe(0);
+  expect(geometry.top).toBe(0);
+  expect(geometry.right).toBe(geometry.width);
+  expect(geometry.bottom).toBe(geometry.height);
   expect(geometry.horizontalOverflow).toEqual([]);
   return geometry;
 }

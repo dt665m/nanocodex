@@ -141,7 +141,7 @@ function createIframeInstance(host) {
     if (frame && modal) return;
     modal = document.createElement("dialog");
     modal.setAttribute("aria-label", "Nanocodex Connect permissions");
-    modal.style.cssText = "border:0;padding:0;background:transparent;max-width:none;max-height:none";
+    modal.style.cssText = "border:0;outline:0;padding:0;margin:0;background:transparent;max-width:none;max-height:none;width:100vw;height:100dvh";
     modal.addEventListener("cancel", (event) => {
       event.preventDefault();
       rejectActive(new UserRejectedRequestError());
@@ -161,7 +161,7 @@ function createIframeInstance(host) {
       `publickey-credentials-create ${dialogOrigin}`,
       "payment",
     ].join("; ");
-    frame.style.cssText = "border:0;width:min(808px,100vw);height:min(780px,100dvh);background:transparent";
+    frame.style.cssText = "border:0;width:100vw;height:100dvh;background:transparent";
     frame.style.display = "none";
     modal.append(frame);
     document.body.append(modal);
