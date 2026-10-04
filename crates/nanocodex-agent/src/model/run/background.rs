@@ -37,6 +37,7 @@ where
             match steps.begin::<_, RecordedCompactionOutcome>(&step, "compaction", pending).await? {
                 crate::agent::ExecutionStep::Replay(result) => Some(result),
                 crate::agent::ExecutionStep::Execute => None,
+                crate::agent::ExecutionStep::OutcomeUnknown => unreachable!("safe model effect"),
             }
         } else { None };
         let recovered = match recovered {
@@ -61,6 +62,7 @@ where
                 match steps.begin::<_, CompactionReceipt>(&preservation, "before_compaction", &request).await? {
                     crate::agent::ExecutionStep::Replay(receipt) => { receipt.validate()?; true }
                     crate::agent::ExecutionStep::Execute => false,
+                    crate::agent::ExecutionStep::OutcomeUnknown => unreachable!("safe preservation effect"),
                 }
             } else { false };
             if !replay {

@@ -403,6 +403,27 @@ impl ExecutionPolicy for DurableExecution {
         })
     }
 
+    fn advance_retaining<'a>(
+        &'a self,
+        operation_id: String,
+        continuation: ExecutionContinuation,
+        retained_steps: Vec<String>,
+    ) -> ExecutionFuture<'a, AgentResult<()>> {
+        Box::pin(async move {
+            let prepared = {
+                let known = self.context_records.lock().map_err(|_| {
+                    NanocodexError::InvalidExecutionPolicy("context cache poisoned".into())
+                })?;
+                crate::context::prepare_continuation(continuation, &known).map_err(agent_error)?
+            };
+            self.owner
+                .advance_retaining(operation_id, prepared.payload, retained_steps)
+                .await
+                .map_err(agent_error)?;
+            self.remember(prepared.keys)
+        })
+    }
+
     fn begin_step<'a>(
         &'a self,
         operation_id: String,

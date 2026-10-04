@@ -192,6 +192,9 @@ pub enum Transition {
         operation_id: String,
         /// Opaque current agent state, rather than a history of requests.
         continuation: EncodedPayload,
+        /// Background effects still owned by this execution boundary.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        retained_steps: Vec<String>,
     },
     /// A host-visible operation was durably accepted.
     OperationAccepted {
@@ -416,7 +419,7 @@ impl OperationState {
             || !self.steers.is_empty()
     }
 
-    fn retire_steps(&mut self) {
+    fn retire_steps(&mut self, retained_steps: &[String]) {
         for (id, step) in &self.steps {
             if step.kind == "model_call"
                 && matches!(step.status, StepStatus::Completed(_))
@@ -427,7 +430,7 @@ impl OperationState {
                 self.retired_model_calls = self.retired_model_calls.max(index);
             }
         }
-        self.steps.clear();
+        self.steps.retain(|id, _| retained_steps.contains(id));
         let consumed = self
             .steers
             .iter()
@@ -813,13 +816,13 @@ impl DurableState {
             ensure_nonempty(operation_id, "operation ID")?;
         }
         match entry {
-            Transition::ExecutionAdvanced { operation_id, .. } => {
+            Transition::ExecutionAdvanced { operation_id, retained_steps, .. } => {
                 self.ensure_prior_operations_terminal(operation_id)?;
                 let operation = self.pending_operation(operation_id)?;
                 if operation
                     .steps
-                    .values()
-                    .any(|step| matches!(step.status, StepStatus::EffectPending))
+                    .iter()
+                    .any(|(id, step)| matches!(step.status, StepStatus::EffectPending) && !retained_steps.contains(id))
                 {
                     return Err(Error::InvalidState(format!(
                         "operation `{operation_id}` cannot advance past an unsettled effect"
@@ -1059,10 +1062,11 @@ impl DurableState {
             Transition::ExecutionAdvanced {
                 operation_id,
                 continuation,
+                retained_steps,
             } => {
                 let operation = self.pending_operation_mut(&operation_id)?;
                 operation.continuation = Some(continuation);
-                operation.retire_steps();
+                operation.retire_steps(&retained_steps);
             }
             Transition::OperationAccepted {
                 operation_id,
@@ -1178,7 +1182,7 @@ impl DurableState {
             } => {
                 let operation = self.pending_operation_mut(&operation_id)?;
                 if operation.continuation.take().is_some() {
-                    operation.retire_steps();
+                    operation.retire_steps(&[]);
                 }
                 operation.status = OperationStatus::Completed {
                     checkpoint: checkpoint.clone(),
@@ -1193,7 +1197,7 @@ impl DurableState {
             } => {
                 let operation = self.pending_operation_mut(&operation_id)?;
                 if operation.continuation.take().is_some() {
-                    operation.retire_steps();
+                    operation.retire_steps(&[]);
                 }
                 operation.status = OperationStatus::Failed {
                     checkpoint: checkpoint.clone(),
@@ -1207,7 +1211,7 @@ impl DurableState {
             } => {
                 let operation = self.pending_operation_mut(&operation_id)?;
                 if operation.continuation.take().is_some() {
-                    operation.retire_steps();
+                    operation.retire_steps(&[]);
                 }
                 operation.status = OperationStatus::Cancelled {
                     checkpoint: checkpoint.clone(),
@@ -1360,6 +1364,7 @@ mod continuation_tests {
             apply(Transition::ExecutionAdvanced {
                 operation_id: id.clone(),
                 continuation: payload.clone(),
+                retained_steps: Vec::new(),
             })?;
             let operation = state.operation(&id).unwrap();
             assert_eq!(operation.retired_steers, model_call - 1);
@@ -1401,6 +1406,7 @@ mod continuation_tests {
         apply(Transition::ExecutionAdvanced {
             operation_id: id.clone(),
             continuation: payload.clone(),
+                retained_steps: Vec::new(),
         })?;
         apply(Transition::SteerBound {
             operation_id: id.clone(),
@@ -1429,6 +1435,7 @@ mod continuation_tests {
         apply(Transition::ExecutionAdvanced {
             operation_id: id.clone(),
             continuation: payload.clone(),
+                retained_steps: Vec::new(),
         })?;
         assert!(
             apply(Transition::StepStarted {
@@ -1557,6 +1564,7 @@ mod withdrawal_tests {
         apply(Transition::ExecutionAdvanced {
             operation_id: "turn".into(),
             continuation: payload.clone(),
+                retained_steps: Vec::new(),
         })?;
         for steer_index in 2..=3 {
             apply(Transition::SteerAccepted {

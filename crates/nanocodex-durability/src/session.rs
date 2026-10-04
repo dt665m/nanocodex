@@ -188,6 +188,7 @@ enum Command {
         caller: Caller,
         operation_id: String,
         continuation: EncodedPayload,
+        retained_steps: Vec<String>,
         result: oneshot::Sender<Result<()>>,
     },
     RecoverFailure {
@@ -448,6 +449,7 @@ impl Driver {
                     caller,
                     operation_id,
                     continuation,
+                    retained_steps,
                     result,
                 } => {
                     let outcome = async {
@@ -457,6 +459,7 @@ impl Driver {
                         self.apply(Transition::ExecutionAdvanced {
                             operation_id,
                             continuation,
+                            retained_steps,
                         })
                         .await
                     }
@@ -2316,11 +2319,18 @@ impl DurableOwner {
         operation_id: String,
         continuation: EncodedPayload,
     ) -> Result<()> {
+        self.advance_retaining(operation_id, continuation, Vec::new()).await
+    }
+
+    pub(crate) async fn advance_retaining(
+        &self, operation_id: String, continuation: EncodedPayload, retained_steps: Vec<String>,
+    ) -> Result<()> {
         let (result, receiver) = oneshot::channel();
         self.send(Command::Advance {
             caller: self.caller()?,
             operation_id,
             continuation,
+            retained_steps,
             result,
         })
         .await?;

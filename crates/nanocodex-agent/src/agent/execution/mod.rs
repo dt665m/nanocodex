@@ -278,6 +278,18 @@ pub trait ExecutionPolicy: Send + Sync {
         continuation: ExecutionContinuation,
     ) -> ExecutionFuture<'a, Result<()>>;
 
+    /// Advances the foreground while retaining named independently owned effects.
+    fn advance_retaining<'a>(
+        &'a self, operation_id: String, continuation: ExecutionContinuation, retained_steps: Vec<String>,
+    ) -> ExecutionFuture<'a, Result<()>> {
+        Box::pin(async move {
+            if !retained_steps.is_empty() {
+                return Err(NanocodexError::ExecutionPolicyCapabilityUnsupported { capability: "background effect retention" });
+            }
+            self.advance(operation_id, continuation).await
+        })
+    }
+
     /// Begins or replays one typed external effect.
     fn begin_step<'a>(
         &'a self,
@@ -498,6 +510,18 @@ pub trait ExecutionPolicy: Send + Sync {
         operation_id: String,
         continuation: ExecutionContinuation,
     ) -> ExecutionFuture<'a, Result<()>>;
+
+    /// Advances the foreground while retaining named independently owned effects.
+    fn advance_retaining<'a>(
+        &'a self, operation_id: String, continuation: ExecutionContinuation, retained_steps: Vec<String>,
+    ) -> ExecutionFuture<'a, Result<()>> {
+        Box::pin(async move {
+            if !retained_steps.is_empty() {
+                return Err(NanocodexError::ExecutionPolicyCapabilityUnsupported { capability: "background effect retention" });
+            }
+            self.advance(operation_id, continuation).await
+        })
+    }
 
     /// Begins or replays one external effect.
     fn begin_step<'a>(
@@ -1006,15 +1030,17 @@ impl ExecutionSteps {
         state: &T,
         history: Vec<nanocodex_oai_api::responses::ResponseItem>,
         prefix: Vec<nanocodex_oai_api::responses::ResponseItem>,
+        retained_steps: Vec<String>,
     ) -> Result<()> {
         self.policy
-            .advance(
+            .advance_retaining(
                 self.operation_id.clone(),
                 ExecutionContinuation {
                     state_json: encode(state)?,
                     history,
                     prefix,
                 },
+                retained_steps,
             )
             .await
     }
