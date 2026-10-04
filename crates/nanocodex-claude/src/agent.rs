@@ -1543,7 +1543,7 @@ fn client_discovered_tools(messages: &[Message]) -> HashSet<&str> {
         .collect()
 }
 
-fn thinking_effort(thinking: Thinking) -> Option<crate::Effort> {
+const fn thinking_effort(thinking: Thinking) -> Option<crate::Effort> {
     match thinking {
         Thinking::None => None,
         Thinking::Low => Some(crate::Effort::Low),

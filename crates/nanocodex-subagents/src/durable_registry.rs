@@ -108,15 +108,22 @@ impl Registry {
 
     /// Reopens a configured root before inference; child hooks share its tree.
     pub async fn recover_registered(self: &Arc<Self>, session: &str) -> std::io::Result<()> {
-        {
+        let empty = {
             let state = self.state.lock().await;
             if state.root_by_session.contains_key(session)
-                || !state.scopes.get(session).is_some_and(|scope| scope.journal.is_some() && !scope.sessions.is_empty()) {
+                || !state.scopes.get(session).is_some_and(|scope| scope.journal.is_some()) {
                 return Ok(());
             }
-        }
+            state.scopes[session].sessions.is_empty()
+        };
         let handle = self.session_handles.read().expect("session handles poisoned")
-            .get(session).cloned().ok_or_else(|| std::io::Error::other("parent handle unavailable for child recovery"))?;
+            .get(session).cloned();
+        // Retirement can leave an already-owned root completion to settle. An
+        // empty tree has no child work to reconstruct; a live owner still checks
+        // the journal so startup failures remain observable through ready().
+        let Some(handle) = handle else {
+            return if empty { Ok(()) } else { Err(std::io::Error::other("parent handle unavailable for child recovery")) };
+        };
         self.recover(handle).await
     }
 
