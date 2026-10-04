@@ -572,8 +572,6 @@ async fn transaction_recovery(
             sse(
                 vec![
                     json!({"type":"thinking","thinking":"partial reasoning","signature":"signed-exhaustion"}),
-                    json!({"type":"server_tool_use","id":"completed-fetch","name":"web_fetch","input":{"url":"https://example.org"}}),
-                    json!({"type":"web_fetch_tool_result","tool_use_id":"completed-fetch","content":{"type":"web_fetch_result","url":"https://example.org","content":"page"}}),
                     json!({"type":"text","text":"partial answer"}),
                 ],
                 "model_context_window_exceeded",
@@ -611,7 +609,6 @@ async fn transaction_recovery(
         || PromptRequest::new("complete one synthetic effect").request_id("transaction-request");
     let (agent, events) = Nanocodex::builder(Claude::new(client.clone(), "test"))
         .auto_compact_window_tokens(100_000)
-        .server_tool(nanocodex_claude::ServerToolDefinition::web_fetch_basic(1))
         .tasks(board.clone())
         // This fixture mutates only the restored, receipt-coupled task board.
         .tool_replay_safety("effect", nanocodex_agent::ReplaySafety::Safe)
@@ -664,7 +661,6 @@ async fn transaction_recovery(
         .automatic_cache(true)
         .adaptive_thinking()
         .auto_compact_window_tokens(50_000)
-        .server_tool(nanocodex_claude::ServerToolDefinition::web_fetch_basic(1))
         .tasks(board.clone())
         // This fixture mutates only the restored, receipt-coupled task board.
         .tool_replay_safety("effect", nanocodex_agent::ReplaySafety::Safe);
@@ -680,6 +676,12 @@ async fn transaction_recovery(
                     )
                     .await
             }
+        });
+    } else {
+        // Keep current declaration authority for fresh inference, without restoring
+        // the old handler: the committed receipt must bypass this sentinel.
+        builder = builder.tool(tool(), |_| async {
+            panic!("committed task receipt must bypass replacement handler")
         });
     }
     let (agent, events) = builder
@@ -750,7 +752,7 @@ async fn transaction_recovery(
         let log = requests.lock().unwrap();
         let continuation = log.last().unwrap()["messages"].to_string();
         assert!(continuation.contains("signed-exhaustion"));
-        assert!(continuation.contains("completed-fetch"));
+        assert!(continuation.contains("partial answer"));
         if after_commit || fail_at.is_none() {
             assert_eq!(log.len(), 4, "committed model responses must not repeat");
         }
@@ -859,7 +861,11 @@ async fn completed_task_mutation_replays_without_handler_into_reconstructed_boar
 
     let restored_board = Arc::new(ClaudeTasks::new());
     let (agent, events) = Nanocodex::builder(Claude::new(client, "test"))
-        // The effect handler is intentionally absent from this fresh host.
+        // Fresh inference still requires current catalog authority. The original
+        // handler is gone; replay must bypass this replacement sentinel.
+        .tool(tool(), |_| async {
+            panic!("committed task receipt must bypass replacement handler")
+        })
         .tasks(restored_board.clone())
         .durability(reopen(&path).await)
         .await
@@ -1284,6 +1290,9 @@ async fn recovery_missing_task_board_leaves_pending_operation_recoverable() {
     let board = Arc::new(ClaudeTasks::new());
     let (agent, events) = Nanocodex::builder(Claude::new(client, "test"))
         .tasks(board.clone())
+        .tool(tool(), |_| async {
+            panic!("committed task receipt must bypass replacement handler")
+        })
         .durability(state)
         .await
         .unwrap()
@@ -1966,7 +1975,9 @@ async fn uncertain_paused_server_turn_survives_compaction_cancellation_and_sqlit
 #[tokio::test]
 async fn paused_server_cursor_replays_across_store_failure_without_terminalizing() {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    for (after_commit, retain_authority) in [(false, true), (true, true), (false, false), (true, false)] {
+    for (after_commit, retain_authority) in
+        [(false, true), (true, true), (false, false), (true, false)]
+    {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("pending-server.sqlite");
         let armed = Arc::new(AtomicBool::new(false));
@@ -2028,7 +2039,8 @@ async fn paused_server_cursor_replays_across_store_failure_without_terminalizing
         for _ in 0..2 {
             let builder = Nanocodex::builder(Claude::new(client.clone(), "different-model"));
             let builder = if retain_authority {
-                builder.server_tool(nanocodex_claude::ServerToolDefinition::code_execution_current())
+                builder
+                    .server_tool(nanocodex_claude::ServerToolDefinition::code_execution_current())
             } else {
                 builder
             };
@@ -2040,19 +2052,30 @@ async fn paused_server_cursor_replays_across_store_failure_without_terminalizing
                 .unwrap();
             let result = agent.prompt(request()).await.unwrap().result().await;
             if after_commit {
-                assert_eq!(result.unwrap().final_message(), "recovered prepared server turn");
+                assert_eq!(
+                    result.unwrap().final_message(),
+                    "recovered prepared server turn"
+                );
             } else {
                 let error = result.unwrap_err();
                 assert!(error.to_string().contains("outcome is unknown"), "{error}");
             }
-            assert_eq!(requests.lock().unwrap().len(), 2,
-                "unknown server effects and completed receipts must not redispatch HTTP, including revoked authority");
-            assert_eq!(effects.load(Ordering::SeqCst), 1,
-                "the provider mutation must execute exactly once");
+            assert_eq!(
+                requests.lock().unwrap().len(),
+                2,
+                "unknown server effects and completed receipts must not redispatch HTTP, including revoked authority"
+            );
+            assert_eq!(
+                effects.load(Ordering::SeqCst),
+                1,
+                "the provider mutation must execute exactly once"
+            );
             let _ = agent.shutdown().await;
             drop((agent, events));
         }
-        println!("Claude HTTP recovery after_commit={after_commit} retain_authority={retain_authority}: requests=2 effects=1");
+        println!(
+            "Claude HTTP recovery after_commit={after_commit} retain_authority={retain_authority}: requests=2 effects=1"
+        );
         let log = requests.lock().unwrap();
         assert!(
             log.iter()
@@ -2082,25 +2105,72 @@ async fn revoked_server_catalog_blocks_fresh_http_after_completed_pause_replay()
             sse(text("unauthorized continuation executed"), "end_turn", 10)
         }
     }).await;
-    let state = DurableSession::open(FaultStore {
-        inner: SqliteStore::open(&path).unwrap(), writes: Arc::new(AtomicUsize::new(0)),
-        fail_at: None, after_commit: true, fail_when_armed: Some(armed),
-    }, "claude-synthetic").await.unwrap();
-    let request = || PromptRequest::new("execute only while authorized").request_id("revoked-server");
+    let state = DurableSession::open(
+        FaultStore {
+            inner: SqliteStore::open(&path).unwrap(),
+            writes: Arc::new(AtomicUsize::new(0)),
+            fail_at: None,
+            after_commit: true,
+            fail_when_armed: Some(armed),
+        },
+        "claude-synthetic",
+    )
+    .await
+    .unwrap();
+    let request =
+        || PromptRequest::new("execute only while authorized").request_id("revoked-server");
     let (agent, events) = Nanocodex::builder(Claude::new(client.clone(), "original-model"))
         .server_tool(nanocodex_claude::ServerToolDefinition::code_execution_current())
-        .durability(state).await.unwrap().build().unwrap();
-    assert!(agent.prompt(request()).await.unwrap().result().await.unwrap_err()
-        .execution_policy_disposition().is_some());
+        .durability(state)
+        .await
+        .unwrap()
+        .build()
+        .unwrap();
+    assert!(
+        agent
+            .prompt(request())
+            .await
+            .unwrap()
+            .result()
+            .await
+            .unwrap_err()
+            .execution_policy_disposition()
+            .is_some()
+    );
     let _ = agent.shutdown().await;
     drop((agent, events));
     let (agent, events) = Nanocodex::builder(Claude::new(client, "new-model"))
-        .durability(reopen(&path).await).await.unwrap().build().unwrap();
-    let error = agent.prompt(request()).await.unwrap().result().await.unwrap_err();
-    assert!(error.to_string().contains("revoked by current host authorization"), "{error}");
-    assert_eq!(requests.lock().unwrap().len(), 1, "replayed pause cannot grant fresh HTTP authority");
-    assert_eq!(effects.load(Ordering::SeqCst), 0, "revoked continuation cannot execute");
-    println!("Claude revoked catalog after settled pause replay: requests=1 continuation effects=0");
+        .durability(reopen(&path).await)
+        .await
+        .unwrap()
+        .build()
+        .unwrap();
+    let error = agent
+        .prompt(request())
+        .await
+        .unwrap()
+        .result()
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("revoked by current host authorization"),
+        "{error}"
+    );
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        1,
+        "replayed pause cannot grant fresh HTTP authority"
+    );
+    assert_eq!(
+        effects.load(Ordering::SeqCst),
+        0,
+        "revoked continuation cannot execute"
+    );
+    println!(
+        "Claude revoked catalog after settled pause replay: requests=1 continuation effects=0"
+    );
     let _ = agent.shutdown().await;
     drop((agent, events));
     server.abort();

@@ -55,13 +55,24 @@ impl StateStore for RecoveryStore {
                     serde_json::from_str(state.state.payload.as_ref().expect("persisted head"))
                         .unwrap();
                 head["nanocodex_durable_state"]["format"] = json!(4);
-                let steps = head["nanocodex_durable_state"]["operations"]["native-effect"]["steps"]
+                let operations = head["nanocodex_durable_state"]["operations"]
                     .as_object_mut()
                     .unwrap();
-                let model = steps.get_mut("model-1").expect("pending provider effect");
-                assert_eq!(model["status"], "effect_pending");
-                // Historical model intents were promoted to Safe by migration.
-                model.as_object_mut().unwrap().remove("replay_safety");
+                // Operation IDs and model-call indices are host-owned. Select the
+                // sole pending model effect by its semantics, not a guessed key.
+                let mut migrated = 0;
+                for operation in operations.values_mut() {
+                    for model in operation["steps"].as_object_mut().unwrap().values_mut() {
+                        if model["kind"] == "model_call" && model["status"] == "effect_pending" {
+                            model.as_object_mut().unwrap().remove("replay_safety");
+                            migrated += 1;
+                        }
+                    }
+                }
+                assert_eq!(
+                    migrated, 1,
+                    "fixture must migrate the pending provider effect"
+                );
                 state.state.payload = Some(head.to_string());
             }
             Ok(state)
@@ -189,14 +200,22 @@ async fn provider_tool_http_effect_is_never_redispatched_after_uncertain_settlem
             )
             .await?;
             if format4 {
+                let saved = state.state().await?;
+                let pending_models: Vec<_> = saved
+                    .pending_operations()
+                    .into_iter()
+                    .flat_map(|(_, operation)| operation.steps.values())
+                    .filter(|step| {
+                        step.kind == "model_call"
+                            && matches!(
+                                step.status,
+                                nanocodex_durability::StepStatus::EffectPending
+                            )
+                    })
+                    .collect();
+                assert_eq!(pending_models.len(), 1);
                 assert_eq!(
-                    state
-                        .state()
-                        .await?
-                        .operation("native-effect")
-                        .unwrap()
-                        .steps["model-1"]
-                        .replay_safety,
+                    pending_models[0].replay_safety,
                     nanocodex_durability::ReplaySafety::Safe,
                     "migration must actually produce saved Safe before current Unsafe constrains it"
                 );
