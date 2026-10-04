@@ -4457,10 +4457,18 @@ final class InboxUITests: XCTestCase {
         composer(app).tap(); composer(app).typeText("Keep my place")
         let conversation = app.descendants(matching: .any)["conversation"].firstMatch
         scrollVisibleConversation(app, upward: false); scrollVisibleConversation(app, upward: false)
-        let anchor = conversation.staticTexts.allElementsBoundByIndex.first {
-            $0.isHittable && $0.label.hasPrefix("Progress note ") && $0.frame.minY >= conversation.frame.minY
+        let latest = app.buttons["latest-messages"]
+        guard latest.waitForExistence(timeout: 5), latest.isHittable else {
+            return XCTFail("Scroll into earlier history before recording the reading position")
         }
-        XCTAssertNotNil(anchor)
+        let readingTop = max(conversation.frame.minY, app.buttons["conversation-drawer-open"].frame.maxY)
+        let controls = app.buttons["toggle-all-tools"]
+        let readingBottom = min(composer(app).frame.minY, controls.exists ? controls.frame.minY : conversation.frame.maxY)
+        let anchor = conversation.staticTexts.matching(NSPredicate(format: "label BEGINSWITH %@", "Progress note "))
+            .allElementsBoundByIndex.first {
+                $0.isHittable && $0.frame.minY >= readingTop && $0.frame.maxY <= readingBottom
+            }
+        XCTAssertNotNil(anchor, "Expected a history row unobscured by the floating header and composer controls")
         guard let anchor else { return }
         let label = anchor.label, y = anchor.frame.minY
         capture(app, "tabs-before-reading-switch")
@@ -5518,9 +5526,14 @@ final class InboxUITests: XCTestCase {
     private func scrollVisibleConversation(_ app: XCUIApplication, upward: Bool) {
         let conversation = app.descendants(matching: .any)["conversation"].firstMatch
         let frame = conversation.frame
-        let top = frame.minY + 36
-        let bottom = min(frame.maxY, composer(app).frame.minY) - 28
-        let height = max(40, bottom - top)
+        // The transcript extends behind the floating header. Starting there
+        // hits the title button instead of moving into earlier history.
+        let top = max(frame.minY, app.buttons["conversation-drawer-open"].frame.maxY) + 16
+        let controls = app.buttons["toggle-all-tools"]
+        let bottom = min(frame.maxY, composer(app).frame.minY,
+                         controls.exists ? controls.frame.minY : frame.maxY) - 28
+        let height = bottom - top
+        guard height > 40 else { return XCTFail("Expected an unobscured transcript region for scrolling") }
         let origin = app.coordinate(withNormalizedOffset: .zero)
         let low = origin.withOffset(CGVector(dx: frame.midX, dy: top + height * 0.85))
         let high = origin.withOffset(CGVector(dx: frame.midX, dy: top + height * 0.15))
