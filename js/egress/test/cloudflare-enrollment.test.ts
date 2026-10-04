@@ -45,6 +45,14 @@ describe("Native Cloudflare enrollment through the private broker", () => {
     expect((await metadata(recoveryOwner)).vault).toHaveLength(1);
   });
 
+  it("enrolls an account-owned deployment token with its explicit account ID", async () => {
+    const receipt = await enrollCloudflare(transport, {
+      owner: "account-owned-enrollment", operation, token: "synthetic-cloudflare-account-token", accountId: "d".repeat(32),
+    });
+    expect(receipt.status).toBe("connected");
+    expect((await metadata("account-owned-enrollment")).vault).toHaveLength(1);
+  });
+
   it("rejects malformed owner and operation before transmitting credentials", async () => {
     await expect(enrollCloudflare(transport, { owner: "../foreign", operation, token }))
       .rejects.toMatchObject({ code: "invalid_owner" });

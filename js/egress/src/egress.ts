@@ -2245,8 +2245,9 @@ async function handleControl(request: Request, url: URL, env: EgressEnv): Promis
     }
     if (connector === "cloudflare" && request.method === "POST" && !callback && !connectionId) {
       const body = await readJson(request, MAX_VAULT_BODY_BYTES);
-      if (!isRecord(body) || Object.keys(body).some(key => key !== "vault_id")
-        || typeof body.vault_id !== "string" || !/^[A-Za-z0-9_-]{22,64}$/.test(body.vault_id)) {
+      if (!isRecord(body) || Object.keys(body).some(key => key !== "vault_id" && key !== "account_id")
+        || typeof body.vault_id !== "string" || !/^[A-Za-z0-9_-]{22,64}$/.test(body.vault_id)
+        || (body.account_id !== undefined && (typeof body.account_id !== "string" || !/^[a-f0-9]{32}$/.test(body.account_id)))) {
         return jsonError(400, "invalid_request");
       }
       let entry: VaultEntry;
@@ -2255,7 +2256,7 @@ async function handleControl(request: Request, url: URL, env: EgressEnv): Promis
       if (entry.kind !== "api_key") return jsonError(400, "vault_api_key_required");
       return connectorBroker(env, userId).fetch(target, {
         method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ access_token: entry.api_key }),
+        body: JSON.stringify({ access_token: entry.api_key, ...(body.account_id === undefined ? {} : { account_id: body.account_id }) }),
       });
     }
     return connectorBroker(env, userId).fetch(target, {

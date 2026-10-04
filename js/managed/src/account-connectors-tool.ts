@@ -97,7 +97,7 @@ export function accountConnectorsTool(
     description: [
       "List, connect, reconnect, or disconnect account connectors without exposing credentials.",
       "Google Workspace is one authorization identity whose connections list the exact Gmail, Drive, Calendar, Tasks, Docs, Sheets, Slides, and Contacts capabilities granted. Google connections also expose granted OAuth scopes; Gmail being connected does not imply settings consent. Inspect scopes before requesting a reconnect.",
-      "Supports Cloudflare, GitHub, Google Workspace, Slack, X, Spotify, SoundCloud and Stripe Link. For Cloudflare, use secure Vault intake for a user API token, then connect with the explicitly authorized vault_id. Never pass token values to tools. Disconnect removes the broker copy; revoke the token at Cloudflare separately. Use tool_search for each service’s API tools. Stripe Link requests user spend approvals. Spotify and SoundCloud connect open the native Nanocodex app; other providers return authorization URLs.",
+      "Supports Cloudflare, GitHub, Google Workspace, Slack, X, Spotify, SoundCloud and Stripe Link. For Cloudflare, use secure Vault intake for a user or account API token, then connect with the explicitly authorized vault_id. Account-owned tokens also require the Cloudflare account_id. Never pass token values to tools. Disconnect removes the broker copy; revoke the token at Cloudflare separately. Use tool_search for each service’s API tools. Stripe Link requests user spend approvals. Spotify and SoundCloud connect open the native Nanocodex app; other providers return authorization URLs.",
       "Connect returns a provider authorization URL. Give that exact URL to the user as a link; the provider may still require consent.",
       "Disconnect revokes one exact listed connection_id and is allowed only when the user explicitly asks to remove or replace it.",
     ].join(" "),
@@ -119,6 +119,10 @@ export function accountConnectorsTool(
         vault_id: {
           type: "string", pattern: "^[A-Za-z0-9_-]{22,64}$",
           description: "Cloudflare connect only: exact explicitly user-authorized Vault API key ID. Never a token value.",
+        },
+        account_id: {
+          type: "string", pattern: "^[a-f0-9]{32}$",
+          description: "Cloudflare connect only: account ID required for an account-owned API token; omit for user tokens.",
         },
         account_hint: {
           type: "string",
@@ -185,10 +189,10 @@ export async function manageAccountConnectors(
   if (operation.provider === "cloudflare") {
     if (!operation.vaultId) return {
       ok: true, status: "input_required", connector: "cloudflare",
-      message: "Use request_vault_intake with kind api_key and name Cloudflare. The user must enter a Cloudflare user API token privately. After its saved receipt, connect with that explicitly authorized vault_id. Wrangler OAuth login has no credential export bridge.",
+      message: "Use request_vault_intake with kind api_key and name Cloudflare. The user must enter a Cloudflare API token privately. Account-owned tokens also require account_id. After its saved receipt, connect with that explicitly authorized vault_id. Wrangler OAuth login has no credential export bridge.",
     };
     const response = await brokerFetch(options.broker, connectorBrokerUrl(options.userId, "cloudflare"), {
-      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ vault_id: operation.vaultId }),
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ vault_id: operation.vaultId, ...(operation.accountId === undefined ? {} : { account_id: operation.accountId }) }),
     });
     if (!response.ok) return connectorFailure(response);
     const value: unknown = await response.json().catch(() => undefined);
@@ -322,13 +326,17 @@ async function soleProviderConnectionId(
 
 function connectorOperation(input: unknown):
   | { operation: "list" }
-  | { operation: "connect"; provider: ConnectorProviderId; accountHint?: string; vaultId?: string }
+  | { operation: "connect"; provider: ConnectorProviderId; accountHint?: string; vaultId?: string; accountId?: string }
   | { operation: "disconnect"; provider: ConnectorProviderId; connectionId?: string } {
   if (!isRecord(input) || typeof input.operation !== "string") {
     throw new TypeError("operation must be list, connect, or disconnect");
   }
-  if (Object.keys(input).some(key => !["operation", "connector", "connection_id", "account_hint", "vault_id"].includes(key))) {
+  if (Object.keys(input).some(key => !["operation", "connector", "connection_id", "account_hint", "vault_id", "account_id"].includes(key))) {
     throw new TypeError("Unknown connector control field; credential values are never accepted");
+  }
+  if (input.account_id !== undefined && (input.operation !== "connect" || input.connector !== "cloudflare"
+    || typeof input.account_id !== "string" || !/^[a-f0-9]{32}$/.test(input.account_id))) {
+    throw new TypeError("account_id requires Cloudflare connect and a 32-character account ID");
   }
   if (input.vault_id !== undefined && (input.operation !== "connect" || input.connector !== "cloudflare"
     || typeof input.vault_id !== "string" || !/^[A-Za-z0-9_-]{22,64}$/.test(input.vault_id))) {
@@ -354,7 +362,7 @@ function connectorOperation(input: unknown):
     throw new TypeError("operation must be list, connect, or disconnect");
   }
   if (input.connection_id !== undefined) throw new TypeError("connect does not accept connection_id");
-  if (input.account_hint === undefined) return { operation: "connect", provider, ...(input.vault_id === undefined ? {} : { vaultId: input.vault_id as string }) };
+  if (input.account_hint === undefined) return { operation: "connect", provider, ...(input.vault_id === undefined ? {} : { vaultId: input.vault_id as string }), ...(input.account_id === undefined ? {} : { accountId: input.account_id as string }) };
   if (provider !== "google" || typeof input.account_hint !== "string") {
     throw new TypeError("account_hint is supported only for Google Workspace");
   }

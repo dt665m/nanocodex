@@ -964,7 +964,12 @@ export class UserConnectorBroker extends DurableObject<ConnectorBrokerEnv> {
     const body = await readJson(request, MAX_BODY_BYTES);
     const token = stringField(body, "access_token");
     if (!token || token.length > 4096 || /\s/.test(token)) throw new ConnectorFailure(400, "invalid_request");
-    const response = await providerFetch(new Request("https://api.cloudflare.com/client/v4/user/tokens/verify", {
+    const accountId = body?.account_id;
+    if (accountId !== undefined && (typeof accountId !== "string" || !/^[a-f0-9]{32}$/.test(accountId))) {
+      throw new ConnectorFailure(400, "invalid_request");
+    }
+    const verifyPath = accountId === undefined ? "/user/tokens/verify" : `/accounts/${accountId}/tokens/verify`;
+    const response = await providerFetch(new Request(`https://api.cloudflare.com/client/v4${verifyPath}`, {
       headers: { authorization: `Bearer ${token}`, accept: "application/json" },
     }));
     if (!response.ok) {
@@ -977,14 +982,14 @@ export class UserConnectorBroker extends DurableObject<ConnectorBrokerEnv> {
       || typeof result.id !== "string" || !/^[a-f0-9]{32}$/.test(result.id)) {
       throw new ConnectorFailure(409, "cloudflare_token_invalid");
     }
-    const expiresAt = result.expires_on === undefined ? undefined
+    const expiresAt = result.expires_on == null ? undefined
       : typeof result.expires_on === "string" ? Date.parse(result.expires_on) : NaN;
     if (expiresAt !== undefined && (!Number.isFinite(expiresAt) || expiresAt <= Date.now() + EXPIRY_SKEW_MS)) {
       throw new ConnectorFailure(409, "cloudflare_token_invalid");
     }
-    const connectionId = this.#connectionIdForIdentity("cloudflare", result.id);
+    const connectionId = this.#connectionIdForIdentity("cloudflare", accountId === undefined ? result.id : `account:${accountId}:${result.id}`);
     this.#connections("cloudflare")[connectionId] = {
-      accessToken: token, accountId: result.id, label: "Cloudflare API token", scopes: [],
+      accessToken: token, accountId: accountId ?? result.id, label: accountId === undefined ? "Cloudflare API token" : "Cloudflare account API token", scopes: [],
       connectedAt: Date.now(), ...(expiresAt === undefined ? {} : { expiresAt }),
     };
     await this.#persist();

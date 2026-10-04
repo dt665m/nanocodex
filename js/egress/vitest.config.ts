@@ -153,8 +153,18 @@ export default defineConfig({
             return new Response(null, { status: body.access_token?.startsWith("music-secret-") ? 204 : 401 });
           }
           if (url.hostname === "api.cloudflare.com") {
-            const valid = request.headers.get("authorization") === "Bearer synthetic-cloudflare-token";
-            if (!valid) return Response.json({ success: false }, { status: 401 });
+            const authorization = request.headers.get("authorization");
+            const accountToken = authorization === "Bearer synthetic-cloudflare-account-token";
+            const expiredToken = authorization === "Bearer synthetic-cloudflare-expired-token";
+            const valid = authorization === "Bearer synthetic-cloudflare-token";
+            if (!valid && !accountToken && !expiredToken) return Response.json({ success: false }, { status: 401 });
+            if (url.pathname.includes("/tokens/verify") && (accountToken || expiredToken)) {
+              if (url.pathname !== `/client/v4/accounts/${"d".repeat(32)}/tokens/verify`) {
+                return Response.json({ success: false }, { status: 401 });
+              }
+              return Response.json({ success: true, result: { id: "e".repeat(32), status: "active",
+                expires_on: expiredToken ? "2000-01-01T00:00:00Z" : null } });
+            }
             if (url.pathname === "/client/v4/user/tokens/verify") {
               return Response.json({ success: true, result: { id: "c".repeat(32), status: "active" } });
             }

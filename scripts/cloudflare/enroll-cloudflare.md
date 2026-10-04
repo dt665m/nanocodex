@@ -25,3 +25,5 @@ authentication to perform a read-only broker status request with a synthetic
 owner. It returns `remote_binding_ready` or a fixed failure. It does not enroll.
 Wrangler logs are redirected to the null device and child stdout/stderr are
 ignored; no raw diagnostic or proxy URL is emitted or retained by the runner.
+
+For an account-owned API token, set the `enrollment_account_id` workflow input (or `ENROLLMENT_ACCOUNT_ID` for native execution). Omit it for user tokens. The broker verifies account tokens at `/accounts/{account_id}/tokens/verify`; the Cloudflare deployment account alone does not select the token type. To connect an already-saved Vault item, call `account_connectors` with `connector: "cloudflare"`, `vault_id`, and `account_id`; do not repeat enrollment.

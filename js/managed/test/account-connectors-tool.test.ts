@@ -24,9 +24,13 @@ describe("managed account connector tool", () => {
     const [url, init] = fetch.mock.calls[0] as unknown as [string, RequestInit];
     expect(url).toContain("/connectors/cloudflare");
     expect(JSON.parse(init.body as string)).toEqual({ vault_id: vaultId });
+    const accountId = "d".repeat(32);
+    expect(await manageAccountConnectors(options, { operation: "connect", connector: "cloudflare", vault_id: vaultId, account_id: accountId })).toMatchObject({ status: "connected" });
+    expect(JSON.parse(String((fetch.mock.calls.at(-1) as unknown as [string, RequestInit])[1].body))).toEqual({ vault_id: vaultId, account_id: accountId });
+    await expect(manageAccountConnectors(options, { operation: "connect", connector: "cloudflare", vault_id: vaultId, account_id: "../user" })).rejects.toThrow();
     expect(await manageAccountConnectors({ ...options, canManage: () => false }, { operation: "connect", connector: "cloudflare", vault_id: vaultId })).toMatchObject({ status: "forbidden" });
     await expect(manageAccountConnectors(options, { operation: "connect", connector: "cloudflare", access_token: "synthetic-token" })).rejects.toThrow();
-    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(fetch).toHaveBeenCalledTimes(2);
   });
 
   it("resolves inventory and control authority from the invoking agent context", async () => {

@@ -55,4 +55,32 @@ describe("Cloudflare Vault-to-connector journey", () => {
     const status = await (await SELF.fetch(`${base}/connectors`)).json<{ connectors: Record<string, { connected: boolean }> }>();
     expect(status.connectors.cloudflare.connected).toBe(false);
   });
+  it("verifies account-owned tokens against the explicit account and preserves auth on failed reconnect", async () => {
+    const base = "https://broker.internal/users/cloudflare-account-token";
+    const account_id = "d".repeat(32);
+    const created = await SELF.fetch(`${base}/credentials/vault/api_key`, json({ name: "Cloudflare account", api_key: "synthetic-cloudflare-account-token" }));
+    const vault = await created.json<{ id: string }>();
+    const vault_id = vault.id;
+    expect((await SELF.fetch(`${base}/connectors/cloudflare`, json({ vault_id }))).status).toBe(409);
+    expect((await SELF.fetch(`${base}/connectors/cloudflare`, json({ vault_id, account_id: "f".repeat(32) }))).status).toBe(409);
+    expect((await SELF.fetch(`${base}/connectors/cloudflare`, json({ vault_id, account_id: "../user" }))).status).toBe(400);
+    const connected = await SELF.fetch(`${base}/connectors/cloudflare`, json({ vault_id, account_id }));
+    expect(connected.status).toBe(200);
+    const result = await connected.json<{ connected: boolean; connection_id: string }>();
+    expect(result.connected).toBe(true);
+    const accountSubject = "D".repeat(43);
+    expect((await SELF.fetch(`https://broker.internal/subjects/${accountSubject}`, { ...json({ user_id: "cloudflare-account-token" }), method: "PUT" })).status).toBe(200);
+    const read = await SELF.fetch(`https://api.cloudflare.com/client/v4/accounts/${account_id}/workers/scripts`, { headers: {
+      authorization: "Bearer NANOCODEX_PROVIDER_CREDENTIAL", "x-nanocodex-subject": accountSubject,
+      "x-nanocodex-connector-connection": result.connection_id,
+    } });
+    expect(read.status).toBe(200);
+    const expired = await SELF.fetch(`${base}/credentials/vault/api_key`, json({ name: "Expired", api_key: "synthetic-cloudflare-expired-token" }));
+    const expiredVault = await expired.json<{ id: string }>();
+    expect((await SELF.fetch(`${base}/connectors/cloudflare`, json({ vault_id: expiredVault.id, account_id }))).status).toBe(409);
+    const status = await (await SELF.fetch(`${base}/connectors`)).json<any>();
+    expect(status.connectors.cloudflare.connections).toHaveLength(1);
+    expect(status.connectors.cloudflare.connections[0]).toMatchObject({ id: result.connection_id, account_id });
+  });
+
 });

@@ -8,10 +8,10 @@ import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { enrollCloudflare, validateEnrollment } from './enroll-credential.mjs';
 
-const input = { owner: process.env.ENROLLMENT_OWNER, operation: process.env.ENROLLMENT_OPERATION, token: process.env.CLOUDFLARE_API_TOKEN };
+const input = { owner: process.env.ENROLLMENT_OWNER, operation: process.env.ENROLLMENT_OPERATION, token: process.env.CLOUDFLARE_API_TOKEN, accountId: process.env.ENROLLMENT_ACCOUNT_ID || undefined };
 const smoke = process.argv[2] === '--smoke';
 const child = process.argv[2] === '--private-child';
-const safeCodes = new Set(['invalid_owner', 'invalid_operation', 'invalid_token', 'invalid_mode', 'remote_binding_failed', 'remote_binding_ready', 'connected', 'enrollment_failed', 'enrollment_outcome_unknown']);
+const safeCodes = new Set(['invalid_account', 'invalid_owner', 'invalid_operation', 'invalid_token', 'invalid_mode', 'remote_binding_failed', 'remote_binding_ready', 'connected', 'enrollment_failed', 'enrollment_outcome_unknown']);
 function report(code) { process.stdout.write(JSON.stringify({ status: code }) + '\n'); }
 if (!child) {
   try {
