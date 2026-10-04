@@ -203,6 +203,8 @@ jobs:
             -only-testing:NanocodexInboxUITests/InboxUITests/testNativeCheckboxOnlyConfirmsDisplayedStateWithoutToggling \
             -only-testing:NanocodexInboxUITests/InboxUITests/testStaleNativeSelectionHandsBackWithoutFillAndRetriesOnlyHandoff \
             -only-testing:NanocodexInboxUITests/InboxUITests/testNativeBrowserCodeUsesSameFillAndHandoffJourney \
+            -only-testing:NanocodexInboxUITests/InboxUITests/testNativeBrowserResponsesWaitForActiveAndBackgroundCancels \
+            -only-testing:NanocodexInboxUITests/InboxUITests/testNativeBrowserInactiveDraftsAndLoginCheckResume \
             -only-testing:NanocodexInboxUITests/InboxUITests/testNativeBrowserFormFillsOnceAndHandsBackWithoutWebsiteSubmit \
             -only-testing:NanocodexInboxUITests/InboxUITests/testNativeBrowserFormHandoffFailureDoesNotRepeatFill \
             -only-testing:NanocodexInboxUITests/InboxUITests/testNativeBrowserFormFailureClearsDraftsWithoutRetry \

@@ -2,6 +2,78 @@ import XCTest
 import UIKit
 
 final class InboxUITests: XCTestCase {
+    func testNativeBrowserResponsesWaitForActiveAndBackgroundCancels() {
+        for outcome in ["success", "failure", "background"] {
+            let app = launchNativeBrowserForm(arguments: ["--browser-native-form-inactive-response"]
+                + (outcome == "failure" ? ["--browser-native-form-fill-fails"] : []))
+            enterNativeBrowserFields(app)
+            revealNativeFill(app).tap()
+            let delivered = app.staticTexts["native-fixture-inactive-responses"]
+            let inactive = expectation(for: NSPredicate(format: "label == 'Responses delivered inactive: 1'"), evaluatedWith: delivered)
+            wait(for: [inactive], timeout: 5)
+            XCTAssertEqual(app.staticTexts["native-fixture-actions"].label, "Fills: 1 · Site submits: 0 · Handoffs: 0")
+            capture(app, "native-response-inactive-" + outcome)
+            if outcome == "background" { app.buttons["Fixture background"].tap() }
+            app.buttons["Fixture active"].tap()
+            if outcome == "success" {
+                XCTAssertTrue(app.buttons["Open native browser form"].waitForExistence(timeout: 5))
+                XCTAssertEqual(app.staticTexts["native-fixture-sequence"].label, "fill_fields → finish")
+                XCTAssertEqual(app.staticTexts["native-fixture-actions"].label, "Fills: 1 · Site submits: 0 · Handoffs: 1")
+            } else {
+                let message = outcome == "background" ? "Private view paused. Refresh to continue."
+                    : "Couldn’t confirm the action. Refresh before continuing."
+                XCTAssertTrue(app.staticTexts[message].waitForExistence(timeout: 5))
+                XCTAssertFalse(app.secureTextFields["Password"].exists)
+                let actions = app.staticTexts["native-fixture-actions"]
+                let retry = expectation(for: NSPredicate(format: "label != 'Fills: 1 · Site submits: 0 · Handoffs: 0'"), evaluatedWith: actions)
+                retry.isInverted = true
+                wait(for: [retry], timeout: 2)
+                XCTAssertTrue(app.buttons["Refresh"].isEnabled, "Discarding a response must release busy state")
+                app.buttons["Refresh"].tap()
+                XCTAssertTrue(app.secureTextFields["Password"].waitForExistence(timeout: 5))
+                XCTAssertFalse(app.buttons["browser-native-fill"].isEnabled, "Recovery must not reuse private drafts")
+            }
+            capture(app, "native-response-resumed-" + outcome)
+            app.terminate()
+        }
+    }
+
+    func testNativeBrowserInactiveDraftsAndLoginCheckResume() {
+        let app = launchNativeBrowserForm(arguments: ["--browser-native-form-inactive-response"])
+        enterNativeBrowserFields(app)
+        app.buttons["Fixture inactive"].tap()
+        app.buttons["Fixture active"].tap()
+        XCTAssertEqual(app.textFields["Email"].value as? String, "synthetic@example.com")
+        revealNativeFill(app).tap()
+        let delivered = app.staticTexts["native-fixture-inactive-responses"]
+        let inactive = expectation(for: NSPredicate(format: "label == 'Responses delivered inactive: 1'"), evaluatedWith: delivered)
+        wait(for: [inactive], timeout: 5)
+        app.buttons["Fixture active"].tap()
+        XCTAssertTrue(app.buttons["Open native browser form"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["native-fixture-filled"].exists, "Both drafts must survive transient inactivity")
+        app.terminate()
+
+        app.launchArguments = ["--browser-native-form-ui-fixture", "--browser-native-form-inactive-response", "--browser-native-form-login"]
+        app.launch()
+        let open = app.buttons["Open native browser form"]
+        XCTAssertTrue(open.waitForExistence(timeout: 10)); open.tap()
+        let checked = expectation(for: NSPredicate(format: "label == 'Responses delivered inactive: 1'"),
+                                  evaluatedWith: app.staticTexts["native-fixture-inactive-responses"])
+        wait(for: [checked], timeout: 5)
+        XCTAssertEqual(app.staticTexts["native-fixture-observations"].label, "Observations: 0")
+        app.buttons["Fixture active"].tap()
+        XCTAssertTrue(app.textFields["Email"].waitForExistence(timeout: 5), "Resuming the consent check must start observation")
+        enterNativeBrowserFields(app)
+        revealNativeFill(app).tap()
+        let filled = expectation(for: NSPredicate(format: "label == 'Responses delivered inactive: 2'"),
+                                 evaluatedWith: app.staticTexts["native-fixture-inactive-responses"])
+        wait(for: [filled], timeout: 5)
+        app.buttons["Fixture active"].tap()
+        XCTAssertTrue(open.waitForExistence(timeout: 5))
+        XCTAssertEqual(app.staticTexts["native-fixture-sequence"].label, "fill_fields → finish")
+        capture(app, "native-login-inactive-response-handed-back")
+    }
+
     func testNativeBrowserFormFallsBackToLegacyBackendOnce() {
         let app = XCUIApplication()
         app.launchArguments = ["--browser-native-form-ui-fixture", "--browser-native-form-legacy"]
@@ -73,6 +145,7 @@ final class InboxUITests: XCTestCase {
         let open = app.buttons["Open native browser form"]
         XCTAssertTrue(open.waitForExistence(timeout: 10)); open.tap()
         XCTAssertTrue(app.staticTexts["Complete the profile fields on this page."].waitForExistence(timeout: 5))
+        app.buttons["Sheet Grabber"].swipeUp()
         let choice = app.buttons["browser-native-choice:Country"]
         for _ in 0..<5 {
             if choice.isHittable { break }
@@ -85,16 +158,21 @@ final class InboxUITests: XCTestCase {
             if toggle.isHittable { break }
             app.collectionViews.firstMatch.swipeUp()
         }
-        toggle.tap()
+        XCTAssertEqual(toggle.value as? String, "0")
+        // A SwiftUI Toggle exposes the entire labelled row as a switch. Tap
+        // the trailing native control, then verify the actual changed value.
+        toggle.coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.5)).tap()
+        XCTAssertEqual(toggle.value as? String, "1")
         let notes = app.textViews["Notes"]
         for _ in 0..<5 {
             if notes.isHittable { break }
             app.collectionViews.firstMatch.swipeDown()
         }
         notes.tap(); notes.typeText("Line one\nLine two")
+        XCTAssertEqual(notes.value as? String, "Line one\nLine two")
         XCTAssertFalse(app.descendants(matching: .any)["browser-private-viewport"].firstMatch.exists)
         revealNativeFill(app).tap()
-        XCTAssertTrue(open.waitForExistence(timeout: 5))
+        XCTAssertTrue(open.waitForExistence(timeout: 5), app.debugDescription)
         XCTAssertTrue(app.staticTexts["native-fixture-filled"].exists)
         XCTAssertEqual(app.staticTexts["native-fixture-actions"].label, "Fills: 1 · Site submits: 0 · Handoffs: 1")
         XCTAssertEqual(app.staticTexts["native-fixture-sequence"].label, "fill_fields → finish")
@@ -224,7 +302,10 @@ final class InboxUITests: XCTestCase {
         showWebsite.tap()
         XCTAssertTrue(app.descendants(matching: .any)["browser-private-viewport"].firstMatch.waitForExistence(timeout: 5))
         dismissNativePasswordSavePrompt(app)
-        app.buttons["Fields"].tap()
+        let fields = app.buttons["Fields"]
+        let ready = expectation(for: NSPredicate(format: "enabled == true AND hittable == true"), evaluatedWith: fields)
+        wait(for: [ready], timeout: 5)
+        fields.tap()
         let password = app.secureTextFields["Password"]
         XCTAssertTrue(password.waitForExistence(timeout: 5))
         XCTAssertTrue(["", "Email"].contains(app.textFields["Email"].value as? String ?? ""))

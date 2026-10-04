@@ -3821,6 +3821,8 @@ private struct BrowserTakeoverSheet: View {
     @State private var queue: [[String: JSON]] = []
     @State private var submission: Task<Void, Never>?
     @State private var observing: Task<Void, Never>?
+    @State private var responseContinuation: CheckedContinuation<Bool, Never>?
+    @State private var responseScenePhase: ScenePhase = .inactive
     @State private var generation = UUID()
     @State private var viewport = CGSize(width: 390, height: 700)
     @State private var finishing = false
@@ -3832,6 +3834,7 @@ private struct BrowserTakeoverSheet: View {
 
     private func clear() {
         generation = UUID(); submission?.cancel(); submission = nil
+        responseContinuation?.resume(returning: false); responseContinuation = nil
         queue.removeAll(); screen = nil; keyboard = nil; inputs = []; keyboardVisible = false
         nativeForm = nil; drafts.removeAll(); editingFields = false; prefersViewport = false
         currentOrigin = nil; finishing = false; touching = false
@@ -3843,6 +3846,24 @@ private struct BrowserTakeoverSheet: View {
             failure = fieldsFilled ? "Fields were filled. Hand back to continue without refilling." : "Private view paused. Refresh to continue."
         }
     }
+    // AutoFill and other system UI can make the scene inactive while HTTP
+    // completes. Keep the result and its busy state until active, so follow-up
+    // observe/finish actions cannot be silently dropped by enqueue's guard.
+    // Backgrounding/disappearance invalidates the generation and wakes the
+    // suspended task through clear(), without replaying an uncertain action.
+    @MainActor private func readyToApplyResponse(_ token: UUID) async -> Bool {
+        guard !Task.isCancelled, generation == token, responseScenePhase != .background,
+              account == model.vaultIntakeAccount else { return false }
+        while responseScenePhase == .inactive {
+            let resumed = await withCheckedContinuation { continuation in
+                responseContinuation = continuation
+            }
+            guard resumed, !Task.isCancelled, generation == token,
+                  account == model.vaultIntakeAccount else { return false }
+        }
+        return !Task.isCancelled && generation == token && responseScenePhase == .active
+            && account == model.vaultIntakeAccount
+    }
     private func checkLoginState() {
         guard !busy, scenePhase == .active else { return }
         failure = nil
@@ -3850,12 +3871,11 @@ private struct BrowserTakeoverSheet: View {
         submission = Task { @MainActor in
             do {
                 let approved = try await model.browserLoginApproved(intake: intake, account: account)
-                guard !Task.isCancelled, generation == token, scenePhase == .active,
-                      account == model.vaultIntakeAccount else { return }
+                guard await readyToApplyResponse(token) else { return }
                 reviewed = approved; loginStateConfirmed = true; submission = nil
                 if approved { observe(configureViewport: true) }
             } catch {
-                guard generation == token, !Task.isCancelled else { return }
+                guard await readyToApplyResponse(token) else { return }
                 clear(); failure = "Couldn’t check this browser session. Try again to continue."
             }
         }
@@ -3940,8 +3960,7 @@ private struct BrowserTakeoverSheet: View {
         submission = Task { @MainActor in
             do {
                 let frame = try await model.browserTakeover(intake: intake, action: action, account: account)
-                guard !Task.isCancelled, generation == token, scenePhase == .active,
-                      account == model.vaultIntakeAccount else { return }
+                guard await readyToApplyResponse(token) else { return }
                 if action["action"] == .string("observe"), action["native_fields"] == .bool(true) { nativeFieldsConfirmed = true }
                 switch frame {
                 case .staleForm(let origin):
@@ -3988,7 +4007,7 @@ private struct BrowserTakeoverSheet: View {
                 }
                 submission = nil; drain()
             } catch {
-                guard generation == token, !Task.isCancelled else { return }
+                guard await readyToApplyResponse(token) else { return }
                 // Old workers reject the new observation key before taking any action.
                 // Downgrade only the read-only probe: controls, hints, then native fields.
                 // Capability choices survive refresh for the lifetime of this sheet.
@@ -4190,9 +4209,8 @@ private struct BrowserTakeoverSheet: View {
                         .disabled(busy || scenePhase != .active) }
                 }
                 ToolbarItemGroup(placement: .bottomBar) {
-                    if !login || reviewed {
-                    if login { Button("Cancel") { enqueue(["action": .string("cancel")]) }.disabled(busy) }
-                    if !fieldsFilled && !staleForm {
+                    if login && reviewed { Button("Cancel") { enqueue(["action": .string("cancel")]) }.disabled(busy) }
+                    if (!login || reviewed) && !fieldsFilled && !staleForm {
                         Button { guard submission == nil else { return }; failure = nil; observe(configureViewport: true) } label: {
                             Label("Refresh", systemImage: "arrow.clockwise")
                         }.disabled(busy || touching || editingFields)
@@ -4206,7 +4224,6 @@ private struct BrowserTakeoverSheet: View {
                         Button { keyboardVisible.toggle() } label: { Label("Keyboard", systemImage: "keyboard") }
                             .disabled(screen == nil || failure != nil || finishing || editingFields)
                     }
-                    }
                 }
             }
             .overlay { if scenePhase != .active { Color(uiColor: .systemBackground).ignoresSafeArea() } }
@@ -4215,6 +4232,7 @@ private struct BrowserTakeoverSheet: View {
         .interactiveDismissDisabled()
         .task {
             account = model.vaultIntakeAccount
+            responseScenePhase = scenePhase
             if login { checkLoginState() } else { observe(configureViewport: true) }
             observing = Task { @MainActor in
                 while !Task.isCancelled {
@@ -4226,7 +4244,17 @@ private struct BrowserTakeoverSheet: View {
         }
         .onDisappear { observing?.cancel(); clear() }
         .onChange(of: scenePhase) { _, phase in
+            responseScenePhase = phase
             if phase == .background { pause() }
+            else if phase == .active {
+                let continuation = responseContinuation
+                responseContinuation = nil
+                continuation?.resume(returning: true)
+                if !busy && failure == nil && screen == nil {
+                    if login && !loginStateConfirmed { checkLoginState() }
+                    else if !login || reviewed { observe(configureViewport: true) }
+                }
+            }
         }
         // Clear only after backgrounding; transient AutoFill/system UI must
         // preserve drafts while the inactive privacy overlay hides them.
@@ -4891,13 +4919,28 @@ private struct SecureBrowserField: View {
 struct BrowserNativeFormUIFixture: View {
     @ObservedObject private var transport = BrowserNativeFormUITransport.shared
     @State private var showing = false
-    private let intake = VaultIntake.parse(.object([
+    @Environment(\.scenePhase) private var scenePhase
+    private var intake: VaultIntake {
+        if ProcessInfo.processInfo.arguments.contains("--browser-native-form-login") {
+            return VaultIntake.parse(BrowserNativeFormUITransport.loginDescription)!
+        }
+        return VaultIntake.parse(.object([
         "type": .string("browser_vault_takeover"), "status": .string("input_required"),
         "challenge_id": .string("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"), "agent_id": .string("fixture"),
         "origin": .string("https://example.com"), "expires_at": .number(4_000_000_000_000)
     ]))!
+    }
     private var evidence: some View {
         VStack {
+            if ProcessInfo.processInfo.arguments.contains("--browser-native-form-inactive-response") {
+                Text("Responses delivered inactive: \(transport.inactiveResponses)")
+                    .accessibilityIdentifier("native-fixture-inactive-responses")
+                HStack {
+                    Button("Fixture inactive") { transport.phaseOverride = .inactive }
+                    Button("Fixture active") { transport.phaseOverride = .active }
+                    Button("Fixture background") { transport.phaseOverride = .background }
+                }.font(.caption2)
+            }
             Text("Input outcome: \(transport.inputOutcome)").accessibilityIdentifier("native-fixture-outcome")
             Text("Observations: \(transport.observations)").accessibilityIdentifier("native-fixture-observations")
             Text("Capability probes: \(transport.probes)").accessibilityIdentifier("native-fixture-probes")
@@ -4916,6 +4959,7 @@ struct BrowserNativeFormUIFixture: View {
         }
         .sheet(isPresented: $showing) {
             BrowserTakeoverSheet(model: .shared, intake: intake)
+                .environment(\.scenePhase, transport.phaseOverride ?? scenePhase)
                 .safeAreaInset(edge: .top) { evidence }
         }
     }
@@ -4923,6 +4967,21 @@ struct BrowserNativeFormUIFixture: View {
 
 @MainActor final class BrowserNativeFormUITransport: ObservableObject {
     static let shared = BrowserNativeFormUITransport()
+    @Published var phaseOverride: ScenePhase?
+    @Published var inactiveResponses = 0
+    private var login: Bool { ProcessInfo.processInfo.arguments.contains("--browser-native-form-login") }
+    static var loginDescription: JSON { .object([
+        "type": .string("browser_login"), "status": .string("input_required"),
+        "request_id": .string("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+        "challenge_id": .string("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"), "agent_id": .string("fixture"),
+        "origin": .string("https://example.com"), "allowed_origins": .array([.string("https://example.com")]),
+        "approved": .bool(true), "expires_at": .number(4_000_000_000_000)
+    ]) }
+    func loginApproved(intake: VaultIntake) async throws -> Bool {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [BrowserNativeFormUIProtocol.self]
+        return try await client.browserLoginApproved(intake: intake, configuration: configuration)
+    }
     @Published private(set) var observations = 0
     @Published private(set) var probes = 0
     private var legacy: Bool { ProcessInfo.processInfo.arguments.contains("--browser-native-form-legacy") }
@@ -4949,8 +5008,9 @@ struct BrowserNativeFormUIFixture: View {
     }
     func reply(_ action: JSON) -> (Int, JSON) {
         let mode = action["action"].string
-        if mode != "observe" { actions.append(mode) }
+        if mode != "observe" && mode != "describe" { actions.append(mode) }
         switch mode {
+        case "describe": return (200, Self.loginDescription)
         case "observe":
             if action["native_fields"] == .bool(true) {
                 probes += 1
@@ -4982,6 +5042,10 @@ struct BrowserNativeFormUIFixture: View {
             if ProcessInfo.processInfo.arguments.contains("--browser-native-form-finish-fails"), finishes == 1 {
                 return (503, .object([:]))
             }
+            if login {
+                return (200, .object(["type": .string("browser_login_receipt"), "status": .string("finished"),
+                    "request_id": .string("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")]))
+            }
             return (200, .object(["status": .string("finished")]))
         default: return (400, .object([:]))
         }
@@ -5012,6 +5076,7 @@ struct BrowserNativeFormUIFixture: View {
         }
         var response: [String: JSON] = ["status": .string("active"), "image": .string("data:image/png;base64," + image.base64EncodedString()),
             "width": .number(390), "height": .number(700)]
+        if login { response["origin"] = .string("https://example.com") }
         if !legacy {
             var form: [String: JSON] = ["document_id": .string(documentID), "fields": .array(fields)]
             if controls && mixed { form["reason"] = .string("Complete the profile fields on this page.") }
@@ -5042,7 +5107,16 @@ private final class BrowserNativeFormUIProtocol: URLProtocol, @unchecked Sendabl
         }
         pending = Task { @MainActor in
             let (status, reply) = BrowserNativeFormUITransport.shared.reply(action)
-            if action["action"] == .string("fill_fields") { try? await Task.sleep(for: .milliseconds(400)) }
+            if ProcessInfo.processInfo.arguments.contains("--browser-native-form-inactive-response"),
+               action["action"] == .string("fill_fields") || action["action"] == .string("describe") {
+                // Deterministic lifecycle boundary: real ManagedClient parsing and
+                // production sheet handlers, with only HTTP and scene input controlled.
+                BrowserNativeFormUITransport.shared.phaseOverride = .inactive
+                try? await Task.sleep(for: .milliseconds(200))
+                BrowserNativeFormUITransport.shared.inactiveResponses += 1
+            } else if action["action"] == .string("fill_fields") {
+                try? await Task.sleep(for: .milliseconds(400))
+            }
             guard !Task.isCancelled, let url = request.url,
                   let data = try? JSONEncoder().encode(reply) else { return }
             client?.urlProtocol(self, didReceive: HTTPURLResponse(url: url, statusCode: status,

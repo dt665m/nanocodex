@@ -1957,6 +1957,12 @@ final class InboxModel: ObservableObject {
         return receipt
     }
     func browserLoginApproved(intake: VaultIntake, account: UUID) async throws -> Bool {
+        #if DEBUG && targetEnvironment(simulator)
+        if ProcessInfo.processInfo.arguments.contains("--browser-native-form-ui-fixture") {
+            guard generation == account else { throw APIError.invalidCredential }
+            return try await BrowserNativeFormUITransport.shared.loginApproved(intake: intake)
+        }
+        #endif
         guard let client, connected, !isDemo, generation == account else { throw APIError.invalidCredential }
         let approved = try await client.browserLoginApproved(intake: intake)
         guard generation == account, connected, !Task.isCancelled else { throw APIError.invalidCredential }
