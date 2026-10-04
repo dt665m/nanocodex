@@ -67,6 +67,10 @@ export type AgentOptions = {
   thinking?: Thinking | undefined;
   workspace?: string | undefined;
   resume?: SessionSnapshot | undefined;
+  /** Creates a fresh durable branch from exported session data; cannot accompany resume. */
+  documentFork?: DocumentForkSeed | undefined;
+  /** Completed receipts to retain, 0..4096. Historical document boundaries remain available. */
+  terminalReceiptRetention?: number | undefined;
 };
 
 /** Model-visible facts for tools executing outside the embedding process. */
@@ -340,6 +344,40 @@ export type TurnUsage = Readonly<{
   cost_status: CostStatus;
 }>;
 
+/** JSON data stored within one durable Agent session. */
+export type DocumentValue = null | boolean | number | string | readonly DocumentValue[] | { readonly [key: string]: DocumentValue };
+
+/** Immutable creation policy used when exporting a durable historical branch. */
+export type DocumentForkPolicy = "initial" | "current" | "asOf" | "block";
+
+export type SessionDocument = Readonly<{
+  version: number;
+  initial: DocumentValue;
+  value: DocumentValue;
+  fork: DocumentForkPolicy;
+}>;
+
+export type DocumentWrite = Readonly<{
+  key: string;
+  /** Zero creates; updates require the exact current document version. */
+  expectedVersion: number;
+  /** Null is a stored value, not deletion. */
+  value: DocumentValue;
+  /** Updates must repeat the immutable creation policy. */
+  fork: DocumentForkPolicy;
+}>;
+
+export type DocumentFork = Readonly<{
+  boundary: string;
+  documents: Readonly<Record<string, SessionDocument>>;
+}>;
+
+/** Data-only seed; destination credentials, tools and storage are supplied independently. */
+export type DocumentForkSeed = Readonly<{
+  checkpoint: SessionSnapshot;
+  documents: DocumentFork;
+}>;
+
 export type ForkOptions = Readonly<{ at?: TurnResult | undefined }>;
 export type WatchEventsOptions = { includeAllSessions?: boolean | undefined };
 
@@ -368,6 +406,10 @@ export type AgentActions = {
     appendDeveloperMessage(text: string): Promise<AgentSessionContext>;
     compact(): Promise<void>;
     context(): Promise<AgentSessionContext>;
+    document(key: string): Promise<SessionDocument | null>;
+    compareExchangeDocuments(writes: readonly DocumentWrite[]): Promise<void>;
+    stageDocumentWrites(operationId: string, writes: readonly DocumentWrite[]): Promise<void>;
+    documentFork(operationId: string): Promise<DocumentForkSeed>;
     fork(options?: ForkOptions): Promise<DefaultAgent>;
     setModel(model: Model): Promise<void>;
     setFastMode(enabled: boolean): Promise<void>;

@@ -247,6 +247,47 @@ export async function checkpoint(agent) {
   return JSON.parse(await agentState(agent).raw.checkpoint());
 }
 
+/** Reads one committed session-owned document; missing keys return null. */
+export async function document(agent, key) {
+  return normalizeDocument(JSON.parse(await agentState(agent).raw.document(key)));
+}
+
+/** Commits a conditional batch independently of a model turn. */
+export function compareExchangeDocuments(agent, writes) {
+  return agentState(agent).raw.compareExchangeDocuments(JSON.stringify(documentWritesConfig(writes)));
+}
+
+/** Stages a conditional batch for the identified durable turn's successful completion. */
+export function stageDocumentWrites(agent, operationId, writes) {
+  return agentState(agent).raw.stageDocumentWrites(operationId, JSON.stringify(documentWritesConfig(writes)));
+}
+
+/** Exports the selected durable model boundary and policy-selected document values. */
+export async function documentFork(agent, operationId) {
+  const seed = JSON.parse(await agentState(agent).raw.documentFork(operationId));
+  return { ...seed, documents: { ...seed.documents, documents: Object.fromEntries(
+    Object.entries(seed.documents.documents).map(([key, value]) => [key, normalizeDocument(value)]),
+  ) } };
+}
+
+function normalizeDocument(value) {
+  return value === null ? null : { ...value, fork: value.fork === "as_of" ? "asOf" : value.fork };
+}
+
+function documentWritesConfig(writes) {
+  return writes.map(({ key, expectedVersion, value, fork }) => ({
+    key, expected_version: expectedVersion, value, fork: fork === "asOf" ? "as_of" : fork,
+  }));
+}
+
+function documentForkConfig(seed) {
+  return { ...seed, documents: { ...seed.documents, documents: Object.fromEntries(
+    Object.entries(seed.documents.documents).map(([key, value]) => [key, {
+      ...value, fork: value.fork === "asOf" ? "as_of" : value.fork,
+    }]),
+  ) } };
+}
+
 export async function context(agent) {
   return parseSessionContext(await agentState(agent).raw.context());
 }
@@ -366,6 +407,9 @@ export function toWasmConfig(options = {}) {
     );
   }
   copy(config, "resume", options.resume);
+  if (options.documentFork !== undefined) {
+    config.document_fork = documentForkConfig(options.documentFork);
+  }
   copy(config, "durability_id", options.durabilityId);
   copy(config, "durability_host_id", options.durabilityHostId);
   copy(config, "terminal_receipt_retention", options.terminalReceiptRetention);

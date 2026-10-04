@@ -3,6 +3,12 @@ export { createQuickJsEvaluator } from "../runtime/quickjs-evaluator.mjs";
 export type {
   AgentActions,
   AgentEvent,
+  DocumentFork,
+  DocumentForkPolicy,
+  DocumentForkSeed,
+  DocumentValue,
+  DocumentWrite,
+  SessionDocument,
   AgentLifecycle,
   AgentOptions,
   AgentSessionContext,

@@ -48,8 +48,10 @@ export function create(options = {}) {
     sessionId,
     workspace,
     resume,
+    documentFork,
     durability,
     durabilityId,
+    terminalReceiptRetention,
     transport,
     module,
     filesystem,
@@ -181,7 +183,9 @@ export function create(options = {}) {
     sessionId: stableSessionId,
     workspace: workspace ?? filesystem?.root,
     resume,
+    documentFork,
     durabilityId,
+    terminalReceiptRetention,
   }).catch(async (error) => {
     if (!creationStarted) await host.dispose();
     throw error;

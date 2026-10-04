@@ -6,6 +6,12 @@ export {
 export { createQuickJsEvaluator } from "../runtime/quickjs-evaluator.mjs";
 export type {
   AgentEvent,
+  DocumentFork,
+  DocumentForkPolicy,
+  DocumentForkSeed,
+  DocumentValue,
+  DocumentWrite,
+  SessionDocument,
   AgentLifecycle,
   AgentSessionContext,
   ChatGptCredential,
