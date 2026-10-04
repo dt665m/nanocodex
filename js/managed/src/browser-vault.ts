@@ -353,6 +353,15 @@ const USERNAME_SELECTOR = 'input:not([type]):not([autocomplete="one-time-code"])
 const PASSWORD_SELECTOR = 'input[type="password"]';
 const OTP_SELECTOR = 'input[autocomplete="one-time-code"],input[name="otp"],input[name="code"],input[name="verification_code"]';
 
+// Native sheets bind form semantics and control state, not unrelated prose such
+// as resend countdowns. Keep the stricter whole-form snapshot for agent actions.
+// Fieldsets contribute attributes only: their descendant controls are included
+// separately, so changing help text inside a fieldset is harmless too.
+export const NATIVE_FORM_STATE = `form => form ? JSON.stringify([
+  [form.cloneNode(false).outerHTML, form.action, form.method, form.target, form.enctype, form.noValidate],
+  [...form.elements].map(e => e instanceof HTMLFieldSetElement ? [e.cloneNode(false).outerHTML] : fieldState(e))
+]) : null`;
+
 /** Fixed isolated-world code. Only bounded visible labels and option indices leave
  * the browser. Values and captured DOM/form state remain private. User authority
  * is enforced by the host; control labels never grant or restrict that authority.
@@ -440,6 +449,7 @@ export const BROWSER_VAULT_CONTINUATION_FUNCTION = `function(origin, mode, snaps
   const fieldState = el => [el.outerHTML, 'value' in el ? el.value : null,
     'checked' in el ? el.checked : null, el instanceof HTMLSelectElement ? [...el.options].map(o => o.selected) : null];
   const formState = form => form ? JSON.stringify([form.outerHTML, [...form.elements].map(fieldState)]) : null;
+  const nativeFormState = ${NATIVE_FORM_STATE};
   const nativeInput = el => !el.readOnly && (
     el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement && !el.multiple && el.options.length <= 200
       && [...el.options].some(o => !o.disabled && !o.hidden && !o.closest('optgroup[disabled],optgroup[hidden]'))
@@ -448,10 +458,10 @@ export const BROWSER_VAULT_CONTINUATION_FUNCTION = `function(origin, mode, snaps
     const snapshot = globalThis.__nanocodexVaultSnapshot;
     if (!snapshot || snapshot.id !== snapshotId || snapshot.document !== document || snapshot.href !== location.href) return false;
     if (challenge) return false;
-    const entries = payload.fields.map(field => ({...snapshot.nodes.get(field.ref), requestedLabel:field.label}));
+    const entries = payload.fields.map(field => ({...snapshot.nodes.get(field.ref), formState:snapshot.nodes.get(field.ref)?.nativeFormState, requestedLabel:field.label}));
     const valid = () => snapshot.document === document && snapshot.href === location.href && entries.every(entry => entry.el && safeControl(entry.el) && nativeInput(entry.el)
       && label(entry.el) === entry.label && JSON.stringify(fieldState(entry.el)) === entry.state
-      && associatedForm(entry.el) === entry.form && formState(entry.form) === entry.formState);
+      && associatedForm(entry.el) === entry.form && nativeFormState(entry.form) === entry.formState);
     if (!valid()) return false;
     // Retain actual nodes only in this isolated world. Never expose selectors or values.
     globalThis.__nanocodexNativeSelection = {id:ref, document, href:location.href, entries, reason:payload.reason, valid};
@@ -531,7 +541,7 @@ export const BROWSER_VAULT_CONTINUATION_FUNCTION = `function(origin, mode, snaps
     const kind = role(el), form = associatedForm(el), text = label(el);
     if (form && form.elements.length > 2000 || kind === 'select' && el.options.length > 200) continue;
     const key = 'e' + (elements.length + 1);
-    nodes.set(key, {el, label:text, state:JSON.stringify(fieldState(el)), form, formState:formState(form)});
+    nodes.set(key, {el, label:text, state:JSON.stringify(fieldState(el)), form, formState:formState(form), nativeFormState:nativeFormState(form)});
     // Never read submit input values as labels; options expose indices and labels only.
     const options = kind === 'select' ? [...el.options].flatMap((option, index) => option.hidden || option.closest('optgroup[hidden]') ? [] : [{index, label:option.label.length <= 8192 ? option.label : ''}]) : undefined;
     elements.push({ref:key, role:kind, text, native_input:nativeInput(el), ...(nativeInput(el) ? {input_type:el instanceof HTMLTextAreaElement ? 'text' : el instanceof HTMLSelectElement ? 'select' : el.type} : {}), ...(options ? {options} : {}), ...(['checkbox','radio'].includes(kind) ? {checked:el.checked} : {})});

@@ -67,6 +67,10 @@ try {
       res.end('<meta name="viewport" content="width=device-width,initial-scale=1"><style>body{font:16px sans-serif}label,input,select,textarea{display:block;margin:8px;min-height:24px}</style><h1>Delivery preferences</h1><label>Contact email<input id="contact" type="email" autocomplete="email"></label><label>Delivery country<select id="country"><option value="">Choose country</option><option value="ca">Canada</option><option value="uk" label="United&#10;Kingdom">United Kingdom</option><option disabled>Unavailable</option></select></label><label>Delivery notes<textarea id="notes"></textarea></label><label>Send status updates<input id="updates" type="checkbox"></label><label>Unrelated field<input id="unrelated"></label><label>Unavailable choices<select id="unavailable"><option disabled>Unavailable</option><option hidden>Hidden</option><optgroup disabled><option>Disabled group</option></optgroup></select></label><button id="save">Save preferences</button><script>window.counts={input:0,change:0,click:0,remoteClick:0};document.addEventListener("input",()=>counts.input++);document.addEventListener("change",()=>counts.change++);document.addEventListener("click",e=>{counts.click++;if(e.isTrusted)counts.remoteClick++});</script>');
       return;
     }
+    if (req.url === '/otp-countdown') {
+      res.end('<meta name="viewport" content="width=device-width,initial-scale=1"><form method="post" action="/verify"><fieldset><label>Verification code<input id="countdown-otp" name="code" autocomplete="one-time-code" inputmode="numeric"></label><input id="nonce" type="hidden" name="nonce" value="initial"><select name="delivery"><option>Phone</option><option>Email</option></select><p id="countdown">Resend in 30 seconds</p><button type="submit">Verify</button></fieldset></form><script>window.ticks=0;window.startCountdown=()=>window.timer=setInterval(()=>{document.getElementById("countdown").textContent="Resend in "+(30-++window.ticks)+" seconds"},40);document.querySelector("form").addEventListener("submit",e=>e.preventDefault())</script>');
+      return;
+    }
     if (req.url === '/otp') {
       res.end('<meta name="viewport" content="width=device-width,initial-scale=1"><style>input{display:block;height:40px;margin:12px}</style><span id="code-label">Verification code</span> <span id="delivery-label">from your device</span><input id="otp" aria-labelledby="code-label delivery-label" aria-label="Fallback label" autocomplete="section-login one-time-code" inputmode="numeric"><input id="account" aria-label="Account" autocomplete="username webauthn"><input id="unsupported" aria-label="Other" autocomplete="arbitrary-private-marker" inputmode="none"><iframe title="Embedded unsupported input" srcdoc="<input autocomplete=one-time-code>"></iframe>');
       return;
@@ -538,6 +542,44 @@ try {
   assert.deepEqual(reactPosts,[{checked:true}],'authorized agent submit sends the updated React state');
   writeFileSync(new URL('react-checkbox-journey.json',profileOutput),JSON.stringify({checked:true,react_state:'true',change_calls:1,native_fill_submissions:0,agent_submit_posts:reactPosts},null,2));
   console.log('PASS: controlled React checkbox native activation updates state once; native fill does not submit; agent submit sends checked:true');
+  // Keep a native OTP draft while unrelated form text changes in real Chrome.
+  const countdownEvidence=[];
+  for (const mutation of ['countdown','countdown-before-sheet','hidden','action','method','target','label','purpose','replacement','option']) {
+    await page.goto(origin+'/otp-countdown');
+    const snapshot=await vaultTool('browser_vault_snapshot');
+    if(mutation==='countdown-before-sheet'){await page.evaluate(()=>startCountdown());await page.waitForFunction(()=>ticks>=3);}
+    const harmless=mutation.startsWith('countdown');
+    const panel=await vaultTool('browser_vault_request_takeover',{operation_id:crypto.randomUUID(),snapshot_id:snapshot.snapshot_id,
+      fields:[{ref:snapshot.elements.find(e=>e.text==='Verification code').ref}]});
+    assert.equal(panel.status,'input_required');
+    const send=action=>requestPrivate('/v1/agents/vault-fixture/browser-vault/takeover',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({challenge_id:panel.challenge_id,...action})});
+    const observe=await send(controls);assert.equal(observe.status,200);
+    const frame=await observe.json(), draft='314159';
+    assert.equal(frame.native_form.fields.length,1);
+    if(mutation!=='countdown-before-sheet')await page.evaluate(()=>startCountdown());
+    const ticksBeforeDraft=await page.evaluate(()=>ticks);
+    await page.waitForFunction(before=>ticks>=before+3,ticksBeforeDraft);
+    await page.evaluate(kind=>{
+      if(kind==='hidden')document.querySelector('#nonce').value='rotated';
+      if(kind==='action')document.querySelector('form').action='/other-verification';
+      if(kind==='method')document.querySelector('form').method='get';
+      if(kind==='target')document.querySelector('form').target='_blank';
+      if(kind==='label')document.querySelector('label').firstChild.textContent='Recovery secret';
+      if(kind==='purpose')document.querySelector('#countdown-otp').autocomplete='new-password';
+      if(kind==='replacement'){const e=document.querySelector('#countdown-otp');e.replaceWith(e.cloneNode(true));}
+      if(kind==='option')document.querySelector('select').selectedIndex=1;
+    },mutation);
+    const filled=await send(batch(frame,[draft]));
+    assert.equal(filled.status,harmless?200:409,mutation+' while native draft is pending');
+    assert.equal(await page.locator('#countdown-otp').inputValue(),harmless?draft:'');
+    const refreshed=await send(controls);assert.equal(refreshed.status,200);
+    const after=await refreshed.json();
+    assert.equal(after.native_form_status,harmless?undefined:'stale',mutation+' observation after fill');
+    countdownEvidence.push({mutation,ticks:await page.evaluate(()=>ticks),fill_status:filled.status,observation:after.native_form_status||'active'});
+    assert.equal((await send({action:'finish'})).status,200);
+  }
+  writeFileSync(new URL('otp-countdown-journey.json',profileOutput),JSON.stringify(countdownEvidence,null,2));
+  console.log('PASS: native OTP draft survives form countdown; hidden value, destination, method, target, label, purpose, node replacement and selected-option changes reject before filling');
   const lease=await vaultTool('browser_vault_request_takeover');
   const vaultIntake={operation:'browser_takeover',kind:'login',agent_id:'vault-fixture',challenge_id:lease.challenge_id};
   const lostFinish=async(url,init)=>{const response=await requestPrivate(url,init);assert.equal(response.status,200);await response.body.cancel();throw Error('Synthetic lost Finish response');};

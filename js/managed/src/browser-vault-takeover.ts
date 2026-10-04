@@ -1,5 +1,5 @@
 import { browserLoginIdentity } from "./browser-login";
-import { PrivateBrowserNoActiveTouch, isBrowserVaultOrigin, type BrowserVaultIdentity, type PrivateBrowserCdp } from "./browser-vault";
+import { NATIVE_FORM_STATE, PrivateBrowserNoActiveTouch, isBrowserVaultOrigin, type BrowserVaultIdentity, type PrivateBrowserCdp } from "./browser-vault";
 
 export type BrowserVaultTakeoverAction =
   | { action: "observe"; native_fields?: boolean; native_field_hints?: boolean; native_field_controls?: boolean; viewport?: { width: number; height: number; mobile: boolean } }
@@ -360,10 +360,13 @@ const NATIVE_FORM_VISIBLE = `e => (e instanceof HTMLInputElement || e instanceof
   })()`;
 const NATIVE_FIELD_STATE = `e => [e.outerHTML, 'value' in e ? e.value : null,
   'checked' in e ? e.checked : null, e instanceof HTMLSelectElement ? [...e.options].map(o => o.selected) : null]`;
+const NATIVE_FIELD_LABEL = `e => [(e.getAttribute('aria-labelledby') || '').trim().split(/\\s+/).slice(0,16)
+  .map(id => document.getElementById(id)?.textContent || '').join(' ').trim(), e.getAttribute('aria-label'),
+  Array.from(e.labels || [], l => l.textContent || '').join(' ').trim(), e.getAttribute('placeholder')]`;
 const NATIVE_FORM_DISCOVER = `function(documentId, origin, refs, hints, controls, selectionId) {
   if (window.top !== window || location.origin !== origin) return null;
   const visible = ${NATIVE_FORM_VISIBLE}, fieldState = ${NATIVE_FIELD_STATE};
-  const formState = form => form ? JSON.stringify([form.outerHTML, [...form.elements].map(fieldState)]) : null;
+  const formState = ${NATIVE_FORM_STATE}, fieldLabel = ${NATIVE_FIELD_LABEL};
   const selection = selectionId ? globalThis.__nanocodexNativeSelection : null;
   if (selectionId && (!selection || selection.id !== selectionId || selection.document !== document || selection.href !== location.href || !selection.valid()
     || !selection.entries.every(b => visible(b.el) && JSON.stringify(fieldState(b.el)) === b.state && (b.el.form || b.el.closest('form')) === b.form && formState(b.form) === b.formState))) return {stale:true};
@@ -385,7 +388,7 @@ const NATIVE_FORM_DISCOVER = `function(documentId, origin, refs, hints, controls
     if (tokens[tokens.length - 1] === 'webauthn') tokens.pop();
     const autocomplete = tokens[tokens.length - 1], inputmode = e.inputMode;
     entries.push({ref,element:e,type:e.type,form:e.form,name:e.name,autocomplete:e.autocomplete,inputmode:e.inputMode,
-      markup:e.outerHTML,state:JSON.stringify(fieldState(e)),formState:formState(e.form)});
+      markup:e.outerHTML,labelState:JSON.stringify(fieldLabel(e)),state:JSON.stringify(fieldState(e)),formState:formState(e.form)});
     fields.push({ref,label,type,multiline,
       ...(type === 'select' ? {options:[...e.options].flatMap((o,index) => o.disabled || o.hidden || o.closest('optgroup[disabled],optgroup[hidden]') ? [] : [{index,label:o.label.replace(/[\\u0000-\\u001f\\u007f]/g, ' ').slice(0,160)}])} : {}),
       ...(type === 'checkbox' ? {checked:e.checked} : {}),
@@ -403,9 +406,9 @@ const NATIVE_FORM_FILL = `function(documentId, origin, fields) {
   const selection = bound.selectionId ? globalThis.__nanocodexNativeSelection : null;
   if (bound.selectionId && (!selection || selection.id !== bound.selectionId || !selection.valid())) return false;
   const controls = bound.controls, visible = ${NATIVE_FORM_VISIBLE}, fieldState = ${NATIVE_FIELD_STATE};
-  const formState = form => form ? JSON.stringify([form.outerHTML, [...form.elements].map(fieldState)]) : null;
+  const formState = ${NATIVE_FORM_STATE}, fieldLabel = ${NATIVE_FIELD_LABEL};
   const valid = b => b && visible(b.element) && b.element.type === b.type
-    && b.element.form === b.form && b.element.name === b.name
+    && b.element.form === b.form && b.element.name === b.name && JSON.stringify(fieldLabel(b.element)) === b.labelState
     && b.element.autocomplete === b.autocomplete && b.element.inputMode === b.inputmode && location.origin === origin;
   const selected = fields.map(f => ({field:f,binding:bound.entries.find(b => b.ref === f.ref)}));
   const validValue = (e, value) => {
@@ -418,6 +421,11 @@ const NATIVE_FORM_FILL = `function(documentId, origin, fields) {
   };
   if (!selected.every(s => valid(s.binding) && validValue(s.binding.element,s.field.value)
     && (!controls || JSON.stringify(fieldState(s.binding.element)) === s.binding.state && formState(s.binding.form) === s.binding.formState))) return false;
+  // Only the submitted controls may advance the selected sheet's baseline.
+  // An input handler that changes hidden state or destinations must stale it.
+  const expectedForms = new Map();
+  if (selection) for (const b of selection.entries) if (b.form && !expectedForms.has(b.form))
+    expectedForms.set(b.form, {state:JSON.parse(b.formState), elements:[...b.form.elements]});
   for (const {field,binding} of selected) {
     if (!valid(binding) || controls && binding.element.outerHTML !== binding.markup) return false;
     const e = binding.element;
@@ -443,7 +451,14 @@ const NATIVE_FORM_FILL = `function(documentId, origin, fields) {
       const previous = JSON.parse(b.state), current = fieldState(b.el);
       if (previous[0] !== current[0]) continue;
       b.state = JSON.stringify(current);
-      if (!b.form || JSON.parse(b.formState)[0] === b.form.outerHTML) b.formState = formState(b.form);
+      if (!b.form) continue;
+      const expected = expectedForms.get(b.form);
+      for (const {binding} of selected) {
+        const index = expected.elements.indexOf(binding.element);
+        if (index >= 0 && expected.state[1][index][0] === binding.element.outerHTML)
+          expected.state[1][index] = fieldState(binding.element);
+      }
+      if (JSON.stringify(expected.state) === formState(b.form)) b.formState = formState(b.form);
     }
   }
   return true;
