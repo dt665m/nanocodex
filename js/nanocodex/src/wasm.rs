@@ -1143,6 +1143,8 @@ struct WasmConfig {
     fast_mode: bool,
     #[serde(default)]
     instant_tool_steering: bool,
+    #[serde(default = "default_inline_docs_token_budget")]
+    inline_docs_token_budget: usize,
     #[serde(default)]
     websocket_warmup: bool,
     #[serde(default = "default_raw_api_events")]
@@ -3535,6 +3537,10 @@ fn parse_revision(revision: &str) -> Result<u64, StoreError> {
     })
 }
 
+const fn default_inline_docs_token_budget() -> usize {
+    3000
+}
+
 const fn default_raw_api_events() -> bool {
     true
 }
@@ -3770,6 +3776,7 @@ async fn build_codex(
         .build()
         .map_err(js_error)?;
     let tools = Tools::builder()
+        .inline_docs_token_budget(config.inline_docs_token_budget)
         .without_defaults()
         .build()
         .map_err(js_error)?;

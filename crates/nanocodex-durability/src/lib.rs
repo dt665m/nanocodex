@@ -17,6 +17,7 @@ mod state;
 mod store;
 
 pub use memory::MemoryStore;
+pub use nanocodex_agent::ReplaySafety;
 #[cfg(all(feature = "postgres", not(target_family = "wasm")))]
 #[cfg_attr(
     docsrs,

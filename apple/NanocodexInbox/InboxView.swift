@@ -864,7 +864,7 @@ struct InboxView: View {
                     Label(model.deviceHandStatus, systemImage: "hand.raised")
                         .accessibilityIdentifier("device-hand-status")
                     Text("Connects automatically to your account unless disabled. Agents can work with workspace files and query captured messages when capture is enabled.").font(.caption).foregroundStyle(.secondary)
-                    Text("Tasks you start can keep this Hand connected in the background on iOS 26 or later. iOS shows progress and lets you stop the task. When idle, this phone connects only during brief background windows or while Nanocodex is open. Force-quitting ends background work.").font(.caption).foregroundStyle(.secondary)
+                    Text("Chat tasks you start while Nanocodex is open can keep this Hand connected after you lock the phone on iOS 26 or later. iOS shows progress and can end background time. When idle, this phone connects only during brief background windows or while Nanocodex is open. Force-quitting ends background work.").font(.caption).foregroundStyle(.secondary)
                     if let error = model.handBackgroundError { Text(error).font(.caption).foregroundStyle(.secondary) }
                 }
                 NativeAppUpdateSection(updater: appUpdates)
@@ -2913,6 +2913,14 @@ private struct ConversationContentView: View {
                     }))
                 }
             }
+            for activity in content.activity where activity.tool?.permissionRequest != nil {
+                if let request = activity.tool?.permissionRequest {
+                    rows.append(.init(id: item.id + ":permission:" + activity.id, revision: cellRevision, content: {
+                        AnyView(PermissionRequestCard(model: model, request: request)
+                            .id("\(activity.id):\(model.vaultIntakeAccount)"))
+                    }))
+                }
+            }
             // Intake prompts remain reachable even when their group is collapsed.
             for activity in content.activity where activity.tool?.vaultIntake != nil {
                 if let intake = activity.tool?.vaultIntake {
@@ -3592,6 +3600,126 @@ private struct ToolActivityView: View {
     }
 }
 
+private struct PermissionRequestCard: View {
+    @ObservedObject var model: InboxModel
+    let request: PermissionRequest
+    @State private var showingReview = false
+    @State private var agentID = ""
+    @State private var status: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label("Account access request", systemImage: "lock.shield").font(.headline)
+            if let status { Text("Request " + status).font(.subheadline) }
+            Text("Review the permissions for your current account before deciding.")
+                .font(.subheadline).foregroundStyle(.secondary)
+            Button("Review permissions") { agentID = model.focused?.id ?? ""; showingReview = true }
+                .buttonStyle(.borderedProminent).disabled(!model.connected)
+                .accessibilityIdentifier("permission-request-open")
+        }
+        .frame(maxWidth: .infinity, alignment: .leading).padding(16)
+        .background(Ink.surface, in: RoundedRectangle(cornerRadius: 16))
+        .accessibilityIdentifier("permission-request-card")
+        .sheet(isPresented: $showingReview) {
+            PermissionRequestSheet(model: model, request: request, agentID: agentID) { status = $0 }
+        }
+    }
+}
+
+private struct PermissionRequestSheet: View {
+    @ObservedObject var model: InboxModel
+    let request: PermissionRequest
+    let agentID: String
+    let completed: (String) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.openURL) private var openURL
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var account = UUID()
+    @State private var review: PermissionRequestReview?
+    @State private var busy = false
+    @State private var receiptSent = false
+    @State private var failure: String?
+    @State private var browserURL: URL?
+    @State private var operation: Task<Void, Never>?
+
+    private func refresh() {
+        guard account == model.vaultIntakeAccount, model.connected, !busy else { return }
+        busy = true; failure = nil; review = nil
+        operation = Task { @MainActor in
+            defer { busy = false }
+            do {
+                let result = try await model.permissionRequestReview(request, account: account)
+                guard !Task.isCancelled, account == model.vaultIntakeAccount else { return }
+                review = result
+                if result.status != "pending" { completed(result.status) }
+            } catch {
+                guard !Task.isCancelled, account == model.vaultIntakeAccount else { return }
+                failure = "Couldn’t verify this request. Refresh its status or review it in your browser."
+            }
+        }
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                if let review {
+                    Section("API key") {
+                        Text(review.keyLabel.isEmpty ? "Unnamed key" : review.keyLabel)
+                        Text(review.request.keyID).font(.caption).foregroundStyle(.secondary)
+                    }
+                    Section("Reason") { Text(review.reason) }
+                    Section("Requested permissions") {
+                        ForEach(review.capabilities) { capability in
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(capability.id).font(.headline)
+                                Text(capability.description).font(.subheadline)
+                            }
+                        }
+                    }
+                    Section {
+                        Text("Expires " + review.expiresAt.formatted())
+                        Text("Status: " + (review.status == "pending" && !review.isPending ? "expired" : review.status))
+                        Text("Approval adds these permissions to this API key until they are removed or the key is revoked. Every client using this key gains the same access.")
+                        if review.isPending {
+                            Text("Review and approve or deny this request in your authenticated account browser.")
+                        } else if review.status != "pending" {
+                            Button(receiptSent ? "Result sent" : "Send result to chat") {
+                                guard !receiptSent, account == model.vaultIntakeAccount, model.connected else { return }
+                                receiptSent = true
+                                model.publishPermissionReceipt(review, agentID: agentID, account: account)
+                            }.disabled(receiptSent).accessibilityIdentifier("permission-request-send-receipt")
+                        }
+                    }.disabled(busy || account != model.vaultIntakeAccount)
+                }
+                if busy { ProgressView("Checking request…") }
+                if let failure { Text(failure).foregroundStyle(.secondary) }
+                if !busy {
+                    Button("Refresh status") { refresh() }.accessibilityIdentifier("permission-request-refresh")
+                    if (review == nil || review?.isPending == true), let browserURL {
+                        Button("Review in browser") {
+                            guard account == model.vaultIntakeAccount, model.connected else { return }
+                            openURL(browserURL)
+                        }.accessibilityIdentifier("permission-request-browser")
+                    }
+                }
+            }
+            .navigationTitle("Review permissions")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } } }
+            .overlay { if scenePhase != .active { Color(uiColor: .systemBackground).ignoresSafeArea() } }
+        }
+        .interactiveDismissDisabled(busy)
+        .task {
+            account = model.vaultIntakeAccount
+            browserURL = try? model.permissionRequestApprovalURL(request, account: account)
+            refresh()
+        }
+        .onDisappear { operation?.cancel() }
+        .onChange(of: model.vaultIntakeAccount) { _, _ in operation?.cancel(); review = nil; browserURL = nil; dismiss() }
+        .onChange(of: model.connected) { _, connected in if !connected { operation?.cancel(); dismiss() } }
+    }
+}
+
 private struct VaultIntakeCard: View {
     @ObservedObject var model: InboxModel
     let intake: VaultIntake
@@ -3648,8 +3776,6 @@ private struct VaultLoginSheet: View {
     @State private var submission: Task<Void, Never>?
     @State private var saving = false
     @State private var attempted = false
-    @State private var verified = false
-    private var authorizing: Bool { intake.operation == "authorize_origin" }
     @State private var failure: String?
 
     private var fields: [(key: String, label: String, secure: Bool, max: Int)] {
@@ -3662,19 +3788,17 @@ private struct VaultLoginSheet: View {
         }
     }
     private var valid: Bool {
-        (authorizing ? verified : !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && name.utf8.count <= 120
+        !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && name.utf8.count <= 120
             && fields.allSatisfy { field in
                 let value = values[field.key] ?? ""
                 return (field.key == "address_line_2" || !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) && value.utf8.count <= field.max
-            })
+            }
     }
     private func clear() { values.removeAll(); name = "" }
     var body: some View {
         NavigationStack {
             Form {
                 Section {
-                    if authorizing { Text(name.isEmpty ? "Verifying login…" : name) }
-                    else {
                     TextField("Name", text: $name).accessibilityIdentifier("vault-intake-name")
                     ForEach(fields, id: \.key) { field in
                         let binding = Binding<String>(get: { values[field.key] ?? "" }, set: { values[field.key] = $0 })
@@ -3685,12 +3809,11 @@ private struct VaultLoginSheet: View {
                         .textInputAutocapitalization(.never).autocorrectionDisabled()
                         .privacySensitive().accessibilityIdentifier("vault-intake-" + field.key)
                     }
-                    }
                 } footer: {
                     Text("Credentials are sent directly to your encrypted Vault, never as a chat message.")
                 }
                 if let origin = intake.origin {
-                    Section("Website access") { Text(origin).font(.subheadline); Text("Saving allows browser login with this item on this exact website.") }
+                    Section("Website (optional)") { Text(origin).font(.subheadline) }
                 }
                 if let failure { Section { Text(failure).foregroundStyle(.red) } }
                 Section {
@@ -3702,12 +3825,7 @@ private struct VaultLoginSheet: View {
                                 var payload = values.filter { !$0.value.isEmpty }
                                 payload["name"] = name.trimmingCharacters(in: .whitespacesAndNewlines)
                                 if let origin = intake.origin { payload["browser_origin"] = origin }
-                                let receipt: VaultIntakeReceipt
-                                if authorizing, let id = intake.vaultID, let origin = intake.origin {
-                                    receipt = try await model.authorizeVaultOrigin(id: id, origin: origin, name: name, account: account)
-                                } else {
-                                    receipt = try await model.saveVaultItem(kind: intake.kind, values: payload, account: account)
-                                }
+                                let receipt = try await model.saveVaultItem(kind: intake.kind, values: payload, account: account)
                                 guard !Task.isCancelled, model.vaultIntakeAccount == account else { return }
                                 model.publishVaultReceipt(receipt, intake: intake, agentID: agentID, account: account)
                                 saved(receipt)
@@ -3718,7 +3836,7 @@ private struct VaultLoginSheet: View {
                             }
                         }
                     } label: {
-                        HStack { Text(saving ? "Saving…" : authorizing ? "Allow this website" : "Save to Vault"); if saving { ProgressView() } }
+                        HStack { Text(saving ? "Saving…" : "Save to Vault"); if saving { ProgressView() } }
                     }
                     .disabled(!valid || saving || attempted)
                     .accessibilityIdentifier("vault-intake-save")
@@ -3737,13 +3855,7 @@ private struct VaultLoginSheet: View {
         .interactiveDismissDisabled(saving)
         .task {
             account = model.vaultIntakeAccount
-            if authorizing, let id = intake.vaultID {
-                do {
-                    let item = try await model.vaultLoginMetadata(id: id, account: account)
-                    guard !Task.isCancelled else { return }
-                    name = item.name; verified = true
-                } catch { failure = "Couldn’t verify this login. Check your Vault." }
-            } else { name = intake.name }
+            name = intake.name
         }
         .onDisappear { submission?.cancel(); clear() }
         .onChange(of: model.vaultIntakeAccount) { _, _ in submission?.cancel(); clear(); dismiss() }

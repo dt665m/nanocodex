@@ -28,10 +28,12 @@ pub enum Admission {
 }
 /// Admission of one external effect.
 pub enum Step {
-    /// Perform the effect. Unsettled effects may execute again after a crash.
+    /// Perform the admitted effect.
     Execute,
     /// Exact settled output, without invoking the handler.
     Replay(Value),
+    /// An interrupted effect may have run and must not be repeated automatically.
+    OutcomeUnknown,
 }
 /// Host-owned durable execution, sharing Nanocodex's store and fencing rules.
 pub trait ClaudeExecutionPolicy: Send + Sync {
@@ -52,6 +54,24 @@ pub trait ClaudeExecutionPolicy: Send + Sync {
         kind: String,
         input: Value,
     ) -> PolicyFuture<'_, Step>;
+    /// Retains explicit replay permission with intent. Both old and current
+    /// permissions must be safe before an interrupted effect can run again.
+    fn begin_step_with_replay(
+        &self,
+        _id: String,
+        _step_id: String,
+        _kind: String,
+        _input: Value,
+        _replay_safety: nanocodex_agent::ReplaySafety,
+    ) -> PolicyFuture<'_, Step> {
+        Box::pin(async {
+            Err(
+                nanocodex_agent::NanocodexError::ExecutionPolicyCapabilityUnsupported {
+                    capability: "effect replay safety",
+                },
+            )
+        })
+    }
     fn complete_step(&self, id: String, step_id: String, output: Value) -> PolicyFuture<'_, ()>;
     fn complete(&self, id: String, checkpoint: Value, output: Value) -> PolicyFuture<'_, ()>;
     fn fail(&self, id: String, checkpoint: Value, error: String) -> PolicyFuture<'_, ()>;

@@ -42,6 +42,7 @@ const INTERNAL_CONFIGURATION = Symbol.for("nanocodex.cloudflare.internalConfigur
 const INTERNAL_FORK_RESUME = Symbol.for("nanocodex.cloudflare.internalForkResume");
 const EPHEMERAL_APPLICATION_OPTIONS = new Set([
   "instantToolSteering",
+  "inlineDocsTokenBudget",
   "beforeCompaction",
   "additionalInstructions",
   "fastMode",
@@ -56,6 +57,7 @@ const EPHEMERAL_APPLICATION_OPTIONS = new Set([
 ]);
 const APPLICATION_OPTIONS = new Set([
   "instantToolSteering",
+  "inlineDocsTokenBudget",
   "beforeCompaction",
   "additionalInstructions",
   "durabilityId",

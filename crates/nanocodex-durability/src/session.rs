@@ -71,6 +71,9 @@ pub enum BeginStep<O = EncodedPayload> {
     Execute,
     /// A prior attempt completed; use this stored output instead of executing.
     Replay(O),
+    /// A prior attempt may have performed an unsafe effect. Settle an explicit
+    /// unknown-outcome receipt; never automatically invoke the handler again.
+    OutcomeUnknown,
 }
 
 enum StoredAdmission {
@@ -120,6 +123,7 @@ impl StoredAdmission {
 }
 
 enum StoredBeginStep {
+    OutcomeUnknown,
     Execute,
     Replay(EncodedPayload),
 }
@@ -236,6 +240,7 @@ enum Command {
         step_id: String,
         kind: String,
         input: EncodedPayload,
+        replay_safety: crate::ReplaySafety,
         result: oneshot::Sender<Result<StoredBeginStep>>,
     },
     CompleteStep {
@@ -640,12 +645,20 @@ impl Driver {
                     step_id,
                     kind,
                     input,
+                    replay_safety,
                     result,
                 } => {
                     let outcome = match self.authorize(&caller) {
                         Ok(()) => {
-                            self.begin_step(&caller, operation_id, step_id, kind, input)
-                                .await
+                            self.begin_step(
+                                &caller,
+                                operation_id,
+                                step_id,
+                                kind,
+                                input,
+                                replay_safety,
+                            )
+                            .await
                         }
                         Err(error) => Err(error),
                     };
@@ -1118,6 +1131,7 @@ impl Driver {
         step_id: String,
         kind: String,
         input: EncodedPayload,
+        replay_safety: crate::ReplaySafety,
     ) -> Result<StoredBeginStep> {
         self.require_claimed(caller, &operation_id)?;
         if let Some((pending_id, _)) = self.state.first_pending_operation()
@@ -1145,10 +1159,17 @@ impl Driver {
                         output.load(&mut *self.store, &self.state_id).await?,
                     ));
                 }
-                StepStatus::EffectPending => {}
+                StepStatus::EffectPending => {
+                    if step.replay_safety != crate::ReplaySafety::Safe
+                        || replay_safety != crate::ReplaySafety::Safe
+                    {
+                        return Ok(StoredBeginStep::OutcomeUnknown);
+                    }
+                }
             }
         }
         let entry = Transition::StepStarted {
+            replay_safety,
             operation_id: operation_id.clone(),
             step_id,
             kind,
@@ -1784,11 +1805,42 @@ impl DurableSession {
                 step_id.into(),
                 kind.into(),
                 EncodedPayload::encode(input)?,
+                crate::ReplaySafety::Unsafe,
+            )
+            .await?
+        {
+            StoredBeginStep::OutcomeUnknown => Ok(BeginStep::OutcomeUnknown),
+            StoredBeginStep::Execute => Ok(BeginStep::Execute),
+            StoredBeginStep::Replay(output) => Ok(BeginStep::Replay(output)),
+        }
+    }
+
+    /// Begins an effect with explicit crash-replay permission. Both the original
+    /// and current policy must be `Safe` to repeat an unsettled effect.
+    pub async fn begin_step_with_replay<I>(
+        &self,
+        operation_id: impl Into<String>,
+        step_id: impl Into<String>,
+        kind: impl Into<String>,
+        input: &I,
+        replay_safety: crate::ReplaySafety,
+    ) -> Result<BeginStep>
+    where
+        I: Serialize + ?Sized,
+    {
+        match self
+            .begin_step_encoded(
+                operation_id.into(),
+                step_id.into(),
+                kind.into(),
+                EncodedPayload::encode(input)?,
+                replay_safety,
             )
             .await?
         {
             StoredBeginStep::Execute => Ok(BeginStep::Execute),
             StoredBeginStep::Replay(output) => Ok(BeginStep::Replay(output)),
+            StoredBeginStep::OutcomeUnknown => Ok(BeginStep::OutcomeUnknown),
         }
     }
 
@@ -1810,9 +1862,11 @@ impl DurableSession {
                 step_id.into(),
                 kind.into(),
                 EncodedPayload::encode(input)?,
+                crate::ReplaySafety::Unsafe,
             )
             .await?
         {
+            StoredBeginStep::OutcomeUnknown => Ok(BeginStep::OutcomeUnknown),
             StoredBeginStep::Execute => Ok(BeginStep::Execute),
             StoredBeginStep::Replay(output) => Ok(BeginStep::Replay(output.decode()?)),
         }
@@ -1824,6 +1878,7 @@ impl DurableSession {
         step_id: String,
         kind: String,
         input: EncodedPayload,
+        replay_safety: crate::ReplaySafety,
     ) -> Result<StoredBeginStep> {
         let (result, receiver) = oneshot::channel();
         self.send(Command::BeginStep {
@@ -1832,6 +1887,7 @@ impl DurableSession {
             step_id,
             kind,
             input,
+            replay_safety,
             result,
         })
         .await?;
@@ -2205,6 +2261,7 @@ impl DurableOwner {
         step_id: String,
         kind: String,
         input: &I,
+        replay_safety: crate::ReplaySafety,
     ) -> Result<BeginStep>
     where
         I: Serialize + ?Sized,
@@ -2216,10 +2273,12 @@ impl DurableOwner {
             step_id,
             kind,
             input: EncodedPayload::encode(input)?,
+            replay_safety,
             result,
         })
         .await?;
         match receive(receiver).await? {
+            StoredBeginStep::OutcomeUnknown => Ok(BeginStep::OutcomeUnknown),
             StoredBeginStep::Execute => Ok(BeginStep::Execute),
             StoredBeginStep::Replay(output) => Ok(BeginStep::Replay(output)),
         }
@@ -2626,6 +2685,7 @@ mod tests {
                 "model-2".into(),
                 "model_call".into(),
                 &"request",
+                crate::ReplaySafety::Safe,
             )
             .await
             .unwrap();

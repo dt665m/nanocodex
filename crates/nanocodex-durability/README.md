@@ -78,7 +78,7 @@ let result = agent.prompt(
 Choose `SqliteStore`, `PostgresStore`, or a persistent host store to retain work
 across process restarts. Reopen the same state ID and replay the same request ID
 and input to recover pending work or return its committed receipt. Unfinished
-Claude effects follow the same at-least-once execution rule described above.
+Claude effects follow the same explicit replay-safety contract as OpenAI effects.
 Claude snapshots use the store's chunked immutable payloads; they do not yet
 use the OpenAI adapter's per-message context pages. Snapshot serialization and
 restoration therefore process the full retained Claude context.
@@ -198,15 +198,30 @@ owner acquisition and loading the complete current state before deciding what
 ran.
 
 Each external effect follows an intent/effect/settlement boundary. A start
-commits `effect_pending`; settlement atomically replaces it with `completed`
-and the exact output. A crash before settlement executes the effect again with
-the same stable identity and input. A crash after settlement replays the output
-without invoking the effect again. Agent model calls, warmups, and compactions
-reconstruct their requests from that retained input, so changed instructions,
-tool catalogs, or environment context cannot redefine an interrupted call.
-New calls use the current runtime; live tool authorization and owner fencing
-still apply. There is no per-effect retry policy or uncertainty state. Operation
-terminals atomically carry their checkpoint and replay receipt.
+commits `effect_pending` with `ReplaySafety`; settlement atomically replaces it
+with `completed` and the exact output. A completed receipt always replays without
+invoking the handler. An interrupted effect executes again only when both its
+original persisted permission and its current permission are `Safe`. Otherwise
+`BeginStep::OutcomeUnknown` requires an explicit unknown-outcome receipt.
+The agent adapters turn this into a failed tool result visible to the model;
+they never silently redispatch the handler.
+
+Custom execution policies must implement `begin_step_with_replay`; the default
+fails closed, including for currently safe effects whose original intent policy
+cannot be established. The crate-provided adapters implement the full contract.
+
+Tools default to `Unsafe`. Parallel safety does not imply replay safety. Native
+tools opt in with `Tool::is_replay_safe`, dynamic providers with the corresponding
+named method, and Claude callbacks with `.tool_replay_safety(name, ReplaySafety::Safe)`.
+Use the opt-in only for genuinely repeatable actions or a host journal that
+reuses completed receipts and reconciles unfinished effects without duplicating
+them. Direct session users choose `begin_step_with_replay`; `begin_step` and
+`begin_step_typed` default to unsafe.
+
+Model calls, warmups, compaction, and the explicitly idempotent preservation
+barrier are repeatable. Provider requests can incur additional usage after a
+crash. Frozen request settings, live authorization, and owner fencing still
+apply. Operation terminals atomically carry their checkpoint and replay receipt.
 
 Unlike a store that stages an output separately from source-ordered transcript
 placement, this store owns one opaque total state. A second materialization

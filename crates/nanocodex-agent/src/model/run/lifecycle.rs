@@ -381,6 +381,9 @@ where
                         receipt.validate()?;
                         true
                     }
+                    crate::agent::ExecutionStep::OutcomeUnknown => {
+                        unreachable!("model helper rejects unknown effects")
+                    }
                     crate::agent::ExecutionStep::Execute => false,
                 }
             } else {
@@ -437,6 +440,9 @@ where
                     .begin::<_, RecordedCompactionOutcome>(&step_id, "compaction", &())
                     .await?
                 {
+                    crate::agent::ExecutionStep::OutcomeUnknown => {
+                        unreachable!("model helper rejects unknown effects")
+                    }
                     crate::agent::ExecutionStep::Execute => None,
                     crate::agent::ExecutionStep::Replay(output) => Some(output),
                 }

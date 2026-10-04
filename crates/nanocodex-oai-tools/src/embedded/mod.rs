@@ -208,6 +208,12 @@ pub trait CodeModeHost: Send + Sync + 'static {
         })
     }
 
+    /// Whether repeating an interrupted direct call is safe. The host must
+    /// enforce idempotency or reconcile its journal before opting in.
+    fn is_replay_safe(&self, _name: &str) -> bool {
+        false
+    }
+
     /// Executes one directly exposed application tool.
     fn execute_tool<'a>(
         &'a self,

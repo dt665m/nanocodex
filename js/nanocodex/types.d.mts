@@ -57,6 +57,9 @@ export type AgentOptions = {
   fastMode?: boolean | undefined;
   /** Yield exec/wait observations on accepted steering; cells continue. Default false. */
   instantToolSteering?: boolean | undefined;
+  /** Inline Code Mode tool docs: default 3000 estimated tokens (UTF-8 bytes / 4).
+   * Whole descriptions are omitted at the limit; discovery and invocation remain available. */
+  inlineDocsTokenBudget?: number | undefined;
   /** Emit full raw API request/response events. Defaults to true. */
   rawApiEvents?: boolean | undefined;
   sessionId?: string | undefined;

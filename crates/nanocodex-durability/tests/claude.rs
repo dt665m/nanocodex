@@ -3,7 +3,7 @@
 //! restart; completed tool receipts after a failed provider continuation; live
 //! cancellation after an effect starts (unknown outcome, never dispatched again);
 //! signed/opaque compaction suffixes and container/discovery state across reopen.
-//! Pending effects after a process crash follow the store's at-least-once policy.
+//! Pending effects require both persisted and current safe replay permission.
 #![cfg(all(feature = "claude", feature = "sqlite"))]
 
 use axum::{Json, Router, response::IntoResponse, routing::post};
@@ -613,6 +613,8 @@ async fn transaction_recovery(
         .auto_compact_window_tokens(100_000)
         .server_tool(nanocodex_claude::ServerToolDefinition::web_fetch_basic(1))
         .tasks(board.clone())
+        // This fixture mutates only the restored, receipt-coupled task board.
+        .tool_replay_safety("effect", nanocodex_agent::ReplaySafety::Safe)
         .tool(tool(), move |_| {
             counter.fetch_add(1, Ordering::SeqCst);
             let board = handler_board.clone();
@@ -663,7 +665,9 @@ async fn transaction_recovery(
         .adaptive_thinking()
         .auto_compact_window_tokens(50_000)
         .server_tool(nanocodex_claude::ServerToolDefinition::web_fetch_basic(1))
-        .tasks(board.clone());
+        .tasks(board.clone())
+        // This fixture mutates only the restored, receipt-coupled task board.
+        .tool_replay_safety("effect", nanocodex_agent::ReplaySafety::Safe);
     if !after_commit || effects.load(Ordering::SeqCst) == 0 {
         builder = builder.tool(tool(), move |_| {
             counter.fetch_add(1, Ordering::SeqCst);
@@ -2138,5 +2142,95 @@ async fn legacy_failed_server_snapshot_accepts_new_input_without_native_replay()
     assert!(messages.to_string().contains("outcome unknown"));
     assert_eq!(messages.to_string().matches("NEW_USER_REQUEST").count(), 1);
     assert_eq!(log[0]["container"], "legacy-container");
+    server.abort();
+}
+
+#[tokio::test]
+async fn interrupted_unsafe_tool_returns_unknown_over_messages_without_redispatch() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.sqlite");
+    let (client, requests, server) = server(|_, request| {
+        let receipt = request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|message| message["content"].as_array().unwrap())
+            .find(|block| block["type"] == "tool_result");
+        if let Some(receipt) = receipt {
+            assert_eq!(receipt["is_error"], true);
+            assert!(receipt["content"].to_string().contains("outcome unknown"));
+            sse(text("reconciled outcome unknown"), "end_turn", 10)
+        } else {
+            sse(
+                vec![json!({"type":"tool_use","id":"one-effect","name":"effect","input":{}})],
+                "tool_use",
+                10,
+            )
+        }
+    })
+    .await;
+    let count = Arc::new(AtomicUsize::new(0));
+    let armed = Arc::new(AtomicBool::new(false));
+    let store = FaultStore {
+        inner: SqliteStore::open(&path).unwrap(),
+        writes: Arc::new(AtomicUsize::new(0)),
+        fail_at: None,
+        after_commit: false,
+        fail_when_armed: Some(armed.clone()),
+    };
+    let state = DurableSession::open(store, "claude-synthetic")
+        .await
+        .unwrap();
+    let handler_count = count.clone();
+    let (agent, events) = Nanocodex::builder(Claude::new(client.clone(), "test"))
+        .tool(tool(), move |_| {
+            handler_count.fetch_add(1, Ordering::SeqCst);
+            armed.store(true, Ordering::SeqCst);
+            async { Ok("external action occurred".into()) }
+        })
+        .durability(state)
+        .await
+        .unwrap()
+        .build()
+        .unwrap();
+    let request = || PromptRequest::new("perform one effect").request_id("unsafe-recovery");
+    assert!(
+        agent
+            .prompt(request())
+            .await
+            .unwrap()
+            .result()
+            .await
+            .is_err()
+    );
+    let _ = agent.shutdown().await;
+    drop((agent, events));
+    let handler_count = count.clone();
+    let (agent, events) = Nanocodex::builder(Claude::new(client, "test"))
+        .tool(tool(), move |_| {
+            handler_count.fetch_add(1, Ordering::SeqCst);
+            async { Ok("must not run".into()) }
+        })
+        .durability(reopen(&path).await)
+        .await
+        .unwrap()
+        .build()
+        .unwrap();
+    assert_eq!(
+        agent
+            .prompt(request())
+            .await
+            .unwrap()
+            .result()
+            .await
+            .unwrap()
+            .final_message(),
+        "reconciled outcome unknown"
+    );
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    assert_eq!(requests.lock().unwrap().len(), 2);
+    agent.shutdown().await.unwrap();
+    drop((agent, events));
     server.abort();
 }

@@ -62,6 +62,8 @@ pub enum ExecutionStepAdmission {
     Execute,
     /// Reuse the exact JSON output retained by a prior attempt.
     Replay(String),
+    /// An interrupted effect is not safe to repeat; its outcome is unknown.
+    OutcomeUnknown,
 }
 
 /// Current execution metadata and the active model context.
@@ -285,6 +287,23 @@ pub trait ExecutionPolicy: Send + Sync {
         input_json: String,
     ) -> ExecutionFuture<'a, Result<ExecutionStepAdmission>>;
 
+    /// Begins an effect with explicit recovery permission. Durable policies must
+    /// retain this with intent and require both old and current `Safe` to retry.
+    fn begin_step_with_replay<'a>(
+        &'a self,
+        _operation_id: String,
+        _step_id: String,
+        _kind: String,
+        _input_json: String,
+        _replay_safety: crate::ReplaySafety,
+    ) -> ExecutionFuture<'a, Result<ExecutionStepAdmission>> {
+        Box::pin(async {
+            Err(NanocodexError::ExecutionPolicyCapabilityUnsupported {
+                capability: "effect replay safety",
+            })
+        })
+    }
+
     /// Commits the output of one executed effect.
     fn complete_step<'a>(
         &'a self,
@@ -488,6 +507,23 @@ pub trait ExecutionPolicy: Send + Sync {
         kind: String,
         input_json: String,
     ) -> ExecutionFuture<'a, Result<ExecutionStepAdmission>>;
+
+    /// Begins an effect with explicit recovery permission. Durable policies must
+    /// retain this with intent and require both old and current `Safe` to retry.
+    fn begin_step_with_replay<'a>(
+        &'a self,
+        _operation_id: String,
+        _step_id: String,
+        _kind: String,
+        _input_json: String,
+        _replay_safety: crate::ReplaySafety,
+    ) -> ExecutionFuture<'a, Result<ExecutionStepAdmission>> {
+        Box::pin(async {
+            Err(NanocodexError::ExecutionPolicyCapabilityUnsupported {
+                capability: "effect replay safety",
+            })
+        })
+    }
     /// Commits one effect output.
     fn complete_step<'a>(
         &'a self,
@@ -939,6 +975,7 @@ pub(crate) enum SteerDelivery {
 }
 
 pub(crate) enum ExecutionStep<O> {
+    OutcomeUnknown,
     Execute,
     Replay(O),
 }
@@ -998,18 +1035,42 @@ impl ExecutionSteps {
         I: Serialize + ?Sized,
         O: DeserializeOwned,
     {
+        let admission = self
+            .begin_with_replay(step_id, kind, input, crate::ReplaySafety::Safe)
+            .await?;
+        if matches!(admission, ExecutionStep::OutcomeUnknown) {
+            return Err(NanocodexError::ExecutionPolicyCapabilityUnsupported {
+                capability: "replay of an unclassified interrupted model effect",
+            });
+        }
+        Ok(admission)
+    }
+
+    pub(crate) async fn begin_with_replay<I, O>(
+        &self,
+        step_id: impl Into<String>,
+        kind: impl Into<String>,
+        input: &I,
+        replay_safety: crate::ReplaySafety,
+    ) -> Result<ExecutionStep<O>>
+    where
+        I: Serialize + ?Sized,
+        O: DeserializeOwned,
+    {
         match self
             .policy
-            .begin_step(
+            .begin_step_with_replay(
                 self.operation_id.clone(),
                 step_id.into(),
                 kind.into(),
                 encode(input)?,
+                replay_safety,
             )
             .await?
         {
             ExecutionStepAdmission::Execute => Ok(ExecutionStep::Execute),
             ExecutionStepAdmission::Replay(output) => Ok(ExecutionStep::Replay(decode(&output)?)),
+            ExecutionStepAdmission::OutcomeUnknown => Ok(ExecutionStep::OutcomeUnknown),
         }
     }
 

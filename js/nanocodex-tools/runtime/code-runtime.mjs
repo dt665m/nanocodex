@@ -1,3 +1,4 @@
+import { createCodeDiscovery } from "./code-discovery.mjs";
 import { createCodeTools } from "./code-tools.mjs";
 import { stringify, storeSnapshot, normalizeImage, normalizeAudio, generatedImageItems } from "./code-values.mjs";
 import { limitCodeOutput } from "./code-output.mjs";
@@ -618,6 +619,7 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
           try {
             await (extras.evaluate || evaluateNative)(source, {
               tools,
+              ...createCodeDiscovery(availableDefinitions),
               toolDefinitions: availableDefinitions,
               text,
               image,
@@ -971,6 +973,9 @@ async function evaluateNative(source, environment) {
   const script = new AsyncFunction(
     "tools",
     "ALL_TOOLS",
+    "searchTools",
+    "describeTool",
+    "describeNamespace",
     "text",
     "image",
     "generatedImage",
@@ -989,6 +994,9 @@ async function evaluateNative(source, environment) {
   await script(
     environment.tools,
     environment.toolDefinitions,
+    environment.searchTools,
+    environment.describeTool,
+    environment.describeNamespace,
     environment.text,
     environment.image,
     environment.generatedImage,
