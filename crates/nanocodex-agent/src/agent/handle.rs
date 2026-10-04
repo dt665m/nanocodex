@@ -13,6 +13,8 @@ pub struct Nanocodex {
     pub(super) next_turn: Arc<AtomicU64>,
     pub(super) agent_id: Arc<str>,
     pub(super) session_id: Arc<str>,
+    #[cfg(not(target_family = "wasm"))]
+    pub(super) startup: Option<Arc<OwnedStartup>>,
     #[cfg(feature = "openai")]
     pub(super) local_session_id: Option<SessionId>,
     #[cfg(all(feature = "openai", not(target_family = "wasm")))]
@@ -27,10 +29,27 @@ impl Clone for Nanocodex {
             next_turn: Arc::clone(&self.next_turn),
             agent_id: Arc::clone(&self.agent_id),
             session_id: Arc::clone(&self.session_id),
+            #[cfg(not(target_family = "wasm"))]
+            startup: self.startup.clone(),
             #[cfg(feature = "openai")]
             local_session_id: self.local_session_id,
             #[cfg(all(feature = "openai", not(target_family = "wasm")))]
             rollout: self.rollout.clone(),
+        }
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub(super) struct OwnedStartup {
+    result: tokio::sync::watch::Receiver<Option<std::result::Result<(), String>>>,
+    task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl Drop for OwnedStartup {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.get_mut().expect("startup task lock").take() {
+            task.abort();
         }
     }
 }
@@ -394,6 +413,43 @@ impl Nanocodex {
         &self.agent_id
     }
 
+    /// Waits for owner-bound startup recovery without submitting a model turn.
+    /// Recovery failures remain observable to every clone and block new prompts.
+    pub async fn ready(&self) -> Result<()> {
+        #[cfg(not(target_family = "wasm"))]
+        if let Some(startup) = &self.startup {
+            let mut result = startup.result.clone();
+            loop {
+                if let Some(outcome) = result.borrow().clone() {
+                    return outcome.map_err(NanocodexError::InvalidExecutionPolicy);
+                }
+                result.changed().await.map_err(|_| {
+                    NanocodexError::InvalidExecutionPolicy("owned startup recovery stopped".into())
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Starts the embedding's reconstruction only after its native owner is bound.
+    #[doc(hidden)]
+    #[cfg(not(target_family = "wasm"))]
+    pub fn with_owned_startup(mut self, hook: Option<Arc<dyn execution::TurnOwnership>>) -> Self {
+        if let Some(hook) = hook {
+            let session = self.session_id.clone();
+            let (send, result) = tokio::sync::watch::channel(None);
+            let task = tokio::spawn(async move {
+                let outcome = hook.prepare(&session).await.map_err(|error| error.to_string());
+                send.send_replace(Some(outcome));
+            });
+            self.startup = Some(Arc::new(OwnedStartup {
+                result,
+                task: std::sync::Mutex::new(Some(task)),
+            }));
+        }
+        self
+    }
+
     /// Returns the stable identity used by events, transport metadata, and any rollout.
     #[must_use]
     pub fn session_id(&self) -> &str {
@@ -464,6 +520,14 @@ impl Nanocodex {
     /// concurrent and later callers on any clone await or reuse that same
     /// result.
     pub async fn shutdown(&self) -> Result<()> {
+        #[cfg(not(target_family = "wasm"))]
+        if let Some(startup) = &self.startup {
+            let task = startup.task.lock().expect("startup task lock").take();
+            if let Some(task) = task {
+                task.abort();
+                let _ = task.await;
+            }
+        }
         self.backend.shutdown().await
     }
 
@@ -478,6 +542,7 @@ impl Nanocodex {
     /// Returns an error for an empty prompt or request ID, when identified
     /// work is submitted without a configured policy, or if the driver stopped.
     pub async fn prompt(&self, request: impl Into<PromptRequest>) -> Result<Turn> {
+        self.ready().await?;
         let PromptRequest {
             prompt,
             request_id,

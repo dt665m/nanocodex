@@ -363,6 +363,8 @@ impl BackendRuntime {
             next_turn: Arc::new(AtomicU64::new(1)),
             agent_id: self.agent_id,
             session_id: self.session_id,
+            #[cfg(not(target_family = "wasm"))]
+            startup: None,
             #[cfg(feature = "openai")]
             local_session_id: self.local_session_id,
             #[cfg(all(feature = "openai", not(target_family = "wasm")))]
@@ -385,6 +387,8 @@ impl BackendRuntime {
             next_turn: Arc::new(AtomicU64::new(1)),
             agent_id: self.agent_id,
             session_id: self.session_id,
+            #[cfg(not(target_family = "wasm"))]
+            startup: None,
             local_session_id: self.local_session_id,
             rollout,
         }

@@ -209,6 +209,8 @@ where
     let rollout = execution.info().cloned();
     #[cfg(target_family = "wasm")]
     let rollout = None;
+    #[cfg(not(target_family = "wasm"))]
+    let ownership = spawner.turn_ownership.clone();
     let agent = runtime.bind_with_rollout(
         LocalLifecycle {
             child_handle,
@@ -247,6 +249,8 @@ where
         shutdown.complete(outcome);
     };
     spawn_driver(driver_task)?;
+    #[cfg(not(target_family = "wasm"))]
+    let agent = agent.with_owned_startup(ownership);
     Ok((agent, event_stream))
 }
 

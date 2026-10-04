@@ -19,7 +19,7 @@ rustdoc-args = ["-D", "warnings"]
 
 [features]
 default = ["durability", "mcp", "openai", "tools"]
-claude = ["dep:nanocodex-claude", "nanocodex-durability?/claude"]
+claude = ["dep:nanocodex-claude", "nanocodex-durability?/claude", "nanocodex-subagents?/claude"]
 claude-tools = ["claude", "dep:nanocodex-claude-tools", "nanocodex-claude/tools"]
 durability = ["dep:nanocodex-durability", "dep:nanocodex-subagents", "openai", "oai-tools"]
 managed = ["dep:nanocodex-managed"]

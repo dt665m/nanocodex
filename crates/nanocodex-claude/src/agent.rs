@@ -184,6 +184,7 @@ pub struct ClaudeBuilder {
     code_tools: Option<nanocodex_oai_tools::Tools>,
     tools_factory: Option<ClaudeToolsFactory>,
     spawn_factory: Option<Arc<dyn AgentFactory>>,
+    turn_ownership: Option<Arc<dyn nanocodex_agent::execution::TurnOwnership>>,
     host_context: Option<Arc<str>>,
     server_tools: Vec<ServerToolDefinition>,
     parallel_tools: bool,
@@ -234,6 +235,7 @@ impl ClaudeBuilder {
             code_tools: None,
             tools_factory: None,
             spawn_factory: None,
+            turn_ownership: None,
             host_context: None,
             server_tools: Vec::new(),
             parallel_tools: false,
@@ -261,6 +263,55 @@ impl ClaudeBuilder {
         F: Fn(AgentHandle) -> Result<ClaudeTools> + Send + Sync + 'static,
     {
         self.tools_factory = Some(Arc::new(factory));
+        self
+    }
+    /// Composes task-tree callbacks with the caller's per-agent callback recipe.
+    #[doc(hidden)]
+    pub fn map_tools_factory<F>(mut self, map: F) -> Self
+    where
+        F: Fn(AgentHandle, ClaudeTools) -> Result<ClaudeTools> + Send + Sync + 'static,
+    {
+        let previous = self.tools_factory.take();
+        self.tools_factory = Some(Arc::new(move |handle| {
+            let tools = match &previous {
+                Some(factory) => factory(handle.clone())?,
+                None => ClaudeTools::new(),
+            };
+            map(handle, tools)
+        }));
+        self
+    }
+    /// Whether embedding-owned child construction has already been configured.
+    #[doc(hidden)]
+    pub fn has_spawn_factory(&self) -> bool { self.spawn_factory.is_some() }
+    /// Returns a caller-configured native identity before attaching durability.
+    #[doc(hidden)]
+    pub fn configured_session_id(&self) -> Option<&str> { self.session_id.as_deref() }
+    /// Derives an independent recipe without the root's execution ownership.
+    #[doc(hidden)]
+    pub fn fresh_child(mut self) -> Self {
+        self.session_id = None;
+        self.restored = None;
+        self.policy = None;
+        self.turn_ownership = None;
+        #[cfg(all(feature = "tools", not(target_family = "wasm")))]
+        if self.task_board.is_some() {
+            let names = nanocodex_claude_tools::tasks::ClaudeTasks::definitions()
+                .into_iter().filter_map(|value| value.get("name").and_then(Value::as_str).map(str::to_owned))
+                .collect::<HashSet<_>>();
+            self.tools.retain(|(definition, _)| !names.contains(&definition.name));
+            self = self.tasks(Arc::new(nanocodex_claude_tools::tasks::ClaudeTasks::new()));
+        }
+        self
+    }
+    /// Sets the model used by an independent native recipe.
+    pub fn model(mut self, model: impl Into<String>) -> Self {
+        self.claude.model = model.into();
+        self
+    }
+    /// Holds successful terminal publication until owned foreground work is idle.
+    pub fn turn_ownership(mut self, hook: Arc<dyn nanocodex_agent::execution::TurnOwnership>) -> Self {
+        self.turn_ownership = Some(hook);
         self
     }
     /// Installs embedding-owned mixed-family child construction.
@@ -693,10 +744,7 @@ impl ClaudeBuilder {
             .map(|policy| policy.state_id().to_owned())
             .or_else(|| self.session_id.clone())
             .unwrap_or_else(|| format!("claude-{}", uuid::Uuid::new_v4()));
-        let mut recipe = self.clone();
-        recipe.session_id = None;
-        recipe.restored = None;
-        recipe.policy = None;
+        let recipe = self.clone().fresh_child();
         let native_factory = Arc::new(ClaudeNativeFactory {
             recipe,
             state: std::sync::Mutex::new(Weak::new()),
@@ -916,6 +964,7 @@ impl ClaudeBuilder {
         }
         *discovered.try_lock().expect("new discovery lock") = restored.discovered;
         let (runtime, events) = BackendRuntime::new(session_id.clone());
+        let ownership = self.turn_ownership.clone();
         let state = Arc::new(State {
             client: self.claude.client.bind_subscription_session(&session_id),
             model: std::sync::RwLock::new(self.claude.model),
@@ -945,6 +994,7 @@ impl ClaudeBuilder {
             parallel_tools: self.parallel_tools,
             conversation: Mutex::new(restored.conversation),
             policy: self.policy,
+            turn_ownership: self.turn_ownership,
             admission: Mutex::new(()),
             idle: Notify::new(),
             compaction_cancel: Mutex::new(None),
@@ -961,7 +1011,12 @@ impl ClaudeBuilder {
             .lock()
             .expect("new native capability lock") = Arc::downgrade(&state);
         let driver = Driver { state, handle };
-        Ok((runtime.bind(driver), events))
+        let agent = runtime.bind(driver);
+        #[cfg(not(target_family = "wasm"))]
+        let agent = agent.with_owned_startup(ownership);
+        #[cfg(target_family = "wasm")]
+        let _ = ownership;
+        Ok((agent, events))
     }
 }
 
@@ -1664,6 +1719,7 @@ struct State {
     parallel_tools: bool,
     conversation: Mutex<Conversation>,
     policy: Option<Arc<dyn ClaudeExecutionPolicy>>,
+    turn_ownership: Option<Arc<dyn nanocodex_agent::execution::TurnOwnership>>,
     admission: Mutex<()>,
     idle: Notify,
     compaction_cancel: Mutex<Option<Arc<Cancellation>>>,
@@ -2115,9 +2171,31 @@ impl State {
         };
         let events = &request.events;
         let (reasoning_mode, effort) = self.emit_run_started(&request);
-        let mut result = self
-            .run_locked(&mut conversation, &request, speed, &cancel)
-            .await;
+        let mut result = async {
+            if let Some(ownership) = &self.turn_ownership {
+                ownership.prepare(&self.session_id).await?;
+            }
+            self.run_locked(&mut conversation, &request, speed, &cancel).await
+        }.await;
+        if let Some(ownership) = &self.turn_ownership {
+            if result.is_ok() {
+                let settled = tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => None,
+                    settled = ownership.settle(&self.session_id, true) => Some(settled),
+                };
+                match settled {
+                    Some(Ok(())) => {},
+                    Some(Err(error)) => result = Err(error),
+                    None => {
+                        ownership.settle(&self.session_id, false).await?;
+                        result = Err(NanocodexError::TurnCancelled);
+                    }
+                }
+            } else if let Err(error) = ownership.settle(&self.session_id, false).await {
+                result = Err(error);
+            }
+        }
         if result
             .as_ref()
             .err()

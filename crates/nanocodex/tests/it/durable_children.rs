@@ -23,17 +23,21 @@ struct Fixture {
     child_started: Arc<Notify>,
     child_release: Arc<Notify>,
     parent_finished: Arc<Notify>,
+    child_finished: Arc<Notify>,
+    claude: bool,
+    preserve_workspace: bool,
     server: tokio::task::JoinHandle<()>,
     workspace: PathBuf,
 }
 
 fn latest_prompt(body: &Value) -> String {
-    body["input"]
+    let messages = body.get("input").unwrap_or(&body["messages"]);
+    messages
         .as_array()
         .unwrap()
         .iter()
         .rev()
-        .find(|item| item["role"] == "user")
+        .find(|item| item["role"] == "user" && !item["content"].to_string().contains("tool_result"))
         .map(|item| item["content"].to_string())
         .unwrap_or_default()
 }
@@ -49,15 +53,21 @@ fn message(text: impl Into<String>) -> Value {
 
 impl Fixture {
     async fn start(label: &str) -> Self {
+        Self::start_family(label, false, None).await
+    }
+
+    async fn start_family(label: &str, claude: bool, path: Option<PathBuf>) -> Self {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
         let child_started = Arc::new(Notify::new());
         let child_release = Arc::new(Notify::new());
         let parent_finished = Arc::new(Notify::new());
-        let workspace = std::env::temp_dir().join(format!(
+        let child_finished = Arc::new(Notify::new());
+        let preserve_workspace = path.is_some();
+        let workspace = path.unwrap_or_else(|| std::env::temp_dir().join(format!(
             "native-facade-{label}-{}",
             nanocodex::agent::session::SessionId::new()
-        ));
+        )));
         std::fs::create_dir_all(&workspace).unwrap();
         let trace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
             "../../output/native-{label}-{}.json",
@@ -65,16 +75,18 @@ impl Fixture {
         ));
         std::fs::create_dir_all(trace.parent().unwrap()).unwrap();
         println!("HTTP_TRANSCRIPT {}", trace.display());
-        let app = Router::new().route("/responses", post({
+        let handler = post({
             let requests = requests.clone();
             let started = child_started.clone();
             let release = child_release.clone();
             let parent_finished = parent_finished.clone();
+            let child_finished = child_finished.clone();
             move |Json(body): Json<Value>| {
                 let requests = requests.clone();
                 let started = started.clone();
                 let release = release.clone();
                 let parent_finished = parent_finished.clone();
+                let child_finished = child_finished.clone();
                 let trace = trace.clone();
                 async move {
                     let ordinal = {
@@ -84,11 +96,17 @@ impl Fixture {
                         requests.len()
                     };
                     let prompt = latest_prompt(&body);
-                    let last = body["input"].as_array().unwrap().last().unwrap();
-                    let continuation = last["type"] == "function_call_output";
+                    let messages = body.get("input").unwrap_or(&body["messages"]).as_array().unwrap();
+                    let last = messages.last().unwrap();
+                    let continuation = last["type"] == "function_call_output" || last["content"][0]["type"] == "tool_result";
                     let output = if continuation {
                         if prompt.contains("spawn-") { parent_finished.notify_one(); }
-                        message(last["output"].as_str().unwrap_or("native done"))
+                        if prompt.contains("gated-child") { child_finished.notify_one(); }
+                        let reply = last.get("output").unwrap_or(&last["content"][0]["content"]);
+                        let reply = reply.as_str().map(str::to_owned).unwrap_or_else(|| {
+                            reply.as_array().map(|blocks| blocks.iter().filter_map(|block| block["text"].as_str()).collect::<Vec<_>>().join("\n")).unwrap_or_else(|| reply.to_string())
+                        });
+                        message(reply)
                     } else if prompt.contains("gated-child") {
                         started.notify_one();
                         release.notified().await;
@@ -108,11 +126,29 @@ impl Fixture {
                     } else {
                         message("durable native answer")
                     };
-                    let frame = json!({"type":"response.completed", "response":{"id":format!("response-{ordinal}"),"status":"completed","output":output}});
-                    ([ ("content-type", "text/event-stream") ], format!("data: {frame}\n\ndata: [DONE]\n\n"))
+                    let stream = if claude {
+                        let item = &output[0];
+                        let (content, stop) = if item["type"] == "function_call" {
+                            (json!({"type":"tool_use","id":item["call_id"],"name":item["name"],"input":serde_json::from_str::<Value>(item["arguments"].as_str().unwrap()).unwrap()}), "tool_use")
+                        } else {
+                            (json!({"type":"text","text":item["content"][0]["text"]}), "end_turn")
+                        };
+                        [
+                            json!({"type":"message_start","message":{"id":format!("message-{ordinal}"),"role":"assistant","model":"claude-sonnet-5-5","content":[],"usage":{"input_tokens":5,"output_tokens":0}}}),
+                            json!({"type":"content_block_start","index":0,"content_block":content}),
+                            json!({"type":"content_block_stop","index":0}),
+                            json!({"type":"message_delta","delta":{"stop_reason":stop},"usage":{"output_tokens":3}}),
+                            json!({"type":"message_stop"}),
+                        ].into_iter().map(|frame| format!("data: {frame}\n\n")).collect()
+                    } else {
+                        let frame = json!({"type":"response.completed", "response":{"id":format!("response-{ordinal}"),"status":"completed","output":output}});
+                        format!("data: {frame}\n\ndata: [DONE]\n\n")
+                    };
+                    ([ ("content-type", "text/event-stream") ], stream)
                 }
             }
-        }));
+        });
+        let app = Router::new().route("/responses", handler.clone()).route("/v1/messages", handler);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -122,6 +158,9 @@ impl Fixture {
             child_started,
             child_release,
             parent_finished,
+            child_finished,
+            claude,
+            preserve_workspace,
             server,
             workspace,
         }
@@ -144,6 +183,12 @@ impl Fixture {
         )
         .await
         .unwrap();
+        #[cfg(feature = "claude")]
+        if self.claude {
+            let client = nanocodex::claude::ClaudeClient::new(reqwest::Client::new(), format!("{}/v1/messages", self.base), "synthetic-key");
+            return Nanocodex::builder(nanocodex::Claude::new(client, "claude-sonnet-5-5"))
+                .durability(state).await.unwrap().build().unwrap();
+        }
         Nanocodex::builder(self.openai())
             .workspace(&self.workspace)
             .tools(Tools::builder().without_defaults().build().unwrap())
@@ -162,7 +207,9 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         self.server.abort();
-        let _ = std::fs::remove_dir_all(&self.workspace);
+        if !self.preserve_workspace {
+            let _ = std::fs::remove_dir_all(&self.workspace);
+        }
     }
 }
 
@@ -184,7 +231,17 @@ async fn answer(agent: &Nanocodex, input: &str, id: &str) -> String {
 
 #[tokio::test]
 async fn configured_native_parent_own_spawn_and_descendant_replay_requests() {
-    let fixture = Fixture::start("facade-replay").await;
+    replay_journey(false).await;
+}
+
+#[cfg(feature = "claude")]
+#[tokio::test]
+async fn configured_claude_parent_owns_same_family_children_and_descendant_replay() {
+    replay_journey(true).await;
+}
+
+async fn replay_journey(claude: bool) {
+    let fixture = Fixture::start_family("facade-replay", claude, None).await;
     let (parent, parent_events) = fixture.parent().await;
     let root_session = parent.session_id().to_owned();
     let (child, child_events) = parent.spawn().await.unwrap();
@@ -250,7 +307,17 @@ async fn configured_native_parent_own_spawn_and_descendant_replay_requests() {
 
 #[tokio::test]
 async fn configured_native_registry_tools_hold_foreground_and_allow_background_then_reopen() {
-    let fixture = Fixture::start("facade-lifetime").await;
+    lifetime_journey(false).await;
+}
+
+#[cfg(feature = "claude")]
+#[tokio::test]
+async fn configured_claude_registry_holds_foreground_and_reopens_background_outputs() {
+    lifetime_journey(true).await;
+}
+
+async fn lifetime_journey(claude: bool) {
+    let fixture = Fixture::start_family("facade-lifetime", claude, None).await;
     let (parent, parent_events) = fixture.parent().await;
     let root_session = parent.session_id().to_owned();
     let foreground = parent

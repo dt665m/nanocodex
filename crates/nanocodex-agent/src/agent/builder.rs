@@ -83,6 +83,12 @@ impl<F> NanocodexBuilder<F> {
         self
     }
 
+    /// Whether embedding-owned child construction has already been configured.
+    #[doc(hidden)]
+    pub fn has_spawn_factory(&self) -> bool {
+        self.codex.spawn_factory.is_some()
+    }
+
     /// Returns an explicitly configured native session identity.
     #[doc(hidden)]
     pub const fn configured_session_id(&self) -> Option<SessionId> {
