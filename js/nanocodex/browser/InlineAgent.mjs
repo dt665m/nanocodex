@@ -36,10 +36,12 @@ import {
 
 /** Creates the Rust/WASM Agent in the current Web API host isolate. */
 export async function create(options = {}) {
+  if (managedTransportOptions(options?.transport) && options.requestPolicy !== undefined) {
+    throw new TypeError('managed request policy must be configured by its owning host');
+  }
   if (options.harness === 'claude') return createClaude(options);
   if (options.harness !== undefined && options.harness !== 'codex') throw new TypeError('unsupported harness family');
   if (managedTransportOptions(options?.transport)) {
-    if (options.requestPolicy !== undefined) throw new TypeError("managed request policy must be configured by its owning host");
     return createManagedAgent(options);
   }
   const internalRuntime = options[Symbol.for("nanocodex.browser.internalRuntime")];

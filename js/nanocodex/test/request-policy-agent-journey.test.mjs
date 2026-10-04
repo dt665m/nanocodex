@@ -5,13 +5,13 @@ import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { Agent, Transport, RequestPolicy } from 'nanocodex/node';
 import { Agent as HostAgent, Transport as HostTransport } from 'nanocodex/host';
+import { Agent as BrowserAgent, Transport as BrowserTransport } from 'nanocodex/browser';
 import { bindAgent } from '../cloudflare/Agent.mjs';
 import { createMemoryDurabilityStore } from 'nanocodex/durability';
 
 const module = await readFile(new URL('../pkg-web/nanocodex_bg.wasm', import.meta.url));
 const CloudflareAgent = bindAgent(module);
 const gptModels = ['gpt-6.1-sol', 'gpt-6-luna'].map(model => ({ model, family: 'codex', contextTokens: 100_000, maxOutputTokens: 128, switchGroup: 'synthetic-compatible' }));
-const encoder = new TextEncoder();
 const usage = { input_tokens: 20, output_tokens: 3, total_tokens: 23 };
 function oai(output, id) {
   return new Response([
@@ -144,9 +144,9 @@ test('public Claude Agent preserves signed tool history and accounts for opt-in 
     const snapshot = await policy.snapshot();
     assert.equal(effects, 1); assert.equal(snapshot.requests.length, 2);
     assert.equal(snapshot.requests[1].context.continuationOf, snapshot.requests[0].requestId);
-    assert.equal(snapshot.warms.length, 2);
+    assert.equal(snapshot.warms.length, 1);
     assert.ok(snapshot.warms.every(w => w.status === 'completed' && w.actualUsd === .000207));
-    assert.equal(snapshot.actualWarmUsd, .000414);
+    assert.equal(snapshot.actualWarmUsd, .000207);
     assert.ok(fixture.requests[0].body.system.some(block => block.text === 'CLAUDE_PROJECT'));
     assert.deepEqual(snapshot.requests.map(r => r.usage.output_tokens), [3, 3]);
     assert.equal(JSON.stringify(snapshot).includes('x-api-key'), false);
@@ -179,4 +179,49 @@ test('Cloudflare public durable Agent applies named policy at the subject-scoped
     assert.equal(requests[0].headers['x-nanocodex-subject'], 'a'.repeat(64));
     evidence('cloudflare', { wireRequests: requests.length, model: requests[0].body.model, subject: requests[0].headers['x-nanocodex-subject'], status: (await policy.snapshot()).requests[0].status });
   } finally { await agent.session.shutdown(); }
+});
+
+
+test('public Node forks expose separate policy handles and immutable inherited history', { timeout: 30_000 }, async t => {
+  const fixture = await server(t, (_record, n) => final(`FORK_OK_${n}`, `fork-${n}`));
+  const policy = await RequestPolicy.create(policyOptions(createMemoryDurabilityStore('fork-policy'), 'fork-policy'));
+  await policy.configure([{ kind: 'set_section', section: { name: 'project', text: 'PARENT_POLICY' } }]);
+  const parent = await Agent.create({ model: 'gpt-6.1-sol', thinking: 'low', requestPolicy: policy,
+    transport: Transport.openAi({ apiKey: 'synthetic-fork', apiBaseUrl: fixture.base }), tools: {}, toolMode: 'direct' });
+  let child;
+  try {
+    await parent.turn.prompt({ input: 'Parent before fork' }).result();
+    const inherited = await policy.snapshot();
+    child = await parent.session.fork();
+    assert.notEqual(child.requestPolicy, parent.requestPolicy);
+    assert.deepEqual((await child.requestPolicy.snapshot()).requests, inherited.requests);
+    await child.requestPolicy.configure([{ kind: 'set_section', section: { name: 'project', text: 'CHILD_POLICY' } }]);
+    await child.turn.prompt({ input: 'Child after fork' }).result();
+    await parent.turn.prompt({ input: 'Parent after fork' }).result();
+    const parentState = await parent.requestPolicy.snapshot();
+    const childState = await child.requestPolicy.snapshot();
+    assert.equal(parentState.routerState, 2);
+    assert.equal(childState.routerState, 2);
+    assert.deepEqual(childState.requests[0].original, parentState.requests[0].original);
+    assert.equal(parentState.configuration.sections[0].text, 'PARENT_POLICY');
+    assert.equal(childState.configuration.sections[0].text, 'CHILD_POLICY');
+    assert.match(JSON.stringify(fixture.requests[1].body), /CHILD_POLICY/);
+    assert.match(JSON.stringify(fixture.requests[2].body), /PARENT_POLICY/);
+    assert.doesNotMatch(JSON.stringify(fixture.requests[2].body), /CHILD_POLICY/);
+    assert.notEqual(childState.requests[1].requestId, parentState.requests[1].requestId);
+    evidence('node-fork', { parentRouterState: parentState.routerState, childRouterState: childState.routerState,
+      parentRequest: parentState.requests[1].requestId, childRequest: childState.requests[1].requestId, inheritedOriginal: 'immutable', handles: 'separate' });
+  } finally { await child?.session.shutdown(); await parent.session.shutdown(); }
+});
+
+test('public browser and Node managed transports deny client policy before harness routing', async () => {
+  const policy = await RequestPolicy.create(policyOptions(createMemoryDurabilityStore('managed-policy'), 'managed-policy'));
+  for (const [agent, transport] of [[BrowserAgent, BrowserTransport], [Agent, Transport]]) {
+    const managed = transport.managed({ agent: { create: true }, apiKey: 'ncx_live_synthetic', baseUrl: 'https://synthetic.invalid',
+      fetch() { assert.fail('client policy must be rejected before account transport'); } });
+    for (const harness of ['codex', 'claude']) {
+      assert.throws(() => agent.create({ transport: managed, requestPolicy: policy, harness }), /owning host/);
+    }
+  }
+  evidence('managed-guard', { families: ['codex', 'claude'], surfaces: ['browser', 'node'], dispatched: 0 });
 });

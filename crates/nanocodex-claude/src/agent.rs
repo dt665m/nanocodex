@@ -1778,7 +1778,13 @@ struct ResponseContext<'a> {
     effect: Option<Effect<'a>>,
 }
 impl State {
-    fn emit(&self, events: &AgentEventPublisher, kind: AgentEventKind, payload: Value) {
+    fn emit(&self, events: &AgentEventPublisher, kind: AgentEventKind, mut payload: Value) {
+        if kind != AgentEventKind::InputAccepted
+            && let Some(turn_id) = events.turn_id()
+            && let Some(object) = payload.as_object_mut()
+        {
+            object.insert("turn_id".into(), json!(turn_id));
+        }
         let Ok(payload) = serde_json::value::to_raw_value(&payload) else {
             return;
         };
@@ -1789,6 +1795,14 @@ impl State {
             kind,
             payload: Arc::from(payload),
         });
+    }
+    fn emit_accepted_input(&self, request: &BackendPrompt) {
+        let turn_id = request.events.turn_id().unwrap_or(request.events.request_id());
+        self.emit(&request.events, AgentEventKind::InputAccepted, json!({
+            "session_id": request.events.request_id(), "turn_id": turn_id,
+            "item_id": format!("{turn_id}:prompt"), "kind": "prompt",
+            "request_id": request.request_id, "input": request.prompt.instruction,
+        }));
     }
     fn model(&self) -> String {
         self.model
@@ -3276,6 +3290,7 @@ impl LifecycleBackend for Driver {
                             Admission::Execute | Admission::Resume => None,
                         };
                         if let Some(result) = terminal {
+                            state.emit_accepted_input(&request);
                             state.accepted_turns.fetch_add(1, Ordering::SeqCst);
                             let (status, kind) = match &result {
                                 Ok(_) => ("completed", AgentEventKind::RunCompleted),
@@ -3313,6 +3328,7 @@ impl LifecycleBackend for Driver {
                             "Claude request_id requires an attached durability policy",
                         ));
                     }
+                    state.emit_accepted_input(&request);
                     state.accepted_turns.fetch_add(1, Ordering::SeqCst);
                     let request_id = request.request_id.clone();
                     let key = request.key;

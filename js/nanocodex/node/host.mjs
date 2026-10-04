@@ -52,7 +52,7 @@ export function createNodeHost(options = {}) {
   const http = createResponsesHttp((endpoint, apiKey, sessionId, metadata, body, signal) => {
     if (disposal) throw new Error("Nanocodex host is already disposed");
     if (options.mpp) throw JSON.stringify({ kind: "transport", detail: "MPP HTTPS transport is unavailable", reconnectable: false });
-    return policyHost.fetch(sessionId, globalThis.fetch.bind(globalThis), "codex", endpoint, { method: "POST", headers: responsesHttpHeaders(apiKey, sessionId, metadata),
+    return policyHost.fetch(metadata.threadId ?? sessionId, globalThis.fetch.bind(globalThis), "codex", endpoint, { method: "POST", headers: responsesHttpHeaders(apiKey, sessionId, metadata),
       body, signal, redirect: "error" });
   });
   const connections = new Map();

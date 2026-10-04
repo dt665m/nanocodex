@@ -82,7 +82,7 @@ export function createBrowserHost(options = {}) {
       if (options.hostAuth) throw JSON.stringify({ kind: "transport", detail: "host-managed HTTPS requires createResponse", reconnectable: false });
       return fetch(incoming);
     };
-    return policyHost.fetch(sessionId, send, "codex", endpoint, { method: "POST", headers: responsesHttpHeaders(apiKey, sessionId, metadata),
+    return policyHost.fetch(metadata.threadId ?? sessionId, send, "codex", endpoint, { method: "POST", headers: responsesHttpHeaders(apiKey, sessionId, metadata),
       body, signal, redirect: "error" });
   });
   const connections = new Map();

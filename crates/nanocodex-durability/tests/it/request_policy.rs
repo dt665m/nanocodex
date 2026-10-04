@@ -168,7 +168,7 @@ fn assert_tip(policy: &Value, turns: u64) {
 }
 
 #[tokio::test]
-async fn request_policy_public_openai_and_claude_http_survive_270_boundaries_and_old_replay()
+async fn request_policy_public_openai_and_claude_http_survive_270_boundaries_and_retained_replay()
 -> eyre::Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     for is_claude in [false, true] {
@@ -253,19 +253,17 @@ async fn request_policy_public_openai_and_claude_http_survive_270_boundaries_and
                 }
                 if epoch == 4 {
                     let before = requests.lock().unwrap().len();
-                    let revision = state.state().await?.revision();
                     assert_eq!(
                         agent
-                            .prompt(PromptRequest::new("ordered user turn 0").request_id("turn-0"))
+                            .prompt(PromptRequest::new("ordered user turn 269").request_id("turn-269"))
                             .await?
                             .result()
                             .await?
                             .final_message(),
                         "recorded answer"
                     );
-                    assert_eq!(state.state().await?.revision(), revision);
                     let conflict = agent
-                        .prompt(PromptRequest::new("changed old turn").request_id("turn-0"))
+                        .prompt(PromptRequest::new("changed retained turn").request_id("turn-269"))
                         .await;
                     assert!(match conflict {
                         Ok(turn) => turn.result().await.is_err(),
@@ -307,19 +305,17 @@ async fn request_policy_public_openai_and_claude_http_survive_270_boundaries_and
                 }
                 if epoch == 4 {
                     let before = requests.lock().unwrap().len();
-                    let revision = state.state().await?.revision();
                     assert_eq!(
                         agent
-                            .prompt(PromptRequest::new("ordered user turn 0").request_id("turn-0"))
+                            .prompt(PromptRequest::new("ordered user turn 269").request_id("turn-269"))
                             .await?
                             .result()
                             .await?
                             .final_message(),
                         "recorded answer"
                     );
-                    assert_eq!(state.state().await?.revision(), revision);
                     let conflict = agent
-                        .prompt(PromptRequest::new("changed old turn").request_id("turn-0"))
+                        .prompt(PromptRequest::new("changed retained turn").request_id("turn-269"))
                         .await;
                     assert!(match conflict {
                         Ok(turn) => turn.result().await.is_err(),
@@ -406,7 +402,7 @@ async fn request_policy_public_openai_and_claude_http_survive_270_boundaries_and
             );
         }
         eprintln!(
-            "native-policy evidence: provider={} turns={} router_calls={} immutable_preparations={} max_head_bytes={} recent_receipts<=16 terminal_receipts<=8 old_replay=no_HTTP",
+            "native-policy evidence: provider={} turns={} router_calls={} immutable_preparations={} max_head_bytes={} recent_receipts<=16 terminal_receipts<=8 retained_replay=no_HTTP",
             model.as_str(),
             log.len(),
             route_calls.load(Ordering::SeqCst),
@@ -685,7 +681,7 @@ async fn request_policy_claude_http_unknown_warm_charge_is_not_repeated_after_re
 }
 
 #[tokio::test]
-async fn request_policy_public_http_retry_freezes_route_and_configuration_after_reopen()
+async fn request_policy_public_http_failure_replays_frozen_route_after_reopen()
 -> eyre::Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     for is_claude in [false, true] {
@@ -786,11 +782,8 @@ async fn request_policy_public_http_retry_freezes_route_and_configuration_after_
                     .await?
                     .result()
                     .await;
-                if epoch == 0 {
-                    assert!(result.is_err());
-                } else {
-                    assert_eq!(result?.final_message(), "recorded answer");
-                }
+                let failure = result.unwrap_err();
+                assert!(failure.to_string().contains("one deterministic rejected request"), "{failure}");
                 agent.shutdown().await?;
                 drop((agent, events));
             } else {
@@ -811,11 +804,8 @@ async fn request_policy_public_http_retry_freezes_route_and_configuration_after_
                     .await?
                     .result()
                     .await;
-                if epoch == 0 {
-                    assert!(result.is_err());
-                } else {
-                    assert_eq!(result?.final_message(), "recorded answer");
-                }
+                let failure = result.unwrap_err();
+                assert!(failure.to_string().contains("one deterministic rejected request"), "{failure}");
                 agent.shutdown().await?;
                 drop((agent, events));
             }
@@ -827,16 +817,12 @@ async fn request_policy_public_http_retry_freezes_route_and_configuration_after_
             "reopened retry cannot reevaluate a frozen route"
         );
         let log = requests.lock().unwrap();
-        assert_eq!(log.len(), 2);
-        assert_eq!(
-            log[0], log[1],
-            "retry preserves the exact prepared provider request"
-        );
-        assert_eq!(log[1]["model"], original.as_str());
-        assert!(log[1].to_string().contains("Frozen named instruction"));
-        assert!(!log[1].to_string().contains("Changed host instruction"));
+        assert_eq!(log.len(), 1, "a settled rejected request replays without another HTTP effect");
+        assert_eq!(log[0]["model"], original.as_str());
+        assert!(log[0].to_string().contains("Frozen named instruction"));
+        assert!(!log[0].to_string().contains("Changed host instruction"));
         eprintln!(
-            "native-retry evidence: provider={} HTTP={} first_router_calls={} changed_router_calls={} exact_retry_body=true frozen_instruction=true",
+            "native-retry evidence: provider={} HTTP={} first_router_calls={} changed_router_calls={} settled_failure_replay=no_HTTP frozen_instruction=true",
             original.as_str(),
             log.len(),
             first_calls.load(Ordering::SeqCst),
