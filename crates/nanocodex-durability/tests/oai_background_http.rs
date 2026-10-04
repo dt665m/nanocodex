@@ -130,3 +130,74 @@ async fn http_hard_limit_waits_for_owned_summary_before_next_generation() -> eyr
     println!("hard_limit_wait=true next_generation_has_summary_and_complete_tail=true");
     agent.shutdown().await?; drop((agent,events)); server.abort(); Ok(())
 }
+
+struct LostAckStore {
+    inner: SqliteStore,
+    armed: Arc<std::sync::atomic::AtomicBool>,
+}
+impl nanocodex_durability::StateStore for LostAckStore {
+    fn read_record<'a>(&'a mut self, id: &'a str, key: &'a str) -> nanocodex_durability::StoreFuture<'a, Result<Option<String>, nanocodex_durability::StoreError>> {
+        self.inner.read_record(id, key)
+    }
+    fn acquire<'a>(&'a mut self, id: &'a str, owner: nanocodex_durability::OwnerId) -> nanocodex_durability::StoreFuture<'a, Result<nanocodex_durability::OwnedState, nanocodex_durability::StoreError>> {
+        self.inner.acquire(id, owner)
+    }
+    fn replace<'a>(&'a mut self, id: &'a str, owner: &'a nanocodex_durability::OwnerToken, revision: u64, payload: &'a str, records: &'a [nanocodex_durability::StoreRecord]) -> nanocodex_durability::StoreFuture<'a, Result<u64, nanocodex_durability::StoreError>> {
+        Box::pin(async move {
+            let result = self.inner.replace(id, owner, revision, payload, records).await?;
+            if self.armed.swap(false, Ordering::SeqCst) {
+                return Err(nanocodex_durability::StoreError::Backend("lost foreground receipt acknowledgement after SQLite commit".into()));
+            }
+            Ok(result)
+        })
+    }
+}
+
+#[tokio::test(flavor="multi_thread", worker_threads=2)]
+async fn http_completed_summary_and_foreground_receipt_recover_without_redispatch() -> eyre::Result<()> {
+    use nanocodex_durability::StepStatus;
+    let (provider, mut receiver, url, server) = fixture(false).await?;
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("state.sqlite");
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let state = DurableSession::open(LostAckStore { inner: SqliteStore::open(&path)?, armed: armed.clone() }, "http-recovery").await?;
+    let (agent,events) = Nanocodex::builder(openai(&url)?).workspace(dir.path()).context_window_tokens(1000).durability(state.clone()).await?.build()?;
+    let request = || PromptRequest::new("recover the summary and foreground exactly").request_id("recover");
+    let turn = agent.prompt(request()).await?;
+    arrivals(&mut receiver,&[(false,1),(true,1),(false,2),(false,3)]).await;
+    provider.release_summary.notify_one();
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let snapshot = state.state().await?;
+            if snapshot.operation("recover").unwrap().steps.iter().any(|(id, step)| id.starts_with("background-compaction-") && matches!(step.status, StepStatus::Completed(_))) { break; }
+            tokio::task::yield_now().await;
+        }
+        Ok::<(),nanocodex_durability::Error>(())
+    }).await??;
+    armed.store(true,Ordering::SeqCst);
+    provider.release_final.notify_one();
+    assert!(timeout(Duration::from_secs(10), turn.result()).await?.is_err());
+    assert!(!armed.load(Ordering::SeqCst),"lost-ACK boundary was not reached");
+    // Read the actual SQLite state after process ownership is replaced below.
+    let _ = agent.shutdown().await; drop((agent,events,state));
+    let state = DurableSession::open(SqliteStore::open(&path)?,"http-recovery").await?;
+    let saved = state.state().await?;
+    let steps = &saved.operation("recover").unwrap().steps;
+    assert!(matches!(steps.get("model-3").unwrap().status,StepStatus::Completed(_)));
+    assert!(steps.iter().any(|(id,step)| id.starts_with("background-compaction-") && matches!(step.status,StepStatus::Completed(_))));
+    let before = provider.requests.lock().unwrap().len();
+    let (agent,events) = Nanocodex::builder(openai(&url)?).workspace(dir.path()).context_window_tokens(1000).durability(state).await?.build()?;
+    let result = timeout(Duration::from_secs(10), agent.prompt(request()).await?.result()).await??;
+    assert_eq!(result.final_message(),"TAIL-FINAL");
+    assert_eq!(provider.requests.lock().unwrap().len(),before,"completed receipts must not redispatch");
+    let snapshot = serde_json::to_value(agent.snapshot().await?)?;
+    let history = snapshot["history"].to_string();
+    for exact in ["opaque-http-summary","TAIL-ONE","TAIL-FINAL"] { assert!(history.contains(exact),"{history}"); }
+    assert_eq!(provider.summaries.load(Ordering::SeqCst),1);
+    let replay = agent.prompt(request()).await?.result().await?;
+    assert_eq!(replay.usage(),result.usage());
+    assert_eq!(provider.requests.lock().unwrap().len(),before);
+    println!("completed_summary_and_model3_lost_ACK_replayed=true zero_additional_HTTP=true exact_tail=true");
+    agent.shutdown().await?; drop((agent,events)); server.abort();
+    Ok(())
+}
