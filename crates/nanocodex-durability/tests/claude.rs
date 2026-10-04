@@ -1962,11 +1962,11 @@ async fn uncertain_paused_server_turn_survives_compaction_cancellation_and_sqlit
 
 // A store failure leaves the operation unfinished, unlike a provider failure.
 // Reopen must use the prepared native cursor: settled model receipts replay,
-// while an admitted effect with no committed receipt remains at least once.
+// while an admitted server effect with no committed receipt remains outcome unknown.
 #[tokio::test]
 async fn paused_server_cursor_replays_across_store_failure_without_terminalizing() {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    for after_commit in [false, true] {
+    for (after_commit, retain_authority) in [(false, true), (true, true), (false, false), (true, false)] {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("pending-server.sqlite");
         let armed = Arc::new(AtomicBool::new(false));
@@ -2025,48 +2025,35 @@ async fn paused_server_cursor_replays_across_store_failure_without_terminalizing
         let _ = agent.shutdown().await;
         drop((agent, events));
 
-        let (agent, events) = Nanocodex::builder(Claude::new(client, "different-model"))
+        let builder = Nanocodex::builder(Claude::new(client, "different-model"));
+        let builder = if retain_authority {
+            builder.server_tool(nanocodex_claude::ServerToolDefinition::code_execution_current())
+        } else {
+            builder
+        };
+        let (agent, events) = builder
             .durability(reopen(&path).await)
             .await
             .unwrap()
             .build()
             .unwrap();
-        assert_eq!(
-            agent
-                .prompt(request())
-                .await
-                .unwrap()
-                .result()
-                .await
-                .unwrap()
-                .final_message(),
-            "recovered prepared server turn"
-        );
-        let expected = if after_commit { 1 } else { 2 };
-        assert_eq!(effects.load(Ordering::SeqCst), expected);
-        assert_eq!(requests.lock().unwrap().len(), 1 + expected);
-        agent
-            .prompt(request())
-            .await
-            .unwrap()
-            .result()
-            .await
-            .unwrap();
-        assert_eq!(
-            requests.lock().unwrap().len(),
-            1 + expected,
-            "terminal replay must not execute again"
-        );
-        assert_eq!(effects.load(Ordering::SeqCst), expected);
+        for _ in 0..2 {
+            let result = agent.prompt(request()).await.unwrap().result().await;
+            if after_commit {
+                assert_eq!(result.unwrap().final_message(), "recovered prepared server turn");
+            } else {
+                let error = result.unwrap_err();
+                assert!(error.to_string().contains("outcome is unknown"), "{error}");
+            }
+            assert_eq!(requests.lock().unwrap().len(), 2,
+                "unknown server effects and completed receipts must not redispatch HTTP, including revoked authority");
+            assert_eq!(effects.load(Ordering::SeqCst), 1,
+                "the provider mutation must execute exactly once");
+        }
+        println!("Claude HTTP recovery after_commit={after_commit} retain_authority={retain_authority}: requests=2 effects=1");
         agent.shutdown().await.unwrap();
         drop((agent, events));
         let log = requests.lock().unwrap();
-        if !after_commit {
-            assert_eq!(
-                log[1], log[2],
-                "unfinished operation must replay its original frozen native request"
-            );
-        }
         assert!(
             log.iter()
                 .all(|request| request["model"] == "original-model")
