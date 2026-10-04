@@ -1082,6 +1082,45 @@ opaque Rust state. See `js/managed`,
 `examples/vercel-workflows`, and `examples/rivet-actors` for all three host
 shapes.
 
+Durable sessions also expose session documents and historical fork seeds. These
+records belong to the session's fenced durability transaction; account-shared
+application data belongs in its separate account store. Conditional writes use
+`expectedVersion: 0` for creation and the returned version for updates:
+
+```js
+await agent.session.compareExchangeDocuments([
+  { key: "journal", expectedVersion: 0, value: { count: 1 }, fork: "asOf" },
+]);
+const journal = await agent.session.document("journal");
+const turn = agent.turn.prompt({ id: "checkpoint-1", input: "Continue." });
+await turn.result();
+const seed = await agent.session.documentFork("checkpoint-1");
+const branch = await Agent.create({
+  transport: freshTransport, tools, durability,
+  durabilityId: "independent-branch", documentFork: seed,
+});
+```
+
+`stageDocumentWrites(operationId, writes)` stages a conditional transaction
+while that operation is running. It publishes together with successful
+completion, its checkpoint and terminal receipt; failure publishes none of the
+staged writes. `compareExchangeDocuments` publishes an immediate atomic
+transaction. All writes validate before any value changes, including version
+conflicts and the session's 64-document / 64 KiB document metadata-and-value
+limit. Use bounded JSON values.
+
+Fork policies are `initial`, `current`, `asOf` and `block`. They select the
+creation value, latest value, value at the completed operation, or refuse a fork
+when the blocked document exists at that boundary. Later-created keys are
+omitted. Every successful operation retains a historical boundary, including
+operations that write no documents and operations whose terminal receipts have
+been pruned. Fork seeds contain loaded model checkpoint data, so they can seed a
+pristine destination backed by a different durability store. Supply current
+destination credentials, tools and authority independently; seeds do not grant
+access or copy schedules or account-shared stores. Claude exposes these same
+durable document methods with its native checkpoint format; see the
+[Claude SDK guide](../../docs/CLAUDE_JAVASCRIPT.md).
+
 Cloudflare Durable Objects can bind their colocated SQLite and initialize the
 canonical schema in one call. The adapter is structural and adds no Workers
 runtime dependency:
