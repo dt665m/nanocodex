@@ -54,7 +54,6 @@ export function AccountChooser({
 }>) {
   const phoneId = useId();
   const codeId = useId();
-  const phoneHintId = useId();
   const codeHintId = useId();
   const failureId = useId();
   const [phone, setPhone] = useState("");
@@ -178,7 +177,7 @@ export function AccountChooser({
           <label htmlFor={phoneId}>Mobile number</label>
           <div className="sms-otp-input-row">
             <input
-              aria-describedby={`${phoneHintId}${visibleFailure ? ` ${failureId}` : ""}`}
+              aria-describedby={visibleFailure ? failureId : undefined}
               aria-invalid={localFailure ? true : undefined}
               autoComplete="tel"
               autoFocus
@@ -198,7 +197,6 @@ export function AccountChooser({
               {operation === "send" ? "Sending…" : "Text me a code"}
             </button>
           </div>
-          <p id={phoneHintId} className="auth-terms">Continuing sends an automated sign-in text. Message and data rates may apply.</p>
         </form>
       ) : (
         <form key="code" className="sms-otp-form" aria-busy={operation === "verify"} noValidate onSubmit={(event) => {

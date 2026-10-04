@@ -203,8 +203,15 @@ test("SDK popup presents centered compact authorization", async ({ page }) => {
   const viewport = popup.viewportSize() ?? await popup.evaluate(() => ({width:innerWidth,height:innerHeight}));
   expect(Math.abs((intro!.x + intro!.width / 2) - viewport.width / 2)).toBeLessThan(2);
   expect(Math.abs((intro!.y + actions!.y + actions!.height) / 2 - viewport.height / 2)).toBeLessThan(2);
-  await popup.getByText("Access details", {exact:true}).click();
-  await expect(popup.getByText("Start tasks using the access approved here.", {exact:true})).toBeVisible();
+  await popup.getByRole("button", {name:/Run agents:/}).focus();
+  await expect(popup.getByRole("tooltip")).toContainText("Run agents");
+  await expect(popup.getByText("Access details", {exact:true})).toHaveCount(0);
+  const tip = await popup.getByRole("tooltip").boundingBox();
+  expect(tip!.x).toBeGreaterThanOrEqual(0);
+  expect(tip!.x + tip!.width).toBeLessThanOrEqual(viewport.width);
+  await popup.getByRole("button", {name:"Cancel", exact:true}).focus();
+  await popup.mouse.move(0, 0);
+  await expect(popup.getByRole("tooltip")).toHaveCount(0);
   await contained(popup);
   await popup.getByRole("button", { name: "Cancel", exact: true }).click();
   await expect(popup.getByRole("status")).toHaveText("Request cancelled");

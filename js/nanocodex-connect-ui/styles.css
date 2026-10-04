@@ -104,8 +104,14 @@
   .connector-logo svg { width: 19px; height: 19px; fill: currentColor; }
   .connector-logo-google { color: #4285f4; font-weight: 600; }
   .connector-logo-mercator svg { fill: none; stroke: currentColor; stroke-width: 1.5; }
-  .permission-chips { display: flex; flex-wrap: wrap; gap: 6px; }
-  .permission-chips > span { border: 1px solid var(--border); background: var(--surface-subtle); border-radius: 20px; padding: 5px 10px; font-size: 12px; }
+  .wizard-section:has(.wizard-request-summary) > .wizard-section-title { display: none; }
+  .permission-icons { display: flex; justify-content: center; gap: 8px; }
+  .permission-icon { position: relative; }
+  .permission-icon button { display: grid; place-items: center; width: 44px; height: 44px; border: 1px solid var(--border); border-radius: 14px; background: var(--surface-subtle); }
+  .permission-icon svg { width: 20px; height: 20px; }
+  .permission-tooltip { display: none; position: absolute; z-index: 2; bottom: calc(100% + 8px); left: 50%; transform: translateX(-50%); width: 190px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface-raised); font-size: 12px; text-align: center; box-shadow: 0 4px 16px #0002; }
+  .permission-tooltip small { display: block; color: var(--muted); margin-top: 3px; }
+  .permission-icon:hover .permission-tooltip, .permission-icon:focus-within .permission-tooltip { display: block; }
   .wizard-visibility { display: grid; }
   .wizard-visibility > div { display: flex; gap: 10px; padding-block: 10px; }
   .wizard-visibility > div + div { border-top: 1px solid var(--border); }
