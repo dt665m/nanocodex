@@ -2062,6 +2062,50 @@ async fn paused_server_cursor_replays_across_store_failure_without_terminalizing
     }
 }
 
+// A settled paused model receipt may replay after revocation, but its next
+// unsent continuation must be checked against the current host catalog.
+#[tokio::test]
+async fn revoked_server_catalog_blocks_fresh_http_after_completed_pause_replay() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("revoked-server.sqlite");
+    let armed = Arc::new(AtomicBool::new(false));
+    let arm = armed.clone();
+    let effects = Arc::new(AtomicUsize::new(0));
+    let counter = effects.clone();
+    let (client, requests, server) = server(move |index, _| {
+        if index == 1 {
+            arm.store(true, Ordering::SeqCst);
+            sse(vec![json!({"type":"server_tool_use","id":"revoked-pause","name":"bash_code_execution","input":{"command":"synthetic effect"}})], "pause_turn", 10)
+        } else {
+            counter.fetch_add(1, Ordering::SeqCst);
+            sse(text("unauthorized continuation executed"), "end_turn", 10)
+        }
+    }).await;
+    let state = DurableSession::open(FaultStore {
+        inner: SqliteStore::open(&path).unwrap(), writes: Arc::new(AtomicUsize::new(0)),
+        fail_at: None, after_commit: true, fail_when_armed: Some(armed),
+    }, "claude-synthetic").await.unwrap();
+    let request = || PromptRequest::new("execute only while authorized").request_id("revoked-server");
+    let (agent, events) = Nanocodex::builder(Claude::new(client.clone(), "original-model"))
+        .server_tool(nanocodex_claude::ServerToolDefinition::code_execution_current())
+        .durability(state).await.unwrap().build().unwrap();
+    assert!(agent.prompt(request()).await.unwrap().result().await.unwrap_err()
+        .execution_policy_disposition().is_some());
+    let _ = agent.shutdown().await;
+    drop((agent, events));
+    let (agent, events) = Nanocodex::builder(Claude::new(client, "new-model"))
+        .durability(reopen(&path).await).await.unwrap().build().unwrap();
+    let error = agent.prompt(request()).await.unwrap().result().await.unwrap_err();
+    assert!(error.to_string().contains("revoked by current host authorization"), "{error}");
+    assert_eq!(requests.lock().unwrap().len(), 1, "replayed pause cannot grant fresh HTTP authority");
+    assert_eq!(effects.load(Ordering::SeqCst), 0, "revoked continuation cannot execute");
+    println!("Claude revoked catalog after settled pause replay: requests=1 continuation effects=0");
+    let _ = agent.shutdown().await;
+    drop((agent, events));
+    server.abort();
+}
+
 // Compatibility fixture for a version-1 terminal failed checkpoint emitted
 // before failure finalization converted unresolved server calls. Seed it through
 // the public store API, then exercise the real provider boundary after reopen.
