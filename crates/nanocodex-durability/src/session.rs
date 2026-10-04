@@ -1800,6 +1800,12 @@ impl DurableSession {
         &self.state_id
     }
 
+    /// Shares this session's store transport for independently fenced child journals.
+    #[doc(hidden)]
+    pub fn child_store(&self) -> impl StateStore + Clone + Send + 'static {
+        self.store.clone()
+    }
+
     /// Copies the current reduced state from the owning driver.
     pub async fn state(&self) -> Result<DurableState> {
         let (result, receiver) = oneshot::channel();
