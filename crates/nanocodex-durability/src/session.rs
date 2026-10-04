@@ -487,28 +487,38 @@ impl Driver {
                     drop(result.send(self.state.documents.current.get(&key).cloned()));
                 }
                 Command::DocumentFork { boundary, result } => {
-                    let outcome =
-                        async {
-                            let payload =
-                                self.state.documents.boundaries.get(&boundary).ok_or_else(
-                                    || {
+                    let outcome = async {
+                        let payload = match self.state.documents.boundaries.get(&boundary) {
+                            Some(payload) => payload.clone(),
+                            None => {
+                                let key = crate::documents::boundary_key(&boundary);
+                                let reference = self
+                                    .store
+                                    .read_record(&self.state_id, &key)
+                                    .await?
+                                    .ok_or_else(|| {
                                         Error::InvalidState(format!(
                                             "document boundary `{boundary}` is not retained"
                                         ))
-                                    },
-                                )?;
-                            let record: crate::documents::Boundary = payload
-                                .load(&mut *self.store, &self.state_id)
-                                .await?
-                                .decode()?;
-                            let checkpoint = record
-                                .checkpoint
-                                .load(&mut *self.store, &self.state_id)
-                                .await?;
-                            let fork = self.state.documents.fork(&boundary, record)?;
-                            Ok((checkpoint, fork))
-                        }
-                        .await;
+                                    })?;
+                                serde_json::from_value::<EncodedPayload>(serde_json::Value::String(
+                                    reference,
+                                ))
+                                .map_err(Error::InvalidPayload)?
+                            }
+                        };
+                        let record: crate::documents::Boundary = payload
+                            .load(&mut *self.store, &self.state_id)
+                            .await?
+                            .decode()?;
+                        let checkpoint = record
+                            .checkpoint
+                            .load(&mut *self.store, &self.state_id)
+                            .await?;
+                        let fork = self.state.documents.fork(&boundary, record)?;
+                        Ok((checkpoint, fork))
+                    }
+                    .await;
                     drop(result.send(outcome));
                 }
                 Command::InitializeDocumentFork {
@@ -534,6 +544,7 @@ impl Driver {
                             }
                             next.documents.current.insert(key, doc);
                         }
+                        next.documents.validate()?;
                         self.persist(next).await
                     }
                     .await;
@@ -2078,16 +2089,19 @@ impl DurableSession {
     }
 
     /// Atomically initializes an empty destination with a policy-selected fork and checkpoint.
-    pub async fn initialize_document_fork<C: Serialize + ?Sized>(
+    pub async fn initialize_document_fork(
         &self,
         fork: crate::DocumentFork,
-        checkpoint: &C,
+        checkpoint: &EncodedPayload,
     ) -> Result<()> {
+        // The source session loaded this payload; preserve its contents rather than
+        // serializing the opaque record reference as the destination checkpoint.
+        checkpoint.json()?;
         let (result, receiver) = oneshot::channel();
         self.send(Command::InitializeDocumentFork {
             caller: Caller::Direct(self.caller_id.clone()),
             fork,
-            checkpoint: EncodedPayload::encode(checkpoint)?,
+            checkpoint: checkpoint.clone(),
             result,
         })
         .await?;

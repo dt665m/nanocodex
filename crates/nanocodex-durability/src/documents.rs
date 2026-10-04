@@ -51,8 +51,9 @@ pub struct DocumentWrite {
 #[serde(deny_unknown_fields)]
 pub(crate) struct Documents {
     pub(crate) current: BTreeMap<String, SessionDocument>,
-    // Boundaries are immutable content-addressed records, retained independently
-    // of bounded operation receipts. No external effect is part of this commit.
+    // Legacy indexes are read on migration; new boundaries exist only until staged.
+    // The execution head never serializes an unbounded boundary index.
+    #[serde(default, skip_serializing)]
     pub(crate) boundaries: BTreeMap<String, EncodedPayload>,
 }
 
@@ -128,6 +129,20 @@ impl Documents {
                 },
             );
         }
+        self.validate()
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.current.len() > 64
+            || serde_json::to_vec(&self.current)
+                .map_err(Error::InvalidPayload)?
+                .len()
+                > 65_536
+        {
+            return Err(Error::InvalidState(
+                "session documents exceed 64 documents or 65536 encoded bytes".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -158,4 +173,9 @@ impl Documents {
             documents,
         })
     }
+}
+
+// Namespaced, deterministic lookup identity; content records remain content addressed.
+pub(crate) fn boundary_key(id: &str) -> String {
+    format!("document-boundary/{}", crate::state::record_key(id))
 }

@@ -226,3 +226,16 @@ apply. Operation terminals atomically carry their checkpoint and replay receipt.
 Unlike a store that stages an output separately from source-ordered transcript
 placement, this store owns one opaque total state. A second materialization
 write would add latency without adding a recovery boundary.
+
+Session documents are committed through `complete_with_documents` or
+`complete_step_with_documents`, together with the corresponding receipt. Keys
+are limited to 256 bytes; a session retains at most 64 documents and 65,536 bytes
+of encoded current document metadata and values, including creation values.
+Oversized transactions and version conflicts change neither receipts nor documents.
+Immutable historical snapshots use operation-derived lookup records in the
+`StateStore`; the execution head has no growing boundary index. Legacy format-5
+heads with a boundary index are migrated into these records on their next commit.
+`document_fork(operation_id)` returns a loaded `EncodedPayload` checkpoint and a
+policy-selected seed. Pass that checkpoint directly to
+`initialize_document_fork(seed, &checkpoint)` in an empty destination; the
+checkpoint contents are copied into the destination store with its documents.

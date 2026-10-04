@@ -163,7 +163,7 @@ impl EncodedPayload {
     }
 }
 
-fn record_key(value: &str) -> String {
+pub(crate) fn record_key(value: &str) -> String {
     use sha2::{Digest, Sha256};
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut encoded = String::with_capacity(64);
@@ -484,8 +484,12 @@ struct RetainedCheckpointRef<'a> {
 impl DurableState {
     pub(crate) fn stage_records(&mut self) -> Vec<crate::StoreRecord> {
         let mut records = Vec::new();
-        for boundary in self.documents.boundaries.values_mut() {
+        for (id, mut boundary) in std::mem::take(&mut self.documents.boundaries) {
             boundary.stage(&mut records);
+            records.push(crate::StoreRecord {
+                key: crate::documents::boundary_key(&id),
+                value: boundary.key.to_string(),
+            });
         }
         for operation in self.operations.values_mut() {
             operation.input.stage(&mut records);

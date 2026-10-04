@@ -211,8 +211,7 @@ async fn process_journey() {
         );
         for destination in ["branch-a", "branch-b"] {
             let (checkpoint, fork) = source.document_fork("early").await.unwrap();
-            let checkpoint: Value = checkpoint.decode().unwrap();
-            assert_eq!(checkpoint, json!({"cursor":1}));
+            assert_eq!(checkpoint.decode::<Value>().unwrap(), json!({"cursor":1}));
             let branch = DurableSession::open(SqliteStore::open(&db).unwrap(), destination)
                 .await
                 .unwrap();
@@ -220,6 +219,16 @@ async fn process_journey() {
                 .initialize_document_fork(fork, &checkpoint)
                 .await
                 .unwrap();
+            assert_eq!(
+                branch
+                    .latest_checkpoint()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .decode::<Value>()
+                    .unwrap(),
+                json!({"cursor":1})
+            );
             assert_eq!(
                 branch.document("initial").await.unwrap().unwrap().value,
                 json!(1)
