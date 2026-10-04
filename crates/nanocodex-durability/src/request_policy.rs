@@ -8,6 +8,46 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use crate::{Error, Result};
 
+const MAX_RECEIPTS: usize = 256;
+const MAX_POLICY_BYTES: usize = 16 * 1024 * 1024;
+
+fn bounded<T: Serialize>(value: &T) -> Result<()> {
+    if serde_json::to_vec(value)?.len() > MAX_POLICY_BYTES {
+        return Err(invalid("request policy checkpoint exceeds 16 MiB; start a new branch"));
+    }
+    Ok(())
+}
+
+/// Whether provider-native continuation data forbids a physical model switch.
+pub(crate) fn contains_opaque(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => object.contains_key("signature") || object.contains_key("encrypted_content")
+            || object.get("type").and_then(Value::as_str).is_some_and(|kind| matches!(kind,
+                "redacted_thinking" | "image" | "document" | "input_image" | "input_audio" | "input_file" | "audio"))
+            || object.values().any(contains_opaque),
+        Value::Array(values) => values.iter().any(contains_opaque),
+        _ => false,
+    }
+}
+
+fn native_tools(request: &Value) -> Vec<Value> {
+    if let Some(items) = request["input"].as_array() {
+        if let Some(item) = items.iter().find(|item| item["type"] == "additional_tools") {
+            return item["tools"].as_array().cloned().unwrap_or_default();
+        }
+    }
+    request["tools"].as_array().cloned().unwrap_or_default()
+}
+
+pub(crate) fn authorize_native(request: &Value, authorized: &Value) -> Result<()> {
+    let catalog = native_tools(authorized);
+    if native_tools(request).iter().any(|definition| !catalog.contains(definition)) {
+        return Err(invalid("prepared request contains a declaration revoked by current host authorization"));
+    }
+    Ok(())
+}
+
+
 /// One named instruction section, ordered by first insertion (re-add appends).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PromptSection {
@@ -246,6 +286,10 @@ impl RequestPolicyState {
             validate_limits(&request, saved.route.dispatched, models)?;
             return Ok(saved.clone());
         }
+        if self.requests.len() >= MAX_RECEIPTS {
+            return Err(invalid("request policy receipt limit reached (256); start a new branch"));
+        }
+        bounded(self)?;
         let previous = self.requests.last();
         let state = previous.map_or(&Value::Null, |p| &p.route.state);
         let choice = if let Some(id) = &request.continuation_of {
@@ -283,8 +327,11 @@ impl RequestPolicyState {
         let request_json = render(&configuration, choice.dispatched)?;
         serde_json::from_str::<Value>(&request_json)?;
         let prepared = PreparedRequest { request, route: choice, request_json, configuration, original_request: None };
-        self.configuration = history;
-        self.requests.push(prepared.clone());
+        let mut next = self.clone();
+        next.configuration = history;
+        next.requests.push(prepared.clone());
+        bounded(&next)?;
+        *self = next;
         Ok(prepared)
     }
 }
@@ -334,9 +381,10 @@ impl RequestPolicySettings {
     /// Retries replay the exact receipt, irrespective of a changed host router.
     pub fn prepare_native(&self, id: String, continuation: bool, switch_safe: bool,
         state: Value, request: Value, family: HarnessFamily) -> Result<PreparedNativeRequest> {
+        bounded(&state)?;
         let mut state: RequestPolicyState = if state.is_null() { RequestPolicyState::default() }
             else { serde_json::from_value(state)? };
-        let catalog: Vec<ToolDeclaration> = request["tools"].as_array().into_iter().flatten()
+        let catalog: Vec<ToolDeclaration> = native_tools(&request).iter()
             .map(|definition| Ok(ToolDeclaration {
                 name: definition["name"].as_str().or_else(|| definition["type"].as_str())
                     .ok_or_else(|| invalid("native declaration lacks name"))?.into(),
@@ -367,7 +415,10 @@ impl RequestPolicySettings {
         }
         let original = request.clone();
         let output = request[if family == HarnessFamily::Claude { "max_tokens" } else { "max_output_tokens" }]
-            .as_u64().ok_or_else(|| invalid("native request lacks output limit"))?;
+            .as_u64().or_else(|| (family == HarnessFamily::Codex).then(||
+                self.models.iter().filter(|physical| physical.model.family() == family)
+                    .map(|physical| physical.max_output_tokens).min()).flatten())
+            .ok_or_else(|| invalid("native request lacks output limit"))?;
         // A byte bound is conservative for inline textual requests. External
         // media has unknown token cost and needs a native measured estimator.
         reject_external_media(&request)?;
@@ -388,6 +439,21 @@ impl RequestPolicySettings {
                     };
                     system.extend(configuration.sections.iter().map(|section| serde_json::json!({"type":"text", "text":section.text})));
                     if !system.is_empty() { rendered["system"] = Value::Array(system); }
+                } else if rendered["input"].as_array().is_some_and(|items| items.iter().any(|item| item["type"] == "additional_tools")) {
+                    let items = rendered["input"].as_array_mut().expect("checked Lite input");
+                    let index = items.iter().position(|item| item["type"] == "additional_tools").expect("checked declaration");
+                    let definitions = Value::Array(configuration.tools.iter().map(|tool| tool.definition.clone()).collect());
+                    if items[index]["tools"] != definitions {
+                        items[index]["tools"] = definitions;
+                        // A changed declaration must not reuse a provider item identity.
+                        items[index].as_object_mut().expect("declaration object").remove("id");
+                    }
+                    if !configuration.sections.is_empty() {
+                        let position = items.iter().position(|item| item["type"] == "message" && item["role"] == "developer")
+                            .map_or(index + 1, |position| position + 1);
+                        items.insert(position, serde_json::json!({"type":"message", "role":"developer",
+                            "content":[{"type":"input_text", "text":configuration.instructions()}]}));
+                    }
                 } else {
                     let base = rendered["instructions"].as_str().unwrap_or("");
                     let additional = configuration.instructions();
@@ -395,9 +461,11 @@ impl RequestPolicySettings {
                         rendered["instructions"] = if base.is_empty() { additional } else { format!("{base}\n\n{additional}") }.into();
                     }
                 }
-                if rendered.get("tools").is_some() || !configuration.tools.is_empty() {
+                if !(family == HarnessFamily::Codex && rendered["input"].as_array().is_some_and(|items| items.iter().any(|item| item["type"] == "additional_tools")))
+                    && (rendered.get("tools").is_some() || !configuration.tools.is_empty()) {
                     rendered["tools"] = Value::Array(configuration.tools.iter().map(|tool| tool.definition.clone()).collect());
                 }
+                if family == HarnessFamily::Codex { rendered["max_output_tokens"] = output.into(); }
                 rendered["model"] = model.as_str().into();
                 validate_native_controls(&rendered, model)?;
                 Ok(serde_json::to_string(&rendered)?)
@@ -407,6 +475,7 @@ impl RequestPolicySettings {
         validate_limits(&limits, prepared.route.dispatched, &self.models)?;
         prepared.original_request = Some(original);
         *state.requests.last_mut().expect("new receipt") = prepared.clone();
+        bounded(&state)?;
         Ok(PreparedNativeRequest {
             request: serde_json::from_str(&prepared.request_json)?, state: serde_json::to_value(state)?,
         })
@@ -437,7 +506,7 @@ fn reject_external_media(value: &Value) -> Result<()> {
 
 fn validate_native_controls(request: &Value, model: HarnessModel) -> Result<()> {
     // A model rewrite must never silently reinterpret adaptive thinking or speed.
-    if request["speed"] == "fast" && !model.supports_fast_mode() {
+    if (request["speed"] == "fast" || request["service_tier"] == "priority") && !model.supports_fast_mode() {
         return Err(invalid("dispatched model does not support requested fast mode"));
     }
     let effort = request["output_config"]["effort"].as_str().or_else(|| request["reasoning"]["effort"].as_str());
@@ -458,6 +527,13 @@ fn validate_native_controls(request: &Value, model: HarnessModel) -> Result<()> 
 #[cfg(feature = "claude")]
 pub trait DurableClaudeRequestExt: Sized {
     /// Acquire the native durable owner and install persisted request decisions.
+    fn durability_with_request_policy(self, state: crate::DurableSession, settings: RequestPolicySettings)
+        -> impl std::future::Future<Output = nanocodex_agent::Result<Self>>;
+}
+
+/// Optional request policy installed on an OpenAI-native durable builder.
+pub trait DurableOpenAiRequestExt: Sized {
+    /// Acquire the durable owner and freeze native configuration/routing before dispatch.
     fn durability_with_request_policy(self, state: crate::DurableSession, settings: RequestPolicySettings)
         -> impl std::future::Future<Output = nanocodex_agent::Result<Self>>;
 }

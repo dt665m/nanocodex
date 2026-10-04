@@ -24,8 +24,21 @@ pub trait DurableAgentExt: Sized {
 
 impl<F> DurableAgentExt for NanocodexBuilder<F> {
     async fn durability(self, state: DurableSession) -> AgentResult<Self> {
+        attach(self, state, None).await
+    }
+}
+
+impl<F> crate::request_policy::DurableOpenAiRequestExt for NanocodexBuilder<F> {
+    async fn durability_with_request_policy(self, state: DurableSession,
+        settings: crate::request_policy::RequestPolicySettings) -> AgentResult<Self> {
+        attach(self, state, Some(settings)).await
+    }
+}
+
+async fn attach<F>(builder: NanocodexBuilder<F>, state: DurableSession,
+    settings: Option<crate::request_policy::RequestPolicySettings>) -> AgentResult<NanocodexBuilder<F>> {
         let state_id = state.state_id().to_owned();
-        let mut builder = self;
+        let mut builder = builder;
         let (owner, checkpoint) = state.acquire_agent().await.map_err(agent_error)?;
         let mut known_records = HashSet::new();
         if let Some(checkpoint) = checkpoint {
@@ -70,17 +83,18 @@ impl<F> DurableAgentExt for NanocodexBuilder<F> {
                                 .to_owned(),
                         )
                     })?;
-                let policy = DurableExecution::ready(owner);
+                let mut policy = DurableExecution::ready(owner);
+                policy.settings = settings.clone();
                 policy.remember(keys)?;
                 let policy: Arc<dyn ExecutionPolicy> = Arc::new(policy);
                 Ok(policy)
             }) )
-    }
 }
 
 struct DurableExecution {
     owner: DurableOwner,
     context_records: Mutex<HashSet<String>>,
+    settings: Option<crate::request_policy::RequestPolicySettings>,
 }
 
 impl DurableExecution {
@@ -88,6 +102,7 @@ impl DurableExecution {
         Self {
             owner,
             context_records: Mutex::new(HashSet::new()),
+            settings: None,
         }
     }
 
@@ -108,6 +123,37 @@ impl DurableExecution {
 }
 
 impl ExecutionPolicy for DurableExecution {
+    fn prepare_request<'a>(&'a self, operation: String, request_id: String,
+        continuation: bool, state: serde_json::Value, request: serde_json::Value,
+        authorized: serde_json::Value) -> ExecutionFuture<'a, AgentResult<Option<nanocodex_agent::execution::RequestPreparation>>> {
+        Box::pin(async move {
+            let Some(settings) = &self.settings else { return Ok(None); };
+            let step = format!("prepare/{request_id}");
+            let input = serde_json::json!({"request":request, "state":state, "continuation":continuation});
+            let prepared = match self.owner.begin_step(operation.clone(), step.clone(),
+                "request_policy".into(), &input, crate::ReplaySafety::Safe).await.map_err(agent_error)? {
+                BeginStep::OutcomeUnknown => return Err(agent_error(Error::InvalidState("request preparation outcome is unknown".into()))),
+                BeginStep::Replay(value) => {
+                    let receipt: nanocodex_agent::execution::RequestPreparation = value.decode().map_err(agent_error)?;
+                    settings.prepare_native(request_id, continuation, false, receipt.state, request,
+                        nanocodex_agent::HarnessFamily::Codex).map_err(agent_error)?
+                },
+                BeginStep::Execute => {
+                    let safe = !continuation && !crate::request_policy::contains_opaque(&request);
+                    let prepared = settings.prepare_native(request_id, continuation, safe, state, request,
+                        nanocodex_agent::HarnessFamily::Codex).map_err(agent_error)?;
+                    let receipt = nanocodex_agent::execution::RequestPreparation {
+                        request: prepared.request.clone(), state: prepared.state.clone(),
+                    };
+                    self.owner.complete_step(operation, step, &receipt).await.map_err(agent_error)?;
+                    prepared
+                }
+            };
+            crate::request_policy::authorize_native(&prepared.request, &authorized).map_err(agent_error)?;
+            Ok(Some(nanocodex_agent::execution::RequestPreparation { request: prepared.request, state: prepared.state }))
+        })
+    }
+
     fn recover_failure<'a>(
         &'a self,
         operation_id: String,
