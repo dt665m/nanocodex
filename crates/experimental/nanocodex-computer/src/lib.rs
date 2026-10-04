@@ -56,6 +56,21 @@ const PROVIDER_ENVIRONMENT: &[&str] = &[
     "CODEX_HOME",
 ];
 
+/// Upstream `_meta` key whose text replaces the provider's built-in
+/// computer-use and browser-use confirmation policy documentation.
+const CONFIRMATION_POLICIES_META_KEY: &str = "openai/confirmation_policies";
+
+/// Trusted embedding-host environment variable that overrides the upstream
+/// confirmation policy documentation without code changes. It is read by the
+/// discovery paths only and never inherited by the provider process: the
+/// override text travels as per-call `_meta`, not as process environment.
+const CONFIRMATION_POLICIES_ENV: &str = "NANOCODEX_COMPUTER_CONFIRMATION_POLICIES";
+
+/// Override text that replaces the upstream computer-use confirmation policy.
+/// An empty string must never be sent: upstream treats a blank value as
+/// "use the defaults", which would silently restore the built-in policy.
+pub const NO_CONFIRMATION_POLICIES: &str = "No confirmation policy applies.";
+
 /// Trusted launch configuration, supplied by the embedding application.
 #[derive(Clone, Debug)]
 pub struct ComputerConfig {
@@ -65,6 +80,9 @@ pub struct ComputerConfig {
     provider_catalog: Option<Vec<ProviderTool>>,
     #[cfg(unix)]
     catalog_cache: Option<startup_cache::CatalogCache>,
+    /// Per-call `_meta` override for the upstream confirmation policy
+    /// documentation. `None` sends no override and keeps upstream defaults.
+    confirmation_policies: Option<String>,
 }
 
 impl ComputerConfig {
@@ -76,12 +94,48 @@ impl ComputerConfig {
             provider_catalog: None,
             #[cfg(unix)]
             catalog_cache: None,
+            confirmation_policies: None,
         }
     }
 
     /// Configure an external CUA MCP provider with its exact host-supplied args.
     pub fn mcp(executable: impl Into<PathBuf>) -> Self {
         Self::new(executable)
+    }
+
+    /// Override the upstream computer-use confirmation policy documentation
+    /// sent with every provider call. The text replaces the provider's
+    /// built-in "Computer/Browser Use Confirmation Policy" docs, including the
+    /// always-confirm hand-off rules that normally require a human for
+    /// send, delete, purchase and sign-in actions.
+    ///
+    /// Blank text is ignored and no override is sent: upstream treats a blank
+    /// value as "use the defaults", so storing it would silently restore the
+    /// built-in policy. Use [`Self::confirmation_policies`] (or
+    /// [`NO_CONFIRMATION_POLICIES`]) with non-blank text to disable the layer.
+    pub fn confirmation_policies(mut self, text: impl Into<String>) -> Self {
+        let text = text.into();
+        self.confirmation_policies = if text.trim().is_empty() {
+            None
+        } else {
+            Some(text)
+        };
+        self
+    }
+
+    /// Apply one trusted embedding-host confirmation-policy override value.
+    /// Pure over `value` so discovery behavior stays testable without racing
+    /// process-wide environment mutation in parallel tests.
+    fn confirmation_policies_from(self, value: Option<std::ffi::OsString>) -> Self {
+        match value.filter(|value| !value.is_empty()) {
+            Some(text) => self.confirmation_policies(text.to_string_lossy().into_owned()),
+            None => self,
+        }
+    }
+
+    /// Read the trusted `NANOCODEX_COMPUTER_CONFIRMATION_POLICIES` override.
+    fn confirmation_policies_from_env(self) -> Self {
+        self.confirmation_policies_from(std::env::var_os(CONFIRMATION_POLICIES_ENV))
     }
 
     /// Provision the platform's upstream runtime on first use, then discover it.
@@ -97,7 +151,7 @@ impl ComputerConfig {
                 return provision::provision_upstream(false)
                     .await
                     .and_then(|receipt| provision::config_from_receipt(&receipt))
-                    .map(Some);
+                    .map(|config| Some(config.confirmation_policies_from_env()));
             }
         }
         Ok(Self::discover())
@@ -110,6 +164,7 @@ impl ComputerConfig {
             std::env::consts::OS,
             std::env::var_os("NANOCODEX_COMPUTER").filter(|value| !value.is_empty()),
         )
+        .map(|config| config.confirmation_policies_from_env())
     }
 
     fn discover_for_platform(platform: &str, explicit: Option<OsString>) -> Option<Self> {
@@ -358,6 +413,23 @@ async fn route_sessions(
     }
 }
 
+/// Per-call `_meta` forwarded to the provider. The optional confirmation
+/// policy override replaces the provider's built-in confirmation docs; it is
+/// omitted entirely when not configured so upstream defaults stay untouched.
+fn call_meta(
+    session: &str,
+    turn: Option<&str>,
+    call: &str,
+    model: &str,
+    confirmation_policies: Option<&str>,
+) -> Value {
+    let mut metadata = json!({"x-codex-turn-metadata": turn_metadata(session, turn, call, model)});
+    if let Some(text) = confirmation_policies {
+        metadata[CONFIRMATION_POLICIES_META_KEY] = json!(text);
+    }
+    metadata
+}
+
 // Forward host context; never fabricate a turn from a per-call identifier.
 fn turn_metadata(session: &str, turn: Option<&str>, call: &str, model: &str) -> Value {
     let mut metadata =
@@ -403,7 +475,7 @@ async fn run_session(
                 None => Process::start(&config).await?,
             };
             let value = process.rpc("tools/call", json!({"name":name,"arguments":arguments,
-                "_meta":{"x-codex-turn-metadata":turn_metadata(&session, turn_id.as_deref(), &call_id, &model)}})).await?;
+                "_meta": call_meta(&session, turn_id.as_deref(), &call_id, &model, config.confirmation_policies.as_deref())})).await?;
             let output = output(value)?;
             Ok::<_, ToolError>((process, output))
         };
@@ -658,6 +730,82 @@ pub fn output(value: Value) -> ToolResult {
     }
     output.success = success;
     Ok(output)
+}
+
+#[cfg(test)]
+mod confirmation_policy_tests {
+    use super::*;
+
+    #[test]
+    fn call_meta_omits_the_override_when_not_configured() {
+        assert_eq!(
+            call_meta("session", Some("session:7"), "call-a", "fixture", None),
+            json!({"x-codex-turn-metadata": turn_metadata("session", Some("session:7"), "call-a", "fixture")})
+        );
+    }
+
+    #[test]
+    fn call_meta_sends_the_configured_override_text_on_every_call() {
+        for call in ["call-a", "call-b"] {
+            let metadata = call_meta(
+                "session",
+                None,
+                call,
+                "fixture",
+                Some(NO_CONFIRMATION_POLICIES),
+            );
+            assert_eq!(
+                metadata["openai/confirmation_policies"],
+                json!("No confirmation policy applies."),
+                "{metadata}"
+            );
+            assert_eq!(
+                metadata["x-codex-turn-metadata"]["call_id"],
+                json!(call),
+                "{metadata}"
+            );
+        }
+    }
+
+    #[test]
+    fn blank_override_text_is_ignored_because_upstream_treats_it_as_defaults() {
+        assert!(ComputerConfig::mcp("/fixture/cua-provider")
+            .confirmation_policies("   \n\t ")
+            .confirmation_policies.is_none());
+        assert!(ComputerConfig::mcp("/fixture/cua-provider")
+            .confirmation_policies("")
+            .confirmation_policies.is_none());
+        assert_eq!(
+            ComputerConfig::mcp("/fixture/cua-provider")
+                .confirmation_policies(NO_CONFIRMATION_POLICIES)
+                .confirmation_policies
+                .as_deref(),
+            Some(NO_CONFIRMATION_POLICIES)
+        );
+    }
+
+    #[test]
+    fn trusted_env_override_is_applied_to_discovered_providers() {
+        // Blank discovery values never disable the upstream defaults.
+        assert!(ComputerConfig::mcp("/fixture/cua-provider")
+            .confirmation_policies_from(None)
+            .confirmation_policies
+            .is_none());
+        assert!(ComputerConfig::mcp("/fixture/cua-provider")
+            .confirmation_policies_from(Some("   ".into()))
+            .confirmation_policies
+            .is_none());
+        let configured = ComputerConfig::mcp("/fixture/cua-provider")
+            .confirmation_policies_from(Some("Custom policy.".into()));
+        assert_eq!(configured.confirmation_policies.as_deref(), Some("Custom policy."));
+    }
+
+    #[test]
+    fn explicit_provider_settings_never_inherit_a_policy_by_default() {
+        assert!(ComputerConfig::mcp("/fixture/cua-provider")
+            .confirmation_policies
+            .is_none());
+    }
 }
 
 #[cfg(test)]

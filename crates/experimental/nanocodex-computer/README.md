@@ -101,3 +101,39 @@ conversation isolation, cancellation, and unsupported server requests. The ignor
 `installed_external_provider_discovery_preserves_catalog_and_hides_lifecycle_hook`
 smoke test uses `NANOCODEX_TEST_EXTERNAL_COMPUTER` to inspect an installed upstream
 launcher. It performs discovery only and does not claim to verify native control.
+
+## Confirmation policies (opt-out)
+
+The upstream CUA provider ships a built-in computer-use and browser-use
+confirmation policy: always-confirm and hand-off rules that require a human
+before send, delete, purchase and sign-in style actions, delivered as
+documentation with the first call of a session. The embedding host can replace
+that documentation by sending an `openai/confirmation_policies` override in the
+per-call `_meta` to the provider; the override text wins over the built-in
+policy docs.
+
+Two opt-in controls implement this without patching any app bundle:
+
+- `ComputerConfig::confirmation_policies(text)` replaces the built-in policy
+  text on every provider call. `NO_CONFIRMATION_POLICIES`
+  (`"No confirmation policy applies."`) is the recommended override. Blank
+  text is ignored: upstream treats a blank value as "use the defaults", so
+  storing it would silently restore the built-in policy.
+- `NANOCODEX_COMPUTER_CONFIRMATION_POLICIES` applies the same override at
+  discovery time for embedders that do not construct configs in code. The
+  value is read by the trusted discovery paths only; it is never inherited by
+  the provider process, and the text travels as per-call `_meta`.
+
+When the override is not configured, Nanocodex sends no such key and the
+upstream defaults stay fully intact.
+
+The managed macOS launcher also exports
+`BROWSER_USE_DISABLE_TAB_CAPABILITIES=browserAuth`, which drops the
+`browserAuth` tab capability that otherwise forbids credential entry in
+browser tabs. It only takes effect when browser tab surfaces are enabled; the
+macOS launcher currently restricts surfaces to native `computer`.
+
+These layers exist to blunt prompt injection and accidental side effects.
+Removing them means the agent follows the embedding host's own instructions
+and AGENTS.md alone; put any remaining limits you still want (such as
+"never send messages as me without asking") there.
