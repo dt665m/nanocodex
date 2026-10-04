@@ -299,12 +299,8 @@ impl Drop for PendingCallReceipts {
 }
 
 enum CellTerminal {
-    Completed {
-        stored: HashMap<String, Value>,
-    },
-    ScriptFailed {
-        message: String,
-    },
+    Completed { stored: HashMap<String, Value> },
+    ScriptFailed { message: String },
     Terminated,
 }
 
@@ -462,7 +458,11 @@ impl CodeModeRuntime {
         }
         let (stored, document_version) = if let Some(journal) = &self.journal {
             match journal
-                .admit_cell(&context.session_id, context.journal_scope.as_deref().unwrap_or(&context.call_id), source.code.as_str())
+                .admit_cell(
+                    &context.session_id,
+                    context.journal_scope.as_deref().unwrap_or(&context.call_id),
+                    source.code.as_str(),
+                )
                 .await
             {
                 Ok(CodeJournalAdmission::Execute { stored, version }) => (stored, version),
@@ -1297,18 +1297,31 @@ fn text_exposes_session_id(text: &str, session_id: i64) -> bool {
     })
 }
 
+struct DriveCellContext<'a> {
+    parent_call_id: &'a str,
+    tools: &'a ToolRegistry,
+    context: &'a OwnedToolContext,
+    updates: &'a mpsc::UnboundedSender<CellUpdate>,
+    actor_started_at: Instant,
+    journal: Option<&'a dyn CodeModeJournal>,
+    captured: Arc<StdMutex<JournalOutput>>,
+}
+
 impl EmbeddedHost {
     async fn drive_cell(
         &mut self,
         cell_id: u64,
-        parent_call_id: &str,
-        tools: &ToolRegistry,
-        context: &OwnedToolContext,
-        updates: &mpsc::UnboundedSender<CellUpdate>,
-        actor_started_at: Instant,
-        journal: Option<&dyn CodeModeJournal>,
-        captured: Arc<StdMutex<JournalOutput>>,
+        drive: DriveCellContext<'_>,
     ) -> Result<CellTerminal, HostFailure> {
+        let DriveCellContext {
+            parent_call_id,
+            tools,
+            context,
+            updates,
+            actor_started_at,
+            journal,
+            captured,
+        } = drive;
         let mut pending_calls: FuturesUnordered<BoxFuture<'_, CompletedNestedCall>> =
             FuturesUnordered::new();
         let mut pending_receipts = PendingCallReceipts {
@@ -1499,13 +1512,15 @@ async fn run_cell_actor(
             .map_err(HostFailure::new)?;
         host.drive_cell(
             cell_id,
-            context.journal_scope.as_deref().unwrap_or(&context.call_id),
-            tools.as_ref(),
-            &context,
-            &updates,
-            started_at,
-            journal.as_deref(),
-            Arc::clone(&captured),
+            DriveCellContext {
+                parent_call_id: context.journal_scope.as_deref().unwrap_or(&context.call_id),
+                tools: tools.as_ref(),
+                context: &context,
+                updates: &updates,
+                actor_started_at: started_at,
+                journal: journal.as_deref(),
+                captured: Arc::clone(&captured),
+            },
         )
         .await
     };
@@ -1596,7 +1611,12 @@ async fn run_cell_actor(
                 _ => None,
             };
             result = journal
-                .complete_cell(context.journal_scope.as_deref().unwrap_or(&context.call_id), document_version, next_stored, &receipt)
+                .complete_cell(
+                    context.journal_scope.as_deref().unwrap_or(&context.call_id),
+                    document_version,
+                    next_stored,
+                    &receipt,
+                )
                 .await;
         }
         result
