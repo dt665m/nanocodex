@@ -9,6 +9,8 @@ mod context;
 mod documents;
 pub use documents::{DocumentFork, DocumentForkPolicy, DocumentWrite, SessionDocument};
 mod memory;
+/// Named configuration, virtual routing and cache decisions at durable request boundaries.
+pub mod request_policy;
 #[cfg(all(feature = "postgres", not(target_family = "wasm")))]
 mod postgres;
 mod session;
