@@ -111,7 +111,7 @@ impl Registry {
         {
             let state = self.state.lock().await;
             if state.root_by_session.contains_key(session)
-                || !state.scopes.get(session).is_some_and(|scope| scope.journal.is_some()) {
+                || !state.scopes.get(session).is_some_and(|scope| scope.journal.is_some() && !scope.sessions.is_empty()) {
                 return Ok(());
             }
         }
