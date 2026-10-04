@@ -3973,6 +3973,12 @@ export class DurableAgentSession extends DurableComputerObject {
       .toArray().some(({ name }) => name === "source_cursor")) {
       this.ctx.storage.sql.exec("ALTER TABLE history_projection_outbox ADD COLUMN source_cursor TEXT NOT NULL DEFAULT '0'");
     }
+    // A bounded wakeup hint survives loss of the live child bindings. Rust's
+    // recovery report remains authoritative for whether background work exists.
+    this.ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS managed_child_recovery (
+      singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+      generation INTEGER NOT NULL, pending INTEGER NOT NULL
+    )`);
     this.#eventLog = new DurableEventLog<StreamMessage>(this.ctx.storage, event => this.#operations.record(event, this.#sessionId()));
     this.#codeEffectJournal = createManagedCodeEffectJournal(this.ctx.storage);
     this.#eventArchive = new ManagedEventArchive<StreamMessage>(
@@ -5487,7 +5493,7 @@ export class DurableAgentSession extends DurableComputerObject {
       await this.#scheduleNextAlarm();
       return;
     }
-    if (this.#recoverableTurnCount() > 0 || this.#goalRuntime.pending()) {
+    if (this.#recoverableTurnCount() > 0 || this.#goalRuntime.pending() || this.#backgroundChildrenPending()) {
       // Recovery remains the sole owner of a retained retry_at and installs
       // the next alarm from the same ordered pass that evaluates that row.
       this.#scheduleRecovery();
@@ -8700,7 +8706,7 @@ export class DurableAgentSession extends DurableComputerObject {
     this.#assertDeletionGeneration(generation);
     CloudflareAgent.destroy(this);
     this.ctx.storage.transactionSync(() => {
-      for (const table of ["managed_recovery_safety", "managed_recovery_progress", "managed_recovery_call_indices", "managed_code_effect_legacy_parents", "managed_code_effect_legacy_sessions", "managed_code_effect_migration", "managed_code_effect_runtime", "managed_code_effects", "managed_code_effect_receipt_chunks", "managed_configuration", "managed_environment_setup", "managed_webhook", "managed_webhook_deliveries", "managed_turn_usage", "managed_model_usage", "managed_artifacts", "managed_artifact_publications", "managed_output_checkpoints", "managed_output_checkpoint_chunks", "managed_turn_file_owners", "managed_connect_inputs"]) this.ctx.storage.sql.exec(`DELETE FROM ${table}`);
+      for (const table of ["managed_recovery_safety", "managed_recovery_progress", "managed_recovery_call_indices", "managed_child_recovery", "managed_code_effect_legacy_parents", "managed_code_effect_legacy_sessions", "managed_code_effect_migration", "managed_code_effect_runtime", "managed_code_effects", "managed_code_effect_receipt_chunks", "managed_configuration", "managed_environment_setup", "managed_webhook", "managed_webhook_deliveries", "managed_turn_usage", "managed_model_usage", "managed_artifacts", "managed_artifact_publications", "managed_output_checkpoints", "managed_output_checkpoint_chunks", "managed_turn_file_owners", "managed_connect_inputs"]) this.ctx.storage.sql.exec(`DELETE FROM ${table}`);
       this.ctx.storage.sql.exec("DROP TABLE IF EXISTS managed_fork_seed");
       this.ctx.storage.sql.exec("DELETE FROM managed_turn_dispatch_chunks");
       this.ctx.storage.sql.exec("DELETE FROM managed_turn_input_chunks");
@@ -8897,7 +8903,43 @@ export class DurableAgentSession extends DurableComputerObject {
       const admitted = this.#managedTurn(current.id);
       if (admitted && (admitted.state === "cancelling" || admitted.retry_at !== null)) break;
     }
-    try { if (this.#goalRuntime.pending()) await this.#continueGoal(); } finally { await this.#scheduleNextAlarm(); }
+    try {
+      if (this.#backgroundChildrenPending()) await this.#recoverBackgroundChildren();
+      if (this.#goalRuntime.pending()) await this.#continueGoal();
+    } finally { await this.#scheduleNextAlarm(); }
+  }
+
+  #backgroundChildrenPending(): boolean {
+    return this.ctx.storage.sql.exec<{ pending: number }>(
+      "SELECT pending FROM managed_child_recovery WHERE singleton = 1",
+    ).toArray()[0]?.pending === 1;
+  }
+
+  async #recoverBackgroundChildren(): Promise<void> {
+    if (this.#deleting || this.#deleted || this.#durabilityExported
+      || this.#durabilityImportState === "pending") return;
+    const generation = this.ctx.storage.sql.exec<{ generation: number }>(
+      "SELECT generation FROM managed_child_recovery WHERE singleton = 1",
+    ).toArray()[0]?.generation;
+    const runtimeGeneration = this.#runtimeOwnershipGeneration;
+    // Reconstruction obtains current credentials, tools and routing grants.
+    // Do not re-admit a terminal foreground parent just to wake its children.
+    const agent = await this.#ensureAgent();
+    const recovered = await Subagents.recover(agent);
+    const active = recovered.agents.filter(child => child.status.state === "pending"
+      || child.status.state === "running");
+    if (recovered.backgroundPending && active.length) await Subagents.wait(agent, {
+      agentIds: active.map(child => child.agent_id), timeoutMs: 10_000,
+    });
+    const settled = await Subagents.recover(agent);
+    if (this.#deleting || this.#agent !== agent
+      || this.#runtimeOwnershipGeneration !== runtimeGeneration) return;
+    // A newer bind may have raced this awaited report. Keep its wakeup until a
+    // later pass observes it; completed retained receipts alone stop polling.
+    this.ctx.storage.sql.exec(
+      "UPDATE managed_child_recovery SET pending = ? WHERE singleton = 1 AND generation = ?",
+      settled.backgroundPending ? 1 : 0, generation!,
+    );
   }
 
   #prepareActiveConversation(authorization: TurnAuthorization): void {
@@ -10198,6 +10240,13 @@ export class DurableAgentSession extends DurableComputerObject {
         preserveRootTransport: !this.#threadRoute(),
         subagentLifecycle: (event: unknown) => {
           applyManagedSubagentLifecycle(this.ctx.storage, bindings, event);
+          if ((event as { type: string }).type === "bind") {
+            // Bind precedes child inference; commit a durable wake before the
+            // foreground turn can complete or its client disconnects.
+            this.ctx.storage.sql.exec(`INSERT INTO managed_child_recovery VALUES (1, 1, 1)
+              ON CONFLICT(singleton) DO UPDATE SET generation = generation + 1, pending = 1`);
+            this.ctx.waitUntil(this.#scheduleNextAlarm());
+          }
         },
         ...(this.#threadRoute()?.backend === "workers_ai" ? {
           workersAi: {
@@ -12761,7 +12810,7 @@ export class DurableAgentSession extends DurableComputerObject {
     // Keep a durable wakeup while in-memory work is owned, including when a
     // hibernatable socket is connected. Losing the isolate also loses those
     // handles; the alarm must still reconstruct the accepted work.
-    if (unfinished) targets.push(now + MAX_RETRY_DELAY_MS);
+    if (unfinished || this.#backgroundChildrenPending()) targets.push(now + MAX_RETRY_DELAY_MS);
     if (!unfinished && (this.#agent || this.#agentPromise)
       && this.#managedRealtimeSession() === undefined) {
       const session = this.#session();
