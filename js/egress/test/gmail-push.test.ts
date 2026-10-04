@@ -112,7 +112,9 @@ describe("Gmail push history protocol", () => {
       f.restart(); f.watchStatus(200); now += 120000;
       await f.alarmRun();
       expect(await (await f.request("/status")).json()).toMatchObject({ renewalError: null });
-      expect(f.alarm).toBeGreaterThan(now + 120000);
+      // The independent five-minute history check may now be due at this boundary.
+      expect(f.alarm).toBeGreaterThanOrEqual(now + 120000);
+      expect(f.alarm).toBeLessThanOrEqual(now + 300000);
     } finally { clock.mockRestore(); }
   });
 
