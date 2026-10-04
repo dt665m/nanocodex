@@ -65,7 +65,8 @@
     "check:pack": "node scripts/check-pack.mjs",
     "test": "npm run build && node --import ./test/register-peer-loader.mjs --test test/*.test.mjs && npm run test:typecheck && npm run check:pack",
     "prepack": "npm test",
-    "test:browser": "node test/browser-journey.mjs"
+    "test:browser": "node test/browser-journey.mjs",
+    "demo:account": "node test/browser-account-demo.mjs"
   },
   "dependencies": {
     "nanocodex-terminal": "workspace:^"

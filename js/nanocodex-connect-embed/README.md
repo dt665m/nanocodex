@@ -14,6 +14,49 @@ npm install nanocodex-connect-embed nanocodex-react nanocodex react react-dom @t
 React 18+ is supported. Connect hooks additionally need a `QueryClientProvider`,
 as described in `nanocodex-react/connect`. No component imports CSS automatically.
 
+## Nanocodex conversation UI
+
+```tsx
+import { AgentConversation } from "nanocodex-connect-embed";
+import "nanocodex-connect-embed/conversation.css";
+import "nanocodex-connect-embed/generated-output.css";
+
+return <AgentConversation {...existingAgentTerminalViewProps} />;
+```
+
+`AgentConversation` is the existing `AgentTerminalView` component with identical
+props and runtime identity. It preserves voice, rich Markdown, queued prompts,
+conversation timing events, custom tools/accessories, transcript scrolling,
+hidden/preview modes, and generated media. It owns its own shared controller, so
+render it directly instead of nesting it inside `AgentProvider` for the same
+source. The full view uses its existing CSS classes; import `conversation.css`
+for its layout. Existing `TerminalComposer`, `TerminalTranscriptSurface`,
+`GeneratedOutputView`, `ConversationHistoryRail`, and `ElevenLabsSettings` are
+also public exports. Dedicated `/composer`, `/transcript`, `/generated-output`,
+and `/conversation` entry points preserve their existing prop contracts.
+
+The `/primitives` entry point avoids importing the rich terminal/Markdown/voice
+presentation when only the minimal embed is needed. `/connect` re-exports existing
+connection hooks and adapter; `/managed` owns the reusable managed source adapter.
+Neither presentation layer implements another transport or transcript reducer.
+
+To match the Nanocodex account app, retain its host styles and wrapper classes:
+`js/account/src/index.css`, `AgentTerminal.css`, and `Home.css` provide the
+`chat-workspace` palette, message bubbles, typography, and rounded composer.
+`conversation.css` supplies the shared component layout; it does not import an
+application theme. The minimal primitives below intentionally have a different,
+optional presentation and remain styleless unless CSS is explicitly imported.
+
+Run `pnpm --filter nanocodex-connect-embed demo:account` for the representative
+app-styled browser demo. It imports those exact app styles with the shipped
+`AgentConversation`, submits over real SDK HTTP/SSE, and records dark/light and
+mobile screenshots, a video, a trace, and request evidence in
+`output/connect-embed-account-demo/`. Set `EMBED_BROWSER_OUTPUT` to choose another
+output directory and `PLAYWRIGHT_CHROMIUM_EXECUTABLE` for an installed browser.
+This is an app-styled fixture with a synthetic agent service, not a signed-in
+account session or live-model recording. Authorization, voice, and host account
+controls are outside this demo.
+
 ## Ready-made minimal embed
 
 ```tsx
@@ -114,32 +157,6 @@ own wrapper to opt in. Optional `themes.css` defines light/dark palettes selecte
 by `data-theme` (or `AgentEmbed theme`). Override `--agent-background`,
 `--agent-foreground`, `--agent-border`, `--agent-muted`, `--agent-accent`,
 `--agent-radius`, and `--agent-font` in your app.
-
-## Existing full conversation UI
-
-```tsx
-import { AgentConversation } from "nanocodex-connect-embed";
-import "nanocodex-connect-embed/conversation.css";
-import "nanocodex-connect-embed/generated-output.css";
-
-return <AgentConversation {...existingAgentTerminalViewProps} />;
-```
-
-`AgentConversation` is the existing `AgentTerminalView` component with identical
-props and runtime identity. It preserves voice, rich Markdown, queued prompts,
-conversation timing events, custom tools/accessories, transcript scrolling,
-hidden/preview modes, and generated media. It owns its own shared controller, so
-render it directly instead of nesting it inside `AgentProvider` for the same
-source. The full view uses its existing CSS classes; import `conversation.css`
-for its layout. Existing `TerminalComposer`, `TerminalTranscriptSurface`,
-`GeneratedOutputView`, `ConversationHistoryRail`, and `ElevenLabsSettings` are
-also public exports. Dedicated `/composer`, `/transcript`, `/generated-output`,
-and `/conversation` entry points preserve their existing prop contracts.
-
-The `/primitives` entry point avoids importing the rich terminal/Markdown/voice
-presentation when only the minimal embed is needed. `/connect` re-exports existing
-connection hooks and adapter; `/managed` owns the reusable managed source adapter.
-Neither presentation layer implements another transport or transcript reducer.
 
 ## Development and verification
 
