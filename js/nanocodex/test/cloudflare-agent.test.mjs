@@ -96,6 +96,8 @@ class MemoryStorage {
       rows = this.forkResume === undefined ? [] : [{ ...this.forkResume }];
     } else if (statement.startsWith("INSERT OR IGNORE INTO nanocodex_cloudflare_fork_resume")) {
       this.forkResume ??= { state_id: args[0], digest: args[1] };
+    } else if (statement === "SELECT state_id FROM nanocodex_durable_owners") {
+      rows = [...this.owners.keys()].map(state_id => ({ state_id }));
     } else if (statement.startsWith("SELECT owner_id, fence FROM nanocodex_durable_owners")) {
       const owner = this.owners.get(args[0]);
       rows = owner === undefined ? [] : [{ owner_id: owner.ownerId, fence: owner.fence }];
@@ -1900,4 +1902,30 @@ test("host shutdown closes a transferred preparation socket that resolves late",
   ready.resolve();
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.equal(socket.closed, true);
+});
+
+
+test("destroy fences every descendant journal and export rejects children without fencing", { timeout: 15_000 }, async () => {
+  const module = await readFile(new URL("../pkg-web/nanocodex_bg.wasm", import.meta.url));
+  const storage = new MemoryStorage();
+  const owner = durableOwner(storage);
+  const agent = await create(module, owner);
+  await Subagents.spawn(agent, { role: "retained-child", task: "Wait for work.", outputSchema: { type: "object" } });
+  await agent.session.shutdown();
+  const owners = [...storage.owners].map(([id, owner]) => [id, { ...owner }]);
+  assert.ok(owners.length >= 3, "root, tree and child have separate fenced owners");
+  await assert.rejects(exportDurabilityState(owner), /retained children requires a task-tree archive/);
+  assert.deepEqual([...storage.owners], owners, "rejected export does not fence or acquire any owner");
+  const store = createCloudflareDurabilityStore(storage);
+  destroy(owner);
+  assert.equal(storage.states.length, 0);
+  assert.equal(storage.records.size, 0);
+  assert.equal(storage.chunks.length, 0);
+  for (const [stateId, token] of owners) {
+    assert.deepEqual(await store.replace(stateId, { ...token, expectedRevision: "0", payload: "stale" }), { status: "fenced" });
+  }
+  const fresh = await create(module, owner);
+  try {
+    assert.deepEqual((await Subagents.list(fresh, { includeCompleted: true })).agents, []);
+  } finally { await fresh.session.shutdown(); }
 });

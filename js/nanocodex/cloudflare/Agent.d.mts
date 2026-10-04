@@ -56,10 +56,13 @@ export type Agent<extended extends object = {}> =
 /** Copies the exact latest committed model boundary; rejects before the first safe boundary. */
 export function checkpoint(agent: Agent): Promise<SessionSnapshot>;
 
-/** Removes the package-owned durable history for one Cloudflare Agent. */
+/** Removes root and descendant history, retaining owner tombstones against stale writes. */
 export function destroy(owner: DurableObjectOwner): void;
 
-/** Fences and exports this inactive Cloudflare Agent's provider-neutral state. */
+/** Rejects retained children before any root-only export fence or mutation. */
+export function assertPortable(owner: DurableObjectOwner): void;
+
+/** Fences and exports an inactive root without retained children. */
 /** Execution head for a host that transfers its immutable records separately. */
 export function exportDurabilityHead(owner: DurableObjectOwner): Promise<DurabilityPortableStateArchive>;
 

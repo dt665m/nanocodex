@@ -3991,6 +3991,12 @@ export class DurableAgentSession extends DurableComputerObject {
       singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
       generation INTEGER NOT NULL, pending INTEGER NOT NULL
     )`);
+    // Recipes are context only. Live lifecycle bindings and current grants must
+    // authorize every reconstructed child before transport can use its pin.
+    this.ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS managed_child_route_recipes (
+      session_id TEXT PRIMARY KEY, root_session_id TEXT NOT NULL,
+      host_context_ref TEXT NOT NULL, recipe_json TEXT NOT NULL
+    )`);
     this.#eventLog = new DurableEventLog<StreamMessage>(this.ctx.storage, event => this.#operations.record(event, this.#sessionId()));
     this.#codeEffectJournal = createManagedCodeEffectJournal(this.ctx.storage, {
       onStoreCommitted: (context, entries) => this.#publishCodeStore(context.sessionId, entries),
@@ -4698,6 +4704,8 @@ export class DurableAgentSession extends DurableComputerObject {
       }
     }
     if (request.method === "POST" && url.pathname === "/durability/export") {
+      try { CloudflareAgent.assertPortable(this); }
+      catch (error) { return json({ error: "durable_children_not_portable", message: errorMessage(error) }, { status: 409 }); }
       if (this.#settings().model.startsWith("claude-")) return json({ error: "claude_portability_unsupported" }, { status: 409 });
       if (this.#configuration().model_routing || this.#threadRoute() || ["@cf/zai-org/glm-5.3", "kimi-k3", "mimo-v2.6-pro"].includes(this.#settings().model)) {
         return json({ error: "routed_session_not_portable", message: "Thread-routed sessions are not yet portable." }, { status: 409 });
@@ -8732,7 +8740,7 @@ export class DurableAgentSession extends DurableComputerObject {
     this.#assertDeletionGeneration(generation);
     CloudflareAgent.destroy(this);
     this.ctx.storage.transactionSync(() => {
-      for (const table of ["managed_recovery_safety", "managed_recovery_progress", "managed_recovery_call_indices", "managed_child_recovery", "managed_code_effect_legacy_parents", "managed_code_effect_legacy_sessions", "managed_code_effect_migration", "managed_code_effect_runtime", "managed_code_effects", "managed_code_effect_receipt_chunks", "managed_configuration", "managed_environment_setup", "managed_webhook", "managed_webhook_deliveries", "managed_turn_usage", "managed_model_usage", "managed_artifacts", "managed_artifact_publications", "managed_output_checkpoints", "managed_output_checkpoint_chunks", "managed_turn_file_owners", "managed_connect_inputs"]) this.ctx.storage.sql.exec(`DELETE FROM ${table}`);
+      for (const table of ["managed_recovery_safety", "managed_recovery_progress", "managed_recovery_call_indices", "managed_child_recovery", "managed_child_route_recipes", "managed_code_effect_legacy_parents", "managed_code_effect_legacy_sessions", "managed_code_effect_migration", "managed_code_effect_runtime", "managed_code_effects", "managed_code_effect_receipt_chunks", "managed_configuration", "managed_environment_setup", "managed_webhook", "managed_webhook_deliveries", "managed_turn_usage", "managed_model_usage", "managed_artifacts", "managed_artifact_publications", "managed_output_checkpoints", "managed_output_checkpoint_chunks", "managed_turn_file_owners", "managed_connect_inputs"]) this.ctx.storage.sql.exec(`DELETE FROM ${table}`);
       this.ctx.storage.sql.exec("DROP TABLE IF EXISTS managed_fork_seed");
       this.ctx.storage.sql.exec("DELETE FROM managed_turn_dispatch_chunks");
       this.ctx.storage.sql.exec("DELETE FROM managed_turn_input_chunks");
@@ -9609,7 +9617,36 @@ export class DurableAgentSession extends DurableComputerObject {
       }
     };
     const bindings = this.#subagentBindings;
-    const readChildRoute = (sessionId: string): RetainedChildRoute | undefined => bindings.routes.get(sessionId);
+    const readChildRoute = (sessionId: string): RetainedChildRoute | undefined => {
+      const live = bindings.routes.get(sessionId);
+      if (live) return live;
+      const row = this.ctx.storage.sql.exec<{ root_session_id: string; host_context_ref: string; recipe_json: string }>(
+        "SELECT root_session_id, host_context_ref, recipe_json FROM managed_child_route_recipes WHERE session_id = ?", sessionId,
+      ).toArray()[0];
+      if (!row) return undefined;
+      // Saved metadata never creates authority. The registry must have rebound
+      // this exact child identity using the current host before reading a pin.
+      const authorization = bindings.authorizations.get(sessionId);
+      if (!authorization || row.root_session_id !== rootRoutingSessionId()
+        || authorization.root_session_id !== row.root_session_id
+        || authorization.host_context_ref !== row.host_context_ref) {
+        throw new Error("Child route requires a current lifecycle binding");
+      }
+      const recipe = JSON.parse(row.recipe_json) as RetainedChildRoute;
+      if (recipe.hostContextRef !== row.host_context_ref || typeof recipe.routeId !== "string"
+        || typeof recipe.parentSessionId !== "string" || recipe.parentSessionId === sessionId
+        || !Object.hasOwn(recipe, "route")) throw new Error("Invalid retained child route recipe");
+      if (recipe.parentSessionId !== rootRoutingSessionId() && !bindings.authorizations.has(recipe.parentSessionId)) {
+        throw new Error("Child route requires its reconstructed parent");
+      }
+      if (recipe.route !== null && !ROUTING_CANDIDATES.some(candidate =>
+        candidate.backend === recipe.route!.backend && candidate.model === recipe.route!.model
+          && candidate.provider_model === recipe.route!.provider_model && candidate.thinking === recipe.route!.thinking)) {
+        throw new Error("Retained child route is no longer supported");
+      }
+      bindings.routes.set(sessionId, recipe);
+      return recipe;
+    };
     // A manual root pins its own model, not its children's inference transport.
     // Install the router even when unavailable so explicit child requests fail
     // at admission instead of falling through to the root's ChatGPT endpoint.
@@ -9651,6 +9688,12 @@ export class DurableAgentSession extends DurableComputerObject {
           if (bindings.routes.has(sessionId) || [...bindings.routes.values()].some(route => route.routeId === binding.routeId)) {
             throw new Error("Child route conflicts with live binding");
           }
+          const recipe = JSON.stringify(binding);
+          if (recipe.length > 65_536) throw new Error("Child route recipe exceeds retention limit");
+          this.ctx.storage.sql.exec(`INSERT INTO managed_child_route_recipes VALUES (?, ?, ?, ?)
+            ON CONFLICT(session_id) DO UPDATE SET root_session_id = excluded.root_session_id,
+              host_context_ref = excluded.host_context_ref, recipe_json = excluded.recipe_json`,
+          sessionId, rootRoutingSessionId(), binding.hostContextRef, recipe);
           bindings.routes.set(sessionId, binding);
         },
       },
@@ -10319,6 +10362,10 @@ export class DurableAgentSession extends DurableComputerObject {
         preserveRootTransport: !this.#threadRoute(),
         subagentLifecycle: (event: unknown) => {
           applyManagedSubagentLifecycle(this.ctx.storage, bindings, event);
+          if ((event as { type: string }).type === "release") {
+            this.ctx.storage.sql.exec("DELETE FROM managed_child_route_recipes WHERE session_id = ?",
+              (event as { sessionId: string }).sessionId);
+          }
           if ((event as { type: string }).type === "bind") {
             // Bind precedes child inference; commit a durable wake before the
             // foreground turn can complete or its client disconnects.

@@ -82,6 +82,7 @@ export function bindAgent(module, hostAgent = HostAgent) {
     destroy,
     exportDurabilityState,
     exportDurabilityHead,
+    assertPortable,
     importDurabilityState: (owner, archive) => importDurabilityState(owner, archive, module),
     route,
   });
@@ -110,9 +111,11 @@ export function destroy(owner) {
   const storage = context.storage;
   createCloudflareDurabilityStore(storage);
   initializeAgentStorage(storage);
-  const stateId = storedStateId(storage) ?? legacyStateId(storage);
+  // The adapter owns one root per Durable Object. Its private state tables
+  // also contain the child registry and every descendant execution journal.
+  const stateIds = storage.sql.exec("SELECT state_id FROM nanocodex_durable_owners").toArray();
   storage.transactionSync(() => {
-    if (stateId !== undefined) {
+    for (const { state_id: stateId } of stateIds) {
       const retained = storage.sql.exec(
         "SELECT fence FROM nanocodex_durable_owners WHERE state_id = ?",
         stateId,
@@ -131,18 +134,34 @@ export function destroy(owner) {
         "DELETE FROM nanocodex_durable_records WHERE state_id = ?",
         stateId,
       );
-      storage.sql.exec(
-        "DELETE FROM nanocodex_durable_states WHERE state_id = ?",
-        stateId,
-      );
+      storage.sql.exec("DELETE FROM nanocodex_durable_states WHERE state_id = ?", stateId);
+      storage.sql.exec("DELETE FROM nanocodex_durable_state_chunks WHERE state_id = ?", stateId);
+      storage.sql.exec("DELETE FROM nanocodex_durable_chunk_heads WHERE state_id = ?", stateId);
     }
     storage.sql.exec("DROP TABLE IF EXISTS nanocodex_cloudflare_fork_resume");
     clearCloudflareEventSocket(context);
   });
 }
 
+/** Rejects root-only portability before fencing any member of an owned tree. */
+export function assertPortable(owner) {
+  const storage = resolveContext(owner).storage;
+  createCloudflareDurabilityStore(storage);
+  initializeAgentStorage(storage);
+  const stateId = storedStateId(storage) ?? legacyStateId(storage);
+  const sessionId = storedSessionId(storage);
+  // A registry alone can be empty. Every actual child first acquires its own
+  // execution owner, retained even after close. Never silently discard those
+  // journals when exporting the current single-session archive format.
+  const states = storage.sql.exec("SELECT state_id FROM nanocodex_durable_owners").toArray();
+  if (states.some(row => row.state_id !== stateId && row.state_id !== `${sessionId}/children`)) {
+    throw new Error("Cloudflare Agent with retained children requires a task-tree archive; root-only export is unavailable");
+  }
+}
+
 /** Fences and exports this inactive Cloudflare Agent's provider-neutral state. */
 export async function exportDurabilityState(owner, request, headOnly = false) {
+  assertPortable(owner);
   const context = reserveInactiveLifecycle(owner, "exporting durability state");
   try {
     const storage = context.storage;
