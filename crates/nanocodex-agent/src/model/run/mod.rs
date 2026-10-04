@@ -214,7 +214,7 @@ impl ModelCheckpoint {
         );
     }
 
-    pub(crate) fn request_policy(&self) -> &Value { &self.conversation.request_policy }
+    pub(crate) const fn request_policy(&self) -> &Value { &self.conversation.request_policy }
     pub(crate) fn restore_request_policy(&mut self, state: Value) { self.conversation.request_policy = state; }
 
     pub(crate) fn snapshot_history(&self) -> Vec<ResponseItem> {

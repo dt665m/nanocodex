@@ -85,7 +85,7 @@ impl<F> NanocodexBuilder<F> {
 
     /// Returns an explicitly configured native session identity.
     #[doc(hidden)]
-    pub fn configured_session_id(&self) -> Option<SessionId> {
+    pub const fn configured_session_id(&self) -> Option<SessionId> {
         self.session_id
     }
 
