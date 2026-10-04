@@ -18,4 +18,7 @@ mod claude;
 ))]
 mod harness;
 
+#[cfg(all(feature = "durability", feature = "tools", not(target_family = "wasm")))]
+mod durable_children;
+
 const fn main() {}
