@@ -595,8 +595,19 @@ async fn request_policy_claude_http_unknown_warm_charge_is_not_repeated_after_re
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let calls = Arc::new(AtomicUsize::new(0));
-    for epoch in 0..2 {
+    let mut safe_checkpoint = Value::Null;
+    for epoch in 0..3 {
         let state = DurableSession::open(SqliteStore::open(&path)?, "uncertain-warm").await?;
+        if epoch == 2 {
+            // An embedding may explicitly abandon an uncertain operation using
+            // its last safe native checkpoint. The charge reservation must
+            // survive that terminal failure before accepting a different turn.
+            let input = state.state().await?.operation("uncertain").unwrap().input.clone();
+            let input: Value = state.resolve(&input).await?.decode()?;
+            state.admit("uncertain", &input).await?;
+            state.begin_attempt("uncertain").await?;
+            state.fail("uncertain", &safe_checkpoint, "host abandoned the turn with its charge still reserved").await?;
+        }
         let client = ClaudeClient::new(
             reqwest::Client::new(),
             format!("http://{address}/v1/messages"),
@@ -614,19 +625,30 @@ async fn request_policy_claude_http_unknown_warm_charge_is_not_repeated_after_re
                     calls.clone(),
                 ),
                 client,
-                warm_policy(),
+                CacheWarmPolicy { max_spend_usd: 0.0003, ..warm_policy() },
             )
             .await?
             .build()?;
+        if epoch == 0 {
+            let nanocodex_agent::ChildSnapshot::Native { payload, .. } = agent.runtime_snapshot().await? else {
+                panic!("expected native Claude snapshot");
+            };
+            safe_checkpoint = serde_json::from_str::<Value>(&payload)?["snapshot"].clone();
+        }
         let failure = agent
-            .prompt(PromptRequest::new("charge once").request_id("uncertain"))
+            .prompt(PromptRequest::new("charge once").request_id(if epoch < 2 { "uncertain" } else { "new-turn" }))
             .await?
             .result()
             .await
             .unwrap_err();
         if epoch == 1 {
             assert!(failure.to_string().contains("uncertain"), "{failure}");
+        } else if epoch == 2 {
+            assert!(failure.to_string().contains("spend limit"), "{failure}");
         }
+        let budget = state.document("nanocodex.cache-warm.budget").await?.unwrap();
+        assert_eq!(budget.value["reserved_usd"], 0.0003);
+        assert_eq!(budget.value["actual_usd"], 0.0);
         assert_eq!(
             charges.load(Ordering::SeqCst),
             1,
@@ -634,6 +656,7 @@ async fn request_policy_claude_http_unknown_warm_charge_is_not_repeated_after_re
         );
         let retained = state.state().await?;
         let operation = retained.operation("uncertain").unwrap();
+        if epoch < 2 {
         assert!(
             operation
                 .steps
@@ -641,16 +664,19 @@ async fn request_policy_claude_http_unknown_warm_charge_is_not_repeated_after_re
                 .any(|step| step.kind == "cache_warm_http"
                     && matches!(step.status, nanocodex_durability::StepStatus::EffectPending))
         );
+        } else {
+            assert!(matches!(operation.status, nanocodex_durability::OperationStatus::Failed { .. }));
+        }
         agent.shutdown().await?;
         drop((agent, events));
     }
     assert_eq!(
         calls.load(Ordering::SeqCst),
-        1,
-        "retry consumes the frozen route receipt"
+        2,
+        "retry consumes the frozen route, while a new turn prepares once before the retained budget refuses dispatch"
     );
     eprintln!(
-        "native-unknown-warm evidence: HTTP_charges={} route_evaluations={} unresolved_effect=pending reopen=no_second_charge",
+        "native-unknown-warm evidence: HTTP_charges={} route_evaluations={} unresolved_effect=pending reopen=no_second_charge new_turn=retained_spend_limit",
         charges.load(Ordering::SeqCst),
         calls.load(Ordering::SeqCst)
     );
