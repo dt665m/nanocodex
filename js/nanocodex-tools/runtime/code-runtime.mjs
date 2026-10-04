@@ -918,6 +918,8 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
       });
     },
     router,
+    toolReplaySafe: () => ["begin", "complete"].every(
+      method => typeof extras.effectJournal?.[method] === "function"),
     codeReplaySafe: () => ["begin", "complete", "beginCell", "completeCell"].every(
       method => typeof extras.effectJournal?.[method] === "function"),
     executeCode,

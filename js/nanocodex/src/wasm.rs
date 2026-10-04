@@ -132,6 +132,9 @@ extern "C" {
     #[wasm_bindgen(catch, js_namespace = ["globalThis", "nanocodexHost"], js_name = codeReplaySafe)]
     fn host_code_replay_safe(definition_host_id: u32) -> Result<bool, JsValue>;
 
+    #[wasm_bindgen(catch, js_namespace = ["globalThis", "nanocodexHost"], js_name = toolReplaySafe)]
+    fn host_tool_replay_safe(definition_host_id: u32, name: &str) -> Result<bool, JsValue>;
+
     #[wasm_bindgen(catch, js_namespace = ["globalThis", "nanocodexHost"], js_name = executeCode)]
     fn host_execute_code(
         source: &str,
@@ -759,6 +762,10 @@ impl JavaScriptCodeModeHost {
 }
 
 impl CodeModeHost for JavaScriptCodeModeHost {
+    fn is_replay_safe(&self, name: &str) -> bool {
+        host_tool_replay_safe(self.definition_host_id, name).unwrap_or(false)
+    }
+
     fn code_replay_safe(&self) -> bool {
         host_code_replay_safe(self.definition_host_id).unwrap_or(false)
     }

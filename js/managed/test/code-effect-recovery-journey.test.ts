@@ -428,7 +428,7 @@ it.each(["input-conflict", "invalid-receipt", "missing-store", "corrupt-store"])
   });
 }, 30_000);
 
-it("merges concurrent cell writes, retains failed-script writes, and rejects an oversized store without losing earlier state", async () => {
+it("merges concurrent cell writes, discards failed-script writes, and rejects an oversized store without losing earlier state", async () => {
   await runInDurableObject(sessions().getByName(crypto.randomUUID()), async (_instance, ctx) => {
     let release!: () => void;
     let entered!: () => void;
@@ -455,7 +455,7 @@ it("merges concurrent cell writes, retains failed-script writes, and rejects an 
     expect(tooLarge.success).toBe(false);
     expect(tooLarge.output).toContain("outcome unknown");
     const latest = JSON.parse(await make().executeCode('text([load("a"), load("b"), load("failed"), load("large") === undefined]);', "concurrent", "read"));
-    expect(latest.output).toContainEqual({ type: "input_text", text: '[1,2,3,true]' });
+    expect(latest.output).toContainEqual({ type: "input_text", text: '[1,2,null,true]' });
     console.log("STORE_MERGE_AND_BOUNDS_JOURNEY", JSON.stringify({ failed, tooLarge, latest }));
     await ctx.storage.deleteAlarm();
   });

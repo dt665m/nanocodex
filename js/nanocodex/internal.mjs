@@ -618,6 +618,9 @@ const hostBridge = Object.freeze({
     host.releaseSession(sessionId);
     releaseHostSession(host, sessionId);
   },
+  toolReplaySafe(definitionHostId, name) {
+    return requiredDefinitionHost(definitionHostId).toolReplaySafe?.(name) === true;
+  },
   codeReplaySafe(definitionHostId) {
     return requiredDefinitionHost(definitionHostId).codeReplaySafe?.() === true;
   },

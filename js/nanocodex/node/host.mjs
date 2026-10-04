@@ -339,6 +339,7 @@ export function createNodeHost(options = {}) {
     close,
     sleep: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
     codeReplaySafe: code.codeReplaySafe,
+    toolReplaySafe: code.toolReplaySafe,
     executeCode: code.executeCodeObserved,
     waitCode: code.waitCodeObserved,
     beginCodeTurn: code.beginTurn,
