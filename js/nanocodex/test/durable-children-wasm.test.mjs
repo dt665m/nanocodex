@@ -47,7 +47,12 @@ async function fixture(t, label) {
       } else if (!encoded.includes('DURABLE_CHILD_EFFECT_RECEIPT')) {
         tool = 'proof'; args = {};
       } else if (phase === 'prepare' && ['RUNNING', 'INTERRUPTED', 'CLOSED', 'FOREGROUND', 'BACKGROUND'].includes(marker)) {
-        held.push(response); return;
+        held.push(() => {
+          const boundary = definitions.find(item => item.name === 'boundary');
+          assert.ok(boundary, 'synthetic pure boundary tool is available');
+          response.writeHead(200, { 'content-type': 'text/event-stream' });
+          response.end(`data: ${JSON.stringify({ type: 'response.completed', response: { id: `boundary-${++serial}`, status: 'completed', output: [{ type: 'function_call', call_id: `boundary-${++serial}`, name: boundary.name, arguments: '{}' }], usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } } })}\n\n`);
+        }); return;
       } else if (!submitted || encoded.includes('MAILBOX_AFTER_RESTART') && !mailboxSubmitted) {
         tool = 'submit_result'; args = { output: { stage: encoded.includes('MAILBOX_AFTER_RESTART') ? 'mailbox' : marker.toLowerCase() } };
       }
@@ -99,7 +104,7 @@ async function fixture(t, label) {
     await rm(directory, { recursive: true, force: true });
   }
   t.after(cleanup);
-  return { start, until, trace, effects, requests, phase(value) { phase = value; }, cleanup };
+  return { start, until, trace, effects, requests, phase(value) { phase = value; }, release() { for (const reply of held.splice(0)) reply(); }, cleanup };
 }
 
 async function completed(owner, id, stage) {
@@ -156,8 +161,9 @@ test('public WASM replay of lost spawn admission acknowledgement returns the sam
   let owner = await f.start({ loseSpawnAcknowledgement: true });
   const root = owner.call('prompt', { id: 'root-spawn-once', input: 'ROOT_SPAWN: delegate to DEDUP_CHILD then finish.' });
   await f.until(() => f.trace.some(row => row.type === 'lost-spawn-ack'), 'persisted spawn admission with lost acknowledgement');
-  await assert.rejects(root, /lost child admission acknowledgement|fenced|reopen/i);
-  await owner.kill(); f.phase('resume');
+  const lostRoot = assert.rejects(root, /owner terminated/);
+  await owner.kill();
+  await lostRoot; f.phase('resume');
   owner = await f.start();
   const result = await owner.call('prompt', { id: 'root-spawn-once', input: 'ROOT_SPAWN: delegate to DEDUP_CHILD then finish.' });
   assert.equal(result.finalMessage, 'ROOT_COMPLETE');
@@ -190,4 +196,61 @@ test('public WASM requires durability for background children and releases foreg
   assert.equal(f.requests.filter(row => row.phase === 'resume' && row.marker === 'FOREGROUND').length, 0);
   assert.ok(f.requests.filter(row => row.phase === 'resume' && row.marker === 'BACKGROUND').every(row => row.auth === 'Bearer synthetic-owner-3'));
   t.diagnostic(JSON.stringify({ foregroundClosed: foreground.agent_id, backgroundRecovered: background.agent_id, effectDispatches: 2, currentAuthOwner: 3 }));
+});
+
+
+test('public WASM cold recovery retains the consumed urgent steering revision', { timeout: 60_000 }, async t => {
+  const f = await fixture(t, 'steer-revision');
+  let owner = await f.start();
+  const child = await owner.call('spawn', task('RUNNING'));
+  await f.until(() => f.requests.some(row => row.marker === 'RUNNING' && JSON.stringify(row.body).includes('DURABLE_CHILD_EFFECT_RECEIPT')), 'child reaches held model boundary');
+  const receipt = await owner.call('send', { agentId: child.agent_id, message: 'MAILBOX_AFTER_RESTART', purpose: 'coordinate', priority: 'urgent' });
+  assert.equal(receipt.disposition, 'steered');
+  f.release();
+  await f.until(() => f.requests.some(row => JSON.stringify(row.body).includes('MAILBOX_AFTER_RESTART')), 'native driver consumes the new revision');
+  await owner.kill(); f.phase('resume');
+  owner = await f.start();
+  await completed(owner, child.agent_id, 'mailbox');
+  assert.equal(f.effects.length, 1, 'steered recovery preserves the original committed effect');
+  const resumed = f.requests.filter(row => row.phase === 'resume');
+  assert.ok(resumed.some(row => row.body.input.some(item => item.type === 'function_call_output' && typeof item.output === 'string' && item.output.startsWith('{') && JSON.parse(item.output).accepted === true)), 'revision 2 completion is accepted after cold restore');
+  assert.ok(resumed.every(row => row.body.input.filter(item => item.type === 'message' && JSON.stringify(item.content).includes('MAILBOX_AFTER_RESTART')).length === 1), 'the accepted mailbox input is retained once');
+  t.diagnostic(JSON.stringify({ child: child.agent_id, disposition: receipt.disposition, effectDispatches: f.effects.length, recoveredOutput: 'mailbox' }));
+});
+
+test('public WASM reconciles native urgent admission when the tree delivery acknowledgement is lost', { timeout: 60_000 }, async t => {
+  const f = await fixture(t, 'steer-lost-delivery');
+  let owner = await f.start({ loseSteerDelivery: true });
+  const child = await owner.call('spawn', task('RUNNING'));
+  await f.until(() => f.requests.some(row => row.marker === 'RUNNING' && JSON.stringify(row.body).includes('DURABLE_CHILD_EFFECT_RECEIPT')), 'child reaches held model boundary');
+  const sending = owner.call('send', { agentId: child.agent_id, message: 'MAILBOX_AFTER_RESTART', purpose: 'coordinate', priority: 'urgent' });
+  await f.until(() => f.trace.some(row => row.type === 'lost-steer-delivery'), 'native admission committed but tree delivery did not');
+  const lost = assert.rejects(sending, /owner terminated/);
+  await owner.kill(); await lost; f.phase('resume');
+  owner = await f.start();
+  await completed(owner, child.agent_id, 'mailbox');
+  assert.equal(f.effects.length, 1);
+  const resumed = f.requests.filter(row => row.phase === 'resume');
+  assert.ok(resumed.length > 0);
+  assert.ok(resumed.every(row => row.body.input.filter(item => item.type === 'message' && JSON.stringify(item.content).includes('MAILBOX_AFTER_RESTART')).length <= 1), 'cross-journal replay must not accept a second steer or turn');
+  await owner.kill(); owner = await f.start();
+  await completed(owner, child.agent_id, 'mailbox');
+  assert.equal(f.effects.length, 1);
+  t.diagnostic(JSON.stringify({ child: child.agent_id, coldOwners: 3, nativeSteerReceipts: 1, effectDispatches: 1 }));
+});
+
+test('public WASM refuses terminal observations after an uncommitted child settlement and recovers the native result', { timeout: 60_000 }, async t => {
+  const f = await fixture(t, 'failed-settlement');
+  let owner = await f.start({ failSettlement: true });
+  const child = await owner.call('spawn', task('COMPLETED'));
+  await f.until(() => f.trace.some(row => row.type === 'failed-child-settlement'), 'native terminal result encounters failed tree settlement');
+  await assert.rejects(owner.call('list', { includeCompleted: true }), /cold recovery|uncommitted|fenced/i);
+  await assert.rejects(owner.call('wait', { agentIds: [child.agent_id], timeoutMs: 100 }), /cold recovery|uncommitted|fenced/i);
+  await assert.rejects(owner.call('recover'), /cold recovery|uncommitted|fenced/i);
+  await owner.kill(); f.phase('resume');
+  owner = await f.start();
+  await completed(owner, child.agent_id, 'completed');
+  assert.equal(f.effects.length, 1, 'recover native completion without redispatching the committed effect');
+  assert.equal(f.requests.filter(row => row.phase === 'resume').length, 0, 'native terminal receipt is handed off without more inference');
+  t.diagnostic(JSON.stringify({ child: child.agent_id, refusedObservations: ['list', 'wait', 'recover'], effectDispatches: 1, resumedModelRequests: 0 }));
 });

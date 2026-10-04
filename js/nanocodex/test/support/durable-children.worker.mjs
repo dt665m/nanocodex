@@ -16,9 +16,23 @@ const store = createSqliteDurabilityStore({ transaction(callback) {
     return result;
   } catch (error) { database.exec('ROLLBACK'); throw error; }
 } });
-let lostAcknowledgement = false;
+let lostAcknowledgement = false, nativeSteerCommitted = false, settlementFailed = false;
 const durability = { ...store, replace(id, request) {
+  const encoded = request.payload + request.records.map(record => record.value).join('');
+  if (workerData.failSettlement && !settlementFailed && id.endsWith('/children') && encoded.includes('"state":"completed"')) {
+    settlementFailed = true;
+    parentPort.postMessage({ type: 'failed-child-settlement', stateId: id });
+    throw new Error('synthetic definitely uncommitted child settlement');
+  }
+  if (workerData.loseSteerDelivery && nativeSteerCommitted && id.endsWith('/children')) {
+    parentPort.postMessage({ type: 'lost-steer-delivery', stateId: id });
+    return new Promise(() => {});
+  }
   const result = store.replace(id, request);
+  if (workerData.loseSteerDelivery && !id.endsWith('/children') && encoded.includes('"child-message:1"')) {
+    nativeSteerCommitted = true;
+    parentPort.postMessage({ type: 'native-steer-committed', stateId: id });
+  }
   // The host committed the admission but its acknowledgement was lost.
   // All assertions about the resulting child use the public SDK below.
   if (workerData.loseSpawnAcknowledgement && !lostAcknowledgement && id.endsWith('/children')) {
@@ -27,7 +41,10 @@ const durability = { ...store, replace(id, request) {
     if (request.records.some(record => record.value.includes('"Spawn"'))) {
       lostAcknowledgement = true;
       parentPort.postMessage({ type: 'lost-spawn-ack', stateId: id });
-      throw new Error('synthetic lost child admission acknowledgement');
+      // Keep the committed write's response in flight until this process dies.
+      // A returned error would be a received acknowledgement which the model
+      // can handle as an ordinary failed tool call.
+      return new Promise(() => {});
     }
   }
   return result;
@@ -40,7 +57,7 @@ try {
     sessionId: '018f1f9a-7b3c-7a07-8000-000000000077',
     ...(workerData.nonDurable ? {} : { durability, durabilityId: 'durable-children-public' }),
     transport: Transport.openAi({ apiKey: workerData.auth, apiBaseUrl: workerData.baseUrl, stateless: true }),
-    tools: { proof: {
+    tools: { boundary: { description: 'A pure synthetic model boundary.', parameters: { type: 'object', properties: {}, additionalProperties: false }, handler() { return 'BOUNDARY_RECEIPT'; } }, proof: {
       description: 'Append a synthetic external effect with its public child identity.',
       parameters: { type: 'object', properties: {}, additionalProperties: false },
       handler(_input, context) {
