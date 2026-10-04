@@ -508,18 +508,20 @@ impl ExecutionPolicy for DurableExecution {
         replay_safety: crate::ReplaySafety,
     ) -> ExecutionFuture<'a, AgentResult<ExecutionStepAdmission>> {
         Box::pin(async move {
-            #[cfg(not(target_family = "wasm"))]
-            if kind == "tool_call" {
-                self.code_journal.bind(&operation_id, &step_id, &input_json).map_err(agent_error)?;
-            }
-            let input = raw(input_json)?;
+            let input = raw(input_json.clone())?;
             match self
                 .owner
-                .begin_step(operation_id, step_id, kind, &input, replay_safety)
+                .begin_step(operation_id.clone(), step_id.clone(), kind.clone(), &input, replay_safety)
                 .await
             {
                 Ok(BeginStep::OutcomeUnknown) => Ok(ExecutionStepAdmission::OutcomeUnknown),
-                Ok(BeginStep::Execute) => Ok(ExecutionStepAdmission::Execute),
+                Ok(BeginStep::Execute) => {
+                    #[cfg(not(target_family = "wasm"))]
+                    if kind == "tool_call" {
+                        self.code_journal.bind(&operation_id, &step_id, &input_json).map_err(agent_error)?;
+                    }
+                    Ok(ExecutionStepAdmission::Execute)
+                }
                 Ok(BeginStep::Replay(output)) => Ok(ExecutionStepAdmission::Replay(
                     output.json().map_err(agent_error)?.to_owned(),
                 )),
@@ -647,6 +649,39 @@ mod tests {
     use nanocodex_agent::ExecutionPolicyDisposition;
 
     use super::*;
+
+    #[cfg(not(target_family = "wasm"))]
+    #[tokio::test]
+    async fn code_replays_and_unknown_steps_do_not_consume_admission_scopes() {
+        use nanocodex_oai_tools::code_mode::{CodeModeJournal, CodeJournalAdmission};
+        let state = DurableSession::open(crate::MemoryStore::new().unwrap(), "code-scopes").await.unwrap();
+        let (owner, _) = state.acquire_agent().await.unwrap();
+        owner.admit_typed::<_, u32, String>("turn".into(), &"input").await.unwrap();
+        owner.begin_attempt("turn".into()).await.unwrap();
+        let policy = DurableExecution::ready(owner, state.clone());
+        // Seed settled and unsafe pending steps through the authoritative owner.
+        // Recovery of either class must avoid reserving an unexecuted cell scope.
+        for index in 0..70 {
+            let step = format!("tool-{index}-reused");
+            let input = serde_json::json!({"call_id":"reused", "name":"exec", "input":"text(1);"});
+            policy.owner.begin_step("turn".into(), step.clone(), "tool_call".into(), &input, crate::ReplaySafety::Unsafe).await.unwrap();
+            if index % 2 == 0 {
+                policy.owner.complete_step("turn".into(), step.clone(), &serde_json::json!({"result":"done"})).await.unwrap();
+            }
+            let admission = policy.begin_step_with_replay("turn".into(), step, "tool_call".into(), input.to_string(), crate::ReplaySafety::Unsafe).await.unwrap();
+            assert!(if index % 2 == 0 { matches!(admission, ExecutionStepAdmission::Replay(_)) } else { matches!(admission, ExecutionStepAdmission::OutcomeUnknown) });
+        }
+        // Two live cells with the same provider ID have independent host steps.
+        for step in ["tool-70-reused", "tool-71-reused"] {
+            let input = serde_json::json!({"call_id":"reused", "name":"exec", "input":"text(1);"});
+            assert!(matches!(policy.begin_step_with_replay("turn".into(), step.into(), "tool_call".into(), input.to_string(), crate::ReplaySafety::Safe).await.unwrap(), ExecutionStepAdmission::Execute));
+        }
+        for step in ["tool-70-reused", "tool-71-reused"] {
+            let key = serde_json::json!(["turn", step]).to_string();
+            assert!(matches!(policy.code_journal.admit_cell("session", &key, "text(1);").await.unwrap(), CodeJournalAdmission::Execute { .. }));
+        }
+        policy.shutdown().await.unwrap();
+    }
 
     #[tokio::test]
     async fn corruption_is_fatal_even_when_an_operation_is_pending() {

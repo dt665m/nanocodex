@@ -232,6 +232,9 @@ where
                 async move {
                     let started_at = active.started_at;
                     let step_id = format!("tool-{call_index}-{}", call.call_id);
+                    let journal_scope = execution_steps.as_ref().map(|steps| {
+                        serde_json::json!([steps.operation_id(), &step_id]).to_string()
+                    });
                     let mut outcome_unknown = false;
                     let recovered = if let Some(steps) = &execution_steps {
                         match steps
@@ -285,6 +288,7 @@ where
                                 history,
                                 &session_id,
                                 &turn_id,
+                                journal_scope.as_deref(),
                                 model,
                                 host_context.as_deref(),
                                 instruction_revision,
@@ -579,6 +583,7 @@ where
         history: Option<Arc<Vec<ResponseItem>>>,
         session_id: &str,
         turn_id: &str,
+        journal_scope: Option<&str>,
         model: Model,
         host_context: Option<&str>,
         instruction_revision: Option<u64>,
@@ -625,7 +630,8 @@ where
             )
             .with_instruction_revision(instruction_revision)
             .with_host_context(host_context)
-            .with_turn_id(Some(turn_id));
+            .with_turn_id(Some(turn_id))
+            .with_journal_scope(journal_scope);
             let mut execution = match call.kind {
                 CodeCallKind::Function => match RawValue::from_string(call.input.clone()) {
                     Ok(input) => tools
@@ -695,7 +701,8 @@ where
             )
             .with_instruction_revision(instruction_revision)
             .with_host_context(host_context)
-            .with_turn_id(Some(turn_id));
+            .with_turn_id(Some(turn_id))
+            .with_journal_scope(journal_scope);
             let execution = match RawValue::from_string(call.input.clone()) {
                 Ok(input) => tools
                     .execute_tool("tool_search", ToolInput::Function(input), context)
@@ -743,7 +750,8 @@ where
             model,
             host_context,
             instruction_revision,
-        )?;
+        )?
+        .map(|context| context.with_journal_scope(journal_scope.map(Arc::from)));
         let context = ToolContext::new(
             model.as_str(),
             session_id,
@@ -753,7 +761,8 @@ where
         )
         .with_instruction_revision(instruction_revision)
         .with_host_context(host_context)
-        .with_turn_id(Some(turn_id));
+        .with_turn_id(Some(turn_id))
+        .with_journal_scope(journal_scope);
         let mut observer = NestedToolEventObserver {
             events,
             tool_call_indices,

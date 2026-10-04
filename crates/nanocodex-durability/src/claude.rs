@@ -180,23 +180,20 @@ impl ClaudeExecutionPolicy for ClaudeExecution {
         replay_safety: crate::ReplaySafety,
     ) -> PolicyFuture<'_, Step> {
         Box::pin(async move {
-            #[cfg(not(target_family = "wasm"))]
-            if kind == "tool" && input.get("name").and_then(Value::as_str) == Some("exec") {
-                let scope = serde_json::json!({
-                    "call_id": input.get("id"), "name": "exec", "input": input.get("input")
-                });
-                self.code_journal
-                    .bind(&id, &step_id, &scope.to_string())
-                    .map_err(agent_error)?;
-            }
             match self
                 .owner
-                .begin_step(id, step_id, kind, &input, replay_safety)
+                .begin_step(id.clone(), step_id.clone(), kind.clone(), &input, replay_safety)
                 .await
                 .map_err(agent_error)?
             {
                 BeginStep::OutcomeUnknown => Ok(Step::OutcomeUnknown),
-                BeginStep::Execute => Ok(Step::Execute),
+                BeginStep::Execute => {
+                    #[cfg(not(target_family = "wasm"))]
+                    if kind == "tool" && input.get("name").and_then(Value::as_str) == Some("exec") {
+                        self.code_journal.bind(&id, &step_id, &input.to_string()).map_err(agent_error)?;
+                    }
+                    Ok(Step::Execute)
+                }
                 BeginStep::Replay(value) => Ok(Step::Replay(value.decode().map_err(agent_error)?)),
             }
         })

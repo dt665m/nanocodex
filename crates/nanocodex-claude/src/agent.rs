@@ -65,6 +65,9 @@ pub struct ClaudeToolInvocation {
     pub session_id: String,
     pub turn_id: String,
     pub call_id: String,
+    /// Host-owned durable operation/step identity for native Code Mode.
+    #[doc(hidden)]
+    pub journal_scope: Option<String>,
     /// Immutable revision captured for the originating model response.
     pub instruction_revision: Option<u64>,
     /// Embedding-private inherited tool context; never serialized to the model.
@@ -2342,6 +2345,8 @@ impl State {
                 .clone()
                 .unwrap_or_else(|| events.turn_id().unwrap_or(events.request_id()).to_owned()),
             call_id: id.to_owned(),
+            journal_scope: cursor.operation.as_ref().map(|operation|
+                json!([operation, format!("tool-{index}-{id}")]).to_string()),
             instruction_revision: cursor.instruction_revision,
             host_context: self.host_context.clone(),
         };

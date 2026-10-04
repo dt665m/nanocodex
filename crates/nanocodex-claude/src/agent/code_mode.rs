@@ -89,6 +89,7 @@ impl ClaudeBuilder {
                 Box::pin(async move {
                     let context = ToolContext::new(&invocation.model, &invocation.session_id, &invocation.call_id, &[], 10_000)
                         .with_turn_id(Some(&invocation.turn_id))
+                        .with_journal_scope(invocation.journal_scope.as_deref())
                         .with_instruction_revision(invocation.instruction_revision)
                         .with_host_context(invocation.host_context.as_deref());
                     if matches!(name.as_str(), "exec" | "wait") {

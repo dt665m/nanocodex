@@ -462,7 +462,7 @@ impl CodeModeRuntime {
         }
         let (stored, document_version) = if let Some(journal) = &self.journal {
             match journal
-                .admit_cell(&context.session_id, &context.call_id, source.code.as_str())
+                .admit_cell(&context.session_id, context.journal_scope.as_deref().unwrap_or(&context.call_id), source.code.as_str())
                 .await
             {
                 Ok(CodeJournalAdmission::Execute { stored, version }) => (stored, version),
@@ -1499,7 +1499,7 @@ async fn run_cell_actor(
             .map_err(HostFailure::new)?;
         host.drive_cell(
             cell_id,
-            &context.call_id,
+            context.journal_scope.as_deref().unwrap_or(&context.call_id),
             tools.as_ref(),
             &context,
             &updates,
@@ -1577,7 +1577,7 @@ async fn run_cell_actor(
         for call in unknown {
             result = journal
                 .complete_effect(
-                    &context.call_id,
+                    context.journal_scope.as_deref().unwrap_or(&context.call_id),
                     call["call_id"].as_str().unwrap_or_default(),
                     &call,
                 )
@@ -1596,7 +1596,7 @@ async fn run_cell_actor(
                 _ => None,
             };
             result = journal
-                .complete_cell(&context.call_id, document_version, next_stored, &receipt)
+                .complete_cell(context.journal_scope.as_deref().unwrap_or(&context.call_id), document_version, next_stored, &receipt)
                 .await;
         }
         result
