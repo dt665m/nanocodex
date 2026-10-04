@@ -317,7 +317,10 @@ impl Tools {
     /// Attaches native Code Mode persistence to this session’s tool selection.
     #[cfg(all(not(target_family = "wasm"), feature = "code-mode"))]
     #[must_use]
-    pub fn with_code_journal(mut self, journal: Arc<dyn crate::code_mode::CodeModeJournal>) -> Self {
+    pub fn with_code_journal(
+        mut self,
+        journal: Arc<dyn crate::code_mode::CodeModeJournal>,
+    ) -> Self {
         self.code_journal = Some(journal);
         self
     }

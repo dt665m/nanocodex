@@ -986,14 +986,16 @@ impl DurableState {
             ensure_nonempty(operation_id, "operation ID")?;
         }
         match entry {
-            Transition::ExecutionAdvanced { operation_id, retained_steps, .. } => {
+            Transition::ExecutionAdvanced {
+                operation_id,
+                retained_steps,
+                ..
+            } => {
                 self.ensure_prior_operations_terminal(operation_id)?;
                 let operation = self.pending_operation(operation_id)?;
-                if operation
-                    .steps
-                    .iter()
-                    .any(|(id, step)| matches!(step.status, StepStatus::EffectPending) && !retained_steps.contains(id))
-                {
+                if operation.steps.iter().any(|(id, step)| {
+                    matches!(step.status, StepStatus::EffectPending) && !retained_steps.contains(id)
+                }) {
                     return Err(Error::InvalidState(format!(
                         "operation `{operation_id}` cannot advance past an unsettled effect"
                     )));
@@ -1577,7 +1579,7 @@ mod continuation_tests {
         apply(Transition::ExecutionAdvanced {
             operation_id: id.clone(),
             continuation: payload.clone(),
-                retained_steps: Vec::new(),
+            retained_steps: Vec::new(),
         })?;
         apply(Transition::SteerBound {
             operation_id: id.clone(),
@@ -1607,7 +1609,7 @@ mod continuation_tests {
         apply(Transition::ExecutionAdvanced {
             operation_id: id.clone(),
             continuation: payload.clone(),
-                retained_steps: Vec::new(),
+            retained_steps: Vec::new(),
         })?;
         assert!(
             apply(Transition::StepStarted {
@@ -1736,7 +1738,7 @@ mod withdrawal_tests {
         apply(Transition::ExecutionAdvanced {
             operation_id: "turn".into(),
             continuation: payload.clone(),
-                retained_steps: Vec::new(),
+            retained_steps: Vec::new(),
         })?;
         for steer_index in 2..=3 {
             apply(Transition::SteerAccepted {

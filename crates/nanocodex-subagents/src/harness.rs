@@ -335,27 +335,27 @@ impl Harness {
             && let Some(operation) = registry
                 .message_steer_operation(&self.root_session_id, command.message.id)
                 .await
+        {
+            match agent
+                .has_steer_receipt(operation, format!("child-message:{}", command.message.id))
+                .await
             {
-                match agent
-                    .has_steer_receipt(operation, format!("child-message:{}", command.message.id))
-                    .await
-                {
-                    Ok(true) => {
-                        self.admit(
-                            command.message.id,
-                            command.response,
-                            MessageDisposition::Steered,
-                        )
-                        .await;
-                        return;
-                    }
-                    Err(error) => {
-                        self.reject(command, error.to_string()).await;
-                        return;
-                    }
-                    Ok(false) => {}
+                Ok(true) => {
+                    self.admit(
+                        command.message.id,
+                        command.response,
+                        MessageDisposition::Steered,
+                    )
+                    .await;
+                    return;
                 }
+                Err(error) => {
+                    self.reject(command, error.to_string()).await;
+                    return;
+                }
+                Ok(false) => {}
             }
+        }
         // Backends without atomic steering receipts retain urgent messages in
         // the durable mailbox until the current turn reaches its boundary.
         let can_steer = !durable || self.agent.as_ref().is_some_and(Nanocodex::durable_steering);
@@ -402,10 +402,10 @@ impl Harness {
                 && let Err(error) = registry
                     .finish_turn_steer(&self.root_session_id, steer, result.is_ok())
                     .await
-                {
-                    let _ = command.response.send(Err(error));
-                    return;
-                }
+            {
+                let _ = command.response.send(Err(error));
+                return;
+            }
             match result {
                 Ok(()) => {
                     self.admit(

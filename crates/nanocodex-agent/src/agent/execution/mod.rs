@@ -123,14 +123,22 @@ pub struct ExecutionOutput {
 pub trait ExecutionPolicy: Send + Sync {
     /// Optionally freezes a native provider request before transport authentication.
     /// The returned state is retained with the native conversation checkpoint.
-    fn prepare_request<'a>(&'a self, _operation: String, _request_id: String,
-        _continuation: bool, _state: serde_json::Value, _request: serde_json::Value,
-        _authorized: serde_json::Value) -> ExecutionFuture<'a, Result<Option<RequestPreparation>>> {
+    fn prepare_request<'a>(
+        &'a self,
+        _operation: String,
+        _request_id: String,
+        _continuation: bool,
+        _state: serde_json::Value,
+        _request: serde_json::Value,
+        _authorized: serde_json::Value,
+    ) -> ExecutionFuture<'a, Result<Option<RequestPreparation>>> {
         Box::pin(async { Ok(None) })
     }
 
     /// Supplies the native cell journal owned by this execution policy.
-    fn code_mode_journal(&self) -> Option<Arc<dyn nanocodex_oai_tools::code_mode::CodeModeJournal>> {
+    fn code_mode_journal(
+        &self,
+    ) -> Option<Arc<dyn nanocodex_oai_tools::code_mode::CodeModeJournal>> {
         None
     }
 
@@ -304,11 +312,16 @@ pub trait ExecutionPolicy: Send + Sync {
 
     /// Advances the foreground while retaining named independently owned effects.
     fn advance_retaining<'a>(
-        &'a self, operation_id: String, continuation: ExecutionContinuation, retained_steps: Vec<String>,
+        &'a self,
+        operation_id: String,
+        continuation: ExecutionContinuation,
+        retained_steps: Vec<String>,
     ) -> ExecutionFuture<'a, Result<()>> {
         Box::pin(async move {
             if !retained_steps.is_empty() {
-                return Err(NanocodexError::ExecutionPolicyCapabilityUnsupported { capability: "background effect retention" });
+                return Err(NanocodexError::ExecutionPolicyCapabilityUnsupported {
+                    capability: "background effect retention",
+                });
             }
             self.advance(operation_id, continuation).await
         })
@@ -381,9 +394,15 @@ pub trait ExecutionPolicy: Send + Sync {
 pub trait ExecutionPolicy: Send + Sync {
     /// Optionally freezes a native provider request before transport authentication.
     /// The returned state is retained with the native conversation checkpoint.
-    fn prepare_request<'a>(&'a self, _operation: String, _request_id: String,
-        _continuation: bool, _state: serde_json::Value, _request: serde_json::Value,
-        _authorized: serde_json::Value) -> ExecutionFuture<'a, Result<Option<RequestPreparation>>> {
+    fn prepare_request<'a>(
+        &'a self,
+        _operation: String,
+        _request_id: String,
+        _continuation: bool,
+        _state: serde_json::Value,
+        _request: serde_json::Value,
+        _authorized: serde_json::Value,
+    ) -> ExecutionFuture<'a, Result<Option<RequestPreparation>>> {
         Box::pin(async { Ok(None) })
     }
 
@@ -545,11 +564,16 @@ pub trait ExecutionPolicy: Send + Sync {
 
     /// Advances the foreground while retaining named independently owned effects.
     fn advance_retaining<'a>(
-        &'a self, operation_id: String, continuation: ExecutionContinuation, retained_steps: Vec<String>,
+        &'a self,
+        operation_id: String,
+        continuation: ExecutionContinuation,
+        retained_steps: Vec<String>,
     ) -> ExecutionFuture<'a, Result<()>> {
         Box::pin(async move {
             if !retained_steps.is_empty() {
-                return Err(NanocodexError::ExecutionPolicyCapabilityUnsupported { capability: "background effect retention" });
+                return Err(NanocodexError::ExecutionPolicyCapabilityUnsupported {
+                    capability: "background effect retention",
+                });
             }
             self.advance(operation_id, continuation).await
         })
@@ -798,7 +822,11 @@ impl Execution {
 
     #[cfg(not(target_family = "wasm"))]
     pub(crate) fn configure_tools(&self, tools: crate::Tools) -> crate::Tools {
-        match self.policy.as_ref().and_then(|policy| policy.code_mode_journal()) {
+        match self
+            .policy
+            .as_ref()
+            .and_then(|policy| policy.code_mode_journal())
+        {
             Some(journal) => tools.with_code_journal(journal),
             None => tools,
         }
@@ -1062,11 +1090,24 @@ pub(crate) enum ExecutionStep<O> {
 }
 
 impl ExecutionSteps {
-    pub(crate) async fn prepare_request(&self, request_id: String, continuation: bool,
-        state: serde_json::Value, request: serde_json::Value, authorized: serde_json::Value)
-        -> Result<Option<RequestPreparation>> {
-        self.policy.prepare_request(self.operation_id.clone(), request_id, continuation,
-            state, request, authorized).await
+    pub(crate) async fn prepare_request(
+        &self,
+        request_id: String,
+        continuation: bool,
+        state: serde_json::Value,
+        request: serde_json::Value,
+        authorized: serde_json::Value,
+    ) -> Result<Option<RequestPreparation>> {
+        self.policy
+            .prepare_request(
+                self.operation_id.clone(),
+                request_id,
+                continuation,
+                state,
+                request,
+                authorized,
+            )
+            .await
     }
 
     pub(crate) fn operation_id(&self) -> &str {

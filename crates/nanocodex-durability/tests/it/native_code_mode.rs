@@ -80,10 +80,12 @@ impl Tool for Effect {
         Ok(ToolOutput::text(format!("EFFECT_{count}")))
     }
 }
+type QueuedResponses = Arc<Mutex<VecDeque<(Value, Option<String>)>>>;
+
 #[derive(Clone)]
 struct Provider {
     claude: bool,
-    responses: Arc<Mutex<VecDeque<(Value, Option<String>)>>>,
+    responses: QueuedResponses,
 }
 async fn responses(
     State(provider): State<Provider>,

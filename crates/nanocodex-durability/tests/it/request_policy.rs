@@ -282,7 +282,9 @@ async fn request_policy_public_openai_and_claude_http_survive_270_boundaries_and
                     let before = requests.lock().unwrap().len();
                     assert_eq!(
                         agent
-                            .prompt(PromptRequest::new("ordered user turn 269").request_id("turn-269"))
+                            .prompt(
+                                PromptRequest::new("ordered user turn 269").request_id("turn-269")
+                            )
                             .await?
                             .result()
                             .await?
@@ -334,7 +336,9 @@ async fn request_policy_public_openai_and_claude_http_survive_270_boundaries_and
                     let before = requests.lock().unwrap().len();
                     assert_eq!(
                         agent
-                            .prompt(PromptRequest::new("ordered user turn 269").request_id("turn-269"))
+                            .prompt(
+                                PromptRequest::new("ordered user turn 269").request_id("turn-269")
+                            )
                             .await?
                             .result()
                             .await?
@@ -363,33 +367,35 @@ async fn request_policy_public_openai_and_claude_http_survive_270_boundaries_and
             270,
             "restart/replay may not evaluate the router again"
         );
-        let log = requests.lock().unwrap();
-        assert_eq!(log.len(), 270);
-        for (index, request) in log.iter().enumerate() {
-            assert_eq!(request["model"], model.as_str());
-            if !is_claude {
-                assert_eq!(request["prompt_cache_key"], "native-policy-journey");
-            }
-            assert_eq!(
-                request[if is_claude {
-                    "max_tokens"
-                } else {
-                    "max_output_tokens"
-                }],
-                32
-            );
-            let encoded = request.to_string();
-            assert!(encoded.contains(&format!("Named section at epoch {}", index / 54)));
-            assert_eq!(
-                encoded.matches("Named section at epoch").count(),
-                1,
-                "flattened configuration must not accumulate stale sections"
-            );
-            if index >= 54 {
-                assert!(
-                    encoded.contains("ordered user turn 0"),
-                    "native original transcript survives reopen"
+        {
+            let log = requests.lock().unwrap();
+            assert_eq!(log.len(), 270);
+            for (index, request) in log.iter().enumerate() {
+                assert_eq!(request["model"], model.as_str());
+                if !is_claude {
+                    assert_eq!(request["prompt_cache_key"], "native-policy-journey");
+                }
+                assert_eq!(
+                    request[if is_claude {
+                        "max_tokens"
+                    } else {
+                        "max_output_tokens"
+                    }],
+                    32
                 );
+                let encoded = request.to_string();
+                assert!(encoded.contains(&format!("Named section at epoch {}", index / 54)));
+                assert_eq!(
+                    encoded.matches("Named section at epoch").count(),
+                    1,
+                    "flattened configuration must not accumulate stale sections"
+                );
+                if index >= 54 {
+                    assert!(
+                        encoded.contains("ordered user turn 0"),
+                        "native original transcript survives reopen"
+                    );
+                }
             }
         }
         let historical_records = audit.lock().unwrap().history.clone();
@@ -441,7 +447,7 @@ async fn request_policy_public_openai_and_claude_http_survive_270_boundaries_and
     Ok(())
 }
 
-fn warm_policy() -> CacheWarmPolicy {
+const fn warm_policy() -> CacheWarmPolicy {
     CacheWarmPolicy {
         ttl_seconds: 300,
         max_spend_usd: 0.0007,
@@ -625,11 +631,23 @@ async fn request_policy_claude_http_unknown_warm_charge_is_not_repeated_after_re
             // An embedding may explicitly abandon an uncertain operation using
             // its last safe native checkpoint. The charge reservation must
             // survive that terminal failure before accepting a different turn.
-            let input = state.state().await?.operation("uncertain").unwrap().input.clone();
+            let input = state
+                .state()
+                .await?
+                .operation("uncertain")
+                .unwrap()
+                .input
+                .clone();
             let input: Value = state.resolve(&input).await?.decode()?;
             state.admit("uncertain", &input).await?;
             state.begin_attempt("uncertain").await?;
-            state.fail("uncertain", &safe_checkpoint, "host abandoned the turn with its charge still reserved").await?;
+            state
+                .fail(
+                    "uncertain",
+                    &safe_checkpoint,
+                    "host abandoned the turn with its charge still reserved",
+                )
+                .await?;
         }
         let client = ClaudeClient::new(
             reqwest::Client::new(),
@@ -648,18 +666,27 @@ async fn request_policy_claude_http_unknown_warm_charge_is_not_repeated_after_re
                     calls.clone(),
                 ),
                 client,
-                CacheWarmPolicy { max_spend_usd: 0.0003, ..warm_policy() },
+                CacheWarmPolicy {
+                    max_spend_usd: 0.0003,
+                    ..warm_policy()
+                },
             )
             .await?
             .build()?;
         if epoch == 0 {
-            let nanocodex_agent::ChildSnapshot::Native { payload, .. } = agent.runtime_snapshot().await? else {
+            let nanocodex_agent::ChildSnapshot::Native { payload, .. } =
+                agent.runtime_snapshot().await?
+            else {
                 panic!("expected native Claude snapshot");
             };
             safe_checkpoint = serde_json::from_str::<Value>(&payload)?["snapshot"].clone();
         }
         let failure = agent
-            .prompt(PromptRequest::new("charge once").request_id(if epoch < 2 { "uncertain" } else { "new-turn" }))
+            .prompt(PromptRequest::new("charge once").request_id(if epoch < 2 {
+                "uncertain"
+            } else {
+                "new-turn"
+            }))
             .await?
             .result()
             .await
@@ -669,7 +696,10 @@ async fn request_policy_claude_http_unknown_warm_charge_is_not_repeated_after_re
         } else if epoch == 2 {
             assert!(failure.to_string().contains("spend limit"), "{failure}");
         }
-        let budget = state.document("nanocodex.cache-warm.budget").await?.unwrap();
+        let budget = state
+            .document("nanocodex.cache-warm.budget")
+            .await?
+            .unwrap();
         assert_eq!(budget.value["reserved_usd"], 0.0003);
         assert_eq!(budget.value["actual_usd"], 0.0);
         assert_eq!(
@@ -680,15 +710,18 @@ async fn request_policy_claude_http_unknown_warm_charge_is_not_repeated_after_re
         let retained = state.state().await?;
         let operation = retained.operation("uncertain").unwrap();
         if epoch < 2 {
-        assert!(
-            operation
-                .steps
-                .values()
-                .any(|step| step.kind == "cache_warm_http"
-                    && matches!(step.status, nanocodex_durability::StepStatus::EffectPending))
-        );
+            assert!(
+                operation
+                    .steps
+                    .values()
+                    .any(|step| step.kind == "cache_warm_http"
+                        && matches!(step.status, nanocodex_durability::StepStatus::EffectPending))
+            );
         } else {
-            assert!(matches!(operation.status, nanocodex_durability::OperationStatus::Failed { .. }));
+            assert!(matches!(
+                operation.status,
+                nanocodex_durability::OperationStatus::Failed { .. }
+            ));
         }
         agent.shutdown().await?;
         drop((agent, events));
@@ -708,8 +741,8 @@ async fn request_policy_claude_http_unknown_warm_charge_is_not_repeated_after_re
 }
 
 #[tokio::test]
-async fn request_policy_public_http_failure_replays_frozen_route_after_reopen()
--> eyre::Result<()> {
+async fn request_policy_public_http_failure_replays_frozen_route_after_reopen() -> eyre::Result<()>
+{
     let _ = rustls::crypto::ring::default_provider().install_default();
     for is_claude in [false, true] {
         let directory = tempfile::tempdir()?;
@@ -810,7 +843,12 @@ async fn request_policy_public_http_failure_replays_frozen_route_after_reopen()
                     .result()
                     .await;
                 let failure = result.unwrap_err();
-                assert!(failure.to_string().contains("one deterministic rejected request"), "{failure}");
+                assert!(
+                    failure
+                        .to_string()
+                        .contains("one deterministic rejected request"),
+                    "{failure}"
+                );
                 agent.shutdown().await?;
                 drop((agent, events));
             } else {
@@ -832,7 +870,12 @@ async fn request_policy_public_http_failure_replays_frozen_route_after_reopen()
                     .result()
                     .await;
                 let failure = result.unwrap_err();
-                assert!(failure.to_string().contains("one deterministic rejected request"), "{failure}");
+                assert!(
+                    failure
+                        .to_string()
+                        .contains("one deterministic rejected request"),
+                    "{failure}"
+                );
                 agent.shutdown().await?;
                 drop((agent, events));
             }
@@ -844,7 +887,11 @@ async fn request_policy_public_http_failure_replays_frozen_route_after_reopen()
             "reopened retry cannot reevaluate a frozen route"
         );
         let log = requests.lock().unwrap();
-        assert_eq!(log.len(), 1, "a settled rejected request replays without another HTTP effect");
+        assert_eq!(
+            log.len(),
+            1,
+            "a settled rejected request replays without another HTTP effect"
+        );
         assert_eq!(log[0]["model"], original.as_str());
         assert!(log[0].to_string().contains("Frozen named instruction"));
         assert!(!log[0].to_string().contains("Changed host instruction"));

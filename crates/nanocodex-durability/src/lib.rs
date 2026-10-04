@@ -5,20 +5,20 @@
 mod agent;
 mod child_journal;
 pub use child_journal::ChildJournal;
-#[cfg(not(target_family = "wasm"))]
-mod code_mode;
 #[cfg(feature = "claude")]
 mod claude;
+#[cfg(not(target_family = "wasm"))]
+mod code_mode;
 mod context;
 mod documents;
 pub use documents::{DocumentFork, DocumentForkPolicy, DocumentWrite, SessionDocument};
-mod memory;
-/// Named configuration, virtual routing and cache decisions at durable request boundaries.
-pub mod request_policy;
 #[cfg(feature = "claude")]
 pub mod cache_warm;
+mod memory;
 #[cfg(all(feature = "postgres", not(target_family = "wasm")))]
 mod postgres;
+/// Named configuration, virtual routing and cache decisions at durable request boundaries.
+pub mod request_policy;
 mod session;
 mod shared_store;
 #[cfg(all(feature = "sqlite", not(target_family = "wasm")))]

@@ -1229,6 +1229,10 @@ impl Registry {
         state.scope_mut(root_session_id).persist().await
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the durable call identity accompanies the existing child registration inputs"
+    )]
     pub(super) async fn insert(
         self: &Arc<Self>,
         root_session_id: String,
@@ -1715,6 +1719,10 @@ impl Registry {
             .await
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "adds a durable call identity to the public message parameters"
+    )]
     pub(super) async fn send_message_keyed(
         self: &Arc<Self>,
         session_id: &str,

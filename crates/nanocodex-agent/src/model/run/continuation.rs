@@ -232,7 +232,17 @@ where
                 &saved,
                 session.conversation.flattened_history(),
                 session.factory.profile().prefix().to_vec(),
-                self.background_compaction.as_ref().map_or_else(Vec::new, |pending| vec![format!("background-compaction-{}", pending.after_model_call_index), format!("before-background-compaction-{}", pending.after_model_call_index)]),
+                self.background_compaction
+                    .as_ref()
+                    .map_or_else(Vec::new, |pending| {
+                        vec![
+                            format!("background-compaction-{}", pending.after_model_call_index),
+                            format!(
+                                "before-background-compaction-{}",
+                                pending.after_model_call_index
+                            ),
+                        ]
+                    }),
             )
             .await?;
         Ok(())

@@ -48,9 +48,14 @@ pub trait ClaudeExecutionPolicy: Send + Sync {
     fn state_id(&self) -> &str;
     /// Prepare and persist deterministic configuration/routing before dispatch.
     /// Defaults to the original native request for existing policy consumers.
-    fn prepare_request(&self, _operation: String, _request_id: String,
-        _continuation: bool, _state: Value, _request: Value)
-        -> PolicyFuture<'_, Option<RequestPreparation>> {
+    fn prepare_request(
+        &self,
+        _operation: String,
+        _request_id: String,
+        _continuation: bool,
+        _state: Value,
+        _request: Value,
+    ) -> PolicyFuture<'_, Option<RequestPreparation>> {
         Box::pin(async { Ok(None) })
     }
     /// Supplies the authoritative native cell journal, if installed.
@@ -70,10 +75,19 @@ pub trait ClaudeExecutionPolicy: Send + Sync {
     fn continuation(&self, id: String) -> PolicyFuture<'_, Option<Value>>;
     fn advance(&self, id: String, state: Value) -> PolicyFuture<'_, ()>;
     /// Foreground checkpoint retaining independently owned background effects.
-    fn advance_retaining(&self, id: String, state: Value, retained_steps: Vec<String>) -> PolicyFuture<'_, ()> {
+    fn advance_retaining(
+        &self,
+        id: String,
+        state: Value,
+        retained_steps: Vec<String>,
+    ) -> PolicyFuture<'_, ()> {
         Box::pin(async move {
             if !retained_steps.is_empty() {
-                return Err(nanocodex_agent::NanocodexError::ExecutionPolicyCapabilityUnsupported { capability: "background effect retention" });
+                return Err(
+                    nanocodex_agent::NanocodexError::ExecutionPolicyCapabilityUnsupported {
+                        capability: "background effect retention",
+                    },
+                );
             }
             self.advance(id, state).await
         })

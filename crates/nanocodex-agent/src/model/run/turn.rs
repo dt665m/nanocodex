@@ -817,7 +817,8 @@ where
             // The restored batch can contain a completed foreground receipt.
             // Replay it before advancing; the initial boundary was already saved.
             if !first_batch {
-                self.retain_execution(session, ExecutionPhase::Generate).await?;
+                self.retain_execution(session, ExecutionPhase::Generate)
+                    .await?;
             }
             first_batch = false;
             self.start_background(&session.factory).await?;
@@ -830,7 +831,12 @@ where
                 transport_continuation_valid,
                 server_reasoning_included,
             } = self
-                .perform_model_call(call_index, &mut session.conversation, &session.factory, &session.tools)
+                .perform_model_call(
+                    call_index,
+                    &mut session.conversation,
+                    &session.factory,
+                    &session.tools,
+                )
                 .await?;
             let TurnResult {
                 id,
@@ -905,7 +911,8 @@ where
                     // Owned work settles before the foreground operation becomes terminal.
                     self.start_background(&session.factory).await?;
                     self.wait_background().await;
-                    self.install_background(&mut session.conversation, &session.factory).await?;
+                    self.install_background(&mut session.conversation, &session.factory)
+                        .await?;
                     return Ok(if message.trim().is_empty() {
                         "The model completed without emitting assistant text.".to_owned()
                     } else {

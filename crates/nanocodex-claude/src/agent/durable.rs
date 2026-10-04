@@ -95,8 +95,13 @@ impl Effect<'_> {
     }
 }
 impl State {
-    pub(super) async fn prepare_policy_request(&self, conversation: &mut Conversation,
-        cursor: &mut Cursor, messages: &[Message], index: u32) -> Result<MessagesRequest> {
+    pub(super) async fn prepare_policy_request(
+        &self,
+        conversation: &mut Conversation,
+        cursor: &mut Cursor,
+        messages: &[Message],
+        index: u32,
+    ) -> Result<MessagesRequest> {
         let mut template = cursor.template.clone();
         let (Some(policy), Some(operation)) = (&self.policy, &cursor.operation) else {
             return Ok(template);
@@ -104,8 +109,16 @@ impl State {
         template.messages = messages.to_vec();
         template.container = conversation.container.clone();
         let id = format!("{operation}/model-{index}");
-        if let Some(prepared) = policy.prepare_request(operation.clone(), id, index > 0,
-            conversation.request_policy.clone(), serde_json::to_value(&template).map_err(provider_error)?).await? {
+        if let Some(prepared) = policy
+            .prepare_request(
+                operation.clone(),
+                id,
+                index > 0,
+                conversation.request_policy.clone(),
+                serde_json::to_value(&template).map_err(provider_error)?,
+            )
+            .await?
+        {
             template = serde_json::from_value(prepared.request).map_err(recovery_error)?;
             if conversation.request_policy != prepared.state {
                 conversation.request_policy = prepared.state;
@@ -225,7 +238,10 @@ impl State {
                 .advance_retaining(
                     operation.clone(),
                     serde_json::to_value(&*cursor).map_err(provider_error)?,
-                    cursor.background.as_ref().map_or_else(Vec::new, |pending| vec![pending.step.clone()]),
+                    cursor
+                        .background
+                        .as_ref()
+                        .map_or_else(Vec::new, |pending| vec![pending.step.clone()]),
                 )
                 .await?;
         }
@@ -285,7 +301,10 @@ impl State {
                 nanocodex_agent::ReplaySafety::Unsafe
             };
         }
-        self.tool_replay_safety.get(name).copied().unwrap_or_default()
+        self.tool_replay_safety
+            .get(name)
+            .copied()
+            .unwrap_or_default()
     }
 
     pub(super) async fn durable_tool(

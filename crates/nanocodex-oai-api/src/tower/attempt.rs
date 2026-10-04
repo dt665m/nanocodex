@@ -303,12 +303,27 @@ impl ResponsesAttempt {
     /// Builds the full native body used for a frozen durable request. Authentication
     /// and connection-local continuation state are applied by the live transport.
     #[doc(hidden)]
-    pub fn native_request(&self, config: &crate::ModelConfig) -> Result<serde_json::Value, serde_json::Error> {
+    pub fn native_request(
+        &self,
+        config: &crate::ModelConfig,
+    ) -> Result<serde_json::Value, serde_json::Error> {
         serde_json::to_value(crate::responses::ResponseCreate::generation_with_policy(
-            config, crate::responses::CreatePolicy::new(crate::ResponsesTransport::Https,
-                self.model, self.thinking, self.fast_mode),
-            ResponsesInput::history(self.profile.prefix(), &self.full_history, self.tail.as_ref()),
-            None, &self.profile, None))
+            config,
+            crate::responses::CreatePolicy::new(
+                crate::ResponsesTransport::Https,
+                self.model,
+                self.thinking,
+                self.fast_mode,
+            ),
+            ResponsesInput::history(
+                self.profile.prefix(),
+                &self.full_history,
+                self.tail.as_ref(),
+            ),
+            None,
+            &self.profile,
+            None,
+        ))
     }
 
     /// Installs a previously prepared full native request for every retry.

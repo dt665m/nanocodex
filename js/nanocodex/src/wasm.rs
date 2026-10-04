@@ -1731,8 +1731,6 @@ impl WasmSubagents {
         )
         .map_err(js_error)
     }
-
-
 }
 
 #[wasm_bindgen(js_class = Nanocodex)]
@@ -3498,10 +3496,12 @@ fn forward_subagent_updates(
                     // Recovery can admit a child before the root's user event
                     // watcher is installed. Host journals and request policy
                     // need these canonical identities even without a watcher.
-                    let identity_event = matches!(event.kind,
+                    let identity_event = matches!(
+                        event.kind,
                         nanocodex::oai::events::AgentEventKind::InputAccepted
-                        | nanocodex::oai::events::AgentEventKind::ModelCallStarted
-                        | nanocodex::oai::events::AgentEventKind::ToolCall);
+                            | nanocodex::oai::events::AgentEventKind::ModelCallStarted
+                            | nanocodex::oai::events::AgentEventKind::ToolCall
+                    );
                     if (identity_event || event_forwarders.get() > 0)
                         && let Ok(encoded) = serde_json::to_string(&event)
                     {

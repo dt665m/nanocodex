@@ -3,10 +3,10 @@
 //! Configuration controls declaration rendering, never tool execution authority.
 //! Provider messages and opaque signatures remain owned by the native harness.
 
+use crate::{Error, Result};
 use nanocodex_agent::{HarnessFamily, HarnessModel};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use crate::{Error, Result};
 
 const MAX_RECEIPTS: usize = 16;
 const MAX_POLICY_BYTES: usize = 16 * 1024 * 1024;
@@ -21,10 +21,26 @@ fn bounded<T: Serialize>(value: &T) -> Result<()> {
 /// Whether provider-native continuation data forbids a physical model switch.
 pub(crate) fn contains_opaque(value: &Value) -> bool {
     match value {
-        Value::Object(object) => object.contains_key("signature") || object.contains_key("encrypted_content")
-            || object.get("type").and_then(Value::as_str).is_some_and(|kind| matches!(kind,
-                "redacted_thinking" | "image" | "document" | "input_image" | "input_audio" | "input_file" | "audio"))
-            || object.values().any(contains_opaque),
+        Value::Object(object) => {
+            object.contains_key("signature")
+                || object.contains_key("encrypted_content")
+                || object
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| {
+                        matches!(
+                            kind,
+                            "redacted_thinking"
+                                | "image"
+                                | "document"
+                                | "input_image"
+                                | "input_audio"
+                                | "input_file"
+                                | "audio"
+                        )
+                    })
+                || object.values().any(contains_opaque)
+        }
         Value::Array(values) => values.iter().any(contains_opaque),
         _ => false,
     }
@@ -32,20 +48,25 @@ pub(crate) fn contains_opaque(value: &Value) -> bool {
 
 fn native_tools(request: &Value) -> Vec<Value> {
     if let Some(items) = request["input"].as_array()
-        && let Some(item) = items.iter().find(|item| item["type"] == "additional_tools") {
-            return item["tools"].as_array().cloned().unwrap_or_default();
-        }
+        && let Some(item) = items.iter().find(|item| item["type"] == "additional_tools")
+    {
+        return item["tools"].as_array().cloned().unwrap_or_default();
+    }
     request["tools"].as_array().cloned().unwrap_or_default()
 }
 
 pub(crate) fn authorize_native(request: &Value, authorized: &Value) -> Result<()> {
     let catalog = native_tools(authorized);
-    if native_tools(request).iter().any(|definition| !catalog.contains(definition)) {
-        return Err(invalid("prepared request contains a declaration revoked by current host authorization"));
+    if native_tools(request)
+        .iter()
+        .any(|definition| !catalog.contains(definition))
+    {
+        return Err(invalid(
+            "prepared request contains a declaration revoked by current host authorization",
+        ));
     }
     Ok(())
 }
-
 
 /// One named instruction section, ordered by first insertion (re-add appends).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -70,17 +91,25 @@ pub struct ToolDeclaration {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ConfigurationPatch {
     /// Insert or replace a named section in its existing position.
-    SetSection { /// Section to install.
-        section: PromptSection },
+    SetSection {
+        /// Section to install.
+        section: PromptSection,
+    },
     /// Remove a section; unknown keys are harmless.
-    RemoveSection { /// Section key.
-        name: String },
+    RemoveSection {
+        /// Section key.
+        name: String,
+    },
     /// Insert or replace a tool declaration in its existing position.
-    SetTool { /// Declaration to install.
-        tool: ToolDeclaration },
+    SetTool {
+        /// Declaration to install.
+        tool: ToolDeclaration,
+    },
     /// Remove a declaration; unknown keys are harmless.
-    RemoveTool { /// Tool key.
-        name: String },
+    RemoveTool {
+        /// Tool key.
+        name: String,
+    },
 }
 
 /// All patches admitted together for one request.
@@ -104,14 +133,20 @@ pub struct EffectiveConfiguration {
 impl EffectiveConfiguration {
     /// Flatten sections for native adapters without positional patch support.
     pub fn instructions(&self) -> String {
-        self.sections.iter().map(|s| s.text.as_str()).collect::<Vec<_>>().join("\n\n")
+        self.sections
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n")
     }
 
     /// Reject declarations not present byte-for-JSON-value in the host catalog.
     /// The dispatcher must still perform its normal per-call authorization.
     pub fn authorize(&self, catalog: &[ToolDeclaration]) -> Result<()> {
         if self.tools.iter().any(|tool| !catalog.contains(tool)) {
-            return Err(invalid("configuration includes an unauthorized tool declaration"));
+            return Err(invalid(
+                "configuration includes an unauthorized tool declaration",
+            ));
         }
         Ok(())
     }
@@ -122,14 +157,18 @@ impl EffectiveConfiguration {
                 nonempty(&section.name)?;
                 if let Some(old) = self.sections.iter_mut().find(|s| s.name == section.name) {
                     *old = section.clone();
-                } else { self.sections.push(section.clone()); }
+                } else {
+                    self.sections.push(section.clone());
+                }
             }
             ConfigurationPatch::RemoveSection { name } => self.sections.retain(|s| &s.name != name),
             ConfigurationPatch::SetTool { tool } => {
                 nonempty(&tool.name)?;
                 if let Some(old) = self.tools.iter_mut().find(|t| t.name == tool.name) {
                     *old = tool.clone();
-                } else { self.tools.push(tool.clone()); }
+                } else {
+                    self.tools.push(tool.clone());
+                }
             }
             ConfigurationPatch::RemoveTool { name } => self.tools.retain(|t| &t.name != name),
         }
@@ -149,31 +188,47 @@ pub struct ConfigurationHistory {
 
 impl ConfigurationHistory {
     /// Historical changes in admission order.
-    pub fn entries(&self) -> &[ConfigurationEntry] { &self.entries }
+    pub fn entries(&self) -> &[ConfigurationEntry] {
+        &self.entries
+    }
 
     /// Replay through an inclusive boundary; `None` selects the latest.
     pub fn at(&self, request_id: Option<&str>) -> Result<EffectiveConfiguration> {
         let mut configuration = self.base.clone();
         for entry in &self.entries {
-            for patch in &entry.patches { configuration.patch(patch)?; }
-            if request_id == Some(entry.request_id.as_str()) { return Ok(configuration); }
+            for patch in &entry.patches {
+                configuration.patch(patch)?;
+            }
+            if request_id == Some(entry.request_id.as_str()) {
+                return Ok(configuration);
+            }
         }
-        if request_id.is_some() { return Err(invalid("unknown configuration boundary")); }
+        if request_id.is_some() {
+            return Err(invalid("unknown configuration boundary"));
+        }
         Ok(configuration)
     }
 
     fn append(&mut self, entry: ConfigurationEntry) -> Result<()> {
         nonempty(&entry.request_id)?;
-        if self.entries.iter().any(|old| old.request_id == entry.request_id) {
+        if self
+            .entries
+            .iter()
+            .any(|old| old.request_id == entry.request_id)
+        {
             return Err(invalid("duplicate configuration boundary"));
         }
         // Validate before admitting any partial patch.
         let mut next = self.at(None)?;
-        for patch in &entry.patches { next.patch(patch)?; }
+        for patch in &entry.patches {
+            next.patch(patch)?;
+        }
         self.entries.push(entry);
         while self.entries.len() > MAX_RECEIPTS {
             let oldest = self.entries.remove(0);
-            for patch in &oldest.patches { self.base.patch(patch)?; }
+            for patch in &oldest.patches {
+                self.base.patch(patch)?;
+            }
         }
         Ok(())
     }
@@ -238,8 +293,13 @@ pub trait VirtualModelRouter {
     fn route(&self, input: RoutingInput<'_>) -> Result<RoutingChoice>;
 }
 
-impl<F> VirtualModelRouter for F where F: Fn(RoutingInput<'_>) -> Result<RoutingChoice> {
-    fn route(&self, input: RoutingInput<'_>) -> Result<RoutingChoice> { self(input) }
+impl<F> VirtualModelRouter for F
+where
+    F: Fn(RoutingInput<'_>) -> Result<RoutingChoice>,
+{
+    fn route(&self, input: RoutingInput<'_>) -> Result<RoutingChoice> {
+        self(input)
+    }
 }
 
 /// Exact prepared request and routing receipt retained for retries and attribution.
@@ -291,10 +351,20 @@ impl RequestPolicyState {
     ) -> Result<PreparedRequest> {
         nonempty(&request.request_id)?;
         nonempty(&request.selection)?;
-        if let Some(saved) = self.requests.iter().find(|p| p.request.request_id == request.request_id) {
-            let entry = self.configuration.entries.iter().find(|e| e.request_id == request.request_id);
+        if let Some(saved) = self
+            .requests
+            .iter()
+            .find(|p| p.request.request_id == request.request_id)
+        {
+            let entry = self
+                .configuration
+                .entries
+                .iter()
+                .find(|e| e.request_id == request.request_id);
             if saved.request != request || entry.is_none_or(|e| e.patches != patches) {
-                return Err(invalid("request identity reused with different routing/configuration input"));
+                return Err(invalid(
+                    "request identity reused with different routing/configuration input",
+                ));
             }
             saved.configuration.authorize(authorized_tools)?;
             validate_limits(&request, saved.route.dispatched, models)?;
@@ -304,16 +374,27 @@ impl RequestPolicyState {
         let previous = self.requests.last();
         let state = previous.map_or(&Value::Null, |p| &p.route.state);
         let choice = if let Some(id) = &request.continuation_of {
-            let predecessor = previous.filter(|p| &p.request.request_id == id)
+            let predecessor = previous
+                .filter(|p| &p.request.request_id == id)
                 .ok_or_else(|| invalid("continuation must reference the latest request"))?;
             if request.selection != predecessor.request.selection {
-                return Err(invalid("virtual selection cannot change during continuation"));
+                return Err(invalid(
+                    "virtual selection cannot change during continuation",
+                ));
             }
-            if !patches.is_empty() { return Err(invalid("configuration changes require a completed native boundary")); }
+            if !patches.is_empty() {
+                return Err(invalid(
+                    "configuration changes require a completed native boundary",
+                ));
+            }
             predecessor.route.clone()
         } else {
-            router.route(RoutingInput { request: &request, state,
-                previous: previous.map(|p| p.route.dispatched), models })?
+            router.route(RoutingInput {
+                request: &request,
+                state,
+                previous: previous.map(|p| p.route.dispatched),
+                models,
+            })?
         };
         validate_limits(&request, choice.dispatched, models)?;
         if let Some(previous) = previous {
@@ -324,20 +405,34 @@ impl RequestPolicyState {
             if from != choice.dispatched {
                 let old = models.iter().find(|p| p.model == from);
                 let new = models.iter().find(|p| p.model == choice.dispatched);
-                let compatible = old.zip(new).is_some_and(|(a,b)|
-                    a.switch_group.as_ref().is_some_and(|g| !g.is_empty() && Some(g) == b.switch_group.as_ref()));
+                let compatible = old.zip(new).is_some_and(|(a, b)| {
+                    a.switch_group
+                        .as_ref()
+                        .is_some_and(|g| !g.is_empty() && Some(g) == b.switch_group.as_ref())
+                });
                 if !request.switch_safe || from.family() == HarnessFamily::Claude || !compatible {
-                    return Err(invalid("native transcript does not permit this physical model switch"));
+                    return Err(invalid(
+                        "native transcript does not permit this physical model switch",
+                    ));
                 }
             }
         }
         let mut history = self.configuration.clone();
-        history.append(ConfigurationEntry { request_id: request.request_id.clone(), patches })?;
+        history.append(ConfigurationEntry {
+            request_id: request.request_id.clone(),
+            patches,
+        })?;
         let configuration = history.at(None)?;
         configuration.authorize(authorized_tools)?;
         let request_json = render(&configuration, choice.dispatched)?;
         serde_json::from_str::<Value>(&request_json)?;
-        let prepared = PreparedRequest { request, route: choice, request_json, configuration, original_request: None };
+        let prepared = PreparedRequest {
+            request,
+            route: choice,
+            request_json,
+            configuration,
+            original_request: None,
+        };
         let mut next = self.clone();
         next.configuration = history;
         next.requests.push(prepared.clone());
@@ -350,22 +445,44 @@ impl RequestPolicyState {
     }
 }
 
-fn validate_limits(request: &RouteRequest, model: HarnessModel, models: &[PhysicalModel]) -> Result<()> {
+fn validate_limits(
+    request: &RouteRequest,
+    model: HarnessModel,
+    models: &[PhysicalModel],
+) -> Result<()> {
     if models.iter().filter(|p| p.model == model).count() != 1 {
-        return Err(invalid("physical model must occur exactly once in the approved catalog"));
+        return Err(invalid(
+            "physical model must occur exactly once in the approved catalog",
+        ));
     }
-    let physical = models.iter().find(|p| p.model == model).expect("checked model");
-    if request.output_tokens == 0 || request.output_tokens > physical.max_output_tokens
-        || request.input_tokens.checked_add(request.output_tokens).is_none_or(|n| n > physical.context_tokens) {
+    let physical = models
+        .iter()
+        .find(|p| p.model == model)
+        .expect("checked model");
+    if request.output_tokens == 0
+        || request.output_tokens > physical.max_output_tokens
+        || request
+            .input_tokens
+            .checked_add(request.output_tokens)
+            .is_none_or(|n| n > physical.context_tokens)
+    {
         return Err(invalid("rendered request exceeds dispatched model limits"));
     }
     Ok(())
 }
 
 fn nonempty(value: &str) -> Result<()> {
-    if value.is_empty() { Err(invalid("configuration and request identities must be nonempty")) } else { Ok(()) }
+    if value.is_empty() {
+        Err(invalid(
+            "configuration and request identities must be nonempty",
+        ))
+    } else {
+        Ok(())
+    }
 }
-fn invalid(message: &str) -> Error { Error::InvalidState(message.into()) }
+fn invalid(message: &str) -> Error {
+    Error::InvalidState(message.into())
+}
 
 /// Host-selected virtual route and named changes for the next native turn.
 /// Router state and exact decisions are persisted in the native checkpoint.
@@ -393,33 +510,66 @@ pub struct PreparedNativeRequest {
 impl RequestPolicySettings {
     /// Prepare supported native JSON without changing original transcript items.
     /// Retries replay the exact receipt, irrespective of a changed host router.
-    pub fn prepare_native(&self, id: String, continuation: bool, switch_safe: bool,
-        state: Value, request: Value, family: HarnessFamily) -> Result<PreparedNativeRequest> {
+    pub fn prepare_native(
+        &self,
+        id: String,
+        continuation: bool,
+        switch_safe: bool,
+        state: Value,
+        request: Value,
+        family: HarnessFamily,
+    ) -> Result<PreparedNativeRequest> {
         bounded(&state)?;
-        let mut state: RequestPolicyState = if state.is_null() { RequestPolicyState::default() }
-            else { serde_json::from_value(state)? };
-        let catalog: Vec<ToolDeclaration> = native_tools(&request).iter()
-            .map(|definition| Ok(ToolDeclaration {
-                name: definition["name"].as_str().or_else(|| definition["type"].as_str())
-                    .ok_or_else(|| invalid("native declaration lacks name"))?.into(),
-                definition: definition.clone(),
-            })).collect::<Result<_>>()?;
-        if let Some(saved) = state.requests.iter().find(|entry| entry.request.request_id == id) {
+        let mut state: RequestPolicyState = if state.is_null() {
+            RequestPolicyState::default()
+        } else {
+            serde_json::from_value(state)?
+        };
+        let catalog: Vec<ToolDeclaration> = native_tools(&request)
+            .iter()
+            .map(|definition| {
+                Ok(ToolDeclaration {
+                    name: definition["name"]
+                        .as_str()
+                        .or_else(|| definition["type"].as_str())
+                        .ok_or_else(|| invalid("native declaration lacks name"))?
+                        .into(),
+                    definition: definition.clone(),
+                })
+            })
+            .collect::<Result<_>>()?;
+        if let Some(saved) = state
+            .requests
+            .iter()
+            .find(|entry| entry.request.request_id == id)
+        {
             if saved.original_request.as_ref() != Some(&request)
-                || saved.request.continuation_of.is_some() != continuation {
-                return Err(invalid("request identity reused with different original native input"));
+                || saved.request.continuation_of.is_some() != continuation
+            {
+                return Err(invalid(
+                    "request identity reused with different original native input",
+                ));
             }
             saved.configuration.authorize(&catalog)?;
             let mut limits = saved.request.clone();
             limits.input_tokens = saved.request_json.len() as u64;
             validate_limits(&limits, saved.route.dispatched, &self.models)?;
             return Ok(PreparedNativeRequest {
-                request: serde_json::from_str(&saved.request_json)?, state: serde_json::to_value(&state)?,
+                request: serde_json::from_str(&saved.request_json)?,
+                state: serde_json::to_value(&state)?,
             });
         }
-        let mut patches = if continuation { Vec::new() } else { self.patches.clone() };
+        let mut patches = if continuation {
+            Vec::new()
+        } else {
+            self.patches.clone()
+        };
         if state.requests.is_empty() {
-            let mut initial = catalog.iter().cloned().map(|tool| ConfigurationPatch::SetTool { tool }).collect::<Vec<_>>();
+            let mut initial = catalog
+                .iter()
+                .cloned()
+                .map(|tool| ConfigurationPatch::SetTool { tool })
+                .collect::<Vec<_>>();
             initial.append(&mut patches);
             patches = initial;
         }
@@ -428,18 +578,36 @@ impl RequestPolicySettings {
             return Err(invalid("continuation requires a persisted predecessor"));
         }
         let original = request.clone();
-        let output = request[if family == HarnessFamily::Claude { "max_tokens" } else { "max_output_tokens" }]
-            .as_u64().or_else(|| (family == HarnessFamily::Codex).then(||
-                self.models.iter().filter(|physical| physical.model.family() == family)
-                    .map(|physical| physical.max_output_tokens).min()).flatten())
-            .ok_or_else(|| invalid("native request lacks output limit"))?;
+        let output = request[if family == HarnessFamily::Claude {
+            "max_tokens"
+        } else {
+            "max_output_tokens"
+        }]
+        .as_u64()
+        .or_else(|| {
+            (family == HarnessFamily::Codex)
+                .then(|| {
+                    self.models
+                        .iter()
+                        .filter(|physical| physical.model.family() == family)
+                        .map(|physical| physical.max_output_tokens)
+                        .min()
+                })
+                .flatten()
+        })
+        .ok_or_else(|| invalid("native request lacks output limit"))?;
         // A byte bound is conservative for inline textual requests. External
         // media has unknown token cost and needs a native measured estimator.
         reject_external_media(&request)?;
         let input = serde_json::to_vec(&request)?.len() as u64;
-        let route_request = RouteRequest { request_id: id, selection: self.selection.clone(),
+        let route_request = RouteRequest {
+            request_id: id,
+            selection: self.selection.clone(),
             continuation_of: if continuation { predecessor } else { None },
-            input_tokens: input, output_tokens: output, switch_safe };
+            input_tokens: input,
+            output_tokens: output,
+            switch_safe,
+        };
         let mut prepared = state.prepare(route_request, patches, &self.models, &catalog,
             &|input: RoutingInput<'_>| self.router.route(input), |configuration, model| {
                 if model.family() != family { return Err(invalid("native transport and dispatched model family differ")); }
@@ -491,28 +659,65 @@ impl RequestPolicySettings {
         *state.requests.last_mut().expect("new receipt") = prepared.clone();
         bounded(&state)?;
         Ok(PreparedNativeRequest {
-            request: serde_json::from_str(&prepared.request_json)?, state: serde_json::to_value(state)?,
+            request: serde_json::from_str(&prepared.request_json)?,
+            state: serde_json::to_value(state)?,
         })
     }
 
     #[cfg(feature = "claude")]
-    pub(crate) fn prepare_claude(&self, id: String, continuation: bool,
-        state: Value, request: Value) -> Result<nanocodex_claude::execution::RequestPreparation> {
-        let prepared = self.prepare_native(id, continuation, false, state, request, HarnessFamily::Claude)?;
-        Ok(nanocodex_claude::execution::RequestPreparation { request: prepared.request, state: prepared.state })
+    pub(crate) fn prepare_claude(
+        &self,
+        id: String,
+        continuation: bool,
+        state: Value,
+        request: Value,
+    ) -> Result<nanocodex_claude::execution::RequestPreparation> {
+        let prepared = self.prepare_native(
+            id,
+            continuation,
+            false,
+            state,
+            request,
+            HarnessFamily::Claude,
+        )?;
+        Ok(nanocodex_claude::execution::RequestPreparation {
+            request: prepared.request,
+            state: prepared.state,
+        })
     }
 }
 
 fn reject_external_media(value: &Value) -> Result<()> {
     match value {
         Value::Object(object) => {
-            if object.get("type").and_then(Value::as_str).is_some_and(|kind|
-                matches!(kind, "image" | "document" | "input_image" | "input_audio" | "input_file" | "audio")) {
-                return Err(invalid("media requests require native measured token limits"));
+            if object
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| {
+                    matches!(
+                        kind,
+                        "image"
+                            | "document"
+                            | "input_image"
+                            | "input_audio"
+                            | "input_file"
+                            | "audio"
+                    )
+                })
+            {
+                return Err(invalid(
+                    "media requests require native measured token limits",
+                ));
             }
-            for value in object.values() { reject_external_media(value)?; }
+            for value in object.values() {
+                reject_external_media(value)?;
+            }
         }
-        Value::Array(values) => for value in values { reject_external_media(value)?; },
+        Value::Array(values) => {
+            for value in values {
+                reject_external_media(value)?;
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -520,19 +725,33 @@ fn reject_external_media(value: &Value) -> Result<()> {
 
 fn validate_native_controls(request: &Value, model: HarnessModel) -> Result<()> {
     // A model rewrite must never silently reinterpret adaptive thinking or speed.
-    if (request["speed"] == "fast" || request["service_tier"] == "priority") && !model.supports_fast_mode() {
-        return Err(invalid("dispatched model does not support requested fast mode"));
+    if (request["speed"] == "fast" || request["service_tier"] == "priority")
+        && !model.supports_fast_mode()
+    {
+        return Err(invalid(
+            "dispatched model does not support requested fast mode",
+        ));
     }
-    let effort = request["output_config"]["effort"].as_str().or_else(|| request["reasoning"]["effort"].as_str());
+    let effort = request["output_config"]["effort"]
+        .as_str()
+        .or_else(|| request["reasoning"]["effort"].as_str());
     if let Some(effort) = effort {
-        let thinking = serde_json::from_value::<nanocodex_agent::Thinking>(Value::String(effort.into()))?;
+        let thinking =
+            serde_json::from_value::<nanocodex_agent::Thinking>(Value::String(effort.into()))?;
         if !model.supports_thinking(thinking) {
-            return Err(invalid("dispatched model does not support requested thinking effort"));
+            return Err(invalid(
+                "dispatched model does not support requested thinking effort",
+            ));
         }
     }
     if model == HarnessModel::Claude(nanocodex_agent::ClaudeModel::Haiku45)
-        && request["thinking"]["type"].as_str().is_some_and(|kind| kind != "disabled") {
-        return Err(invalid("dispatched model does not support adaptive thinking"));
+        && request["thinking"]["type"]
+            .as_str()
+            .is_some_and(|kind| kind != "disabled")
+    {
+        return Err(invalid(
+            "dispatched model does not support adaptive thinking",
+        ));
     }
     Ok(())
 }
@@ -541,19 +760,28 @@ fn validate_native_controls(request: &Value, model: HarnessModel) -> Result<()> 
 #[cfg(feature = "claude")]
 pub trait DurableClaudeRequestExt: Sized {
     /// Acquire the native durable owner and install persisted request decisions.
-    fn durability_with_request_policy(self, state: crate::DurableSession, settings: RequestPolicySettings)
-        -> impl std::future::Future<Output = nanocodex_agent::Result<Self>>;
+    fn durability_with_request_policy(
+        self,
+        state: crate::DurableSession,
+        settings: RequestPolicySettings,
+    ) -> impl std::future::Future<Output = nanocodex_agent::Result<Self>>;
     /// Explicitly enable economically justified cache warming on native requests.
     /// The live client supplies current authentication; credentials are never journaled.
-    fn durability_with_request_policy_and_cache_warm(self, state: crate::DurableSession,
-        settings: RequestPolicySettings, client: nanocodex_claude::ClaudeClient,
-        policy: crate::cache_warm::CacheWarmPolicy)
-        -> impl std::future::Future<Output = nanocodex_agent::Result<Self>>;
+    fn durability_with_request_policy_and_cache_warm(
+        self,
+        state: crate::DurableSession,
+        settings: RequestPolicySettings,
+        client: nanocodex_claude::ClaudeClient,
+        policy: crate::cache_warm::CacheWarmPolicy,
+    ) -> impl std::future::Future<Output = nanocodex_agent::Result<Self>>;
 }
 
 /// Optional request policy installed on an OpenAI-native durable builder.
 pub trait DurableOpenAiRequestExt: Sized {
     /// Acquire the durable owner and freeze native configuration/routing before dispatch.
-    fn durability_with_request_policy(self, state: crate::DurableSession, settings: RequestPolicySettings)
-        -> impl std::future::Future<Output = nanocodex_agent::Result<Self>>;
+    fn durability_with_request_policy(
+        self,
+        state: crate::DurableSession,
+        settings: RequestPolicySettings,
+    ) -> impl std::future::Future<Output = nanocodex_agent::Result<Self>>;
 }

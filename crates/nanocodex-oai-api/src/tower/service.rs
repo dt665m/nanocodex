@@ -466,8 +466,9 @@ impl ResponsesService {
                     body["client_metadata"]["turn_state"] = state.into();
                 }
             }
-            return EncodedRequest::new(&body).map_err(|error|
-                ResponsesServiceError::responses(error, FailurePhase::Encode, connection.generation));
+            return EncodedRequest::new(&body).map_err(|error| {
+                ResponsesServiceError::responses(error, FailurePhase::Encode, connection.generation)
+            });
         }
         let encoded = match request.kind {
             ResponsesAttemptKind::Warmup => EncodedRequest::new(&ResponseCreate::warmup(
@@ -812,7 +813,8 @@ impl Service<ResponsesAttempt> for ResponsesService {
                 let queued_at = Instant::now();
                 // Owned background work must not occupy the foreground socket
                 // or its request lock. The full replay owns its routing state.
-                let independent = request.independent_connection
+                let independent = request
+                    .independent_connection
                     .then(|| Arc::new(Mutex::new(ConnectionState::new())));
                 let connection_state = independent.as_ref().unwrap_or(&service.connection);
                 let mut connection = connection_state.lock().await;

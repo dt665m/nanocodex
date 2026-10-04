@@ -18,27 +18,55 @@ pub(super) async fn progress(work: &mut Option<SummaryWork<'_>>) -> Result<(Conv
     }
 }
 pub(super) fn poll(work: &mut Option<SummaryWork<'_>>) {
-    if let Some(work) = work && work.result.is_none() {
+    if let Some(work) = work
+        && work.result.is_none()
+    {
         work.result = work.future.as_mut().now_or_never();
     }
 }
 pub(super) async fn wait(work: &mut Option<SummaryWork<'_>>) {
-    if let Some(work) = work && work.result.is_none() {
+    if let Some(work) = work
+        && work.result.is_none()
+    {
         work.result = Some(work.future.as_mut().await);
     }
 }
 impl State {
-    pub(super) fn start_summary<'a>(&'a self, cursor: &Cursor, cancel: &'a Cancellation) -> Option<SummaryWork<'a>> {
+    pub(super) fn start_summary<'a>(
+        &'a self,
+        cursor: &Cursor,
+        cancel: &'a Cancellation,
+    ) -> Option<SummaryWork<'a>> {
         let pending = cursor.background.clone()?;
         let cursor = cursor.clone();
-        Some(SummaryWork { result: None, future: Box::pin(async move {
-            let mut context = pending.cutoff;
-            let usage = self.compact_locked(&mut context, cancel, CompactionMode::Background, &cursor, &pending.step).await?;
-            Ok((context, usage))
-        }) })
+        Some(SummaryWork {
+            result: None,
+            future: Box::pin(async move {
+                let mut context = pending.cutoff;
+                let usage = self
+                    .compact_locked(
+                        &mut context,
+                        cancel,
+                        CompactionMode::Background,
+                        &cursor,
+                        &pending.step,
+                    )
+                    .await?;
+                Ok((context, usage))
+            }),
+        })
     }
-    pub(super) async fn install_summary(&self, cursor: &mut Cursor, work: &mut Option<SummaryWork<'_>>, context: &mut Conversation, pending: &mut Vec<Message>, usage: &mut Usage) -> Result<bool> {
-        if !work.as_ref().is_some_and(|work| work.result.is_some()) { return Ok(false); }
+    pub(super) async fn install_summary(
+        &self,
+        cursor: &mut Cursor,
+        work: &mut Option<SummaryWork<'_>>,
+        context: &mut Conversation,
+        pending: &mut Vec<Message>,
+        usage: &mut Usage,
+    ) -> Result<bool> {
+        if !work.as_ref().is_some_and(|work| work.result.is_some()) {
+            return Ok(false);
+        }
         // Acquire shared discovery state before the ownership fence so the
         // context and discoveries swap without yielding after that fence.
         let mut discovered = self.discovered.lock().await;
@@ -50,7 +78,10 @@ impl State {
         let (summary, cost) = work.result.take().expect("completed result")?;
         add_usage(usage, &cost);
         let cutoff = input.cutoff.packed_messages();
-        if pending.len() < cutoff.len() || serde_json::to_value(&pending[..cutoff.len()]).map_err(provider_error)? != serde_json::to_value(&cutoff).map_err(provider_error)? {
+        if pending.len() < cutoff.len()
+            || serde_json::to_value(&pending[..cutoff.len()]).map_err(provider_error)?
+                != serde_json::to_value(&cutoff).map_err(provider_error)?
+        {
             return Ok(false);
         }
         let mut messages = summary.messages;

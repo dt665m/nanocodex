@@ -277,7 +277,9 @@ impl EmbeddedToolRuntime {
     /// Whether the embedding host durably reconciles interrupted Code Mode cells.
     #[must_use]
     pub fn code_replay_safe(&self) -> bool {
-        self.host.as_ref().is_some_and(|host| host.code_replay_safe())
+        self.host
+            .as_ref()
+            .is_some_and(|host| host.code_replay_safe())
     }
 
     /// Whether a direct tool or its embedding host explicitly permits replay.

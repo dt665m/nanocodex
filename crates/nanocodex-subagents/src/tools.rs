@@ -459,9 +459,10 @@ async fn start_agent_with_host_context(
 ) -> AgentToolResult<AgentStartReport> {
     let _spawn = registry.spawn_lock.lock().await;
     if let Some((key, input)) = &call
-        && let Some(report) = registry.replay_spawn(session_id, key, input).await? {
-            return Ok(report);
-        }
+        && let Some(report) = registry.replay_spawn(session_id, key, input).await?
+    {
+        return Ok(report);
+    }
     registry.register_handle(parent.clone());
     let AgentTask {
         lifetime,

@@ -2447,11 +2447,12 @@ async fn historical_document_fork_restores_native_claude_checkpoint_after_receip
             .final_message(),
         "document answer"
     );
-    let log = requests.lock().unwrap();
-    let last = serde_json::to_string(log.last().unwrap()).unwrap();
-    assert!(last.contains("CLAUDE_BOUNDARY_0") && last.contains("CLAUDE_CHILD_ONLY"));
-    assert!(!last.contains("CLAUDE_BOUNDARY_4"));
-    drop(log);
+    {
+        let log = requests.lock().unwrap();
+        let last = serde_json::to_string(log.last().unwrap()).unwrap();
+        assert!(last.contains("CLAUDE_BOUNDARY_0") && last.contains("CLAUDE_CHILD_ONLY"));
+        assert!(!last.contains("CLAUDE_BOUNDARY_4"));
+    }
     assert_eq!(
         source.document("asOf").await.unwrap().unwrap().value,
         json!(2)

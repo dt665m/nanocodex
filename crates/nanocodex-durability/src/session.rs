@@ -2540,28 +2540,45 @@ impl DurableOwner {
     pub(crate) async fn document(&self, key: &str) -> Result<Option<crate::SessionDocument>> {
         self.caller()?;
         let (result, receiver) = oneshot::channel();
-        self.send(Command::Document { key: key.to_owned(), result }).await?;
+        self.send(Command::Document {
+            key: key.to_owned(),
+            result,
+        })
+        .await?;
         receiver.await.map_err(|_| Error::DriverStopped)
     }
 
     pub(crate) async fn complete_step_with_documents<T: Serialize + ?Sized>(
-        &self, operation_id: String, step_id: String, output: &T,
+        &self,
+        operation_id: String,
+        step_id: String,
+        output: &T,
         writes: Vec<crate::DocumentWrite>,
     ) -> Result<()> {
         let (result, receiver) = oneshot::channel();
         self.send(Command::CompleteDocuments {
-            caller: self.caller()?, operation_id, step_id: Some(step_id),
-            checkpoint: None, output: EncodedPayload::encode(output)?, writes, result,
-        }).await?;
+            caller: self.caller()?,
+            operation_id,
+            step_id: Some(step_id),
+            checkpoint: None,
+            output: EncodedPayload::encode(output)?,
+            writes,
+            result,
+        })
+        .await?;
         receive(receiver).await
     }
 
     #[cfg(not(target_family = "wasm"))]
     pub(crate) async fn complete_code_cell(
-        &self, operation_id: String, step_id: String, output: &serde_json::Value,
+        &self,
+        operation_id: String,
+        step_id: String,
+        output: &serde_json::Value,
         writes: Vec<crate::DocumentWrite>,
     ) -> Result<()> {
-        self.complete_step_with_documents(operation_id, step_id, output, writes).await
+        self.complete_step_with_documents(operation_id, step_id, output, writes)
+            .await
     }
 
     pub(crate) async fn load_payloads(
@@ -2608,11 +2625,15 @@ impl DurableOwner {
         operation_id: String,
         continuation: EncodedPayload,
     ) -> Result<()> {
-        self.advance_retaining(operation_id, continuation, Vec::new()).await
+        self.advance_retaining(operation_id, continuation, Vec::new())
+            .await
     }
 
     pub(crate) async fn advance_retaining(
-        &self, operation_id: String, continuation: EncodedPayload, retained_steps: Vec<String>,
+        &self,
+        operation_id: String,
+        continuation: EncodedPayload,
+        retained_steps: Vec<String>,
     ) -> Result<()> {
         let (result, receiver) = oneshot::channel();
         self.send(Command::Advance {
