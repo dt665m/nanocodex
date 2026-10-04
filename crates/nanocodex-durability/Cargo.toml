@@ -19,7 +19,7 @@ rustdoc-args = ["-D", "warnings"]
 
 [features]
 default = []
-claude = ["dep:nanocodex-claude"]
+claude = ["dep:nanocodex-claude", "nanocodex-claude/code-mode"]
 sqlite = ["dep:rusqlite"]
 postgres = ["dep:tokio-postgres"]
 

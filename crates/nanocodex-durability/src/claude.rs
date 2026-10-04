@@ -21,13 +21,30 @@ impl DurableAgentExt for ClaudeBuilder {
         let checkpoint = checkpoint
             .map(|value| value.decode::<Value>().map_err(agent_error))
             .transpose()?;
-        self.execution_policy(Arc::new(ClaudeExecution { state_id, owner, settings: None }), checkpoint)
+        let owner = Arc::new(owner);
+        #[cfg(not(target_family = "wasm"))]
+        let code_journal = Arc::new(crate::code_mode::DurableCodeJournal::new(
+            owner.clone(),
+            state,
+        ));
+        self.execution_policy(
+            Arc::new(ClaudeExecution {
+                settings: None,
+                state_id,
+                owner,
+                #[cfg(not(target_family = "wasm"))]
+                code_journal,
+            }),
+            checkpoint,
+        )
     }
 }
 
 struct ClaudeExecution {
     state_id: String,
-    owner: DurableOwner,
+    owner: Arc<DurableOwner>,
+    #[cfg(not(target_family = "wasm"))]
+    code_journal: Arc<crate::code_mode::DurableCodeJournal>,
     settings: Option<crate::request_policy::RequestPolicySettings>,
 }
 
@@ -37,7 +54,14 @@ impl crate::request_policy::DurableClaudeRequestExt for ClaudeBuilder {
         let state_id = state.state_id().to_owned();
         let (owner, checkpoint) = state.acquire_agent().await.map_err(agent_error)?;
         let checkpoint = checkpoint.map(|value| value.decode::<Value>().map_err(agent_error)).transpose()?;
-        self.execution_policy(Arc::new(ClaudeExecution { state_id, owner, settings: Some(settings) }), checkpoint)
+        let owner = Arc::new(owner);
+        #[cfg(not(target_family = "wasm"))]
+        let code_journal = Arc::new(crate::code_mode::DurableCodeJournal::new(owner.clone(), state));
+        self.execution_policy(Arc::new(ClaudeExecution {
+            state_id, owner, settings: Some(settings),
+            #[cfg(not(target_family = "wasm"))]
+            code_journal,
+        }), checkpoint)
     }
 }
 
@@ -58,7 +82,7 @@ impl ClaudeExecutionPolicy for ClaudeExecution {
                 BeginStep::Replay(value) => {
                     let prepared: RequestPreparation = value.decode().map_err(agent_error)?;
                     // Current host authorization and limits still constrain a frozen receipt.
-                    settings.prepare_claude(request_id, continuation, prepared.state.clone(), request).map(Some).map_err(agent_error)
+                    settings.prepare_claude(request_id, continuation, prepared.state, request).map(Some).map_err(agent_error)
                 },
                 BeginStep::Execute => {
                     let prepared = settings.prepare_claude(request_id, continuation, state, request).map_err(agent_error)?;
@@ -67,6 +91,12 @@ impl ClaudeExecutionPolicy for ClaudeExecution {
                 }
             }
         })
+    }
+    #[cfg(not(target_family = "wasm"))]
+    fn code_mode_journal(
+        &self,
+    ) -> Option<Arc<dyn nanocodex_oai_tools::code_mode::CodeModeJournal>> {
+        Some(self.code_journal.clone())
     }
 
     fn state_id(&self) -> &str {
@@ -150,6 +180,15 @@ impl ClaudeExecutionPolicy for ClaudeExecution {
         replay_safety: crate::ReplaySafety,
     ) -> PolicyFuture<'_, Step> {
         Box::pin(async move {
+            #[cfg(not(target_family = "wasm"))]
+            if kind == "tool" && input.get("name").and_then(Value::as_str) == Some("exec") {
+                let scope = serde_json::json!({
+                    "call_id": input.get("id"), "name": "exec", "input": input.get("input")
+                });
+                self.code_journal
+                    .bind(&id, &step_id, &scope.to_string())
+                    .map_err(agent_error)?;
+            }
             match self
                 .owner
                 .begin_step(id, step_id, kind, &input, replay_safety)

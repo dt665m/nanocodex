@@ -5934,6 +5934,7 @@ dependencies = [
  "getrandom 0.4.3",
  "nanocodex-agent",
  "nanocodex-claude-tools",
+ "nanocodex-oai-tools",
  "regex",
  "reqwest",
  "rustls",

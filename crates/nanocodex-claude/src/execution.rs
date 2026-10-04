@@ -53,6 +53,13 @@ pub trait ClaudeExecutionPolicy: Send + Sync {
         -> PolicyFuture<'_, Option<RequestPreparation>> {
         Box::pin(async { Ok(None) })
     }
+    /// Supplies the authoritative native cell journal, if installed.
+    #[cfg(all(feature = "code-mode", not(target_family = "wasm")))]
+    fn code_mode_journal(
+        &self,
+    ) -> Option<std::sync::Arc<dyn nanocodex_oai_tools::code_mode::CodeModeJournal>> {
+        None
+    }
     fn admit(
         &self,
         id: String,

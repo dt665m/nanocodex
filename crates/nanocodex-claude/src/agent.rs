@@ -20,6 +20,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 mod durable;
 mod background;
+#[cfg(all(feature = "code-mode", not(target_family = "wasm")))]
+mod code_mode;
 use crate::execution::{Admission, ClaudeExecutionPolicy, Step};
 use durable::{Cursor, Effect, Snapshot};
 use std::{
@@ -175,6 +177,8 @@ pub struct ClaudeBuilder {
     workspace: String,
     tools: Vec<(ToolDefinition, Handler)>,
     tool_replay_safety: HashMap<String, nanocodex_agent::ReplaySafety>,
+    #[cfg(all(feature = "code-mode", not(target_family = "wasm")))]
+    code_tools: Option<nanocodex_oai_tools::Tools>,
     tools_factory: Option<ClaudeToolsFactory>,
     spawn_factory: Option<Arc<dyn AgentFactory>>,
     host_context: Option<Arc<str>>,
@@ -223,6 +227,8 @@ impl ClaudeBuilder {
             workspace: String::new(),
             tools: Vec::new(),
             tool_replay_safety: HashMap::new(),
+            #[cfg(all(feature = "code-mode", not(target_family = "wasm")))]
+            code_tools: None,
             tools_factory: None,
             spawn_factory: None,
             host_context: None,
@@ -712,6 +718,9 @@ impl ClaudeBuilder {
             self.tool_replay_safety.extend(tools.tool_replay_safety);
         }
 
+        #[cfg(all(feature = "code-mode", not(target_family = "wasm")))]
+        let code_runtime = self.install_code_mode(&session_id)?;
+
         if self.claude.model.trim().is_empty()
             || self.max_tokens == 0
             || self.context_window_tokens == 0
@@ -926,6 +935,8 @@ impl ClaudeBuilder {
             server_tools: self.server_tools,
             handlers,
             tool_replay_safety: self.tool_replay_safety,
+            #[cfg(all(feature = "code-mode", not(target_family = "wasm")))]
+            code_runtime,
             discovered,
             client_tool_search: self.client_tool_search,
             parallel_tools: self.parallel_tools,
@@ -1643,6 +1654,8 @@ struct State {
     server_tools: Vec<ServerToolDefinition>,
     handlers: HashMap<String, Handler>,
     tool_replay_safety: HashMap<String, nanocodex_agent::ReplaySafety>,
+    #[cfg(all(feature = "code-mode", not(target_family = "wasm")))]
+    code_runtime: Option<Arc<nanocodex_oai_tools::runtime::ToolRuntime>>,
     discovered: Arc<Mutex<HashSet<String>>>,
     client_tool_search: bool,
     parallel_tools: bool,
@@ -3608,6 +3621,10 @@ impl LifecycleBackend for Driver {
                 }
                 drop(cancels);
                 notified.await;
+            }
+            #[cfg(all(feature = "code-mode", not(target_family = "wasm")))]
+            if let Some(runtime) = &state.code_runtime {
+                runtime.control().cancel().await;
             }
             if let Some(policy) = &state.policy {
                 policy.shutdown().await?;

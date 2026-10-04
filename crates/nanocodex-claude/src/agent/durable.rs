@@ -283,6 +283,20 @@ impl State {
         }
         settled
     }
+    fn replay_safety(&self, name: &str) -> nanocodex_agent::ReplaySafety {
+        #[cfg(all(feature = "code-mode", not(target_family = "wasm")))]
+        if let Some(runtime) = &self.code_runtime
+            && (matches!(name, "exec" | "wait") || runtime.contains(name))
+        {
+            return if runtime.is_replay_safe(name) {
+                nanocodex_agent::ReplaySafety::Safe
+            } else {
+                nanocodex_agent::ReplaySafety::Unsafe
+            };
+        }
+        self.tool_replay_safety.get(name).copied().unwrap_or_default()
+    }
+
     pub(super) async fn durable_tool(
         &self,
         control: (&Cursor, &Cancellation),
@@ -301,10 +315,7 @@ impl State {
                 .begin_with_replay(
                     "tool",
                     json!({"id":id,"name":name,"input":input}),
-                    self.tool_replay_safety
-                        .get(name)
-                        .copied()
-                        .unwrap_or_default(),
+                    self.replay_safety(name),
                 )
                 .await?
         } else {
