@@ -121,9 +121,11 @@ agent.shutdown().await?;
 # }
 ```
 
-The host supplies credentials and function handlers. Conversation state is held
-in memory. This feature does not install Grok CLI tools or add a durability
-adapter. No `grok` executable is required. See the
+The host supplies credentials and function handlers. Enable `xai-tools` for the
+independent native file/shell and portable host adapters, and the `xai` feature
+of `nanocodex-durability` for fenced persistent sessions. Manual and automatic
+compaction, steering, snapshots, and shared subagents use the common lifecycle.
+No `grok` executable is required. See the
 [xAI backend guide](../../docs/NANOXAI.md) for the exact upstream revision,
 license provenance, supported surface and limitations.
 
@@ -264,6 +266,7 @@ embedding needs more control:
   when the default-off `claude` feature is enabled
 - `xai` — xAI Responses client, builder and host tool contracts when the
   default-off `xai` feature is enabled
+- `xai_tools` — explicitly installed xAI host capabilities when `xai-tools` is enabled
 - [`tools`] — tool contracts, built-ins, Code Mode, and MCP
 - `observability` — native tracing and OTLP setup when the default-off
   `observability` feature is enabled

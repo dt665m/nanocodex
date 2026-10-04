@@ -35,6 +35,7 @@ use crate::subagents::{self, ChildAgents, DEFAULT_MAX_SUBAGENTS, SubagentToolSet
 use crate::vm::{ConfiguredVm, VmArgs};
 
 mod claude;
+mod xai;
 
 pub(crate) struct ConfiguredAgent {
     pub(crate) handle: Nanocodex,
@@ -58,7 +59,7 @@ struct SessionBuild {
 }
 
 /// Authentication flags shared by every direct-OpenAI CLI consumer.
-#[derive(Args)]
+#[derive(Args, Clone)]
 pub(crate) struct AuthArgs {
     /// Explicit `OpenAI` API key override.
     #[arg(long, value_parser = NonEmptyStringValueParser::new())]
@@ -161,15 +162,15 @@ pub(crate) struct AgentArgs {
     #[command(flatten)]
     model_policy: ModelArgs,
 
-    /// Select the native coding harness: codex or claude.
-    #[arg(long, global = true, value_parser = ["codex", "claude"])]
+    /// Select the native coding harness: codex, claude or xai.
+    #[arg(long, global = true, value_parser = ["codex", "claude", "xai"])]
     harness: Option<String>,
 
     /// Select the native Claude harness (shorthand for --harness claude).
     #[arg(long, global = true)]
     claude: bool,
 
-    /// Model in the selected harness family. Defaults use OPENAI_MODEL or ANTHROPIC_MODEL.
+    /// Model in the selected harness family. Defaults use OPENAI_MODEL, ANTHROPIC_MODEL or XAI_MODEL.
     #[arg(long, global = true, value_parser = NonEmptyStringValueParser::new())]
     model: Option<String>,
 
@@ -180,6 +181,14 @@ pub(crate) struct AgentArgs {
     /// Native Anthropic Messages endpoint, including /v1/messages.
     #[arg(long, global = true, env = "ANTHROPIC_MESSAGES_URL", value_parser = NonEmptyStringValueParser::new())]
     claude_messages_url: Option<String>,
+
+    /// Explicit xAI API key override.
+    #[arg(long, global = true, env = "XAI_API_KEY", value_parser = NonEmptyStringValueParser::new(), hide_env_values = true)]
+    xai_api_key: Option<String>,
+
+    /// Native xAI Responses endpoint, including /v1/responses.
+    #[arg(long, global = true, env = "XAI_RESPONSES_URL", value_parser = NonEmptyStringValueParser::new())]
+    xai_responses_url: Option<String>,
 
     /// Optional namespace prepended to the model identifier on the wire.
     ///
@@ -196,10 +205,9 @@ pub(crate) struct AgentArgs {
     #[arg(
         long,
         env = "NANOCODEX_FAST_MODE",
-        default_value_t = true,
         action = ArgAction::Set
     )]
-    fast_mode: bool,
+    fast_mode: Option<bool>,
 
     /// Replace the standard system/developer instructions.
     #[arg(long, value_parser = NonEmptyStringValueParser::new())]
@@ -209,10 +217,9 @@ pub(crate) struct AgentArgs {
     #[arg(
         long,
         env = "NANOCODEX_IMAGE_GENERATION",
-        default_value_t = true,
         action = ArgAction::Set
     )]
-    image_generation: bool,
+    image_generation: Option<bool>,
 
     /// Whether clean, reusable Tact-style subagents are exposed in Code Mode.
     #[arg(
@@ -298,7 +305,10 @@ impl AgentArgs {
 
     pub(crate) fn selected_harness(&self) -> Result<HarnessFamily> {
         match (self.claude, self.harness.as_deref()) {
-            (true, Some("codex")) => Err(eyre!("--claude conflicts with --harness codex")),
+            (true, Some(family)) if family != "claude" => {
+                Err(eyre!("--claude conflicts with --harness {family}"))
+            }
+            (false, Some("xai")) => Ok(HarnessFamily::Xai),
             (true, _) | (false, Some("claude")) => Ok(HarnessFamily::Claude),
             _ => Ok(HarnessFamily::Codex),
         }
@@ -332,7 +342,7 @@ impl AgentArgs {
         self.browser.disable();
         self.mcp.disable();
         self.model_policy.web_search = Some(false);
-        self.image_generation = false;
+        self.image_generation = Some(false);
         self.subagents = false;
         self.rollouts = false;
         self.instructions = Some(instructions.into());
@@ -384,7 +394,7 @@ impl AgentArgs {
             .unwrap_or_else(|| {
                 self.harness_model()
                     .ok()
-                    .filter(|model| model.family() == HarnessFamily::Claude)
+                    .filter(|model| model.family() != HarnessFamily::Codex)
                     .map_or(Thinking::Xhigh, HarnessModel::default_thinking)
             })
     }
@@ -394,7 +404,7 @@ impl AgentArgs {
     }
 
     pub(crate) fn fast_mode(&self) -> bool {
-        self.fast_mode
+        self.fast_mode.unwrap_or(true)
             && self
                 .selected_harness()
                 .is_ok_and(|family| family == HarnessFamily::Codex)
@@ -441,6 +451,11 @@ impl AgentArgs {
         if harness == HarnessFamily::Claude {
             return self
                 .build_claude(durable, vm, tui, local_durability, requested_model)
+                .await;
+        }
+        if harness == HarnessFamily::Xai {
+            return self
+                .build_xai(durable, vm, tui, local_durability, requested_model)
                 .await;
         }
         let thinking = self
@@ -531,7 +546,7 @@ impl AgentArgs {
             None => Tools::builder(),
         }
         .web_search(web_search)
-        .image_generation(self.image_generation);
+        .image_generation(self.image_generation.unwrap_or(true));
         let managed_mcp = if self.mcp.loads_managed() {
             let _timing = crate::startup_timing::Stage::new("managed_mcp_credentials");
             load_managed_mcp_credential(&codex_home).await?
@@ -588,7 +603,7 @@ impl AgentArgs {
         let codex_tools = tools.clone();
         let mut codex_recipe = Nanocodex::builder(openai.clone())
             .reasoning_mode(self.reasoning_mode)
-            .fast_mode(self.fast_mode)
+            .fast_mode(self.fast_mode.unwrap_or(true))
             .workspace(session.workspace.clone())
             .codex_home(codex_home.clone())
             .tools_factory(move |parent| {
@@ -633,6 +648,19 @@ impl AgentArgs {
                     builder.build()
                 }
             });
+        let harness_builder = xai::register_xai_recipe(
+            harness_builder,
+            xai::XaiConnection::new(self.xai_api_key, self.xai_responses_url),
+            session.workspace.clone(),
+            self.instructions
+                .clone()
+                .unwrap_or_else(xai::default_instructions),
+            claude_tools.clone(),
+            self.model_policy.web_search,
+            subagent_runtime
+                .as_ref()
+                .map(|(registry, _, _)| Arc::clone(registry)),
+        );
         let harness = claude::register_claude_recipe(
             harness_builder, claude::ClaudeConnection::new(
                 self.claude_auth, self.claude_api_key, self.claude_messages_url,
@@ -647,7 +675,7 @@ impl AgentArgs {
             .model(model)
             .reasoning_mode(self.reasoning_mode)
             .thinking(thinking)
-            .fast_mode(self.fast_mode)
+            .fast_mode(self.fast_mode.unwrap_or(true))
             .spawn_factory(harness.spawn_factory())
             .workspace(session.workspace)
             .codex_home(codex_home);

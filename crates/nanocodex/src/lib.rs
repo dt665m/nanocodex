@@ -54,6 +54,11 @@ pub use nanocodex_oai_tools::tool;
 #[cfg_attr(docsrs, doc(cfg(feature = "xai")))]
 pub use nanocodex_xai::Xai;
 
+/// Independent host-authorized xAI tool adapters.
+#[cfg(feature = "xai-tools")]
+#[cfg_attr(docsrs, doc(cfg(feature = "xai-tools")))]
+pub use nanocodex_xai_tools as xai_tools;
+
 /// Owned agent lifecycle, builders, turns, branching, and snapshots.
 ///
 /// Provider and tool-runtime APIs keep their canonical detailed paths under

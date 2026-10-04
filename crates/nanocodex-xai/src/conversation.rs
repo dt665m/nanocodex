@@ -31,6 +31,7 @@ pub(crate) fn replay_output(output: &[Value]) -> Vec<Value> {
                     | "reasoning"
                     | "function_call"
                     | "web_search_call"
+                    | "x_search_call"
                     | "custom_tool_call"
                     | "code_interpreter_call"
             )

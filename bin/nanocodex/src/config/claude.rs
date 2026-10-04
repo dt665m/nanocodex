@@ -132,13 +132,13 @@ impl AgentArgs {
         let instructions = self.instructions.unwrap_or_else(|| {
             "You are a coding agent. Use the native Claude workspace tools to inspect and change the authorized workspace. Bash runs foreground commands through the retained workspace host. Use exec for MCP and shared subagent tools.".to_owned()
         });
-        let codex_auth = self.auth.resolve().map_err(|error| error.to_string());
+        let codex_auth = self.auth;
         let codex_tools = tools
             .clone()
             .into_builder()
             .workspace(true)
             .web_search(web_search)
-            .image_generation(self.image_generation)
+            .image_generation(self.image_generation.unwrap_or(true))
             .build()?;
         let codex_home_for_recipe = codex_home.clone();
         let codex_workspace = workspace.clone();
@@ -148,7 +148,7 @@ impl AgentArgs {
         let api_base_url = self.api_base_url;
         let model_id_prefix = self.model_id_prefix;
         let reasoning_mode = self.reasoning_mode;
-        let fast_mode = self.fast_mode;
+        let fast_mode = self.fast_mode.unwrap_or(true);
         let websocket_warmup = self.websocket_warmup;
         let store_responses = self.store_responses;
         let harness_builder =
@@ -169,7 +169,10 @@ impl AgentArgs {
                         ));
                     };
                     let auth = auth
-                        .map_err(nanocodex::NanocodexError::InvalidRequest)?
+                        .resolve()
+                        .map_err(|error| {
+                            nanocodex::NanocodexError::InvalidRequest(error.to_string())
+                        })?
                         .nanocodex()
                         .map_err(|error| {
                             nanocodex::NanocodexError::InvalidRequest(error.to_string())
@@ -217,6 +220,15 @@ impl AgentArgs {
                     builder.build()
                 }
             });
+        let harness_builder = super::xai::register_xai_recipe(
+            harness_builder,
+            super::xai::XaiConnection::new(self.xai_api_key, self.xai_responses_url),
+            workspace.clone(),
+            instructions.clone(),
+            tools.clone(),
+            self.model_policy.web_search,
+            tool_registry.clone(),
+        );
         let harness = register_claude_recipe(
             harness_builder,
             connection,
@@ -372,7 +384,7 @@ pub(super) fn register_claude_recipe(
     })
 }
 
-fn claude_effort(thinking: Thinking) -> Option<Effort> {
+const fn claude_effort(thinking: Thinking) -> Option<Effort> {
     match thinking {
         Thinking::None => None,
         Thinking::Low => Some(Effort::Low),
@@ -489,7 +501,7 @@ fn native_tools(
     Ok(native)
 }
 
-fn text_reply(text: String) -> ClaudeToolReply {
+const fn text_reply(text: String) -> ClaudeToolReply {
     ClaudeToolReply::success(ToolResultContent::Text(text))
 }
 

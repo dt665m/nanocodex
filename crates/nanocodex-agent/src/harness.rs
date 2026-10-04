@@ -280,6 +280,18 @@ pub enum XaiModel {
     Grok45,
 }
 impl XaiModel {
+    /// Context capacity in the pinned Grok Build model catalog.
+    pub const fn context_window_tokens(self) -> u64 {
+        500_000
+    }
+    /// Model-specific automatic compaction threshold from Grok Build.
+    pub const fn auto_compact_threshold_percent(self) -> u32 {
+        80
+    }
+    /// Whether this model advertises provider-hosted search.
+    pub const fn supports_backend_search(self) -> bool {
+        matches!(self, Self::Grok46)
+    }
     /// Known upstream routing choices.
     pub const ALL: [Self; 2] = [Self::Grok46, Self::Grok45];
     /// Native model identifier.

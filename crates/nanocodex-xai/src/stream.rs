@@ -56,8 +56,9 @@ impl Decoder {
     }
 }
 /// Terminal-state handling adapted from stream_responses_tracked. Incomplete
-/// output is rejected here (no upstream recovery/compaction runtime is embedded),
-/// and uncommitted function deltas can never cause a host tool invocation.
+/// output is rejected here; the sampler separately recognizes empty prompt-limit
+/// rejections for bounded compaction. Uncommitted function deltas can never
+/// cause a host tool invocation.
 pub(crate) fn terminal(event: &Value) -> Result<Option<Value>, String> {
     match event["type"].as_str() {
         Some("response.completed") => {

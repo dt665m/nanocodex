@@ -35,8 +35,9 @@ async fn native_tool_call_id_replay_and_failed_continuation_do_not_repeat_effect
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let calls = Arc::new(AtomicUsize::new(0));
     let called = calls.clone();
+    // Exercise the caller-controlled fail-fast policy; bounded retries have their own journey.
     let (agent,mut events)=Nanocodex::builder(Xai::new(XaiClient::new(reqwest::Client::new(),format!("http://{addr}/v1/responses"),"fixture"),"grok-4.6"))
-        .web_search().tool(ToolDefinition{name:"write_note".into(),description:"Record a synthetic note".into(),parameters:json!({"type":"object","properties":{"text":{"type":"string"}},"required":["text"]})},move|input|{let called=called.clone();async move{assert_eq!(input["text"],"violet");called.fetch_add(1,Ordering::SeqCst);Ok("saved violet".into())}}).build().unwrap();
+        .max_retries(0).web_search().tool(ToolDefinition{name:"write_note".into(),description:"Record a synthetic note".into(),parameters:json!({"type":"object","properties":{"text":{"type":"string"}},"required":["text"]})},move|input|{let called=called.clone();async move{assert_eq!(input["text"],"violet");called.fetch_add(1,Ordering::SeqCst);Ok("saved violet".into())}}).build().unwrap();
     assert!(
         agent
             .prompt("write violet")

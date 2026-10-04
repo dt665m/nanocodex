@@ -7,7 +7,14 @@ license = "Apache-2.0"
 publish.workspace = true
 description = "Portable source adaptation of the xAI Grok Build Responses harness"
 
+[features]
+default = []
+tools = ["nanocodex-xai-tools/native"]
+
 [dependencies]
+nanocodex-xai-tools.workspace = true
+serde.workspace = true
+sha2.workspace = true
 nanocodex-agent = { path = "../nanocodex-agent", version = "0.6.6", default-features = false }
 serde_json.workspace = true
 reqwest = { workspace = true, features = ["stream"] }

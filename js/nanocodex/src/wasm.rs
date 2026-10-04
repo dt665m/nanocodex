@@ -62,9 +62,11 @@ use nanocodex_voice_protocol::{
 mod claude;
 mod claude_subscription;
 mod transport;
+mod xai;
 
 pub use claude::WasmNanoclaude;
 pub use claude_subscription::WasmClaudeSubscription;
+pub use xai::WasmNanoxai;
 
 use transport::JavaScriptResponsesHost;
 
@@ -1172,6 +1174,8 @@ struct WasmConfig {
     subagent_routing: bool,
     #[serde(default)]
     claude_harness: Option<serde_json::Value>,
+    #[serde(default)]
+    xai_harness: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1375,6 +1379,7 @@ struct WasmHarnessFactory {
     hosts: Arc<Mutex<HashMap<String, u32>>>,
     codex: Option<(serde_json::Value, nanocodex::oai::auth::OpenAiAuth)>,
     claude: Option<serde_json::Value>,
+    xai: Option<serde_json::Value>,
 }
 
 impl WasmHarnessFactory {
@@ -1399,7 +1404,7 @@ impl WasmHarnessFactory {
                 (recipe, Some(auth))
             }
             HarnessFamily::Claude => (factory.claude.clone().ok_or_else(unavailable)?, None),
-            HarnessFamily::Xai => return Err(unavailable()),
+            HarnessFamily::Xai => (factory.xai.clone().ok_or_else(unavailable)?, None),
         };
         let object = recipe.as_object_mut().ok_or_else(unavailable)?;
         for key in [
@@ -1449,7 +1454,15 @@ impl WasmHarnessFactory {
                 )
                 .await
             }
-            HarnessFamily::Xai => return Err(unavailable()),
+            HarnessFamily::Xai => {
+                xai::build_xai(
+                    serde_json::from_value(recipe).map_err(|_| unavailable())?,
+                    Some(factory.clone()),
+                    snapshot,
+                    host_context,
+                )
+                .await
+            }
         }
         .map_err(|_| NanocodexError::InvalidRequest("target harness construction failed".into()))?;
         factory
@@ -1680,6 +1693,7 @@ impl WasmNanocodex {
                     auth.clone(),
                 )),
                 claude: config.claude_harness.clone(),
+                xai: config.xai_harness.clone(),
             });
             let subagents = WasmSubagents::new(
                 config.host_definition_id,

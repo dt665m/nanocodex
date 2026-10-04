@@ -201,6 +201,7 @@ pub(super) struct TurnKey(pub(super) u64);
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct TurnResult {
+    pub(super) backend_checkpoint: Option<Arc<str>>,
     pub(super) request_id: Option<String>,
     pub(super) final_message: String,
     pub(super) usage: Option<TurnUsage>,
@@ -217,6 +218,22 @@ pub(super) enum TurnCheckpoint {
 }
 
 impl TurnResult {
+    /// Attaches an opaque backend-local historical checkpoint identity. This is
+    /// separate from caller request IDs, which can collide across sessions.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_backend_checkpoint(mut self, identity: impl Into<Arc<str>>) -> Self {
+        self.backend_checkpoint = Some(identity.into());
+        self
+    }
+
+    /// Reads the opaque identity for validation by its owning backend.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn backend_checkpoint(&self) -> Option<&str> {
+        self.backend_checkpoint.as_deref()
+    }
+
     /// Returns the durable request identity selected during prompt admission.
     #[must_use]
     pub fn request_id(&self) -> Option<&str> {
@@ -269,6 +286,7 @@ impl TurnResult {
         usage: Option<TurnUsage>,
     ) -> Self {
         Self {
+            backend_checkpoint: None,
             request_id,
             final_message,
             usage,

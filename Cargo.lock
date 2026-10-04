@@ -5779,6 +5779,7 @@ dependencies = [
  "nanocodex-observability",
  "nanocodex-subagents",
  "nanocodex-xai",
+ "nanocodex-xai-tools",
  "reqwest",
  "rustls",
  "serde_json",
@@ -6011,6 +6012,7 @@ dependencies = [
  "nanocodex-claude-tools",
  "nanocodex-oai-api",
  "nanocodex-oai-tools",
+ "nanocodex-xai",
  "reqwest",
  "rusqlite",
  "rustls",
@@ -6383,6 +6385,7 @@ dependencies = [
  "nanocodex-claude",
  "nanocodex-oai-api",
  "nanocodex-oai-tools",
+ "nanocodex-xai",
  "serde",
  "serde_json",
  "tokio",
@@ -6506,6 +6509,7 @@ dependencies = [
  "nanocodex-claude",
  "nanocodex-subagents",
  "nanocodex-voice-protocol",
+ "nanocodex-xai",
  "reqwest",
  "serde",
  "serde_json",
@@ -6522,14 +6526,29 @@ dependencies = [
  "futures-util",
  "js-sys",
  "nanocodex-agent",
+ "nanocodex-xai-tools",
  "reqwest",
  "rustls",
+ "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tokio",
  "uuid",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-time",
+]
+
+[[package]]
+name = "nanocodex-xai-tools"
+version = "0.6.6"
+dependencies = [
+ "globset",
+ "nix 0.31.3",
+ "regex",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
