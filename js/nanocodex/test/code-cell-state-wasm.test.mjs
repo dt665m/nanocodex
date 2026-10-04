@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { Worker } from 'node:worker_threads';
 import test from 'node:test';
-import { createManagedCodeEffectJournal } from '../../managed/src/managed-recovery-safety.ts';
+import { createManagedCodeEffectJournal } from './support/managed-code-journal.mjs';
 import { createSqliteDurabilityStore, sqliteDurabilitySchema } from '../runtime/durability-store.mjs';
 import { startResponsesServer, messageReader, sendCompleted, sendFinal } from './support/responses.mjs';
 

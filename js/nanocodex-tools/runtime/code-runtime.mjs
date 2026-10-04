@@ -718,8 +718,13 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
         if (update.type === "nested_call_completed") cell.completedCalls.push(update.call);
       }, cell, turnId).then((result) => {
         const completed = JSON.parse(result);
-        if (!completed.success && typeof completed.output === "string" && !cell.content.length) {
-          cell.content.push({ type: "input_text", text: completed.output.split("Output:\n").slice(1).join("Output:\n") || completed.output });
+        if (!completed.success && typeof completed.output === "string") {
+          const failure = completed.output.split("Output:\n").slice(1).join("Output:\n") || completed.output;
+          // Guest output cannot suppress a terminal recovery/journal failure.
+          // Receipt replay may already have hydrated this exact diagnostic.
+          if (!cell.content.some(item => item.type === "input_text" && item.text === failure)) {
+            cell.content.push({ type: "input_text", text: failure });
+          }
         }
         cell.result = { success: completed.success };
         cell.wake?.();

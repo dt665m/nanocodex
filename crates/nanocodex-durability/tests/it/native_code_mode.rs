@@ -46,8 +46,8 @@ async fn responses(State(provider): State<Provider>, Json(request): Json<Value>)
 fn plan(cells: &[(&str, &str)]) -> Provider {
     let mut responses = VecDeque::new();
     for (source, expected) in cells {
-        // Provider IDs repeat across prompts; durable scope includes the model ordinal.
-        responses.push_back((json!({"type":"custom_tool_call","call_id":"call0","name":"exec","input":source}), None));
+        // Each provider tool call has a unique conversation identity.
+        responses.push_back((json!({"type":"custom_tool_call","call_id":uuid::Uuid::new_v4().to_string(),"name":"exec","input":source}), None));
         responses.push_back((json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"CELL_VERIFIED"}]}), Some((*expected).into())));
     }
     Provider { responses: Arc::new(Mutex::new(responses)) }
