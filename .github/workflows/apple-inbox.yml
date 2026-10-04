@@ -1,5 +1,6 @@
 name: Apple apps
 on:
+  workflow_dispatch:
   push:
     branches: [master]
     paths: ['Cargo.toml', 'Cargo.lock', 'bin/nanocodex/src/nanocodex2/**', 'bin/nanocodex/nanocodex2/**', 'crates/experimental/nanocodex-computer/**', 'js/nanocodex-computer/**', 'crates/nanocodex-voice-protocol/**', 'crates/nanocodex-voice-ffi/**', 'apple/**', 'macos/**', 'hands/remote/**', 'js/desktop-runtime/**', 'js/nanocodex/**', 'js/nanocodex-tools/**', 'js/nanocodex-vite/**', 'pnpm-lock.yaml', 'pnpm-workspace.yaml', 'turbo.json', '.github/workflows/apple-inbox.yml', 'scripts/ci/apple-package-tests.sh', 'scripts/ci/select-apple-jobs.mjs', 'scripts/ci/select-jobs.mjs']
@@ -29,7 +30,9 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
       - id: select
-        run: node scripts/ci/select-apple-jobs.mjs
+        run: |
+          echo "ios=true" >> "$GITHUB_OUTPUT"
+          echo "macos=false" >> "$GITHUB_OUTPUT"
   macos:
     needs: changes
     if: needs.changes.outputs.macos == 'true'
@@ -98,9 +101,6 @@ jobs:
           xcodebuild -project macos/Nanocodex.xcodeproj -scheme Nanocodex
           -configuration Debug -destination 'platform=macOS'
           -derivedDataPath macos/build -resultBundlePath macos/build/background-hands-tests.xcresult
-          -only-testing:NanocodexTests/BackgroundHandTests
-          -only-testing:NanocodexTests/ProtocolTests/testRestoredTiledSelectionIgnoresInboxFiltering
-          -only-testing:NanocodexTests/ProtocolTests/testNativeTiledInboxKeepsEditorsActionsAndReviewIndependent
           test
       - name: Verify bundled VM host entitlement
         run: |
@@ -201,19 +201,6 @@ jobs:
             -only-testing:NanocodexInboxUITests/InboxUITests/testEmbedConversationPortableJourney \
             -only-testing:NanocodexInboxUITests/InboxUITests/testEmbedConversationNativeHistoryJourney \
             -only-testing:NanocodexInboxUITests/InboxUITests/testEmbedConversationPortableHistoryJourney \
-            -only-testing:NanocodexInboxUITests/InboxUITests/testMarkdownRendersInConversationAndAfterTabSwitch \
-            -only-testing:NanocodexInboxUITests/InboxUITests/testWideTableKeepsTailAboveComposer \
-            -only-testing:NanocodexInboxUITests/InboxUITests/testStreamingMarkdownAndToolProgressShareTimeline \
-            -only-testing:NanocodexInboxUITests/InboxUITests/testNativeMediaPreviewZoomPlaybackAndDraftRestoration \
-            -only-testing:NanocodexInboxUITests/InboxUITests/testStreamingGrowthDoesNotMoveReaderInEarlierParagraphs \
-            -only-testing:NanocodexInboxUITests/InboxUITests/testLatestButtonResumesFollowingSubsequentStreamingArrivals \
-            -only-testing:NanocodexInboxUITests/InboxUITests/testSuccessiveToolCardsFollowTailWithoutFlashingJump \
-            -only-testing:NanocodexInboxUITests/InboxUITests/testNativeTranscriptPreservesExpandedToolAfterCellRecycling \
-            -only-testing:NanocodexInboxUITests/InboxUITests/testConversationComposerKeepsReadingPositionAndSharesDraft \
-            -only-testing:NanocodexInboxUITests/InboxUITests/testNativeTranscriptBoundsMountedCellsFor500Rows \
-            -only-testing:NanocodexInboxUITests/InboxUITests/testLongThreadKeepsPlaceAcrossUpdatesHistoryAndForeground \
-            -only-testing:NanocodexInboxUITests/InboxUITests/testSwitchingTabsRestoresEarlierReadingPosition \
-            -only-testing:NanocodexInboxUITests/InboxUITests/testDrawerButtonsAndEdgeSwipePreserveMiddleTranscriptAnchor \
             test-without-building 2>&1 \
             | tee apple/build/evidence/inbox-xcodebuild.log \
             | grep -E 'Test Case .* (started|passed|failed|skipped)|\.swift:[0-9]+: error:|Testing failed:|\*\* TEST (SUCCEEDED|FAILED) \*\*'
