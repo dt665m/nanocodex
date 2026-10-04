@@ -118,6 +118,40 @@ The Rust adapter owns these boundaries; hosts do not manage pruning or recovery.
 Format 5 retains replay permission alongside immutable payload records. Format 4
 heads remain readable, with legacy tool intents treated as unsafe.
 
+Automatic compaction runs as one owned background effect alongside foreground
+model/tool batches. Its journaled input contains an immutable conversation cutoff;
+foreground checkpoints retain both the pending intent and any completed summary
+receipt. The preservation hook settles before the summary provider request starts.
+Responses summaries use a separate full-replay transport connection, so a held
+summary cannot occupy the foreground connection or its request lock.
+
+When a summary settles, the adapter rechecks durable ownership and verifies that
+the current conversation still starts with the exact cutoff. It then installs the
+summary followed by every item appended since that cutoff. Rewritten prefixes,
+image repairs and competing summaries invalidate that result. Claude retains the
+complete signed thinking, opaque blocks and tool-result content in this tail.
+Responses installation clears the old response continuation ID; the next request
+uses the installed summary and complete tail as its full-replay baseline.
+
+Foreground work continues while the summary is pending below the hard context
+boundary. At the hard boundary or context-exhaustion recovery it waits for the
+owned summary before admitting another model request. Cancellation stops owned
+work; a superseding store owner prevents the old response from publishing. Cold
+recovery replays a completed summary receipt without another summary request and
+retains foreground receipts until their exact outputs have been incorporated.
+An unfinished safe summary may be requested again under the new owner.
+
+The real HTTP/SSE and SQLite journeys in `tests/oai_background_http.rs` and
+`tests/claude_background_http.rs` cover held-summary overlap, immutable inputs,
+complete tails, hard-limit admission, lost foreground acknowledgements and owner
+takeover. Run them with:
+
+```sh
+CARGO_INCREMENTAL=0 cargo +1.97 test -p nanocodex-durability \
+  --features sqlite,claude --test oai_background_http --test claude_background_http \
+  -- --nocapture
+```
+
 Completed tool outputs replay exactly without consulting the recovered runtime's
 current tool catalog. A receipt for a capability, such as a child agent, requires
 the capability's own durable identity and reconstruction path. The subagent
