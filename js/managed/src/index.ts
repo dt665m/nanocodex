@@ -8946,7 +8946,7 @@ export class DurableAgentSession extends DurableComputerObject {
   async #publishCodeStore(sessionId: string, entries: readonly (readonly [string, unknown])[]): Promise<void> {
     // Each child keeps its own journal namespace. Root forks inherit the root's
     // store; the task-tree fork policy separately governs child ownership.
-    if (sessionId !== this.#sessionId()) return;
+    if (sessionId !== this.#agent?.sessionId) return;
     const agent = this.#agent;
     const owner = this.#session()?.owner_id;
     const generation = this.#runtimeOwnershipGeneration;
@@ -8989,9 +8989,12 @@ export class DurableAgentSession extends DurableComputerObject {
     return entries as [string, unknown][];
   }
 
-  async #restoreForkCodeStore(seed: unknown): Promise<void> {
+  async #restoreForkCodeStore(seed: unknown, runtimeSessionId: string): Promise<void> {
+    // A native root identity differs from the managed API's thread ID. Restore
+    // only its own empty store, including a crash after native head creation.
+    if (this.ctx.storage.sql.exec("SELECT session_id FROM managed_code_store_versions WHERE session_id = ?", runtimeSessionId).toArray().length) return;
     const entries = await this.#codeStoreForkEntries(seed);
-    if (entries !== undefined) await this.#codeEffectJournal.restoreStore!(this.#sessionId()!, entries);
+    if (entries !== undefined) await this.#codeEffectJournal.restoreStore!(runtimeSessionId, entries);
   }
 
   #backgroundChildrenPending(): boolean {
@@ -9459,14 +9462,15 @@ export class DurableAgentSession extends DurableComputerObject {
       ).toArray().some(row => row.revision !== "0" || row.payload !== null);
       if (forkSeed && !hasHead) {
         const seed: unknown = JSON.parse(forkSeed.snapshot_json);
-        await this.#restoreForkCodeStore(seed);
         Object.defineProperty(options, Symbol.for("nanocodex.cloudflare.internalForkResume"), { value: seed });
       }
       Object.defineProperty(options, Symbol.for("nanocodex.cloudflare.internalConfiguration"), { value: this.#settings() });
       Object.defineProperty(options, Symbol.for("nanocodex.cloudflare.internalRuntime"), {
         value: { prepare: complete, preparationSignal: signal },
       });
-      return await CloudflareAgent.create({ ctx: this.ctx, env: { NANOCODEX: this.#modelEgress() } }, options);
+      const agent = await CloudflareAgent.create({ ctx: this.ctx, env: { NANOCODEX: this.#modelEgress() } }, options);
+      if (forkSeed) await this.#restoreForkCodeStore(JSON.parse(forkSeed.snapshot_json), agent.sessionId);
+      return agent;
     } finally {
       // A failed binding/create must not leave discovery owned by an obsolete
       // construction that a retry can join without installing its MCP catalog.
@@ -10426,7 +10430,6 @@ export class DurableAgentSession extends DurableComputerObject {
       ).toArray().some(row => row.revision !== "0" || row.payload !== null);
       if (forkSeed && !hasHead) {
         const seed: unknown = JSON.parse(forkSeed.snapshot_json);
-        await this.#restoreForkCodeStore(seed);
         Object.defineProperty(agentOptions, Symbol.for("nanocodex.cloudflare.internalForkResume"), { value: seed });
       }
       Object.defineProperty(agentOptions, internalConfiguration, { value: this.#settings() });
@@ -10438,6 +10441,7 @@ export class DurableAgentSession extends DurableComputerObject {
       } : this;
       signal?.throwIfAborted();
       agent = await (create ? create(agentOptions) : CloudflareAgent.create(owner, agentOptions));
+      if (forkSeed) await this.#restoreForkCodeStore(JSON.parse(forkSeed.snapshot_json), agent.sessionId);
       if (alternateClaude) observeClaudeRelease(agent, () => { void claudeTools?.close(); });
       cloudflareAgentMs = performance.now() - phaseStartedAt;
     } catch (error) {

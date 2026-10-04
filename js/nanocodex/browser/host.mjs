@@ -73,17 +73,25 @@ export function createBrowserHost(options = {}) {
     if (options.mpp) throw JSON.stringify({ kind: "transport", detail: "MPP HTTPS transport is unavailable", reconnectable: false });
     const send = async (input, init) => {
       const incoming = new Request(input, init);
+      let response;
       if (options.createResponse) {
         const authorization = options.hostAuth
           ? { authorization: "host_managed" }
           : { authorization: "bearer", bearerToken: apiKey };
-        return options.createResponse(endpoint, sessionId, { ...metadata, ...authorization, body: await incoming.text(), signal: incoming.signal });
+        response = await options.createResponse(endpoint, sessionId, { ...metadata, ...authorization, body: await incoming.text(), signal: incoming.signal });
+      } else {
+        if (options.hostAuth) throw JSON.stringify({ kind: "transport", detail: "host-managed HTTPS requires createResponse", reconnectable: false });
+        response = await fetch(incoming);
       }
-      if (options.hostAuth) throw JSON.stringify({ kind: "transport", detail: "host-managed HTTPS requires createResponse", reconnectable: false });
-      return fetch(incoming);
+      // Workerd does not implement redirect:error. Manual transport plus an
+      // explicit rejection preserves the no-credential-redirect boundary.
+      if (response.type === "opaqueredirect" || (response.status >= 300 && response.status < 400)) {
+        throw new Error("Responses HTTPS redirects are not allowed");
+      }
+      return response;
     };
     return policyHost.fetch(metadata.threadId ?? sessionId, send, "codex", endpoint, { method: "POST", headers: responsesHttpHeaders(apiKey, sessionId, metadata),
-      body, signal, redirect: "error" });
+      body, signal, redirect: "manual" });
   });
   const connections = new Map();
   const openingAttempts = new Set();

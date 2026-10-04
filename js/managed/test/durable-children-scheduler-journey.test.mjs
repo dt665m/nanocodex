@@ -85,7 +85,7 @@ export class FixtureModel extends DurableObject {
 export default {fetch(request,env){const path=new URL(request.url).pathname;if(path.startsWith('/model/'))return env.MODEL.getByName('provider').fetch(new Request('https://fixture.internal/'+path.slice(7),request));return env.NANOCODEX_SESSIONS.getByName('scheduler').fetch(request);}};
 `;
 
-test('production managed alarm cold-reopens a background child after root terminal, then stops completed-child polling', { timeout: 120_000 }, async () => {
+test('production managed alarm cold-reopens a background child after root terminal, then stops completed-child recovery', { timeout: 120_000 }, async () => {
   const root = fileURLToPath(new URL('..', import.meta.url));
   const output = fileURLToPath(new URL('../../../output/durable-children-scheduler/', import.meta.url)) + crypto.randomUUID();
   await mkdir(output, { recursive: true });
@@ -232,24 +232,24 @@ test('production managed alarm cold-reopens a background child after root termin
     trace.push({ public_child_result: result });
 
     // Expire the actual configured idle timeout, then deliver platform alarms.
-    // Completed reusable children must stop the scheduler's recovery wakeups.
+    // Completed reusable children must stop child recovery. Independent history
+    // projection/archival work may still have a platform alarm.
     await new Promise(resolve => setTimeout(resolve, 1_100));
     await call('/__alarm', 'POST');
     const idle = await poll(async () => {
       const value = await inspect();
-      return value.session.alarm === null && value.session.recovery[0]?.pending === 0 ? value : undefined;
+      return value.session.recovery[0]?.pending === 0 ? value : undefined;
     });
     const requestCount = idle.model.requests.length;
     await call('/__alarm', 'POST');
     await call('/__alarm', 'POST');
     const settled = await inspect();
-    assert.equal(settled.session.alarm, null);
     assert.equal(settled.session.recovery[0].pending, 0);
     assert.equal(settled.model.requests.length, requestCount);
     assert.equal(settled.session.effects.filter(row => row.call_id === 'background-proof').length, 1);
     assert.equal((await call('/__proof')).text, 'BACKGROUND_EFFECT\n');
     trace.push({ completed_children_do_not_poll: settled });
-    console.log(JSON.stringify({ evidence: output, root: 'completed before SIGKILL', child: 'alarm cold reopen / BACKGROUND_CHILD_OK', childId, effects: 1, terminalRootReinferences: 0, completedChildAlarm: null }));
+    console.log(JSON.stringify({ evidence: output, root: 'completed before SIGKILL', child: 'alarm cold reopen / BACKGROUND_CHILD_OK', childId, effects: 1, terminalRootReinferences: 0, completedChildRecovery: false }));
   } finally {
     if (processHandle) await kill();
     await logWrites;

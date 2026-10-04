@@ -2556,6 +2556,7 @@ impl DurableOwner {
         receive(receiver).await
     }
 
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) async fn complete_code_cell(
         &self, operation_id: String, step_id: String, output: &serde_json::Value,
         writes: Vec<crate::DocumentWrite>,
