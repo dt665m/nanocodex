@@ -22,7 +22,8 @@ use nanocodex_agent::{
     AgentEvents, AgentHandle, ChildSnapshot, Nanocodex, NanocodexError, Result as AgentResult,
     TurnResult,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use nanocodex_durability::{ChildJournal, StateStore};
 use serde_json::Value;
 use std::{
     collections::HashMap,
@@ -36,6 +37,8 @@ use tokio::sync::{mpsc, oneshot, watch};
 use web_time::Instant;
 
 pub(super) struct ChildSession {
+    pub(super) execution: Option<ChildExecution>,
+    pub(super) interrupted: bool,
     pub(super) descriptor: AgentDescriptor,
     pub(super) host_context: Option<Arc<str>>,
     pub(super) event_task: Option<Task<()>>,
@@ -115,6 +118,58 @@ struct AgentScope {
     sessions: HashMap<AgentId, ChildSession>,
     messages: MessageThreads,
     closing: bool,
+    journal: Option<ChildJournal>,
+}
+
+/// Exact admission retained until child execution and registry settlement agree.
+#[derive(Clone, Serialize, Deserialize)]
+pub(super) struct ChildExecution {
+    operation_id: String,
+    prompt: String,
+    instruction_revision: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ChildTreeRecord {
+    version: u32,
+    topology: TaskTree,
+    messages: MessageThreads,
+    closing: bool,
+    sessions: HashMap<AgentId, ChildRecord>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ChildRecord {
+    descriptor: AgentDescriptor,
+    host_context: Option<String>,
+    status: AgentStatus,
+    output_schema: Value,
+    snapshot: Option<ChildSnapshot>,
+    next_instruction_revision: u64,
+    active_instruction_revision: Option<u64>,
+    submitted_output: Option<Value>,
+    last_output: Option<Value>,
+    execution: Option<ChildExecution>,
+    interrupted: bool,
+}
+
+impl AgentScope {
+    async fn persist(&mut self) -> std::io::Result<()> {
+        if self.journal.is_none() { return Ok(()); }
+        let record = ChildTreeRecord {
+            version: 1, topology: self.topology.clone(), messages: self.messages.clone(),
+            closing: self.closing,
+            sessions: self.sessions.iter().map(|(&id, child)| (id, ChildRecord {
+                descriptor: child.descriptor.clone(), host_context: child.host_context.as_deref().map(str::to_owned),
+                status: child.status.clone(), output_schema: child.output_schema.clone(),
+                snapshot: child.stored_runtime.clone(), next_instruction_revision: child.next_instruction_revision,
+                active_instruction_revision: child.active_instruction_revision,
+                submitted_output: child.submitted_output.clone(), last_output: child.last_output.clone(),
+                execution: child.execution.clone(), interrupted: child.interrupted,
+            })).collect(),
+        };
+        self.journal.as_mut().expect("journal present").commit(&record).await.map_err(std::io::Error::other)
+    }
 }
 
 pub(super) struct AgentReservation {
@@ -293,7 +348,11 @@ impl RegistryState {
         if session.steering || session.active_instruction_revision != Some(instruction_revision) {
             return Ok(SubmissionOutcome::Superseded);
         }
-        if session.submitted_output.is_some() {
+        if let Some(accepted) = &session.submitted_output {
+            if scope.journal.is_some() {
+                let (candidate, decoded_json_text) = validate_submitted_output(&session.output_validator, output.clone())?;
+                if accepted == &candidate { return Ok(SubmissionOutcome::Accepted { decoded_json_text }); }
+            }
             return Err(CompletionError::new(
                 CompletionErrorCode::AlreadyAccepted,
                 false,
@@ -904,6 +963,8 @@ impl RegistryState {
 
 const AGENT_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 
+include!("durable_registry.rs");
+
 impl Registry {
     pub(super) fn new(
         updates: mpsc::UnboundedSender<ScopedAgentUpdate>,
@@ -998,7 +1059,10 @@ impl Registry {
     }
 
     pub(super) async fn reserve(&self, session_id: &str) -> std::io::Result<AgentReservation> {
-        self.state.lock().await.reserve_for(session_id)
+        let mut state = self.state.lock().await;
+        let reservation = state.reserve_for(session_id)?;
+        state.scope_mut(&reservation.root_session_id).persist().await?;
+        Ok(reservation)
     }
 
     pub(super) async fn reserve_many(
@@ -1007,7 +1071,10 @@ impl Registry {
         count: usize,
     ) -> std::io::Result<Vec<AgentReservation>> {
         let mut state = self.state.lock().await;
-        (0..count).map(|_| state.reserve_for(session_id)).collect()
+        let reservations: Vec<_> = (0..count).map(|_| state.reserve_for(session_id)).collect::<std::io::Result<_>>()?;
+        let root = state.root_session_id(session_id).to_owned();
+        state.scope_mut(&root).persist().await?;
+        Ok(reservations)
     }
 
     pub(super) async fn submit_result(
@@ -1016,10 +1083,11 @@ impl Registry {
         instruction_revision: Option<u64>,
         output: Value,
     ) -> std::io::Result<SubmissionOutcome> {
-        self.state
-            .lock()
-            .await
-            .submit_result(session_id, instruction_revision, output)
+        let mut state = self.state.lock().await;
+        let outcome = state.submit_result(session_id, instruction_revision, output)?;
+        let root = state.root_session_id(session_id).to_owned();
+        state.scope_mut(&root).persist().await?;
+        Ok(outcome)
     }
 
     pub(super) async fn begin_turn_steer(
@@ -1055,6 +1123,8 @@ impl Registry {
         contract: OutputContract,
     ) -> std::io::Result<()> {
         let OutputContract { validator, schema } = contract;
+        let durable = self.state.lock().await.scopes.get(&root_session_id).is_some_and(|scope| scope.journal.is_some());
+        let snapshot = if durable { Some(agent.runtime_snapshot().await.map_err(std::io::Error::other)?) } else { None };
         let mut state = self.state.lock().await;
         state.validate_insert(&root_session_id, &descriptor)?;
         let (harness, harness_task) = harness::spawn(
@@ -1067,10 +1137,12 @@ impl Registry {
             None,
         );
         state.insert(
-            root_session_id,
+            root_session_id.clone(),
             descriptor.id,
             descriptor.session_id.clone(),
             ChildSession {
+                execution: None,
+                interrupted: false,
                 descriptor,
                 host_context,
                 event_task: Some(event_task),
@@ -1080,7 +1152,7 @@ impl Registry {
                 active: false,
                 output_validator: validator,
                 output_schema: serde_json::from_str(&schema).expect("compiled schema is JSON"),
-                stored_runtime: None,
+                stored_runtime: snapshot,
                 next_instruction_revision: 0,
                 active_instruction_revision: None,
                 steering: false,
@@ -1090,6 +1162,7 @@ impl Registry {
                 evicted: false,
             },
         )?;
+        state.scope_mut(&root_session_id).persist().await?;
         drop(state);
         self.changed();
         Ok(())
@@ -1401,7 +1474,7 @@ impl Registry {
                     .ok_or_else(|| std::io::Error::other(format!("unknown agent_id {id}")))?;
                 if matches!(
                     session.status,
-                    AgentStatus::Pending | AgentStatus::Closing | AgentStatus::Closed
+                    AgentStatus::Closing | AgentStatus::Closed
                 ) || session.harness.is_some()
                 {
                     break;
@@ -1445,7 +1518,7 @@ impl Registry {
             let contract = OutputContract::compile(&schema)?;
             let needs_assignment = !snapshot.has_conversation();
             let (agent, events) = parent
-                .restore_runtime(snapshot, host_context)
+                .restore_runtime_with_factory(snapshot, host_context)
                 .await
                 .map_err(std::io::Error::other)?;
             let (start, ready) = oneshot::channel();
@@ -1507,17 +1580,17 @@ impl Registry {
         let delivery = prepared
             .harness
             .enqueue_delivery(prepared.message.clone())?;
-        self.state
-            .lock()
-            .await
-            .commit_message(&prepared.root_session_id, prepared.message.clone())?;
+        {
+            let mut state = self.state.lock().await;
+            state.commit_message(&prepared.root_session_id, prepared.message.clone())?;
+            state.scope_mut(&prepared.root_session_id).persist().await?;
+        }
         let disposition = match delivery.release().await {
             Ok(disposition) => disposition,
             Err(error) => {
-                self.state
-                    .lock()
-                    .await
-                    .rollback_message(&prepared.root_session_id, prepared.message.id);
+                let mut state = self.state.lock().await;
+                state.rollback_message(&prepared.root_session_id, prepared.message.id);
+                state.scope_mut(&prepared.root_session_id).persist().await?;
                 return Err(error);
             }
         };

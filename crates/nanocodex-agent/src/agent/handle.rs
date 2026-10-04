@@ -171,6 +171,18 @@ impl AgentHandle {
                 .await
         }
     }
+    /// Restores a retained child through the embedding's configured factory.
+    /// Durable hosts use this even within the same family to reopen each child's
+    /// independent execution journal before rebuilding the native driver.
+    pub async fn restore_runtime_with_factory(
+        &self,
+        snapshot: ChildSnapshot,
+        host_context: Option<Arc<str>>,
+    ) -> Result<(Nanocodex, AgentEvents)> {
+        self.native.ensure_available(self.clone()).await?;
+        self.factory.as_ref().unwrap_or(&self.native)
+            .restore(self.clone(), snapshot, host_context).await
+    }
     /// Restores through the native factory, bypassing mixed routing.
     pub async fn restore_native_runtime(
         &self,

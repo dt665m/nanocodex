@@ -1,0 +1,151 @@
+// Durable registry transitions run under the same registry lock as their live
+// counterpart. A failed store write poisons the journal, preventing another
+// receipt or inference admission until authoritative cold reconstruction.
+impl Registry {
+    /// Reopens one child tree on the host's existing fenced durability store.
+    /// Configure a per-child durable native factory before calling `recover`.
+    pub async fn enable_durability(
+        &self,
+        store: impl StateStore + 'static,
+        root_session_id: &str,
+    ) -> std::io::Result<()> {
+        let mut state = self.state.lock().await;
+        if state.scopes.get(root_session_id).is_some_and(|scope| scope.journal.is_some() || !scope.sessions.is_empty()) {
+            return Err(std::io::Error::other("child durability must be enabled before spawning or recovery"));
+        }
+        let journal = ChildJournal::open(store, root_session_id).await.map_err(std::io::Error::other)?;
+        let mut scope = AgentScope::default();
+        if let Some(record) = journal.load::<ChildTreeRecord>().map_err(std::io::Error::other)? {
+            if record.version != 1 { return Err(std::io::Error::other("unsupported child tree journal version")); }
+            scope.topology = record.topology;
+            scope.messages = record.messages;
+            scope.closing = record.closing;
+            for (id, record) in record.sessions {
+                let contract = OutputContract::compile(&record.output_schema)?;
+                if id != record.descriptor.id || scope.topology.agent_for_session(&record.descriptor.session_id) != Some(id) {
+                    return Err(std::io::Error::other("invalid child topology checkpoint"));
+                }
+                state.root_by_session.insert(record.descriptor.session_id.clone(), root_session_id.to_owned());
+                let status = if matches!(record.status, AgentStatus::Running) { AgentStatus::Interrupted } else { record.status };
+                scope.sessions.insert(id, ChildSession {
+                    descriptor: record.descriptor, host_context: record.host_context.map(Arc::from),
+                    event_task: None, harness: None, harness_task: None,
+                    status, active: false, output_validator: contract.validator,
+                    output_schema: record.output_schema, stored_runtime: record.snapshot,
+                    next_instruction_revision: record.next_instruction_revision,
+                    active_instruction_revision: record.active_instruction_revision,
+                    steering: false, submitted_output: record.submitted_output, last_output: record.last_output,
+                    last_used: 0, evicted: true, execution: record.execution, interrupted: record.interrupted,
+                });
+            }
+        }
+        scope.journal = Some(journal);
+        state.scopes.insert(root_session_id.to_owned(), scope);
+        Ok(())
+    }
+
+    /// Reconnects stable child capabilities and resumes unfinished work.
+    /// Committed child effects replay in each child's own `DurableSession`.
+    /// Repeated calls leave resident drivers and their active turns untouched.
+    pub async fn recover(self: &Arc<Self>, parent: AgentHandle) -> std::io::Result<()> {
+        let root = parent.session_id().to_owned();
+        self.register_handle(parent);
+        let _residency = self.residency_lock.lock().await;
+        let _messages = self.message_lock.lock().await;
+        let (ids, closing) = {
+            let mut state = self.state.lock().await;
+            let Some(scope) = state.scopes.get_mut(&root) else { return Ok(()); };
+            // Verifies this generation before opening child execution owners.
+            scope.persist().await?;
+            (scope.topology.all_postorder().into_iter().rev().collect::<Vec<_>>(), scope.closing)
+        };
+        for id in ids {
+            let (descriptor, status, resident, execution, interrupted) = {
+                let state = self.state.lock().await;
+                let child = &state.scopes[&root].sessions[&id];
+                (child.descriptor.clone(), child.status.clone(), child.harness.is_some(), child.execution.clone(), child.interrupted)
+            };
+            self.send(&root, AgentUpdate::Added(descriptor.clone()));
+            self.send(&root, AgentUpdate::Status { id, status: status.clone() });
+            if resident || matches!(status, AgentStatus::Closed) { continue; }
+            if closing || matches!(status, AgentStatus::Closing) {
+                // Closing was committed before any cancellation request. Restore
+                // the native journal so cancellation cannot resurrect on restart.
+                self.rehydrate_for_close(&root, id).await?;
+                continue;
+            }
+            self.rehydrate(&root, id, MessagePurpose::Coordinate).await?;
+            let harness = self.state.lock().await.harness_in_scope(&root, id)?;
+            if let Some(execution) = execution {
+                let capacity = self.reserve_turn()?;
+                harness.start(execution.prompt, capacity).await?;
+                if interrupted { harness.interrupt().await?; }
+            } else if matches!(status, AgentStatus::Pending) {
+                harness.start(super::model::agent_prompt(id, &descriptor.task), self.reserve_turn()?).await?;
+            }
+            let pending = self.state.lock().await.scopes[&root].messages.pending_for(id);
+            for message in pending {
+                harness.enqueue_delivery(message)?.release().await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn rehydrate_for_close(self: &Arc<Self>, root: &str, id: AgentId) -> std::io::Result<()> {
+        // Temporarily permit construction, without publishing a reusable status.
+        {
+            let mut state = self.state.lock().await;
+            state.scopes.get_mut(root).expect("scope").sessions.get_mut(&id).expect("child").status = AgentStatus::Interrupted;
+        }
+        self.rehydrate(root, id, MessagePurpose::Coordinate).await?;
+        let harness = {
+            let mut state = self.state.lock().await;
+            let child = state.scopes.get_mut(root).expect("scope").sessions.get_mut(&id).expect("child");
+            child.status = AgentStatus::Closing;
+            child.harness.clone().ok_or_else(|| std::io::Error::other("closing child checkpoint missing"))?
+        };
+        // Shutdown of the native driver cancels its own retained operation.
+        harness.close().await?;
+        Ok(())
+    }
+
+    pub(super) async fn admit_child_turn(
+        &self, root: &str, id: AgentId, prompt: String, message_id: Option<MessageId>,
+    ) -> std::io::Result<(u64, String, Option<String>)> {
+        let mut state = self.state.lock().await;
+        let last_used = state.next_access();
+        let scope = state.scopes.get_mut(root).ok_or_else(|| std::io::Error::other("child scope unavailable"))?;
+        let durable = scope.journal.is_some();
+        let child = scope.sessions.get_mut(&id).ok_or_else(|| std::io::Error::other("child unavailable"))?;
+        if child.active || !child.status.can_start_turn() { return Err(std::io::Error::other("child cannot start a turn")); }
+        let (revision, prompt, operation_id) = if durable {
+            if child.execution.is_none() {
+                let revision = child.next_instruction_revision.checked_add(1).ok_or_else(|| std::io::Error::other("child instruction revision exhausted"))?;
+                child.next_instruction_revision = revision;
+                child.execution = Some(ChildExecution {
+                    operation_id: format!("child-turn:{id}:{revision}"), prompt, instruction_revision: revision,
+                });
+                child.submitted_output = None;
+                child.interrupted = false;
+            }
+            let execution = child.execution.as_ref().expect("admission retained");
+            (execution.instruction_revision, execution.prompt.clone(), Some(execution.operation_id.clone()))
+        } else {
+            let revision = child.next_instruction_revision.checked_add(1).ok_or_else(|| std::io::Error::other("child instruction revision exhausted"))?;
+            child.next_instruction_revision = revision;
+            child.submitted_output = None;
+            (revision, prompt, None)
+        };
+        child.active_instruction_revision = Some(revision);
+        child.active = true;
+        child.status = AgentStatus::Running;
+        child.steering = false;
+        child.last_used = last_used;
+        if let Some(message_id) = message_id { scope.messages.mark_terminal(message_id); }
+        scope.persist().await?;
+        drop(state);
+        self.send(root, AgentUpdate::Status { id, status: AgentStatus::Running });
+        self.changed();
+        Ok((revision, prompt, operation_id))
+    }
+}

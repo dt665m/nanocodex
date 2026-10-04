@@ -6380,6 +6380,7 @@ dependencies = [
  "jsonschema",
  "nanocodex-agent",
  "nanocodex-claude",
+ "nanocodex-durability",
  "nanocodex-oai-api",
  "nanocodex-oai-tools",
  "serde",

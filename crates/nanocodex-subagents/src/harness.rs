@@ -11,7 +11,7 @@ use super::{
 };
 use nanocodex_agent::input::Prompt;
 use nanocodex_agent::{
-    ChildSnapshot, Nanocodex, NanocodexError, Result as AgentResult, TurnControl, TurnResult,
+    ChildSnapshot, Nanocodex, NanocodexError, PromptRequest, Result as AgentResult, TurnControl, TurnResult,
 };
 use std::{collections::VecDeque, sync::Weak};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -295,7 +295,7 @@ impl Harness {
                 capacity,
                 response,
             } => {
-                let _ = response.send(self.start_turn(prompt, capacity).await);
+                let _ = response.send(self.start_turn(prompt, capacity, None).await);
                 false
             }
             HarnessCommand::Interrupt { response } => {
@@ -388,7 +388,7 @@ impl Harness {
             && let Ok(capacity) = self.capacity.reserve()
         {
             let delegation = self.begin_delegation(command.message.id).await;
-            if let Err(error) = self.start_turn(command.message.prompt(), capacity).await {
+            if let Err(error) = self.start_turn(command.message.prompt(), capacity, Some(command.message.id)).await {
                 self.rollback_delegation(delegation).await;
                 self.reject(command, error.to_string()).await;
                 return;
@@ -436,7 +436,7 @@ impl Harness {
             }
             .expect("a pending message should still exist");
             let delegation = self.begin_delegation(id).await;
-            match self.start_turn(message.prompt(), capacity).await {
+            match self.start_turn(message.prompt(), capacity, Some(id)).await {
                 Ok(()) => {
                     if let Some(registry) = self.registry.upgrade() {
                         registry
@@ -531,7 +531,7 @@ impl Harness {
             .await;
     }
 
-    async fn start_turn(&mut self, prompt: String, capacity: TurnCapacity) -> std::io::Result<()> {
+    async fn start_turn(&mut self, prompt: String, capacity: TurnCapacity, message_id: Option<MessageId>) -> std::io::Result<()> {
         if self.active.is_some() {
             return Err(std::io::Error::other(format!(
                 "agent {} is not idle",
@@ -546,15 +546,6 @@ impl Harness {
             .agent
             .as_ref()
             .ok_or_else(|| std::io::Error::other(format!("agent {} is closed", self.id)))?;
-        let Some(instruction_revision) = registry
-            .harness_turn_started(&self.root_session_id, self.id)
-            .await
-        else {
-            return Err(std::io::Error::other(format!(
-                "agent {} cannot start another turn",
-                self.id
-            )));
-        };
         // A first turn interrupted before a committed model boundary still
         // needs its assignment after idle eviction. Include it in the next
         // admitted prompt when rehydrating from memory.
@@ -566,10 +557,11 @@ impl Harness {
             "{prompt}\n\n{}",
             completion_instructions(&self.output_schema)
         );
-        let turn = match agent
-            .prompt(Prompt::new(prompt).with_instruction_revision(instruction_revision))
-            .await
-        {
+        let (instruction_revision, prompt, operation_id) = registry
+            .admit_child_turn(&self.root_session_id, self.id, prompt, message_id).await?;
+        let mut request = PromptRequest::new(Prompt::new(prompt).with_instruction_revision(instruction_revision));
+        if let Some(operation_id) = operation_id { request = request.request_id(operation_id); }
+        let turn = match agent.prompt(request).await {
             Ok(turn) => turn,
             Err(error) => {
                 let error = format!("could not start agent {}: {error}", self.id);

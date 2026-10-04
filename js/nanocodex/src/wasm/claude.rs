@@ -18,7 +18,7 @@
 use super::{
     AgentEvents, Cell, DurableAgentExt, HashMap, JavaScriptDurabilityStore, JavaScriptSpawnRouter,
     JsFuture, JsValue, Mutex, Prompt, Rc, RefCell, RustNanocodex, TurnState, WasmHarnessFactory,
-    WasmSubagents, WasmSubagentsConfig, WasmTurn, forward_events, host_cancel_code_turn, js_error,
+    WasmChildDurability, WasmSubagents, WasmSubagentsConfig, WasmTurn, forward_events, host_cancel_code_turn, js_error,
     validate_operation_id,
 };
 use nanocodex_claude::{
@@ -292,6 +292,10 @@ impl WasmNanoclaude {
         // Serde errors can include caller-supplied strings; do not echo config secrets.
         let config: ClaudeConfig = serde_json::from_str(config_json)
             .map_err(|_| js_error("invalid Nanoclaude configuration"))?;
+        let durability = config.durability_host_id.as_ref().map(|route_id| WasmChildDurability {
+            route_id: route_id.clone(),
+            terminal_receipt_retention: config.terminal_receipt_retention,
+        });
         let (factory, subagents) = if let Some(settings) = &config.subagents {
             let host = config
                 .host_definition_id
@@ -322,6 +326,7 @@ impl WasmNanoclaude {
                 hosts: Arc::new(Mutex::new(HashMap::new())),
                 codex,
                 claude: Some(serde_json::to_value(&config).map_err(js_error)?),
+                durability: durability.clone(),
             });
             let subagents = WasmSubagents::new(
                 host,
@@ -336,6 +341,9 @@ impl WasmNanoclaude {
             (None, None)
         };
         let (inner, events) = build_claude(config, factory, None, None).await?;
+        if let (Some(subagents), Some(durability)) = (&subagents, durability) {
+            subagents.recover(&inner, durability.route_id).await?;
+        }
         let event_forwarding = Rc::new(Cell::new(false));
         forward_events(events, Rc::clone(&event_forwarding));
         Ok(Self {
@@ -619,6 +627,12 @@ pub(super) async fn build_claude(
     for definition in config.server_tools {
         builder = builder.server_tool(definition);
     }
+    builder = builder.host_context(host_context);
+    if let Some(snapshot) = snapshot {
+        builder = builder.restore_runtime(snapshot).map_err(js_error)?;
+    }
+    // Native policy is restored first; durability owns the current conversation
+    // and must override an older registry residency checkpoint.
     if let (Some(route_id), Some(state_id)) = (config.durability_host_id, config.durability_id) {
         let store = JavaScriptDurabilityStore { route_id };
         let durable = if let Some(limit) = config.terminal_receipt_retention {
@@ -657,10 +671,6 @@ pub(super) async fn build_claude(
                     registry.clone(),
                 )
             });
-    }
-    builder = builder.host_context(host_context);
-    if let Some(snapshot) = snapshot {
-        builder = builder.restore_runtime(snapshot).map_err(js_error)?;
     }
     builder.build().map_err(js_error)
 }
