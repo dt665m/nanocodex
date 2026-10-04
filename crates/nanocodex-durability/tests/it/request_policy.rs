@@ -127,7 +127,30 @@ impl StateStore for AuditedSqlite {
             audit.max_head_bytes = audit.max_head_bytes.max(payload.len());
             audit.last_head = payload.to_owned();
             for record in records {
-                if let Ok(value) = serde_json::from_str::<Value>(&record.value)
+                // Chunk records contain raw text, not payload envelopes.
+                if record.key.contains('/') {
+                    continue;
+                }
+                // StateStore journals use an inline '=' envelope or a '+' chunk
+                // manifest. Inspect the committed public record representation.
+                let json = if let Some(content) = record.value.strip_prefix('=') {
+                    content.to_owned()
+                } else if let Some(count) = record.value.strip_prefix('+') {
+                    let count: usize = count.parse().expect("chunk manifest count");
+                    (0..count)
+                        .map(|index| {
+                            let key = format!("{}/{index}", record.key);
+                            records
+                                .iter()
+                                .find(|part| part.key == key)
+                                .map(|part| part.value.as_str())
+                                .expect("staged payload chunk")
+                        })
+                        .collect::<String>()
+                } else {
+                    continue;
+                };
+                if let Ok(value) = serde_json::from_str::<Value>(&json)
                     && value.get("request").is_some()
                     && let Some(receipt) = value["state"]["requests"]
                         .as_array()
@@ -138,14 +161,18 @@ impl StateStore for AuditedSqlite {
                         .prepared
                         .entry(id.into())
                         .or_insert_with(|| receipt.clone());
-                    if let Some(previous) = audit
-                        .history
-                        .insert(record.key.clone(), record.value.clone())
-                    {
-                        assert_eq!(
-                            previous, record.value,
-                            "an immutable preparation record was rewritten"
-                        );
+                    for retained in records.iter().filter(|part| {
+                        part.key == record.key || part.key.starts_with(&format!("{}/", record.key))
+                    }) {
+                        if let Some(previous) = audit
+                            .history
+                            .insert(retained.key.clone(), retained.value.clone())
+                        {
+                            assert_eq!(
+                                previous, retained.value,
+                                "an immutable preparation record was rewritten"
+                            );
+                        }
                     }
                 }
             }
