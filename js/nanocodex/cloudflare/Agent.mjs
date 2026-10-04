@@ -716,7 +716,8 @@ async function createOwned(module, resolved, options, hostAgent, lifecycle, prep
       sessionId,
       durability,
       durabilityId: stateId,
-      ...(forkResume === undefined ? {} : { resume: forkResume }),
+      ...(forkResume === undefined ? {} : forkResume.checkpoint !== undefined && forkResume.documents !== undefined
+        ? { documentFork: forkResume } : { resume: forkResume }),
     });
     // Managed voice needs the durable session before the separate Responses
     // relay is ready. Its preconnection remains owned by the host and a later

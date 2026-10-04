@@ -2774,7 +2774,18 @@ async function managedFetchRoute(
     }
     if (resource === "forks") {
       if (request.method !== "POST") return json({ error: "method_not_allowed" }, { status: 405 });
-      if (url.search || await hasRequestBody(request)) return json({ error: "invalid_request" }, { status: 400 });
+      if (url.search) return json({ error: "invalid_request" }, { status: 400 });
+      let at: string | undefined;
+      const encodedSelector = await request.text();
+      if (encodedSelector) {
+        if (encodedSelector.length > 1024) return json({ error: "invalid_request" }, { status: 400 });
+        let selector: unknown;
+        try { selector = JSON.parse(encodedSelector); } catch { return json({ error: "invalid_request" }, { status: 400 }); }
+        if (!isRecord(selector) || Object.keys(selector).length !== 1
+          || typeof selector.at !== "string" || !IDEMPOTENCY_KEY.test(selector.at))
+          return json({ error: "invalid_request" }, { status: 400 });
+        at = selector.at;
+      }
       const key = request.headers.get("idempotency-key");
       if (!key || !IDEMPOTENCY_KEY.test(key)) return json({ error: "invalid_idempotency_key" }, { status: 400 });
       if (principal.connectGrant || !["agents:read", "agents:write", "tools:use"].every(
@@ -2789,21 +2800,21 @@ async function managedFetchRoute(
       const child = env.NANOCODEX_SESSIONS.getByName(childId, durablePlacementOptions(clientIngressColo));
       const done = await child.fetch("https://session.internal/fork/status", { headers: sessionHeaders });
       if (done.ok) {
-        const retained = await done.json<{ parent_agent_id: string; request_key: string; settings: ManagedAgentSettings }>();
-        if (retained.parent_agent_id !== agentId || retained.request_key !== creationKey)
+        const retained = await done.json<{ parent_agent_id: string; request_key: string; at: string | null; settings: ManagedAgentSettings }>();
+        if (retained.parent_agent_id !== agentId || retained.request_key !== creationKey || (retained.at ?? null) !== (at ?? null))
           return json({ error: "fork_seed_conflict" }, { status: 409 });
         return forkCreationResponse(url, childId, agentId, retained.settings);
       }
       await done.body?.cancel();
       if (done.status !== 404) return done;
       const source = await stub.fetch("https://session.internal/fork/snapshot", {
-        method: "POST", headers: sessionHeaders,
+        method: "POST", headers: sessionHeaders, body: JSON.stringify({ at: at ?? null }),
       });
       if (!source.ok) return source;
-      const checkpoint = await source.json<{snapshot: unknown; settings: ManagedAgentSettings}>();
-      if (!checkpoint.snapshot || !isRecord(checkpoint.snapshot))
+      const checkpoint = await source.json<{seed: unknown; settings: ManagedAgentSettings}>();
+      if (!isRecord(checkpoint.seed) || !isRecord(checkpoint.seed.checkpoint) || !isRecord(checkpoint.seed.documents))
         return json({ error: "checkpoint_unavailable" }, { status: 409 });
-      const encodedSeed = JSON.stringify({ snapshot: checkpoint.snapshot,
+      const encodedSeed = JSON.stringify({ snapshot: checkpoint.seed, at: at ?? null,
         parent_agent_id: agentId, request_key: creationKey });
       if (encodedSeed.length > 16_000_000)
         return json({ error: "checkpoint_too_large" }, { status: 413 });
@@ -2823,8 +2834,8 @@ async function managedFetchRoute(
         if (seeded.status === 409) {
           const retained = await child.fetch("https://session.internal/fork/status", { headers: sessionHeaders });
           if (retained.ok) {
-            const row = await retained.json<{ parent_agent_id: string; request_key: string; settings: ManagedAgentSettings }>();
-            if (row.parent_agent_id === agentId && row.request_key === creationKey)
+            const row = await retained.json<{ parent_agent_id: string; request_key: string; at: string | null; settings: ManagedAgentSettings }>();
+            if (row.parent_agent_id === agentId && row.request_key === creationKey && (row.at ?? null) === (at ?? null))
               return forkCreationResponse(url, childId, agentId, row.settings);
           } else await retained.body?.cancel();
         }
@@ -4756,30 +4767,34 @@ export class DurableAgentSession extends DurableComputerObject {
         return json({ error: "not_found" }, { status: 404 });
       this.ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS managed_fork_seed (
         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-        parent_agent_id TEXT NOT NULL, request_key TEXT NOT NULL, snapshot_json TEXT NOT NULL
+        parent_agent_id TEXT NOT NULL, request_key TEXT NOT NULL, snapshot_json TEXT NOT NULL, selector TEXT
       )`);
-      const current = this.ctx.storage.sql.exec<{ parent_agent_id: string; request_key: string; snapshot_json: string }>(
-        "SELECT parent_agent_id,request_key,snapshot_json FROM managed_fork_seed WHERE singleton = 1",
+      if (!this.ctx.storage.sql.exec<{name: string}>("PRAGMA table_info(managed_fork_seed)").toArray().some(row => row.name === "selector"))
+        this.ctx.storage.sql.exec("ALTER TABLE managed_fork_seed ADD COLUMN selector TEXT");
+      const current = this.ctx.storage.sql.exec<{ parent_agent_id: string; request_key: string; snapshot_json: string; selector: string | null }>(
+        "SELECT parent_agent_id,request_key,snapshot_json,selector FROM managed_fork_seed WHERE singleton = 1",
       ).toArray()[0];
       if (url.pathname === "/fork/status") {
         if (request.method !== "GET") return json({ error: "method_not_allowed" }, { status: 405 });
-        return current ? json({ parent_agent_id: current.parent_agent_id, request_key: current.request_key, settings: this.#settings() })
+        return current ? json({ parent_agent_id: current.parent_agent_id, request_key: current.request_key, at: current.selector, settings: this.#settings() })
           : json({ error: "not_found" }, { status: 404 });
       }
       if (request.method !== "POST") return json({ error: "method_not_allowed" }, { status: 405 });
       if (url.pathname === "/fork/seed") {
         const encoded = await request.text();
         if (encoded.length > 16_000_000) return json({ error: "checkpoint_too_large" }, { status: 413 });
-        let seed: {snapshot: unknown; parent_agent_id: unknown; request_key: unknown};
+        let seed: {snapshot: unknown; parent_agent_id: unknown; request_key: unknown; at?: unknown};
         try { seed = JSON.parse(encoded); }
         catch { return json({ error: "invalid_request" }, { status: 400 }); }
-        if (!isRecord(seed.snapshot) || typeof seed.parent_agent_id !== "string"
+        if (!isRecord(seed.snapshot) || !isRecord(seed.snapshot.checkpoint) || !isRecord(seed.snapshot.documents)
+          || (seed.at !== undefined && seed.at !== null && (typeof seed.at !== "string" || !IDEMPOTENCY_KEY.test(seed.at)))
+          || typeof seed.parent_agent_id !== "string"
           || !SESSION_ID.test(seed.parent_agent_id) || seed.parent_agent_id === this.#sessionId()
           || typeof seed.request_key !== "string" || !IDEMPOTENCY_KEY.test(seed.request_key))
           return json({ error: "invalid_request" }, { status: 400 });
         const snapshot = JSON.stringify(seed.snapshot);
         if (current) return current.parent_agent_id === seed.parent_agent_id
-            && current.request_key === seed.request_key && current.snapshot_json === snapshot
+            && current.request_key === seed.request_key && current.snapshot_json === snapshot && current.selector === (seed.at ?? null)
           ? json({ seeded: true }) : json({ error: "fork_seed_conflict" }, { status: 409 });
         // A seed must precede *all* turn admissions and runtime construction.
         // SQLite serializes concurrent seed/admission in this Durable Object.
@@ -4789,8 +4804,8 @@ export class DurableAgentSession extends DurableComputerObject {
             "SELECT accepted_turns FROM session_state WHERE singleton = 1").one().accepted_turns !== 0)
           return json({ error: "fork_seed_conflict" }, { status: 409 });
         this.ctx.storage.sql.exec(
-          "INSERT INTO managed_fork_seed(singleton,parent_agent_id,request_key,snapshot_json) VALUES (1,?,?,?)",
-          seed.parent_agent_id, seed.request_key, snapshot);
+          "INSERT INTO managed_fork_seed(singleton,parent_agent_id,request_key,snapshot_json,selector) VALUES (1,?,?,?,?)",
+          seed.parent_agent_id, seed.request_key, snapshot, seed.at ?? null);
         return json({ seeded: true });
       }
       if (this.#settings().model.startsWith("claude-")) return json({ error: "claude_checkpoint_fork_unsupported" }, { status: 409 });
@@ -4801,9 +4816,17 @@ export class DurableAgentSession extends DurableComputerObject {
       // Current Rust checkpoint owns typed model/tool history; never infer it
       // from rendered events, including while a turn is executing.
       try {
+        const selector = await request.json<{at?: unknown}>();
+        if (!isRecord(selector) || Object.keys(selector).some(key => key !== "at")
+          || (selector.at !== undefined && selector.at !== null && (typeof selector.at !== "string" || !IDEMPOTENCY_KEY.test(selector.at))))
+          return json({ error: "invalid_request" }, { status: 400 });
+        const operationId = typeof selector.at === "string" ? selector.at : this.ctx.storage.sql.exec<{id: string}>(
+          "SELECT id FROM managed_turns WHERE state = 'completed' ORDER BY terminal_cursor DESC LIMIT 1",
+        ).toArray()[0]?.id;
+        if (!operationId) return json({ error: "checkpoint_unavailable" }, { status: 409 });
         const agent = await this.#ensureAgent();
-        const snapshot = await CloudflareAgent.checkpoint(agent);
-        return json({ snapshot, settings: this.#settings() }, { headers: { "cache-control": "no-store" } });
+        const seed = await agent.session.documentFork(operationId);
+        return json({ seed, settings: this.#settings() }, { headers: { "cache-control": "no-store" } });
       } catch (error) {
         return json({ error: "checkpoint_unavailable", message: errorMessage(error) }, { status: 409 });
       }
