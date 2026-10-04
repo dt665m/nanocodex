@@ -2459,17 +2459,9 @@ impl State {
             if background.is_none() {
                 background = self.start_summary(&cursor, cancel);
             }
-            if conversation.active_context_tokens >= cursor.threshold {
-                background::wait(&mut background).await;
-            } else {
-                background::poll(&mut background);
-            }
-            if self.install_summary(&mut cursor, &mut background, conversation, &mut pending, &mut usage).await? {
-                previous_message_id = None;
-                cursor.pending = pending.clone();
-                cursor.usage = usage.clone();
-                self.advance_cursor(&mut cursor, conversation).await?;
-            }
+            // A recovered foreground receipt must see its original request.
+            // Install summaries only after consuming it, before the existing
+            // continuation checkpoint or terminal settlement.
             if index > 0
                 && conversation.allows_auto_compaction()
                 && !conversation.messages.is_empty()
@@ -2873,6 +2865,14 @@ impl State {
                 if interrupted {
                     return Err(NanocodexError::TurnCancelled);
                 }
+                if conversation.active_context_tokens >= cursor.threshold {
+                    background::wait(&mut background).await;
+                } else {
+                    background::poll(&mut background);
+                }
+                if self.install_summary(&mut cursor, &mut background, conversation, &mut pending, &mut usage).await? {
+                    previous_message_id = None;
+                }
                 cursor.index = index + 1;
                 cursor.pending = pending.clone();
                 cursor.usage = usage.clone();
@@ -2895,6 +2895,14 @@ impl State {
                     .saturating_add(response.usage.cache_read_input_tokens)
                     .saturating_add(response.usage.cache_creation_input_tokens)
                     .saturating_add(response.usage.output_tokens);
+                if conversation.active_context_tokens >= cursor.threshold {
+                    background::wait(&mut background).await;
+                } else {
+                    background::poll(&mut background);
+                }
+                if self.install_summary(&mut cursor, &mut background, conversation, &mut pending, &mut usage).await? {
+                    previous_message_id = None;
+                }
                 cursor.index = index + 1;
                 cursor.pending = pending.clone();
                 cursor.usage = usage.clone();
@@ -2956,6 +2964,14 @@ impl State {
                 ));
                 pending = conversation.packed_messages();
                 previous_message_id = conversation.previous_message_id.clone();
+                if conversation.active_context_tokens >= cursor.threshold {
+                    background::wait(&mut background).await;
+                } else {
+                    background::poll(&mut background);
+                }
+                if self.install_summary(&mut cursor, &mut background, conversation, &mut pending, &mut usage).await? {
+                    previous_message_id = None;
+                }
                 cursor.index = index + 1;
                 cursor.pending = pending.clone();
                 cursor.usage = usage.clone();
@@ -2993,6 +3009,14 @@ impl State {
                 conversation.previous_message_id = previous_message_id.clone();
                 conversation.summary.clear();
                 conversation.advance_boundary();
+                if conversation.active_context_tokens >= cursor.threshold {
+                    background::wait(&mut background).await;
+                } else {
+                    background::poll(&mut background);
+                }
+                if self.install_summary(&mut cursor, &mut background, conversation, &mut pending, &mut usage).await? {
+                    previous_message_id = None;
+                }
                 cursor.index = index + 1;
                 cursor.pending = pending.clone();
                 cursor.usage = usage.clone();
@@ -3015,9 +3039,8 @@ impl State {
             background::wait(&mut background).await;
             let mut completed = conversation.packed_messages();
             self.install_summary(&mut cursor, &mut background, conversation, &mut completed, &mut usage).await?;
-            cursor.pending = completed;
-            cursor.usage = usage.clone();
-            self.advance_cursor(&mut cursor, conversation).await?;
+            // Keep the terminal foreground receipt until settle commits the
+            // result. A lost acknowledgement must replay this same response.
             return Ok(TurnResult::from_backend(
                 request.request_id.clone(),
                 text,
