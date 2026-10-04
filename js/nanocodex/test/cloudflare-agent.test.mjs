@@ -292,8 +292,8 @@ test("prepared construction shares cold engine initialization without retaining 
   const agents = await Promise.all([first, second]);
   try {
     assert.equal(instantiations.mock.callCount(), 2, "normal Agent construction reuses the initialized engine");
-    assert.equal(storage.owners.size, 1);
-    assert.equal(otherStorage.owners.size, 1);
+    assert.equal(storage.owners.size, 2, "root and child registry are independently fenced");
+    assert.equal(otherStorage.owners.size, 2);
   } finally {
     await Promise.all(agents.map(agent => agent.session.shutdown()));
   }
@@ -517,7 +517,7 @@ test("Cloudflare Agent reconstruction takes over the same durable owner after fe
   await reopened.session.shutdown();
 });
 
-test("Cloudflare root takeover starts without children and stale cleanup preserves new children", async () => {
+test("Cloudflare root takeover restores children and stale cleanup preserves the replacement", async () => {
   const module = await readFile(new URL("../pkg-web/nanocodex_bg.wasm", import.meta.url));
   const storage = new MemoryStorage();
   const lifecycles = [];
@@ -535,21 +535,24 @@ test("Cloudflare root takeover starts without children and stale cleanup preserv
     assert.equal(storage.subagentCheckpoints.size, 0);
     replacement = await create(module, durableOwner(storage), options);
     assert.equal(replacement.sessionId, first.sessionId, "root identity remains durable");
-    assert.deepEqual((await Subagents.list(replacement, { includeCompleted: true })).agents, []);
+    const recovered = (await Subagents.list(replacement, { includeCompleted: true })).agents;
+    assert.equal(recovered.length, 1);
+    assert.equal(recovered[0].role, "old-child");
     const child = await Subagents.spawn(replacement, { role: "new-child", task: "Use only live authority.", outputSchema: { type: "object" } });
     const newBind = lifecycles.find(({ type, descriptor }) => type === "bind" && descriptor.role === "new-child");
     assert.ok(newBind);
     assert.notEqual(newBind.sessionId, oldBind.sessionId);
-    await first.session.shutdown();
+    await assert.rejects(first.session.shutdown(), /fenced/);
     const routed = JSON.parse(await globalThis.nanocodexHost.executeTool("identity", "{}", newBind.sessionId, "after-stale-cleanup"));
     assert.equal(routed.structured_result.role, "new-child");
-    assert.throws(() => globalThis.nanocodexHost.executeTool("identity", "{}", oldBind.sessionId, "old-child"), /no Nanocodex host is active/);
+    const restored = JSON.parse(await globalThis.nanocodexHost.executeTool("identity", "{}", oldBind.sessionId, "restored-child"));
+    assert.equal(restored.structured_result.role, "old-child");
     assert.equal(lifecycles.some(({ type }) => type === "reconstruct"), false);
     await Subagents.close(replacement, child.agent_id);
     assert.equal(storage.subagents.size, 0);
     assert.equal(storage.subagentCheckpoints.size, 0);
   } finally {
-    await first.session.shutdown();
+    await first.session.shutdown().catch(error => assert.match(String(error), /fenced/));
     await replacement?.session.shutdown();
   }
 });
@@ -721,7 +724,10 @@ test("failed reconstruction keeps the prior same-owner reservation fail closed",
     module,
     durableOwner(storage, binding, FIRST_OBJECT_ID),
   );
-  assert.deepEqual((await Subagents.list(reconstructed, { includeCompleted: true })).agents, []);
+  const retained = (await Subagents.list(reconstructed, { includeCompleted: true })).agents;
+  assert.equal(retained.length, 1);
+  assert.equal(retained[0].role, "retry-proof");
+  assert.equal(retained[0].status.state, "closed");
   first.dispose();
   await reconstructed.session.shutdown();
   assert.equal(storage.subagents.size, 0);
@@ -1371,10 +1377,15 @@ test("live child continuation preserves schema, history, routing, and spawning a
     assert.deepEqual(lifecycleEvents.filter(({ type }) => type === "release").map(({ sessionId }) => sessionId), [childSessionId]);
     assert.equal(storage.subagents.size, 0);
     assert.equal(storage.subagentCheckpoints.size, 0);
-    const persisted = [...storage.records.values(), ...storage.states.map(({ payload }) => payload)].join("\n");
-    assert.equal(persisted.includes(marker), false, "child history never reaches root durability");
+    const rootHistory = [...storage.records].filter(([key]) => JSON.parse(key)[0] === storage.stateId)
+      .map(([, value]) => value).join("\n");
+    assert.equal(rootHistory.includes(marker), false, "child model history is isolated from root records");
+    assert.ok([...storage.records.values()].some(value => value.includes(marker)), "child history has its own durable journal");
     agent = await create(module, durableOwner(storage), options);
-    assert.deepEqual((await Subagents.list(agent, { includeCompleted: true })).agents, []);
+    const retained = (await Subagents.list(agent, { includeCompleted: true })).agents;
+    assert.equal(retained.length, 1);
+    assert.equal(retained[0].agent_id, child.agent_id);
+    assert.equal(retained[0].status.state, "closed");
     await assert.rejects(Subagents.send(agent, { agentId: child.agent_id, message: "Cannot resume after restart." }));
     assert.equal(classifierCalls, 1);
     assert.equal(childRequests.length, 5, "restart neither restores nor replays child inference");
@@ -1475,7 +1486,9 @@ test("closing one live child preserves sibling history and its pinned route", { 
     assert.equal(storage.subagents.size, 0);
     assert.equal(storage.subagentCheckpoints.size, 0);
     agent = await create(module, durableOwner(storage), options);
-    assert.deepEqual((await Subagents.list(agent, { includeCompleted: true })).agents, []);
+    const retainedChildren = (await Subagents.list(agent, { includeCompleted: true })).agents;
+    assert.deepEqual(retainedChildren.map(child => [child.agent_id, child.status.state]),
+      [[closed.agent_id, "closed"], [retained.agent_id, "closed"]]);
     assert.equal(modelCalls, 6);
   } finally {
     await agent.session.shutdown();

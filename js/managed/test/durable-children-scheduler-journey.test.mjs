@@ -110,10 +110,10 @@ test('production managed alarm cold-reopens a background child after root termin
   assert.ok(assets.length > 0, 'the journey bundles the actual WASM transport');
   let code = bundle.outputFiles[0].text;
   if (process.env.CHILD_DEBUG) code = code
-    .replace('try {\n      identity = await extras.effectIdentity', 'try {\n      console.log("CHILD_EFFECT_IDENTITY_START", sessionId, callId, turnId);\n      identity = await extras.effectIdentity')
-    .replace('const effectContext = {', 'console.log("CHILD_EFFECT_IDENTITY_READY", identity);\n    const effectContext = {')
+    .replaceAll('const payload = event?.payload;', 'const payload = event?.payload; console.log("CHILD_ID_EVENT",event?.type,payload);')
     .replace('async resolve(sessionId, parentCallId, turnId, signal) {', 'async resolve(sessionId, parentCallId, turnId, signal) { console.log("CHILD_ID_RESOLVE", sessionId,parentCallId,turnId);')
-    .replace('const payload = event?.payload;', 'const payload = event?.payload; console.log("CHILD_ID_EVENT",event?.type,payload);');
+    .replace('const effectContext = {', 'console.log("CHILD_EFFECT_IDENTITY_READY"); const effectContext = {')
+    .replace('decision = await journal.begin(effectContext);', 'console.log("CHILD_JOURNAL_BEGIN"); decision = await journal.begin(effectContext); console.log("CHILD_JOURNAL_READY",decision);');
   await writeFile(output + '/worker.mjs', code);
   for (const asset of assets) await writeFile(output + '/' + asset.name, asset.contents);
   await writeFile(output + '/assets.json', JSON.stringify(assets.map(asset => asset.name)));

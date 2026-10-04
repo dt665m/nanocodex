@@ -3495,7 +3495,14 @@ fn forward_subagent_updates(
                     }
                 }
                 SubagentUpdate::Event { id, event } => {
-                    if event_forwarders.get() > 0
+                    // Recovery can admit a child before the root's user event
+                    // watcher is installed. Host journals and request policy
+                    // need these canonical identities even without a watcher.
+                    let identity_event = matches!(event.kind,
+                        nanocodex::oai::events::AgentEventKind::InputAccepted
+                        | nanocodex::oai::events::AgentEventKind::ModelCallStarted
+                        | nanocodex::oai::events::AgentEventKind::ToolCall);
+                    if (identity_event || event_forwarders.get() > 0)
                         && let Ok(encoded) = serde_json::to_string(&event)
                     {
                         let id = id.to_string();
