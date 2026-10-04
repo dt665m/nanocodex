@@ -17,9 +17,9 @@
 
 use super::{
     AgentEvents, Cell, DurableAgentExt, HashMap, JavaScriptDurabilityStore, JavaScriptSpawnRouter,
-    JsFuture, JsValue, Mutex, Prompt, Rc, RefCell, RustNanocodex, TurnState, WasmHarnessFactory,
-    WasmChildDurability, WasmSubagents, WasmSubagentsConfig, WasmTurn, forward_events, host_cancel_code_turn, js_error,
-    validate_operation_id,
+    JsFuture, JsValue, Mutex, Prompt, Rc, RefCell, RustNanocodex, TurnState, WasmChildDurability,
+    WasmHarnessFactory, WasmSubagents, WasmSubagentsConfig, WasmTurn, forward_events,
+    host_cancel_code_turn, js_error, validate_operation_id,
 };
 use nanocodex_claude::{
     Claude, ClaudeAuthFuture, ClaudeAuthProvider, ClaudeAuthUnavailable, ClaudeClient,
@@ -305,17 +305,22 @@ impl WasmNanoclaude {
         // Serde errors can include caller-supplied strings; do not echo config secrets.
         let config: ClaudeConfig = serde_json::from_str(config_json)
             .map_err(|_| js_error("invalid Nanoclaude configuration"))?;
-        let durability = config.durability_host_id.as_ref().map(|route_id| WasmChildDurability {
-            route_id: route_id.clone(),
-            terminal_receipt_retention: config.terminal_receipt_retention,
-        });
+        let durability = config
+            .durability_host_id
+            .as_ref()
+            .map(|route_id| WasmChildDurability {
+                route_id: route_id.clone(),
+                terminal_receipt_retention: config.terminal_receipt_retention,
+            });
         let (factory, subagents) = if let Some(settings) = &config.subagents {
             let host = config
                 .host_definition_id
                 .ok_or_else(|| js_error("subagents require hostDefinitionId"))?;
             let (registry, control, updates) =
                 nanocodex_subagents::channel(settings.max_concurrency);
-            if durability.is_some() { registry.require_durability(); }
+            if durability.is_some() {
+                registry.require_durability();
+            }
             if config.subagent_routing {
                 registry.set_spawn_router(Arc::new(JavaScriptSpawnRouter {
                     host_definition_id: host,
@@ -442,8 +447,11 @@ impl WasmNanoclaude {
 
     #[wasm_bindgen(js_name = recoverSubagents)]
     pub async fn recover_subagents(&self) -> Result<String, JsValue> {
-        self.subagents.as_ref().ok_or_else(|| js_error("subagents are disabled"))?
-            .recover_report(self.inner.session_id()).await
+        self.subagents
+            .as_ref()
+            .ok_or_else(|| js_error("subagents are disabled"))?
+            .recover_report(self.inner.session_id())
+            .await
     }
 
     pub async fn shutdown(&self) -> Result<(), JsValue> {

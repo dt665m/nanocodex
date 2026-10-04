@@ -181,7 +181,9 @@ pub trait LifecycleBackend: Send + Sync + 'static {
     }
 
     /// Whether identified steering retains receipts in the execution journal.
-    fn durable_steering(&self) -> bool { false }
+    fn durable_steering(&self) -> bool {
+        false
+    }
 
     /// Reconciles identified input even after its native turn has settled.
     fn has_steer_receipt(&self, _operation_id: String, _id: String) -> BackendFuture<Result<bool>> {
@@ -524,7 +526,9 @@ impl LifecycleBackend for LocalLifecycle {
         })
     }
 
-    fn durable_steering(&self) -> bool { self.execution.durable_steering() }
+    fn durable_steering(&self) -> bool {
+        self.execution.durable_steering()
+    }
 
     fn has_steer_receipt(&self, operation_id: String, id: String) -> BackendFuture<Result<bool>> {
         let execution = self.execution.clone();

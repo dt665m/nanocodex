@@ -83,11 +83,34 @@ impl<F> NanocodexBuilder<F> {
         self
     }
 
+    /// Returns an explicitly configured native session identity.
+    #[doc(hidden)]
+    pub fn configured_session_id(&self) -> Option<SessionId> {
+        self.session_id
+    }
+
+    /// Derives an independent native recipe without root execution ownership.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn fresh_child(mut self) -> Self {
+        self.session_id = None;
+        self.resume = None;
+        self.prompt_cache.key = None;
+        self.codex.execution = ExecutionConfig::default();
+        self.codex.before_compaction = None;
+        self
+    }
+
     /// Composes embedding tools with the caller's existing per-agent tool recipe.
     #[doc(hidden)]
     #[must_use]
     pub fn map_tools_factory<T>(mut self, map: T) -> Self
-    where T: Fn(AgentHandle, Tools) -> std::result::Result<Tools, ToolsBuildError> + Send + Sync + 'static {
+    where
+        T: Fn(AgentHandle, Tools) -> std::result::Result<Tools, ToolsBuildError>
+            + Send
+            + Sync
+            + 'static,
+    {
         let previous = self.tools;
         self.tools = ToolsConfiguration::PerAgent(Arc::new(move |handle| {
             let tools = match &previous {

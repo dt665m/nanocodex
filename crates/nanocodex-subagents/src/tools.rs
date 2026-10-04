@@ -4,13 +4,10 @@
 use super::{
     message::MAX_MESSAGE_BYTES,
     model::{
-        AgentDescriptor, AgentLifetime, AgentId, AgentStatus, AgentUpdate, MessageId, MessagePriority,
-        MessagePurpose, agent_prompt,
+        AgentDescriptor, AgentId, AgentLifetime, AgentStatus, AgentUpdate, MessageId,
+        MessagePriority, MessagePurpose, agent_prompt,
     },
-    runtime::{
-        AgentDirectoryEntry, AgentSummary, OutputContract, Registry,
-        forward_events,
-    },
+    runtime::{AgentDirectoryEntry, AgentSummary, OutputContract, Registry, forward_events},
 };
 use async_trait::async_trait;
 use futures_util::future::join_all;
@@ -269,7 +266,11 @@ pub async fn start_agents_observed(
     observe_session: impl Fn(&str) + Send + Sync + 'static,
 ) -> AgentToolResult<Vec<AgentStartReport>> {
     registry.register_handle(parent.clone());
-    for task in &tasks { registry.validate_lifetime(session_id, task.lifetime).await?; }
+    for task in &tasks {
+        registry
+            .validate_lifetime(session_id, task.lifetime)
+            .await?;
+    }
     let prepared = prepare_batch(tasks)?;
     let mut startup = registry.batch_startup();
     let capacities = registry.reserve_turns(prepared.len())?;
@@ -435,7 +436,16 @@ pub async fn start_agent_with(
     options: SpawnOptions,
 ) -> AgentToolResult<AgentStartReport> {
     let host_context = registry.host_context_for_session(session_id).await;
-    start_agent_with_host_context(parent, registry, session_id, task, options, host_context, None).await
+    start_agent_with_host_context(
+        parent,
+        registry,
+        session_id,
+        task,
+        options,
+        host_context,
+        None,
+    )
+    .await
 }
 
 async fn start_agent_with_host_context(
@@ -449,7 +459,9 @@ async fn start_agent_with_host_context(
 ) -> AgentToolResult<AgentStartReport> {
     let _spawn = registry.spawn_lock.lock().await;
     if let Some((key, input)) = &call {
-        if let Some(report) = registry.replay_spawn(session_id, key, input).await? { return Ok(report); }
+        if let Some(report) = registry.replay_spawn(session_id, key, input).await? {
+            return Ok(report);
+        }
     }
     registry.register_handle(parent.clone());
     let AgentTask {
@@ -550,7 +562,9 @@ struct SpawnAgent {
 
 #[async_trait]
 impl Tool for SpawnAgent {
-    fn is_replay_safe(&self) -> bool { self.registry.upgrade().is_some_and(|r| r.durable_replay()) }
+    fn is_replay_safe(&self) -> bool {
+        self.registry.upgrade().is_some_and(|r| r.durable_replay())
+    }
     fn definition(&self) -> ToolDefinition {
         ToolDefinition::function(
             SPAWN_AGENT_TOOL,
@@ -563,7 +577,10 @@ impl Tool for SpawnAgent {
 
     async fn execute(&self, input: ToolInput, context: ToolContext<'_>) -> ToolResult {
         let args = input.decode_json::<Value>()?;
-        let call = Some((format!("{}:{}", context.session_id(), context.call_id()), args.clone()));
+        let call = Some((
+            format!("{}:{}", context.session_id(), context.call_id()),
+            args.clone(),
+        ));
         let (task, options) = serde_json::from_value::<SpawnAgentTask>(args)?.into_parts()?;
         let host_context = context.host_context().map(Arc::<str>::from);
         let registry = self
@@ -705,7 +722,9 @@ struct SubmitResult {
 
 #[async_trait]
 impl Tool for SubmitResult {
-    fn is_replay_safe(&self) -> bool { self.registry.upgrade().is_some_and(|r| r.durable_replay()) }
+    fn is_replay_safe(&self) -> bool {
+        self.registry.upgrade().is_some_and(|r| r.durable_replay())
+    }
     fn definition(&self) -> ToolDefinition {
         ToolDefinition::function(
             SUBMIT_RESULT_TOOL,
@@ -742,13 +761,19 @@ impl Tool for SubmitResult {
     async fn execute(&self, input: ToolInput, context: ToolContext<'_>) -> ToolResult {
         let args = input.decode_json::<Value>()?;
         let SubmitResultArgs { output } = serde_json::from_value(args.clone())?;
-        let registry = self.registry.upgrade().ok_or_else(|| std::io::Error::other("subagent runtime is closed"))?;
+        let registry = self
+            .registry
+            .upgrade()
+            .ok_or_else(|| std::io::Error::other("subagent runtime is closed"))?;
         let session = context.session_id().to_owned();
         let revision = context.instruction_revision();
         let key = format!("{}:{}", context.session_id(), context.call_id());
         let output = platform_receipt(async move {
-            registry.submit_result_keyed(&session, revision, output, key, args).await
-        }).await?;
+            registry
+                .submit_result_keyed(&session, revision, output, key, args)
+                .await
+        })
+        .await?;
         Ok(ToolOutput::from_json(output, true))
     }
 }
@@ -759,7 +784,9 @@ struct SendAgentMessage {
 
 #[async_trait]
 impl Tool for SendAgentMessage {
-    fn is_replay_safe(&self) -> bool { self.registry.upgrade().is_some_and(|r| r.durable_replay()) }
+    fn is_replay_safe(&self) -> bool {
+        self.registry.upgrade().is_some_and(|r| r.durable_replay())
+    }
     fn definition(&self) -> ToolDefinition {
         ToolDefinition::function(
             SEND_AGENT_MESSAGE_TOOL,
@@ -804,7 +831,10 @@ impl Tool for SendAgentMessage {
 
     async fn execute(&self, input: ToolInput, context: ToolContext<'_>) -> ToolResult {
         let args = input.decode_json::<Value>()?;
-        let call = Some((format!("{}:{}", context.session_id(), context.call_id()), args.clone()));
+        let call = Some((
+            format!("{}:{}", context.session_id(), context.call_id()),
+            args.clone(),
+        ));
         let SendMessageTask {
             agent_id,
             message,
@@ -893,8 +923,11 @@ impl Tool for ListAgents {
             .ok_or_else(|| std::io::Error::other("subagent runtime is closed"))?;
         let session = context.session_id().to_owned();
         let agents = platform_receipt(async move {
-            registry.directory(&session, include_completed, include_self).await
-        }).await?;
+            registry
+                .directory(&session, include_completed, include_self)
+                .await
+        })
+        .await?;
         json_output(&AgentDirectory { agents })
     }
 }
@@ -946,9 +979,9 @@ impl Tool for WaitAgent {
             .unwrap_or(DEFAULT_WAIT_TIMEOUT)
             .min(MAX_WAIT_TIMEOUT);
         let session = context.session_id().to_owned();
-        let (agents, timed_out) = platform_receipt(async move {
-            registry.wait(&session, &agent_ids, duration).await
-        }).await?;
+        let (agents, timed_out) =
+            platform_receipt(async move { registry.wait(&session, &agent_ids, duration).await })
+                .await?;
         json_output(&WaitReport { agents, timed_out })
     }
 }
@@ -1015,7 +1048,8 @@ impl Tool for ChangeAgentLifecycle {
                 LifecycleOperation::Interrupt => registry.interrupt(&session, agent_id).await,
                 LifecycleOperation::Close => registry.close(&session, agent_id).await,
             }
-        }).await?;
+        })
+        .await?;
         json_output(&LifecycleReport { agents })
     }
 }
@@ -1385,15 +1419,21 @@ mod strict_spawn_tests {
 // Store callbacks can be isolate-local on WASM; tools retain a Send receipt.
 // The abort guard ties local admission to cancellation of the calling tool.
 #[cfg(target_family = "wasm")]
-fn platform_receipt<T: Send + 'static>(future: impl std::future::Future<Output = std::io::Result<T>> + 'static) -> impl std::future::Future<Output = std::io::Result<T>> + Send {
+fn platform_receipt<T: Send + 'static>(
+    future: impl std::future::Future<Output = std::io::Result<T>> + 'static,
+) -> impl std::future::Future<Output = std::io::Result<T>> + Send {
     let pending = super::platform::spawn(future);
     let cancel = pending.abort_on_drop();
     async move {
         let _cancel = cancel;
-        pending.await.map_err(|_| std::io::Error::other("child operation cancelled"))?
+        pending
+            .await
+            .map_err(|_| std::io::Error::other("child operation cancelled"))?
     }
 }
 #[cfg(not(target_family = "wasm"))]
-async fn platform_receipt<T>(future: impl std::future::Future<Output = std::io::Result<T>> + Send) -> std::io::Result<T> {
+async fn platform_receipt<T>(
+    future: impl std::future::Future<Output = std::io::Result<T>> + Send,
+) -> std::io::Result<T> {
     future.await
 }

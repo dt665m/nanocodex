@@ -1465,11 +1465,15 @@ impl WasmHarnessFactory {
             };
             let (session_key, state_key, route_key, retention_key) = match family {
                 HarnessFamily::Codex => (
-                    "session_id", "durability_id", "durability_host_id",
+                    "session_id",
+                    "durability_id",
+                    "durability_host_id",
                     "terminal_receipt_retention",
                 ),
                 HarnessFamily::Claude => (
-                    "sessionId", "durabilityId", "durabilityHostId",
+                    "sessionId",
+                    "durabilityId",
+                    "durabilityHostId",
                     "terminalReceiptRetention",
                 ),
             };
@@ -1556,8 +1560,7 @@ impl AgentFactory for WasmHarnessFactory {
         let factory = Arc::new(self.clone());
         Box::pin(async move {
             parent.ensure_available().await?;
-            if parent.harness_family() == snapshot.model().family()
-                && factory.durability.is_none()
+            if parent.harness_family() == snapshot.model().family() && factory.durability.is_none()
             {
                 return parent.restore_native_runtime(snapshot, host_context).await;
             }
@@ -1567,10 +1570,10 @@ impl AgentFactory for WasmHarnessFactory {
                     SpawnOptions::new()
                         .harness(model.family())
                         .harness_model(model)
-                    .thinking(match &snapshot {
-                        nanocodex_agent::ChildSnapshot::Codex(snapshot) => snapshot.thinking,
-                        nanocodex_agent::ChildSnapshot::Native { thinking, .. } => *thinking,
-                    }),
+                        .thinking(match &snapshot {
+                            nanocodex_agent::ChildSnapshot::Codex(snapshot) => snapshot.thinking,
+                            nanocodex_agent::ChildSnapshot::Native { thinking, .. } => *thinking,
+                        }),
                     host_context,
                     Some(snapshot),
                 )
@@ -1702,17 +1705,33 @@ impl WasmSubagents {
         // Background drivers remain owned by their registry until a cold host
         // scheduler acquires a new fenced parent generation.
         if !self.registry.has_background(session_id).await {
-            release_subagent_scope(self.host_definition_id, &self.sessions, &self.parents, &self.hosts, session_id);
+            release_subagent_scope(
+                self.host_definition_id,
+                &self.sessions,
+                &self.parents,
+                &self.hosts,
+                session_id,
+            );
             self.remove_parent(session_id);
         }
         Ok(())
     }
 
     async fn recover_report(&self, session_id: &str) -> Result<String, JsValue> {
-        self.registry.recover(self.parent(session_id)?).await.map_err(js_error)?;
-        let agents = self.registry.summaries_all(session_id).await.map_err(js_error)?;
+        self.registry
+            .recover(self.parent(session_id)?)
+            .await
+            .map_err(js_error)?;
+        let agents = self
+            .registry
+            .summaries_all(session_id)
+            .await
+            .map_err(js_error)?;
         let background_pending = self.registry.has_background(session_id).await;
-        serde_json::to_string(&serde_json::json!({ "agents": agents, "backgroundPending": background_pending })).map_err(js_error)
+        serde_json::to_string(
+            &serde_json::json!({ "agents": agents, "backgroundPending": background_pending }),
+        )
+        .map_err(js_error)
     }
 
     async fn close_all(&self, root_session_id: &str) -> std::io::Result<()> {
@@ -1759,14 +1778,19 @@ impl WasmNanocodex {
         config: WasmConfig,
         auth: nanocodex::oai::auth::OpenAiAuth,
     ) -> Result<Self, JsValue> {
-        let durability = config.durability_host_id.as_ref().map(|route_id| WasmChildDurability {
-            route_id: route_id.clone(),
-            terminal_receipt_retention: config.terminal_receipt_retention,
-        });
+        let durability = config
+            .durability_host_id
+            .as_ref()
+            .map(|route_id| WasmChildDurability {
+                route_id: route_id.clone(),
+                terminal_receipt_retention: config.terminal_receipt_retention,
+            });
         let (factory, subagents) = if let Some(settings) = &config.subagents {
             let (registry, control, updates) =
                 nanocodex_subagents::channel(settings.max_concurrency);
-            if durability.is_some() { registry.require_durability(); }
+            if durability.is_some() {
+                registry.require_durability();
+            }
             if config.subagent_routing {
                 registry.set_spawn_router(Arc::new(JavaScriptSpawnRouter {
                     host_definition_id: config.host_definition_id,
@@ -2201,8 +2225,11 @@ impl WasmNanocodex {
     /// Reattaches durable children under this runtime's current host authority.
     #[wasm_bindgen(js_name = recoverSubagents)]
     pub async fn recover_subagents(&self) -> Result<String, JsValue> {
-        self.subagents.as_ref().ok_or_else(|| js_error("subagents are disabled"))?
-            .recover_report(self.inner.session_id()).await
+        self.subagents
+            .as_ref()
+            .ok_or_else(|| js_error("subagents are disabled"))?
+            .recover_report(self.inner.session_id())
+            .await
     }
 
     /// Gracefully stops the driver and joins every resource owned by this agent.
@@ -3800,7 +3827,8 @@ impl WasmSubagents {
         let agents = subagents
             .registry
             .directory(session_id, task.include_completed, task.include_self)
-            .await.map_err(js_error)?;
+            .await
+            .map_err(js_error)?;
         serde_json::to_string(&WasmSubagentDirectoryReport { agents }).map_err(js_error)
     }
     pub async fn send_subagent_message(
@@ -3962,6 +3990,9 @@ async fn build_codex(
         let registry = Arc::clone(&factory.registry);
         let parents = Arc::clone(&factory.parents);
         RustNanocodex::builder(openai)
+            .turn_ownership(Arc::new(nanocodex_subagents::RegistryOwnership(
+                registry.clone(),
+            )))
             .spawn_factory(factory.clone())
             .tools_factory(move |agent| {
                 let agent = agent.with_spawn_factory(factory.clone());

@@ -11,7 +11,8 @@ use super::{
 };
 use nanocodex_agent::input::Prompt;
 use nanocodex_agent::{
-    ChildSnapshot, Nanocodex, NanocodexError, PromptRequest, Result as AgentResult, TurnControl, TurnResult,
+    ChildSnapshot, Nanocodex, NanocodexError, PromptRequest, Result as AgentResult, TurnControl,
+    TurnResult,
 };
 use std::{collections::VecDeque, sync::Weak};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -326,15 +327,32 @@ impl Harness {
         if !command.wait_for_commit().await {
             return;
         }
-        let durable = self.registry.upgrade().is_some_and(|registry| registry.durable_replay());
+        let durable = self
+            .registry
+            .upgrade()
+            .is_some_and(|registry| registry.durable_replay());
         if let (Some(registry), Some(agent)) = (self.registry.upgrade(), self.agent.as_ref()) {
-            if let Some(operation) = registry.message_steer_operation(&self.root_session_id, command.message.id).await {
-                match agent.has_steer_receipt(operation, format!("child-message:{}", command.message.id)).await {
+            if let Some(operation) = registry
+                .message_steer_operation(&self.root_session_id, command.message.id)
+                .await
+            {
+                match agent
+                    .has_steer_receipt(operation, format!("child-message:{}", command.message.id))
+                    .await
+                {
                     Ok(true) => {
-                        self.admit(command.message.id, command.response, MessageDisposition::Steered).await;
+                        self.admit(
+                            command.message.id,
+                            command.response,
+                            MessageDisposition::Steered,
+                        )
+                        .await;
                         return;
                     }
-                    Err(error) => { self.reject(command, error.to_string()).await; return; }
+                    Err(error) => {
+                        self.reject(command, error.to_string()).await;
+                        return;
+                    }
                     Ok(false) => {}
                 }
             }
@@ -345,7 +363,10 @@ impl Harness {
         let steer = if priority == MessagePriority::Urgent && self.active.is_some() && can_steer {
             match self.registry.upgrade() {
                 Some(registry) => {
-                    match registry.begin_turn_steer(&self.root_session_id, self.id, command.message.id).await {
+                    match registry
+                        .begin_turn_steer(&self.root_session_id, self.id, command.message.id)
+                        .await
+                    {
                         Ok(steer) => steer,
                         Err(error) => {
                             let _ = command.response.send(Err(error));
@@ -365,13 +386,24 @@ impl Harness {
                 command.message.prompt(),
                 completion_instructions(&self.output_schema)
             );
-            let control = &self.active.as_ref().expect("steering requires an active turn").control;
+            let control = &self
+                .active
+                .as_ref()
+                .expect("steering requires an active turn")
+                .control;
             let input = Prompt::new(prompt).with_instruction_revision(steer.revision());
             let result = if durable {
-                control.steer_with_id(format!("child-message:{}", command.message.id), input).await
-            } else { control.steer(input).await };
+                control
+                    .steer_with_id(format!("child-message:{}", command.message.id), input)
+                    .await
+            } else {
+                control.steer(input).await
+            };
             if let Some(registry) = self.registry.upgrade() {
-                if let Err(error) = registry.finish_turn_steer(&self.root_session_id, steer, result.is_ok()).await {
+                if let Err(error) = registry
+                    .finish_turn_steer(&self.root_session_id, steer, result.is_ok())
+                    .await
+                {
                     let _ = command.response.send(Err(error));
                     return;
                 }
@@ -407,7 +439,10 @@ impl Harness {
             && let Ok(capacity) = self.capacity.reserve()
         {
             let delegation = self.begin_delegation(command.message.id).await;
-            if let Err(error) = self.start_turn(command.message.prompt(), capacity, Some(command.message.id)).await {
+            if let Err(error) = self
+                .start_turn(command.message.prompt(), capacity, Some(command.message.id))
+                .await
+            {
                 self.rollback_delegation(delegation).await;
                 self.reject(command, error.to_string()).await;
                 return;
@@ -458,7 +493,7 @@ impl Harness {
             match self.start_turn(message.prompt(), capacity, Some(id)).await {
                 Ok(()) => {
                     if let Some(registry) = self.registry.upgrade() {
-                        registry
+                        let _ = registry
                             .message_delivered(
                                 &self.root_session_id,
                                 id,
@@ -501,7 +536,7 @@ impl Harness {
             return;
         }
         if let Some(registry) = self.registry.upgrade() {
-            registry
+            let _ = registry
                 .message_rejected(&self.root_session_id, command.message.id)
                 .await;
         }
@@ -510,7 +545,7 @@ impl Harness {
 
     async fn publish_message_failure(&self, id: MessageId, error: String) {
         if let Some(registry) = self.registry.upgrade() {
-            registry
+            let _ = registry
                 .message_failed(&self.root_session_id, id, error)
                 .await;
         }
@@ -528,7 +563,10 @@ impl Harness {
             )));
             return;
         };
-        let result = registry.message_admitted(&self.root_session_id, id, disposition).await.map(|()| disposition);
+        let result = registry
+            .message_admitted(&self.root_session_id, id, disposition)
+            .await
+            .map(|()| disposition);
         let _ = response.send(result);
     }
 
@@ -548,7 +586,12 @@ impl Harness {
             .await;
     }
 
-    async fn start_turn(&mut self, prompt: String, capacity: TurnCapacity, message_id: Option<MessageId>) -> std::io::Result<()> {
+    async fn start_turn(
+        &mut self,
+        prompt: String,
+        capacity: TurnCapacity,
+        message_id: Option<MessageId>,
+    ) -> std::io::Result<()> {
         if self.active.is_some() {
             return Err(std::io::Error::other(format!(
                 "agent {} is not idle",
@@ -575,10 +618,16 @@ impl Harness {
             completion_instructions(&self.output_schema)
         );
         let (instruction_revision, prompt, operation_id, cancel_on_admission) = registry
-            .admit_child_turn(&self.root_session_id, self.id, prompt, message_id).await?;
-        let mut request = PromptRequest::new(Prompt::new(prompt).with_instruction_revision(instruction_revision));
-        if let Some(operation_id) = operation_id { request = request.request_id(operation_id); }
-        if cancel_on_admission { request = request.cancel_on_admission(); }
+            .admit_child_turn(&self.root_session_id, self.id, prompt, message_id)
+            .await?;
+        let mut request =
+            PromptRequest::new(Prompt::new(prompt).with_instruction_revision(instruction_revision));
+        if let Some(operation_id) = operation_id {
+            request = request.request_id(operation_id);
+        }
+        if cancel_on_admission {
+            request = request.cancel_on_admission();
+        }
         let turn = match agent.prompt(request).await {
             Ok(turn) => turn,
             Err(error) => {
@@ -638,8 +687,14 @@ impl Harness {
             )))
         });
         if let Some(registry) = self.registry.upgrade() {
-            let snapshot = match &self.agent { Some(agent) => agent.runtime_snapshot().await.ok(), None => None };
-            if let Err(error) = registry.harness_turn_finished(&self.root_session_id, self.id, result, snapshot).await {
+            let snapshot = match &self.agent {
+                Some(agent) => agent.runtime_snapshot().await.ok(),
+                None => None,
+            };
+            if let Err(error) = registry
+                .harness_turn_finished(&self.root_session_id, self.id, result, snapshot)
+                .await
+            {
                 tracing::error!(%error, "durable child settlement failed; cold recovery required");
             }
         }

@@ -105,6 +105,20 @@ impl Registry {
         Ok(())
     }
 
+    /// Reopens a configured root before inference; child hooks share its tree.
+    pub async fn recover_registered(self: &Arc<Self>, session: &str) -> std::io::Result<()> {
+        {
+            let state = self.state.lock().await;
+            if state.root_by_session.contains_key(session)
+                || !state.scopes.get(session).is_some_and(|scope| scope.journal.is_some()) {
+                return Ok(());
+            }
+        }
+        let handle = self.session_handles.read().expect("session handles poisoned")
+            .get(session).cloned().ok_or_else(|| std::io::Error::other("parent handle unavailable for child recovery"))?;
+        self.recover(handle).await
+    }
+
     /// Reconnects stable child capabilities and resumes unfinished work.
     /// Committed child effects replay in each child's own `DurableSession`.
     /// Repeated calls leave resident drivers and their active turns untouched.
@@ -212,6 +226,48 @@ impl Registry {
         state.summaries(session, &ids)
     }
 
+    /// Holds parent completion until its owned foreground subtree is idle.
+    /// A background boundary detaches that subtree from the caller's lifetime.
+    pub async fn wait_foreground(&self, session: &str) -> std::io::Result<()> {
+        let mut revision = self.revision.subscribe();
+        loop {
+            let busy = {
+                let mut state = self.state.lock().await;
+                let root = state.root_session_id(session).to_owned();
+                let Some(scope) = state.scopes.get_mut(&root) else { return Ok(()); };
+                scope.persist().await?;
+                let owner = scope.topology.agent_for_session(session);
+                scope.sessions.iter().any(|(&id, child)| {
+                    owns_foreground(scope, owner, id)
+                        && (child.active || scope.messages.has_pending_for(id)
+                            || (!child.interrupted && (child.execution.is_some()
+                                || matches!(child.status, AgentStatus::Pending | AgentStatus::Running | AgentStatus::Closing))))
+                })
+            };
+            if !busy { return Ok(()); }
+            revision.changed().await.map_err(std::io::Error::other)?;
+        }
+    }
+
+    /// Cancels the caller's owned work before a failed or aborted parent settles.
+    /// Explicit background subtrees retain their durable owners.
+    pub async fn abort_foreground(&self, session: &str) -> std::io::Result<()> {
+        {
+            let state = self.state.lock().await;
+            let root = state.root_session_id(session);
+            if let Some(scope) = state.scopes.get(root)
+                && let Some(owner) = scope.topology.agent_for_session(session)
+                && scope.sessions.get(&owner).is_some_and(|child| child.interrupted)
+            {
+                // An ancestor already fenced the whole subtree and is joining
+                // its drivers. Do not recursively wait on its admission lock.
+                scope.ensure_readable()?;
+                return Ok(());
+            }
+        }
+        self.release_parent(session).await
+    }
+
     /// Releases foreground work while retaining background trees and their
     /// ancestor factory checkpoints. Explicit close-all remains cancellation.
     pub async fn release_parent(&self, session: &str) -> std::io::Result<()> {
@@ -220,13 +276,15 @@ impl Registry {
             let mut state = self.state.lock().await;
             let root = state.root_session_id(session).to_owned();
             let Some(scope) = state.scopes.get(&root) else { return Ok(()); };
+            let owner = scope.topology.agent_for_session(session);
             let background = scope.sessions.iter().filter_map(|(&id, child)| {
-                (child.descriptor.lifetime == AgentLifetime::Background
+                (owner.is_none_or(|owner| scope.topology.is_descendant(id, owner)) && child.descriptor.lifetime == AgentLifetime::Background
                     && !matches!(child.status, AgentStatus::Closing | AgentStatus::Closed)).then_some(id)
             }).collect::<Vec<_>>();
             let mut ids = Vec::new();
             let mut supporting = Vec::new();
             for id in scope.topology.all_postorder() {
+                if owner.is_some_and(|owner| !scope.topology.is_descendant(id, owner)) { continue; }
                 if background.iter().any(|&bg| id == bg || scope.topology.is_descendant(id, bg)) { continue; }
                 if background.iter().any(|&bg| scope.topology.is_descendant(bg, id)) { supporting.push(id); }
                 else { ids.push(id); }
@@ -294,4 +352,15 @@ impl Registry {
         self.changed();
         Ok((revision, prompt, operation_id, cancel_on_admission))
     }
+}
+
+// Ownership is relative to the caller. A background parent's own foreground
+// children remain owned by it while the outer root ignores that whole subtree.
+fn owns_foreground(scope: &AgentScope, owner: Option<AgentId>, id: AgentId) -> bool {
+    if owner.is_some_and(|owner| !scope.topology.is_descendant(id, owner)) { return false; }
+    !scope.sessions.iter().any(|(&boundary, child)| {
+        child.descriptor.lifetime == AgentLifetime::Background
+            && owner.is_none_or(|owner| scope.topology.is_descendant(boundary, owner))
+            && (boundary == id || scope.topology.is_descendant(id, boundary))
+    })
 }

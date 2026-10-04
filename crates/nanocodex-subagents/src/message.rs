@@ -23,8 +23,12 @@ pub(super) struct MessageThreads {
 
 impl MessageThreads {
     pub(super) fn pending_for(&self, agent_id: AgentId) -> Vec<AgentMessage> {
-        let mut messages: Vec<_> = self.pending.iter().filter_map(|id| self.message(*id))
-            .filter(|message| message.to == agent_id).collect();
+        let mut messages: Vec<_> = self
+            .pending
+            .iter()
+            .filter_map(|id| self.message(*id))
+            .filter(|message| message.to == agent_id)
+            .collect();
         messages.sort_by_key(|message| (message.priority != MessagePriority::Urgent, message.id));
         messages
     }

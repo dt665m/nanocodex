@@ -180,8 +180,11 @@ impl AgentHandle {
         host_context: Option<Arc<str>>,
     ) -> Result<(Nanocodex, AgentEvents)> {
         self.native.ensure_available(self.clone()).await?;
-        self.factory.as_ref().unwrap_or(&self.native)
-            .restore(self.clone(), snapshot, host_context).await
+        self.factory
+            .as_ref()
+            .unwrap_or(&self.native)
+            .restore(self.clone(), snapshot, host_context)
+            .await
     }
     /// Restores through the native factory, bypassing mixed routing.
     pub async fn restore_native_runtime(
@@ -377,7 +380,9 @@ impl Nanocodex {
     }
 
     /// Whether this native driver atomically retains identified steering receipts.
-    pub fn durable_steering(&self) -> bool { self.backend.durable_steering() }
+    pub fn durable_steering(&self) -> bool {
+        self.backend.durable_steering()
+    }
 
     /// Checks a retained steering admission without restarting its operation.
     pub async fn has_steer_receipt(&self, operation_id: String, id: String) -> Result<bool> {
