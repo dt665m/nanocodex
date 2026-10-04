@@ -72,15 +72,6 @@ pub(super) struct Effect<'a> {
     step: String,
 }
 impl Effect<'_> {
-    pub(super) async fn begin(&self, kind: &str, input: Value) -> Result<Step> {
-        match self
-            .begin_with_replay(kind, input, nanocodex_agent::ReplaySafety::Safe)
-            .await?
-        {
-            Step::OutcomeUnknown => Err(recovery_error("unclassified interrupted model effect")),
-            admission => Ok(admission),
-        }
-    }
     pub(super) async fn begin_with_replay(
         &self,
         kind: &str,

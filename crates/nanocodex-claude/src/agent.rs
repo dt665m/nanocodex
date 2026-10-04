@@ -1950,6 +1950,12 @@ impl State {
         request.tool_choice = context.disable_tools.then(|| json!({"type":"none"}));
         // Preserve the embedding's stable caller prefix before adding OMP's
         // own identity cache marker; that marker is not caller cache policy.
+        // A durable cursor freezes original parameters, never current authority.
+        // Recheck the actual prepared declarations before replay or dispatch.
+        let authorized = self.available_tools();
+        if request.tools.iter().any(|tool| !authorized.contains(tool)) {
+            return Err(provider_error("prepared Claude request contains a declaration revoked by current host authorization").into());
+        }
         request.cache_system_prefix().map_err(provider_error)?;
         client.prepare_request(&mut request);
         if cancel.flag.load(Ordering::SeqCst) && context.effect.is_none() {
@@ -1957,9 +1963,18 @@ impl State {
         }
         if let Some(effect) = &context.effect
             && let Step::Replay(value) = effect
-                .begin(
+                .begin_with_replay(
                     "model",
                     client.durable_request(&request).map_err(provider_error)?,
+                    // Provider-hosted tools can mutate remote state. A missing
+                    // terminal receipt must not automatically repeat that charge
+                    // or side effect. Disabled tools make compaction text-only.
+                    if request.tool_choice.as_ref().is_some_and(|choice| choice["type"] == "none")
+                        || !request.tools.iter().any(|tool| matches!(tool, ClaudeToolSpec::Server(_))) {
+                        nanocodex_agent::ReplaySafety::Safe
+                    } else {
+                        nanocodex_agent::ReplaySafety::Unsafe
+                    },
                 )
                 .await?
         {
@@ -1969,6 +1984,13 @@ impl State {
         }
         if cancel.flag.load(Ordering::SeqCst) {
             return Err(NanocodexError::TurnCancelled.into());
+        }
+        if let Some(events) = events {
+            self.emit(events, AgentEventKind::ModelCallStarted, json!({
+                "call_index": index.saturating_add(1), "model": request.model,
+                "reasoning_mode": if request.thinking.is_some() { "thinking" } else { "none" },
+                "effort": self.effort().map(|effort| format!("{effort:?}").to_lowercase()).unwrap_or_else(|| "model_default".into()),
+            }));
         }
         let mut stream = tokio::select! {
             result = client.stream(&request) => match result {
