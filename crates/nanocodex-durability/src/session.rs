@@ -146,6 +146,12 @@ struct AgentAcquisition {
 }
 
 enum Command {
+    StageDocuments {
+        caller: Caller,
+        operation_id: String,
+        writes: Vec<crate::DocumentWrite>,
+        result: oneshot::Sender<Result<()>>,
+    },
     Document {
         key: String,
         result: oneshot::Sender<Option<crate::SessionDocument>>,
@@ -486,6 +492,31 @@ impl Driver {
                     });
                     drop(result.send(outcome));
                 }
+                Command::StageDocuments {
+                    caller,
+                    operation_id,
+                    writes,
+                    result,
+                } => {
+                    let outcome = async {
+                        // This handle shares the model owner's actor. It may stage
+                        // data for that owner's claimed running operation, but it
+                        // cannot complete or admit model work through this seam.
+                        if let Some(generation) = self.active_agent_generation {
+                            self.require_claimed(&Caller::Agent(generation), &operation_id)?;
+                        } else {
+                            self.authorize(&caller)?;
+                            self.require_claimed(&caller, &operation_id)?;
+                        }
+                        self.require_running(&operation_id)?;
+                        let mut next = self.state.clone();
+                        next.documents.stage(operation_id, writes)?;
+                        next.advance_revision(self.state.revision() + 1)?;
+                        self.persist(next).await
+                    }
+                    .await;
+                    drop(result.send(outcome));
+                }
                 Command::Document { key, result } => {
                     drop(result.send(self.state.documents.current.get(&key).cloned()));
                 }
@@ -598,7 +629,9 @@ impl Driver {
                                         output,
                                     },
                                 )?;
-                                next.documents.commit(&operation_id, checkpoint, writes)?;
+                                let mut staged = next.documents.take_staged(&operation_id);
+                                staged.extend(writes);
+                                next.documents.commit(&operation_id, checkpoint, staged)?;
                             }
                         }
                         if let Some(limit) = self.terminal_receipt_limit {
@@ -1375,12 +1408,27 @@ impl Driver {
     ) -> Result<()> {
         self.require_claimed(caller, &operation_id)?;
         self.require_running(&operation_id)?;
-        let entry = Transition::OperationCompleted {
-            operation_id: operation_id.clone(),
-            checkpoint,
-            output,
-        };
-        let outcome = self.apply_terminal(entry).await;
+        let outcome = async {
+            let mut next = self.state.clone();
+            let writes = next.documents.take_staged(&operation_id);
+            next.apply_transition(
+                self.state
+                    .revision()
+                    .checked_add(1)
+                    .ok_or_else(|| Error::InvalidState("state revision overflow".into()))?,
+                Transition::OperationCompleted {
+                    operation_id: operation_id.clone(),
+                    checkpoint: checkpoint.clone(),
+                    output,
+                },
+            )?;
+            next.documents.commit(&operation_id, checkpoint, writes)?;
+            if let Some(limit) = self.terminal_receipt_limit {
+                let _ = next.retain_terminal_receipts(limit);
+            }
+            self.persist(next).await
+        }
+        .await;
         if finishing_attempt_releases_claim(&outcome) {
             self.release_claim_if_owned(caller, &operation_id);
         }
@@ -1454,6 +1502,13 @@ impl Driver {
             Error::InvalidState("state revision exceeded the u64 range".to_owned())
         })?;
         let mut next = self.state.clone();
+        match &entry {
+            Transition::OperationFailed { operation_id, .. }
+            | Transition::OperationCancelled { operation_id, .. } => {
+                next.documents.take_staged(operation_id);
+            }
+            _ => {}
+        }
         next.apply_transition(expected_revision, entry)?;
         if let Some(limit) = self.terminal_receipt_limit {
             let _ = next.retain_terminal_receipts(limit);
@@ -2065,6 +2120,26 @@ impl DurableSession {
         receive(receiver).await
     }
 
+    /// Stages bounded document writes for a claimed running operation. The
+    /// operation's successful completion publishes them with its result and
+    /// checkpoint. Failure/cancellation discards them. This also works through
+    /// a retained handle after attaching the session to a model Agent.
+    pub async fn stage_document_writes(
+        &self,
+        operation_id: impl Into<String>,
+        writes: Vec<crate::DocumentWrite>,
+    ) -> Result<()> {
+        let (result, receiver) = oneshot::channel();
+        self.send(Command::StageDocuments {
+            caller: Caller::Direct(self.caller_id.clone()),
+            operation_id: operation_id.into(),
+            writes,
+            result,
+        })
+        .await?;
+        receive(receiver).await
+    }
+
     /// Reads a session-owned document. Missing keys return `None`.
     pub async fn document(&self, key: impl Into<String>) -> Result<Option<crate::SessionDocument>> {
         let (result, receiver) = oneshot::channel();
@@ -2109,6 +2184,45 @@ impl DurableSession {
         })
         .await?;
         receive(receiver).await
+    }
+
+    /// Loads the complete model checkpoint and policy-selected documents from a
+    /// successful Agent operation, including after receipt pruning or reopening.
+    pub async fn agent_document_fork(
+        &self,
+        operation_id: impl Into<String>,
+    ) -> Result<(
+        nanocodex_agent::session::SessionSnapshot,
+        crate::DocumentFork,
+    )> {
+        let (checkpoint, documents) = self.document_fork(operation_id).await?;
+        let snapshot = crate::context::load_snapshot(self.into(), checkpoint).await?;
+        Ok((snapshot, documents))
+    }
+
+    /// Initializes an empty Agent session with an independently indexed model
+    /// checkpoint. The seed contains data only; destination authority is supplied
+    /// separately by the caller when constructing the destination Agent.
+    pub async fn initialize_agent_document_fork(
+        &self,
+        documents: crate::DocumentFork,
+        snapshot: &nanocodex_agent::session::SessionSnapshot,
+    ) -> Result<()> {
+        let prepared =
+            crate::context::prepare_snapshot(snapshot.clone(), &std::collections::HashSet::new())?;
+        self.initialize_document_fork(documents, &prepared.payload)
+            .await
+    }
+
+    /// Initializes a destination from JSON checkpoint contents received across
+    /// a public transport. Use `initialize_document_fork` for a Rust payload.
+    pub async fn initialize_document_fork_value<C: Serialize + ?Sized>(
+        &self,
+        fork: crate::DocumentFork,
+        checkpoint: &C,
+    ) -> Result<()> {
+        self.initialize_document_fork(fork, &EncodedPayload::encode(checkpoint)?)
+            .await
     }
 
     /// Commits the step receipt and document writes in one fenced store replacement.

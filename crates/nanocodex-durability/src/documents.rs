@@ -51,10 +51,19 @@ pub struct DocumentWrite {
 #[serde(deny_unknown_fields)]
 pub(crate) struct Documents {
     pub(crate) current: BTreeMap<String, SessionDocument>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) staged: Option<StagedDocuments>,
     // Legacy indexes are read on migration; new boundaries exist only until staged.
     // The execution head never serializes an unbounded boundary index.
     #[serde(default, skip_serializing)]
     pub(crate) boundaries: BTreeMap<String, EncodedPayload>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StagedDocuments {
+    pub(crate) operation_id: String,
+    pub(crate) writes: Vec<DocumentWrite>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -130,6 +139,53 @@ impl Documents {
             );
         }
         self.validate()
+    }
+
+    pub(crate) fn stage(&mut self, operation_id: String, writes: Vec<DocumentWrite>) -> Result<()> {
+        let mut staged = match &self.staged {
+            Some(staged) if staged.operation_id != operation_id => {
+                return Err(Error::InvalidState(
+                    "another operation has staged documents".into(),
+                ));
+            }
+            Some(staged) => staged.clone(),
+            None => StagedDocuments {
+                operation_id,
+                writes: Vec::new(),
+            },
+        };
+        for write in writes {
+            if staged.writes.iter().any(|existing| existing == &write) {
+                continue;
+            }
+            staged.writes.push(write);
+        }
+        if staged.writes.len() > 64
+            || serde_json::to_vec(&staged)
+                .map_err(Error::InvalidPayload)?
+                .len()
+                > 65_536
+        {
+            return Err(Error::InvalidState(
+                "staged documents exceed 64 writes or 65536 encoded bytes".into(),
+            ));
+        }
+        let mut preview = self.clone();
+        preview.write(staged.writes.clone())?;
+        self.staged = Some(staged);
+        Ok(())
+    }
+
+    pub(crate) fn take_staged(&mut self, operation_id: &str) -> Vec<DocumentWrite> {
+        if self
+            .staged
+            .as_ref()
+            .is_some_and(|staged| staged.operation_id == operation_id)
+        {
+            self.staged.take().expect("checked staged documents").writes
+        } else {
+            Vec::new()
+        }
     }
 
     pub(crate) fn validate(&self) -> Result<()> {
