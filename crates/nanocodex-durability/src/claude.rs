@@ -84,6 +84,15 @@ impl ClaudeExecutionPolicy for ClaudeExecution {
         })
     }
 
+    fn advance_retaining(&self, id: String, state: Value, retained_steps: Vec<String>) -> PolicyFuture<'_, ()> {
+        Box::pin(async move {
+            self.owner
+                .advance_retaining(id, payload(&state)?, retained_steps)
+                .await
+                .map_err(agent_error)
+        })
+    }
+
     fn begin_step(
         &self,
         id: String,

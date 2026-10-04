@@ -32,11 +32,13 @@ impl Snapshot {
         Ok(snapshot)
     }
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Cursor {
     #[serde(default)]
     pub(super) instruction_revision: Option<u64>,
+    #[serde(default)]
+    pub(super) background: Option<background::PendingSummary>,
     pub(super) snapshot: Snapshot,
     pub(super) template: MessagesRequest,
     #[serde(default)]
@@ -178,6 +180,7 @@ impl State {
         }
         let mut cursor = Cursor {
             instruction_revision: None,
+            background: None,
             snapshot: self.snapshot(conversation).await?,
             template: self.request_template(speed),
             wire_profile: Some(self.client.freeze_wire_profile()),
@@ -208,9 +211,10 @@ impl State {
         cursor.snapshot = self.snapshot(conversation).await?;
         if let (Some(policy), Some(operation)) = (&self.policy, &cursor.operation) {
             policy
-                .advance(
+                .advance_retaining(
                     operation.clone(),
                     serde_json::to_value(&*cursor).map_err(provider_error)?,
+                    cursor.background.as_ref().map_or_else(Vec::new, |pending| vec![pending.step.clone()]),
                 )
                 .await?;
         }

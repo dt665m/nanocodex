@@ -124,14 +124,17 @@ where
         };
         let active_context_tokens = conversation.active_context_tokens();
         if self.background_compaction.is_some() {
+            self.start_background(factory).await?;
             if self.background_work.is_some() {
                 self.poll_background().await;
                 if self.force_compaction || active_context_tokens >= auto_compact_token_limit {
                     self.wait_background().await;
                 }
                 if let Some(installed) = self.install_background(conversation, factory)? {
-                    self.force_compaction = false;
-                    return Ok(installed);
+                    if installed {
+                        self.force_compaction = false;
+                        return Ok(true);
+                    }
                 }
             }
             if !self.force_compaction && active_context_tokens < auto_compact_token_limit {

@@ -19,6 +19,7 @@ use nanocodex_agent::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 mod durable;
+mod background;
 use crate::execution::{Admission, ClaudeExecutionPolicy, Step};
 use durable::{Cursor, Effect, Snapshot};
 use std::{
@@ -1691,6 +1692,7 @@ fn provider_error(error: impl std::fmt::Display) -> NanocodexError {
 }
 #[derive(Clone, Copy)]
 enum CompactionMode {
+    Background,
     Automatic,
     ContextRecovery,
     Manual,
@@ -2207,7 +2209,7 @@ impl State {
         // activate a name, and references removed by summary require rediscovery.
         // Acquire before the context swap so both states change without yielding.
         let mut discovered = self.discovered.lock().await;
-        if cursor.tool_search {
+        if cursor.tool_search && !matches!(mode, CompactionMode::Background) {
             let references = client_discovered_tools(&retained);
             discovered.retain(|name| references.contains(name.as_str()));
         }
@@ -2233,7 +2235,7 @@ impl State {
             CompactionMode::Automatic if context.rounds_since_compaction < 3 => {
                 context.rapid_compactions.saturating_add(1)
             }
-            CompactionMode::Automatic | CompactionMode::ContextRecovery => 1,
+            CompactionMode::Automatic | CompactionMode::Background | CompactionMode::ContextRecovery => 1,
             CompactionMode::Manual => 0,
         };
         context.rounds_since_compaction = 0;
@@ -2430,6 +2432,7 @@ impl State {
             cursor.usage = usage.clone();
             self.advance_cursor(&mut cursor, conversation).await?;
         }
+        let mut background = None;
         let mut previous_message_id = conversation.previous_message_id.clone();
         for index in cursor.index..u32::MAX {
             if self
@@ -2441,6 +2444,29 @@ impl State {
             }
             if cancel.flag.load(Ordering::SeqCst) && self.policy.is_none() {
                 return Err(NanocodexError::TurnCancelled);
+            }
+            if cursor.background.is_none() && conversation.allows_auto_compaction()
+                && conversation.active_context_tokens >= cursor.threshold.saturating_mul(4) / 5
+                && conversation.active_context_tokens < cursor.threshold && !pending.is_empty() {
+                let mut cutoff = conversation.clone();
+                cutoff.messages = pending.clone();
+                cutoff.summary.clear();
+                cursor.background = Some(background::PendingSummary { cutoff, step: format!("background-summary-{index}") });
+                self.advance_cursor(&mut cursor, conversation).await?;
+            }
+            if background.is_none() {
+                background = self.start_summary(&cursor, cancel);
+            }
+            if conversation.active_context_tokens >= cursor.threshold {
+                background::wait(&mut background).await;
+            } else {
+                background::poll(&mut background);
+            }
+            if self.install_summary(&mut cursor, &mut background, conversation, &mut pending, &mut usage).await? {
+                previous_message_id = None;
+                cursor.pending = pending.clone();
+                cursor.usage = usage.clone();
+                self.advance_cursor(&mut cursor, conversation).await?;
             }
             if index > 0
                 && conversation.allows_auto_compaction()
@@ -2470,7 +2496,8 @@ impl State {
                 self.advance_cursor(&mut cursor, conversation).await?;
             }
             let discovered = self.discovered.lock().await.clone();
-            let response = self
+            let response = {
+            let foreground = self
                 .response(
                     pending.clone(),
                     cursor.template.tools.clone(),
@@ -2486,7 +2513,17 @@ impl State {
                         effect: cursor.effect(self, &format!("model-{index}")),
                     },
                 )
-                .await;
+                ;
+            tokio::pin!(foreground);
+            loop {
+                tokio::select! {
+                    result = &mut foreground => break result,
+                    result = background::progress(&mut background) => {
+                        if let Some(work) = &mut background { work.result = Some(result); }
+                    }
+                }
+            }
+            };
             let response = match response {
                 Ok(response) => response,
                 Err(failure) => {
@@ -2971,6 +3008,12 @@ impl State {
                 .saturating_add(response.usage.cache_read_input_tokens)
                 .saturating_add(response.usage.cache_creation_input_tokens)
                 .saturating_add(response.usage.output_tokens);
+            background::wait(&mut background).await;
+            let mut completed = conversation.packed_messages();
+            self.install_summary(&mut cursor, &mut background, conversation, &mut completed, &mut usage).await?;
+            cursor.pending = completed;
+            cursor.usage = usage.clone();
+            self.advance_cursor(&mut cursor, conversation).await?;
             return Ok(TurnResult::from_backend(
                 request.request_id.clone(),
                 text,

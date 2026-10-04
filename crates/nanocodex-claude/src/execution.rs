@@ -47,6 +47,15 @@ pub trait ClaudeExecutionPolicy: Send + Sync {
     fn begin_attempt(&self, id: String) -> PolicyFuture<'_, ()>;
     fn continuation(&self, id: String) -> PolicyFuture<'_, Option<Value>>;
     fn advance(&self, id: String, state: Value) -> PolicyFuture<'_, ()>;
+    /// Foreground checkpoint retaining independently owned background effects.
+    fn advance_retaining(&self, id: String, state: Value, retained_steps: Vec<String>) -> PolicyFuture<'_, ()> {
+        Box::pin(async move {
+            if !retained_steps.is_empty() {
+                return Err(nanocodex_agent::NanocodexError::ExecutionPolicyCapabilityUnsupported { capability: "background effect retention" });
+            }
+            self.advance(id, state).await
+        })
+    }
     fn begin_step(
         &self,
         id: String,
