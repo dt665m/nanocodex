@@ -8,12 +8,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use crate::{Error, Result};
 
-const MAX_RECEIPTS: usize = 256;
+const MAX_RECEIPTS: usize = 16;
 const MAX_POLICY_BYTES: usize = 16 * 1024 * 1024;
 
 fn bounded<T: Serialize>(value: &T) -> Result<()> {
     if serde_json::to_vec(value)?.len() > MAX_POLICY_BYTES {
-        return Err(invalid("request policy checkpoint exceeds 16 MiB; start a new branch"));
+        return Err(invalid("request policy current checkpoint exceeds 16 MiB"));
     }
     Ok(())
 }
@@ -141,6 +141,10 @@ impl EffectiveConfiguration {
 /// Append-only configuration history, serialized in the session document.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ConfigurationHistory {
+    /// Effective prefix folded out of the bounded current checkpoint. Full changes
+    /// remain in immutable native preparation journal records.
+    #[serde(default)]
+    base: EffectiveConfiguration,
     entries: Vec<ConfigurationEntry>,
 }
 
@@ -150,7 +154,7 @@ impl ConfigurationHistory {
 
     /// Replay through an inclusive boundary; `None` selects the latest.
     pub fn at(&self, request_id: Option<&str>) -> Result<EffectiveConfiguration> {
-        let mut configuration = EffectiveConfiguration::default();
+        let mut configuration = self.base.clone();
         for entry in &self.entries {
             for patch in &entry.patches { configuration.patch(patch)?; }
             if request_id == Some(entry.request_id.as_str()) { return Ok(configuration); }
@@ -168,6 +172,10 @@ impl ConfigurationHistory {
         let mut next = self.at(None)?;
         for patch in &entry.patches { next.patch(patch)?; }
         self.entries.push(entry);
+        while self.entries.len() > MAX_RECEIPTS {
+            let oldest = self.entries.remove(0);
+            for patch in &oldest.patches { self.base.patch(patch)?; }
+        }
         Ok(())
     }
 }
@@ -258,8 +266,15 @@ pub struct PreparedRequest {
 pub struct RequestPolicyState {
     /// Positional source history; current native adapters flatten it.
     pub configuration: ConfigurationHistory,
-    /// Receipts in admission order.
+    /// Recent receipts in admission order, bounded to 16 and 16 MiB total.
+    /// The durable adapter stores every preparation in immutable journal records.
     pub requests: Vec<PreparedRequest>,
+    /// Cumulative actual and reserved warm spend; no credentials are retained.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_warm_budget: Option<Value>,
+    /// Latest actual warm usage; complete receipts remain in immutable journal records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_cache_warm: Option<Value>,
 }
 
 impl RequestPolicyState {
@@ -285,9 +300,6 @@ impl RequestPolicyState {
             saved.configuration.authorize(authorized_tools)?;
             validate_limits(&request, saved.route.dispatched, models)?;
             return Ok(saved.clone());
-        }
-        if self.requests.len() >= MAX_RECEIPTS {
-            return Err(invalid("request policy receipt limit reached (256); start a new branch"));
         }
         bounded(self)?;
         let previous = self.requests.last();
@@ -330,6 +342,9 @@ impl RequestPolicyState {
         let mut next = self.clone();
         next.configuration = history;
         next.requests.push(prepared.clone());
+        if next.requests.len() > MAX_RECEIPTS {
+            next.requests.drain(..next.requests.len() - MAX_RECEIPTS);
+        }
         bounded(&next)?;
         *self = next;
         Ok(prepared)
@@ -528,6 +543,12 @@ fn validate_native_controls(request: &Value, model: HarnessModel) -> Result<()> 
 pub trait DurableClaudeRequestExt: Sized {
     /// Acquire the native durable owner and install persisted request decisions.
     fn durability_with_request_policy(self, state: crate::DurableSession, settings: RequestPolicySettings)
+        -> impl std::future::Future<Output = nanocodex_agent::Result<Self>>;
+    /// Explicitly enable economically justified cache warming on native requests.
+    /// The live client supplies current authentication; credentials are never journaled.
+    fn durability_with_request_policy_and_cache_warm(self, state: crate::DurableSession,
+        settings: RequestPolicySettings, client: nanocodex_claude::ClaudeClient,
+        policy: crate::cache_warm::CacheWarmPolicy)
         -> impl std::future::Future<Output = nanocodex_agent::Result<Self>>;
 }
 

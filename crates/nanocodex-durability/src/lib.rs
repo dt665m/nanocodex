@@ -15,6 +15,8 @@ pub use documents::{DocumentFork, DocumentForkPolicy, DocumentWrite, SessionDocu
 mod memory;
 /// Named configuration, virtual routing and cache decisions at durable request boundaries.
 pub mod request_policy;
+#[cfg(feature = "claude")]
+pub mod cache_warm;
 #[cfg(all(feature = "postgres", not(target_family = "wasm")))]
 mod postgres;
 mod session;

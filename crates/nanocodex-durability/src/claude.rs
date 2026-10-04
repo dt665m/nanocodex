@@ -30,6 +30,7 @@ impl DurableAgentExt for ClaudeBuilder {
         self.execution_policy(
             Arc::new(ClaudeExecution {
                 settings: None,
+                warm: None,
                 state_id,
                 owner,
                 #[cfg(not(target_family = "wasm"))]
@@ -46,6 +47,7 @@ struct ClaudeExecution {
     #[cfg(not(target_family = "wasm"))]
     code_journal: Arc<crate::code_mode::DurableCodeJournal>,
     settings: Option<crate::request_policy::RequestPolicySettings>,
+    warm: Option<(nanocodex_claude::ClaudeClient, crate::cache_warm::CacheWarmPolicy)>,
 }
 
 impl crate::request_policy::DurableClaudeRequestExt for ClaudeBuilder {
@@ -58,7 +60,23 @@ impl crate::request_policy::DurableClaudeRequestExt for ClaudeBuilder {
         #[cfg(not(target_family = "wasm"))]
         let code_journal = Arc::new(crate::code_mode::DurableCodeJournal::new(owner.clone(), state));
         self.execution_policy(Arc::new(ClaudeExecution {
-            state_id, owner, settings: Some(settings),
+            state_id, owner, settings: Some(settings), warm: None,
+            #[cfg(not(target_family = "wasm"))]
+            code_journal,
+        }), checkpoint)
+    }
+    async fn durability_with_request_policy_and_cache_warm(self, state: DurableSession,
+        settings: crate::request_policy::RequestPolicySettings, client: nanocodex_claude::ClaudeClient,
+        policy: crate::cache_warm::CacheWarmPolicy) -> AgentResult<Self> {
+        policy.validate().map_err(agent_error)?;
+        let state_id = state.state_id().to_owned();
+        let (owner, checkpoint) = state.acquire_agent().await.map_err(agent_error)?;
+        let checkpoint = checkpoint.map(|value| value.decode::<Value>().map_err(agent_error)).transpose()?;
+        let owner = Arc::new(owner);
+        #[cfg(not(target_family = "wasm"))]
+        let code_journal = Arc::new(crate::code_mode::DurableCodeJournal::new(owner.clone(), state));
+        self.execution_policy(Arc::new(ClaudeExecution {
+            state_id, owner, settings: Some(settings), warm: Some((client, policy)),
             #[cfg(not(target_family = "wasm"))]
             code_journal,
         }), checkpoint)
@@ -77,19 +95,24 @@ impl ClaudeExecutionPolicy for ClaudeExecution {
             // Configuration and virtual selection are frozen in the receipt. A
             // recovered turn consumes that receipt even if host settings changed.
             let input = serde_json::json!({"request":request, "state":state, "continuation":continuation});
-            match self.owner.begin_step(operation.clone(), step.clone(), "request_policy".into(), &input, crate::ReplaySafety::Safe).await.map_err(agent_error)? {
+            let prepared = match self.owner.begin_step(operation.clone(), step.clone(), "request_policy".into(), &input, crate::ReplaySafety::Safe).await.map_err(agent_error)? {
                 BeginStep::OutcomeUnknown => Err(agent_error(crate::Error::InvalidState("request preparation outcome is unknown".into()))),
                 BeginStep::Replay(value) => {
                     let prepared: RequestPreparation = value.decode().map_err(agent_error)?;
                     // Current host authorization and limits still constrain a frozen receipt.
-                    settings.prepare_claude(request_id, continuation, prepared.state, request).map(Some).map_err(agent_error)
+                    settings.prepare_claude(request_id.clone(), continuation, prepared.state, request).map_err(agent_error)
                 },
                 BeginStep::Execute => {
-                    let prepared = settings.prepare_claude(request_id, continuation, state, request).map_err(agent_error)?;
-                    self.owner.complete_step(operation, step, &prepared).await.map_err(agent_error)?;
-                    Ok(Some(prepared))
+                    let prepared = settings.prepare_claude(request_id.clone(), continuation, state, request).map_err(agent_error)?;
+                    self.owner.complete_step(operation.clone(), step, &prepared).await.map_err(agent_error)?;
+                    Ok(prepared)
                 }
+            }?;
+            if !continuation && let Some((client, policy)) = &self.warm {
+                return crate::cache_warm::warm(&self.owner, &operation, &request_id, prepared, client, policy)
+                    .await.map(Some).map_err(agent_error);
             }
+            Ok(Some(prepared))
         })
     }
     #[cfg(not(target_family = "wasm"))]
