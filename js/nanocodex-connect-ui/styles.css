@@ -27,7 +27,7 @@
 .connect-onboarding, .connect-onboarding * { box-sizing: border-box; }
 @scope (.connect-onboarding) {
   :scope.dialog-shell {
-    display: flex; flex-direction: column; width: 100%; height: 100dvh;
+    display: flex; flex-direction: column; justify-content: center; width: 100%; height: 100dvh; padding-block: 24px;
     overflow: hidden; min-height: 0; background: var(--surface);
     border: 0; border-radius: 0; box-shadow: none;
   }
@@ -42,7 +42,7 @@
   .dialog-header { padding: 20px 24px 0; }
   .wordmark { font-weight: 600; font-size: 13px; }
   .secure-label { color: var(--muted); font-size: 12px; }
-  .dialog-content { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }
+  .dialog-content { flex: 0 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }
   .wizard-page { width: 100%; }
   .wizard-app { display: grid; gap: 12px; }
   .wizard-app p { color: var(--muted); line-height: 1.55; }
@@ -56,8 +56,8 @@
   .identity-nanocodex svg { width: 44px; height: 44px; }
   .identity-link { color: var(--muted); font-size: 16px; }
   .request-origin { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
-  .sms-auth-panel { width: min(420px, 100%); margin: 0 auto; padding: clamp(48px, 10vh, 96px) 32px 32px; }
-  .sms-auth-panel .wizard-intro { display: grid; gap: 22px; text-align: center; margin-bottom: 28px; }
+  .sms-auth-panel { width: min(420px, 100%); margin: 0 auto; padding: 0 24px; }
+  .sms-auth-panel .wizard-intro { display: grid; gap: 16px; text-align: center; margin-bottom: 20px; }
   .sms-auth-panel .request-identity { justify-items: center; }
   .sms-auth-panel .wizard-app { gap: 10px; }
   .sms-auth-panel h1 { font-size: 24px; }
@@ -78,19 +78,20 @@
   .auth-boundary { margin-top: 16px; text-align: center; color: var(--muted); font-size: 12px; }
   .auth-brand { display: flex; gap: 5px; justify-content: center; align-items: center; padding-top: 16px; color: var(--muted); font-size: 11px; font-weight: 600; }
   .auth-brand span { font-weight: 400; }
-  .wizard-review-page { display: grid; grid-template-columns: minmax(0, .88fr) minmax(0, 1.12fr); gap: 80px; width: min(960px, 100%); margin: 0 auto; padding: 72px 40px 40px; }
-  .wizard-review-page > .wizard-intro { display: flex; flex-direction: column; align-items: flex-start; gap: 24px; }
-  .wizard-review-page h1 { font-size: 30px; line-height: 1.2; }
+  .wizard-review-page { display: grid; gap: 20px; width: min(420px, 100%); margin: 0 auto; padding: 0 24px; }
+  .wizard-review-page > .wizard-intro { display: flex; flex-direction: column; align-items: center; text-align: center; gap: 12px; }
+  .wizard-review-page .request-identity { justify-items: center; }
+  .wizard-review-page h1 { font-size: 24px; line-height: 1.2; }
   .consent-account { display: inline-flex; gap: 8px; align-items: center; max-width: 100%; border: 1px solid var(--border); border-radius: 24px; padding: 6px 10px; font-size: 12px; overflow-wrap: anywhere; }
   .consent-account > span:first-child { color: var(--muted); }
-  .wizard-sections { display: grid; align-content: start; gap: 24px; min-width: 0; }
+  .wizard-sections { display: grid; align-content: start; gap: 16px; min-width: 0; }
   .wizard-section { min-width: 0; }
   .wizard-section-title { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 8px; margin-bottom: 8px; }
   .wizard-section-title small { color: var(--muted); font-size: 12px; }
   .section-description { color: var(--muted); font-size: 12px; line-height: 1.6; margin-bottom: 12px; }
   .wizard-connectors { display: grid; }
   .wizard-connector-card + .wizard-connector-card { border-top: 1px solid var(--border); }
-  .connection-card { display: grid; width: 100%; grid-template-columns: 32px minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 14px 0; border: 0; border-radius: 8px; background: transparent; text-align: left; }
+  .connection-card { display: grid; width: 100%; grid-template-columns: 32px minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 10px 0; border: 0; border-radius: 8px; background: transparent; text-align: left; }
   .connection-card:disabled.is-connected { opacity: 1; }
   .connection-card:focus-visible { outline-offset: -3px; background: var(--surface-raised); }
   .connection-card:hover:not(:disabled) { background: var(--surface-subtle); }
@@ -103,6 +104,8 @@
   .connector-logo svg { width: 19px; height: 19px; fill: currentColor; }
   .connector-logo-google { color: #4285f4; font-weight: 600; }
   .connector-logo-mercator svg { fill: none; stroke: currentColor; stroke-width: 1.5; }
+  .permission-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .permission-chips > span { border: 1px solid var(--border); background: var(--surface-subtle); border-radius: 20px; padding: 5px 10px; font-size: 12px; }
   .wizard-visibility { display: grid; }
   .wizard-visibility > div { display: flex; gap: 10px; padding-block: 10px; }
   .wizard-visibility > div + div { border-top: 1px solid var(--border); }
@@ -118,9 +121,9 @@
   dd { overflow-wrap: anywhere; }
   .resource-list { margin: 0; padding: 12px 0; list-style: none; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
   .advanced-details pre { overflow: auto; max-height: 160px; white-space: pre-wrap; word-break: break-word; font-size: 11px; }
-  .dialog-actions { display: flex; justify-content: flex-end; gap: 10px; flex: 0 0 auto; width: min(960px, 100%); margin: 0 auto; padding: 24px 40px 32px; }
+  .dialog-actions { display: flex; justify-content: flex-end; gap: 10px; flex: 0 0 auto; width: min(420px, 100%); margin: 0 auto; padding: 16px 24px 0; }
   .dialog-actions button { min-height: 44px; padding: 10px 20px; border: 1px solid var(--border-strong); border-radius: 10px; background: var(--surface); font-size: 13px; font-weight: 500; }
-  .dialog-actions button:last-child { background: var(--text); color: var(--surface); border-color: transparent; }
+  .dialog-actions button:last-child { flex: 1; background: var(--text); color: var(--surface); border-color: transparent; }
   .dialog-actions button:hover:not(:disabled) { opacity: .8; }
   .account-failure, .dialog-error { margin: 12px 0; border-radius: 10px; padding: 10px 12px; color: var(--negative); background: color-mix(in srgb, var(--negative) 7%, var(--surface)); font-size: 12px; line-height: 1.5; }
   .dialog-content > .dialog-error { margin-inline: 24px; }
@@ -156,16 +159,16 @@
   .wizard-account-avatar { border-radius: 8px; background: var(--surface-raised); display: grid; place-items: center; width: 32px; height: 32px; }
   .wizard-cancel { min-height: 44px; background: transparent; border: 0; }
   @media (max-width: 620px) {
-    .wizard-review-page { grid-template-columns: minmax(0, 1fr); gap: 28px; padding: 32px 24px 24px; }
-    .wizard-review-page > .wizard-intro { gap: 16px; }
-    .wizard-review-page h1 { font-size: 26px; }
+    .wizard-review-page { gap: 20px; }
+
+
     .wizard-review-page .wizard-app { gap: 10px; }
-    .dialog-actions { padding: 12px 24px max(20px, env(safe-area-inset-bottom)); border-top: 1px solid var(--border); }
+    :scope.dialog-shell { padding-bottom: max(24px, env(safe-area-inset-bottom)); }
     .dialog-actions button:last-child { flex: 1; }
     .sms-auth-panel { padding-inline: 24px; }
   }
   @media (max-height: 520px) {
-    .sms-auth-panel { padding-top: 24px; }
+
     .sms-auth-panel .wizard-intro { gap: 16px; margin-bottom: 20px; }
     .dialog-actions { padding-block: 10px; }
   }

@@ -12,7 +12,7 @@ The Vite fixture imports the built public `ConnectOnboarding` component and the 
 
 The journeys cover invalid phone input, a delivery failure and recovery, malformed and rejected codes, changing the number, successful sign-in, explicit consent, consent cancellation, initial cancellation, and Escape. Light/dark desktop, mobile, and short viewports assert edge-to-edge full-page geometry, no horizontal overflow, input/button keyboard focus, and consent heading focus with reset scroll position. Synthetic HTTP requests, host receipts, screenshots, and traces are written to the ignored repository `output/connect-full-page/` directory.
 
-This verifies the real React rendering and user flow. It does not test the external SMS provider, production account backend, or the SDK iframe transport. A separate journey opens the real SDK popup and verifies the desktop two-column authorization layout.
+This verifies the real React rendering and user flow. It does not test the external SMS provider, production account backend, or the SDK iframe transport. A separate journey opens the real SDK popup and verifies the centered compact authorization layout.
 
 Four connection-list journeys also cover grouped GitHub/Google rows, the approval gate for missing connections, keyboard focus visibility, and cancellation.
 

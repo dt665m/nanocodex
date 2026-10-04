@@ -184,7 +184,7 @@ for (const variant of [
   });
 }
 
-test("SDK popup presents the desktop authorization layout", async ({ page }) => {
+test("SDK popup presents centered compact authorization", async ({ page }) => {
   await page.goto("/launcher.html");
   const opened = page.waitForEvent("popup");
   await page.getByRole("button", { name: "Connect account" }).click();
@@ -196,7 +196,15 @@ test("SDK popup presents the desktop authorization layout", async ({ page }) => 
   await expect(popup.getByRole("heading", { name: "Connect to Atlas Workspace" })).toBeFocused();
   const intro = await popup.locator(".wizard-review-page > .wizard-intro").boundingBox();
   const access = await popup.locator(".wizard-review-page > .wizard-sections").boundingBox();
-  expect(access!.x).toBeGreaterThan(intro!.x + intro!.width);
+  expect(Math.abs(access!.x - intro!.x)).toBeLessThan(1);
+  expect(access!.width).toBeLessThanOrEqual(372);
+  expect(access!.y).toBeGreaterThan(intro!.y);
+  const actions = await popup.locator(".dialog-actions").boundingBox();
+  const viewport = popup.viewportSize() ?? await popup.evaluate(() => ({width:innerWidth,height:innerHeight}));
+  expect(Math.abs((intro!.x + intro!.width / 2) - viewport.width / 2)).toBeLessThan(2);
+  expect(Math.abs((intro!.y + actions!.y + actions!.height) / 2 - viewport.height / 2)).toBeLessThan(2);
+  await popup.getByText("Access details", {exact:true}).click();
+  await expect(popup.getByText("Start tasks using the access approved here.", {exact:true})).toBeVisible();
   await contained(popup);
   await popup.getByRole("button", { name: "Cancel", exact: true }).click();
   await expect(popup.getByRole("status")).toHaveText("Request cancelled");

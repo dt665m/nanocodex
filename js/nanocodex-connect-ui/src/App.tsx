@@ -1652,7 +1652,7 @@ function ConnectionWizard({
                       ? `Continue in ${focusedMcp.name}. You’ll return here when it is connected.`
                       : request.hostPrincipalExchange ? "Approve with your host identity." : "Continue with SMS verification."
                 : presentation === "dialog"
-                  ? "Review what you share with this app."
+                  ? null
                   : `Review ${requester}’s hosted access.`}</>}
       footer={completed && presentation === "wizard" ? (
         <div className="completion-actions">
@@ -1667,7 +1667,7 @@ function ConnectionWizard({
           title={focusedProvider ? connectorProviderLabel(focusedProvider) : "Account access"}
           titleId="wizard-services-heading"
         >
-          <p className="section-description">Let this app and its agents read and make changes within each account’s granted permissions.</p>
+          <p className="section-description">Read &amp; write · granted permissions only</p>
           <WizardConnectorList connectorAction={connectorAction} connectorStatuses={connectorStatuses} disabled={disabled} onConnectConnector={onConnectConnector} request={request} />
           {connectorAction ? <p className="section-description" role="status">{connectorAction === "spotify" || connectorAction === "soundcloud" ? `Finish connecting ${connectorProviderLabel(connectorAction)} in the Nanocodex app.` : `Finish connecting ${connectorProviderLabel(connectorAction)} in the opened window.`}</p> : null}
           {deviceCode ? (
@@ -1789,6 +1789,13 @@ function WizardRequestSummary({ appVisibility, request }: Readonly<{
   return (
     <section className="wizard-request-summary" aria-labelledby="wizard-request-heading">
       <h2 className="sr-only" id="wizard-request-heading">Installation capabilities</h2>
+      <div className="permission-chips" aria-label="Requested permissions">
+        {request.auth.resources.includes("urn:nanocodex:agent:run") ? <span>↗ Run agents</span> : null}
+        {appVisibility.map(permission => <span key={permission.resource}>✓ {permission.label === "Reply" ? "Read replies" : permission.label === "Actions" ? "View tool calls" : permission.label}</span>)}
+      </div>
+      {request.mpp ? <p className="section-description">Spend: {formatToken(request.mpp.maxPerRequest, request.mpp.symbol)} / request · {formatToken(request.mpp.limit, request.mpp.symbol)} / day{request.mpp.recipient ? ` · to ${shortAddress(request.mpp.recipient)}` : ""}</p> : null}
+      <details className="advanced-details">
+        <summary>Access details</summary>
       <div className="wizard-visibility" role="list" aria-label="App sees">
         {request.auth.resources.includes("urn:nanocodex:agent:run") ? <div role="listitem"><span aria-hidden="true">✓</span><div><strong>Run an agent</strong><small>Start tasks using the access approved here.</small></div></div> : null}
         <AppVisibilityPermissions permissions={appVisibility} />
@@ -1802,8 +1809,7 @@ function WizardRequestSummary({ appVisibility, request }: Readonly<{
           </div>
         ) : null}
       </div>
-      <details className="advanced-details">
-        <summary>Technical details</summary>
+
         <dl className="key-details">
           <Detail label="App" value={request.app.origin} />
           {request.mpp ? <Detail label="Spend" value={`${formatToken(request.mpp.maxPerRequest, request.mpp.symbol)} / request · ${formatToken(request.mpp.limit, request.mpp.symbol)} / day`} /> : null}

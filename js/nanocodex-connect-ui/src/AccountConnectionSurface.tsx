@@ -42,7 +42,7 @@ export function AccountConnectionSurface({
         {requester ? <RequestIdentity name={requester} origin={origin} /> : null}
         <div className="wizard-app">
           <h1 ref={heading} tabIndex={-1}>{title}</h1>
-          <p>{description}</p>
+          {description ? <p>{description}</p> : null}
         </div>
         {accountLabel ? <div className="consent-account"><svg aria-hidden="true" viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.4"><circle cx="10" cy="6" r="3" /><path d="M4 17v-2a6 6 0 0 1 12 0v2" /></svg><span>{accountLabel}</span></div> : null}
         {confirmationCode ? (
