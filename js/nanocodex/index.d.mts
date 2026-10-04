@@ -27,6 +27,7 @@ export type {
   CodeEvaluator,
   CodeEffectContext,
   CodeEffectReceipt,
+  CodeCellReceipt,
   CodeEffectJournal,
   CodeEvaluatorEnvironment,
   DefaultAgent,
