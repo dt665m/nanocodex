@@ -283,6 +283,9 @@ impl EmbeddedToolRuntime {
     /// Whether a direct tool or its embedding host explicitly permits replay.
     #[must_use]
     pub fn is_replay_safe(&self, name: &str) -> bool {
+        if matches!(name, "exec" | "wait") {
+            return self.code_replay_safe();
+        }
         if let Some(local) = self.local.iter().find(|tool| tool.name.as_ref() == name) {
             return local.handler.is_replay_safe();
         }

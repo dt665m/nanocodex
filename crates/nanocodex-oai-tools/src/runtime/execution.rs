@@ -270,6 +270,9 @@ impl ToolRuntime {
     /// Whether a direct tool explicitly permits repeating an interrupted call.
     #[must_use]
     pub fn is_replay_safe(&self, name: &str) -> bool {
+        if matches!(name, "exec" | "wait") {
+            return self.code_replay_safe();
+        }
         self.registry.is_replay_safe(name)
     }
 
