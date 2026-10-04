@@ -1,6 +1,6 @@
 //! Native cell journal uses the authoritative model owner's fenced step actor.
 use crate::{
-    BeginStep, DocumentForkPolicy, DocumentWrite, DurableSession, Error, ReplaySafety,
+    BeginStep, DocumentForkPolicy, DocumentWrite, DurableSession, Error, ReplaySafety, StepStatus,
     session::DurableOwner,
 };
 use nanocodex_oai_tools::code_mode::{CodeJournalAdmission, CodeModeJournal};
@@ -79,7 +79,7 @@ impl DurableCodeJournal {
 impl CodeModeJournal for DurableCodeJournal {
     async fn admit_cell(
         &self,
-        session_id: &str,
+        _session_id: &str,
         call_id: &str,
         source: &str,
     ) -> Result<CodeJournalAdmission, String> {
@@ -95,13 +95,72 @@ impl CodeModeJournal for DurableCodeJournal {
                 scope.operation.clone(),
                 scope.step.clone(),
                 "code_cell".into(),
-                &json!({"session_id":session_id,"source":source}),
+                &json!({"session_id":self.state.state_id(),"source":source}),
                 ReplaySafety::Unsafe,
             )
             .await
             .map_err(|e| e.to_string())?;
         match admission {
-            BeginStep::OutcomeUnknown => Ok(CodeJournalAdmission::Unknown),
+            BeginStep::OutcomeUnknown => {
+                // The original unsafe cell is never executed again. Settle each
+                // unfinished nested intent as unknown before retaining the cell
+                // receipt, so the enclosing operation may advance. A crash while
+                // reconciling repeats only missing settlements, never dispatch.
+                let state = self.state.state().await.map_err(|e| e.to_string())?;
+                let operation = state
+                    .operation(&scope.operation)
+                    .ok_or("Code Mode operation missing during recovery")?;
+                let prefix = format!("{}/effect:", scope.step);
+                let message = "Code Mode cell has an unfinished durable attempt; execution outcome unknown. External effects will not be redispatched.";
+                let mut nested = Vec::new();
+                for (step_id, step) in &operation.steps {
+                    let Some(effect_id) = step_id.strip_prefix(&prefix) else {
+                        continue;
+                    };
+                    if step.kind != "code_effect" {
+                        continue;
+                    }
+                    let receipt = match &step.status {
+                        StepStatus::Completed(output) => self
+                            .owner
+                            .load_payload(output.clone())
+                            .await
+                            .map_err(|e| e.to_string())?
+                            .decode::<Value>()
+                            .map_err(|e| e.to_string())?,
+                        StepStatus::EffectPending => {
+                            let input: Value = self
+                                .owner
+                                .load_payload(step.input.clone())
+                                .await
+                                .map_err(|e| e.to_string())?
+                                .decode()
+                                .map_err(|e| e.to_string())?;
+                            let receipt = json!({
+                                "call_id": effect_id, "name": input["name"], "input": input["input"],
+                                "output": message, "structured_result": {
+                                    "error": message, "code": "CODE_MODE_CALL_INTERRUPTED", "outcome": "unknown"
+                                }, "success": false, "started_after_ns": 0, "duration_ns": 0, "metadata": null,
+                            });
+                            self.owner
+                                .complete_step(scope.operation.clone(), step_id.clone(), &receipt)
+                                .await
+                                .map_err(|e| e.to_string())?;
+                            receipt
+                        }
+                    };
+                    nested.push(receipt);
+                }
+                let receipt = json!({
+                    "cell": null, "output": format!("Script failed\nOutput:\n{message}"),
+                    "success": false, "nested_calls": nested, "notifications": [],
+                });
+                self.owner
+                    .complete_code_cell(scope.operation, scope.step, &receipt, vec![])
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(CodeJournalAdmission::Replay(receipt))
+            }
             BeginStep::Replay(output) => Ok(CodeJournalAdmission::Replay(
                 output.decode().map_err(|e| e.to_string())?,
             )),

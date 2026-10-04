@@ -20,7 +20,13 @@ fn native_cells_survive_process_restart_and_historical_fork() {
         vec!["oai"]
     };
     for family in families {
-        for stage in ["seed", "restart-and-fork", "verify"] {
+        for stage in [
+            "seed",
+            "restart-and-fork",
+            "verify",
+            "interrupt",
+            "recover-interrupted",
+        ] {
             let result = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -54,10 +60,10 @@ impl Tool for Effect {
         ToolDefinition::function(
             "effect",
             "Records one external dispatch.",
-            json!({"type":"object","properties":{}}),
+            json!({"type":"object","properties":{"hold":{"type":"boolean"}}}),
         )
     }
-    async fn execute(&self, _: ToolInput, _: ToolContext<'_>) -> ToolResult {
+    async fn execute(&self, input: ToolInput, _: ToolContext<'_>) -> ToolResult {
         let path = self.directory.join(format!(
             "{}-dispatches",
             std::env::var("NANOCODEX_CODE_JOURNEY_FAMILY").unwrap()
@@ -68,6 +74,9 @@ impl Tool for Effect {
             .unwrap_or(0)
             + 1;
         std::fs::write(path, count.to_string()).unwrap();
+        if input.decode_json::<Value>().unwrap()["hold"] == true {
+            std::future::pending::<()>().await;
+        }
         Ok(ToolOutput::text(format!("EFFECT_{count}")))
     }
 }
@@ -288,10 +297,14 @@ async fn native_process() {
             .unwrap();
         if std::env::var("NANOCODEX_CODE_JOURNEY_FAMILY").unwrap() == "claude" {
             let (checkpoint, documents) = source.document_fork("seed").await.unwrap();
-            fork.initialize_document_fork(documents, &checkpoint).await.unwrap();
+            fork.initialize_document_fork(documents, &checkpoint)
+                .await
+                .unwrap();
         } else {
             let (snapshot, documents) = source.agent_document_fork("seed").await.unwrap();
-            fork.initialize_agent_document_fork(documents, &snapshot).await.unwrap();
+            fork.initialize_agent_document_fork(documents, &snapshot)
+                .await
+                .unwrap();
         }
         let (agent, events, server, provider) = build_agent(
             source.clone(),
@@ -323,7 +336,7 @@ async fn native_process() {
                 .value,
             json!({"memo":9})
         );
-    } else {
+    } else if stage == "verify" {
         let (agent, events, server, provider) = build_agent(
             source.clone(),
             &directory,
@@ -341,6 +354,55 @@ async fn native_process() {
         let (agent, events, server, provider) = build_agent(fork.clone(), &directory, &[("if(load(\"memo\") !== 9) throw new Error(\"BAD_FORK\"); text(\"FORK_COLD_VERIFIED\");", "FORK_COLD_VERIFIED")]).await;
         prompt(&agent, "fork-check").await;
         close(agent, events, server, provider).await;
+    } else if stage == "interrupt" {
+        let (agent, _events, _server, _provider) = build_agent(
+            source.clone(),
+            &directory,
+            &[(
+                "store(\"memo\", 100); await tools.effect({hold:true});",
+                "never",
+            )],
+        )
+        .await;
+        let _turn = agent
+            .prompt(PromptRequest::new("interrupted").request_id("interrupted"))
+            .await
+            .unwrap();
+        let dispatches = directory.join(format!(
+            "{}-dispatches",
+            std::env::var("NANOCODEX_CODE_JOURNEY_FAMILY").unwrap()
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if std::fs::read_to_string(&dispatches).unwrap_or_default() == "2" {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("native effect must dispatch before killing the process");
+        println!("NATIVE_CODE_INTERRUPT effect dispatched; process exiting without settlement");
+        std::process::exit(0);
+    } else {
+        let (agent, events, server, provider) = build_agent(source.clone(), &directory, &[]).await;
+        let claude = std::env::var("NANOCODEX_CODE_JOURNEY_FAMILY").unwrap() == "claude";
+        provider.responses.lock().unwrap().push_back((if claude {
+            json!({"type":"text","text":"CELL_VERIFIED"})
+        } else {json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"CELL_VERIFIED"}]})}, Some("outcome unknown".into())));
+        prompt(&agent, "interrupted").await;
+        // A settled unknown receipt replays with no provider request or effect dispatch.
+        prompt(&agent, "interrupted").await;
+        close(agent, events, server, provider).await;
+        assert_eq!(
+            source
+                .document("nanocodex.code-mode.store")
+                .await
+                .unwrap()
+                .unwrap()
+                .value,
+            json!({"memo":2})
+        );
     }
     assert_eq!(
         std::fs::read_to_string(directory.join(format!(
@@ -348,10 +410,14 @@ async fn native_process() {
             std::env::var("NANOCODEX_CODE_JOURNEY_FAMILY").unwrap()
         )))
         .unwrap(),
-        "1"
+        if stage == "recover-interrupted" {
+            "2"
+        } else {
+            "1"
+        }
     );
     println!(
         "NATIVE_CODE_DURABLE_TRACE {}",
-        json!({"stage":stage,"store":source.document("nanocodex.code-mode.store").await.unwrap(),"external_dispatches":1})
+        json!({"stage":stage,"store":source.document("nanocodex.code-mode.store").await.unwrap(),"external_dispatches":if stage == "recover-interrupted" {2} else {1}})
     );
 }
