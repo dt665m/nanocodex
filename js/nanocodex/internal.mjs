@@ -209,6 +209,11 @@ export async function listSubagents(agent, options) {
   return JSON.parse(await agentState(agent).raw.listSubagents(JSON.stringify(options ?? {})));
 }
 
+/** Internal host scheduler seam; recovery uses this live parent's current host. */
+export async function recoverSubagents(agent) {
+  return JSON.parse(await agentState(agent).raw.recoverSubagents());
+}
+
 export async function sendSubagentMessage(agent, options) {
   return JSON.parse(await agentState(agent).raw.sendSubagentMessage(JSON.stringify(options)));
 }
