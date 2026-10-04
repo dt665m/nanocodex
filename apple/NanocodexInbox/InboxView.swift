@@ -3837,6 +3837,12 @@ private struct BrowserTakeoverSheet: View {
         currentOrigin = nil; finishing = false; touching = false
     }
     private var busy: Bool { submission != nil || !queue.isEmpty || finishing }
+    private func pause() {
+        clear()
+        if failure == nil {
+            failure = fieldsFilled ? "Fields were filled. Hand back to continue without refilling." : "Private view paused. Refresh to continue."
+        }
+    }
     private func checkLoginState() {
         guard !busy, scenePhase == .active else { return }
         failure = nil
@@ -4193,7 +4199,7 @@ private struct BrowserTakeoverSheet: View {
                     }
                     Spacer()
                     if nativeForm != nil && !editingFields {
-                        Button("Fields") { editingFields = true; prefersViewport = false; keyboardVisible = false; detent = .medium }
+                        Button("Fields") { editingFields = true; prefersViewport = false; keyboardVisible = false }
                             .disabled(busy || touching || failure != nil)
                     }
                     if prefersViewport {
@@ -4220,12 +4226,12 @@ private struct BrowserTakeoverSheet: View {
         }
         .onDisappear { observing?.cancel(); clear() }
         .onChange(of: scenePhase) { _, phase in
-            if phase != .active {
-                clear()
-                if failure == nil {
-                    failure = fieldsFilled ? "Fields were filled. Hand back to continue without refilling." : "Private view paused. Refresh to continue."
-                }
-            }
+            if phase == .background { pause() }
+        }
+        // Clear only after backgrounding; transient AutoFill/system UI must
+        // preserve drafts while the inactive privacy overlay hides them.
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in
+            pause()
         }
         .onChange(of: model.vaultIntakeAccount) { _, _ in clear(); dismiss() }
         .onChange(of: model.connected) { _, connected in if !connected { clear(); dismiss() } }
@@ -4903,8 +4909,10 @@ struct BrowserNativeFormUIFixture: View {
     }
     var body: some View {
         VStack {
-            Button("Open native browser form") { showing = true }
-            evidence
+            if !showing {
+                Button("Open native browser form") { showing = true }
+                evidence
+            }
         }
         .sheet(isPresented: $showing) {
             BrowserTakeoverSheet(model: .shared, intake: intake)

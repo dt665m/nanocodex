@@ -15,6 +15,7 @@ final class InboxUITests: XCTestCase {
         showWebsite.tap()
         let viewport = app.descendants(matching: .any)["browser-private-viewport"].firstMatch
         XCTAssertTrue(viewport.waitForExistence(timeout: 5))
+        XCTAssertEqual(app.staticTexts.matching(identifier: "native-fixture-observations").count, 1)
         let observationCount = app.staticTexts["native-fixture-observations"]
         let observed = expectation(for: NSPredicate(format: "label BEGINSWITH 'Observations: ' AND label != 'Observations: 0'"), evaluatedWith: observationCount)
         wait(for: [observed], timeout: 5)
@@ -160,9 +161,15 @@ final class InboxUITests: XCTestCase {
         let password = app.secureTextFields["Password"]
         email.tap(); email.typeText("discarded@example.com")
         password.tap(); password.typeText("discarded-password")
+        let observationsBeforeBackground = app.staticTexts["native-fixture-observations"].label
         XCUIDevice.shared.press(.home)
+        XCTAssertTrue(app.wait(for: .runningBackground, timeout: 5))
         app.activate()
+        dismissNativePasswordSavePrompt(app)
         XCTAssertTrue(app.staticTexts["Private view paused. Refresh to continue."].waitForExistence(timeout: 5))
+        XCTAssertFalse(password.exists, "Backgrounding must remove the private form until explicit refresh")
+        XCTAssertEqual(app.staticTexts["native-fixture-observations"].label, observationsBeforeBackground,
+                       "Returning to the app must not resume browser observation automatically")
         app.buttons["Refresh"].tap()
         XCTAssertTrue(email.waitForExistence(timeout: 5))
         XCTAssertFalse(app.buttons["browser-native-fill"].isEnabled, "Backgrounding must discard all drafts")
@@ -216,8 +223,13 @@ final class InboxUITests: XCTestCase {
         }
         showWebsite.tap()
         XCTAssertTrue(app.descendants(matching: .any)["browser-private-viewport"].firstMatch.waitForExistence(timeout: 5))
+        dismissNativePasswordSavePrompt(app)
         app.buttons["Fields"].tap()
-        XCTAssertTrue(app.secureTextFields["Password"].waitForExistence(timeout: 5))
+        let password = app.secureTextFields["Password"]
+        XCTAssertTrue(password.waitForExistence(timeout: 5))
+        XCTAssertTrue(["", "Email"].contains(app.textFields["Email"].value as? String ?? ""))
+        XCTAssertTrue(["", "Password"].contains(password.value as? String ?? ""))
+        XCTAssertFalse(app.descendants(matching: .any)["browser-private-viewport"].firstMatch.exists)
         XCTAssertFalse(app.buttons["browser-native-fill"].isEnabled)
         XCTAssertEqual(app.staticTexts["native-fixture-actions"].label, "Fills: 0 · Site submits: 0 · Handoffs: 0")
     }
@@ -249,7 +261,20 @@ final class InboxUITests: XCTestCase {
         XCTAssertTrue(open.waitForExistence(timeout: 10))
         open.tap()
         XCTAssertTrue(app.textFields["Email"].waitForExistence(timeout: 5))
+        XCTAssertEqual(app.staticTexts.matching(identifier: "native-fixture-actions").count, 1,
+                       "Only the presented sheet should expose fixture evidence")
         return app
+    }
+    private func dismissNativePasswordSavePrompt(_ app: XCUIApplication) {
+        // Removing password fields can present iOS's save prompt. Dismiss the
+        // system interruption explicitly so the next tap reaches the sheet.
+        for owner in [app, XCUIApplication(bundleIdentifier: "com.apple.springboard")] {
+            let prompt = owner.alerts["Save Password?"]
+            if prompt.waitForExistence(timeout: 2) {
+                prompt.buttons["Not Now"].tap()
+                return
+            }
+        }
     }
     private func enterNativeBrowserFields(_ app: XCUIApplication) {
         let email = app.textFields["Email"]
