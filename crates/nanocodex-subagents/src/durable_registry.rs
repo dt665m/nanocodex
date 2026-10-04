@@ -72,9 +72,9 @@ impl Registry {
         if state.scopes.get(root_session_id).is_some_and(|scope| scope.journal.is_some() || !scope.sessions.is_empty()) {
             return Err(std::io::Error::other("child durability must be enabled before spawning or recovery"));
         }
-        let journal = ChildJournal::open(store, root_session_id).await.map_err(std::io::Error::other)?;
+        let mut journal = ChildJournal::open(store, root_session_id).await.map_err(std::io::Error::other)?;
         let mut scope = AgentScope::default();
-        if let Some(record) = journal.load::<ChildTreeRecord>().map_err(std::io::Error::other)? {
+        if let Some(record) = journal.load::<ChildTreeRecord>().await.map_err(std::io::Error::other)? {
             if record.version != 1 { return Err(std::io::Error::other("unsupported child tree journal version")); }
             scope.calls = record.calls;
             scope.topology = record.topology;
@@ -166,6 +166,76 @@ impl Registry {
         };
         // Shutdown of the native driver cancels its own retained operation.
         harness.close().await?;
+        Ok(())
+    }
+
+    /// Background admission requires a fenced tree owned by this parent.
+    pub async fn validate_lifetime(&self, session: &str, lifetime: AgentLifetime) -> std::io::Result<()> {
+        if lifetime == AgentLifetime::Foreground { return Ok(()); }
+        let mut state = self.state.lock().await;
+        let root = state.root_session_id(session).to_owned();
+        let scope = state.scope_mut(&root);
+        if scope.journal.is_none() {
+            return Err(std::io::Error::other("background children require a durable parent"));
+        }
+        scope.persist().await
+    }
+
+    /// Whether releasing this parent leaves a durable background tree to schedule.
+    pub async fn has_background(&self, session: &str) -> bool {
+        let state = self.state.lock().await;
+        let root = state.root_session_id(session);
+        state.scopes.get(root).is_some_and(|scope| scope.sessions.values().any(|child| {
+            child.descriptor.lifetime == AgentLifetime::Background
+                && !matches!(child.status, AgentStatus::Closing | AgentStatus::Closed)
+        }))
+    }
+
+    pub async fn summaries_all(&self, session: &str) -> std::io::Result<Vec<AgentSummary>> {
+        let state = self.state.lock().await;
+        let root = state.root_session_id(session);
+        let Some(scope) = state.scopes.get(root) else { return Ok(Vec::new()); };
+        let mut ids = scope.topology.ids();
+        ids.sort_unstable();
+        state.summaries(session, &ids)
+    }
+
+    /// Releases foreground work while retaining background trees and their
+    /// ancestor factory checkpoints. Explicit close-all remains cancellation.
+    pub async fn release_parent(&self, session: &str) -> std::io::Result<()> {
+        let _messages = self.message_lock.lock().await;
+        let (root, ids, harnesses, supporting) = {
+            let mut state = self.state.lock().await;
+            let root = state.root_session_id(session).to_owned();
+            let Some(scope) = state.scopes.get(&root) else { return Ok(()); };
+            let background = scope.sessions.iter().filter_map(|(&id, child)| {
+                (child.descriptor.lifetime == AgentLifetime::Background
+                    && !matches!(child.status, AgentStatus::Closing | AgentStatus::Closed)).then_some(id)
+            }).collect::<Vec<_>>();
+            let mut ids = Vec::new();
+            let mut supporting = Vec::new();
+            for id in scope.topology.all_postorder() {
+                if background.iter().any(|&bg| id == bg || scope.topology.is_descendant(id, bg)) { continue; }
+                if background.iter().any(|&bg| scope.topology.is_descendant(bg, id)) { supporting.push(id); }
+                else { ids.push(id); }
+            }
+            let harnesses = state.harnesses(&root, &ids, true)?;
+            let scope = state.scope_mut(&root);
+            for id in &ids { scope.sessions.get_mut(id).expect("child").interrupted = true; }
+            for id in &supporting { scope.sessions.get_mut(id).expect("ancestor").interrupted = true; }
+            scope.persist().await?;
+            let supporting = supporting.into_iter().filter_map(|id| scope.sessions[&id].harness.clone()).collect::<Vec<_>>();
+            (root, ids, harnesses, supporting)
+        };
+        // An ancestor is retained only as a factory capability. Its foreground
+        // turn must stop even when a descendant outlives the parent.
+        first_error(join_all(supporting.into_iter().map(|harness| async move { harness.interrupt().await })).await)?;
+        for &id in &ids { self.send(&root, AgentUpdate::Status { id, status: AgentStatus::Closing }); }
+        self.changed();
+        self.stop_and_close(root.clone(), ids, harnesses).await?;
+        if !self.has_background(&root).await {
+            self.session_handles.write().expect("session handles poisoned").remove(&root);
+        }
         Ok(())
     }
 

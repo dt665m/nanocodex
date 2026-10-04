@@ -330,12 +330,12 @@ Cloudflare Agents default to direct tool mode because Workers prohibit dynamic
 `eval`/`new Function`. Caller-defined tools therefore work without a code
 evaluator. Select `toolMode: "code"` only when also supplying an evaluator that
 is explicitly compatible with the deployed Worker runtime. Runtime-owned
-Subagents are installed by default, including on a durable root. All children are
-ephemeral: their identities, topology, conversations, results, and routing exist
-only for the lifetime of the root runtime. Root shutdown or restart discards the
-entire child tree; only the root's own durable history resumes. Existing child
-checkpoints from older versions are discarded. Within a live runtime, completed
-children remain available for follow-up messages until closed. Use
+Subagents are installed by default, including on a durable root. With a durability
+store, child identities, topology, queued messages, typed results, and native
+conversation checkpoints survive owner loss. Reopening the same durable parent
+recovers unfinished children with the host's current authentication. Without a
+durability store, the child tree lives only in memory. Completed children remain
+available for follow-up messages until closed. Use
 `Subagents.create({ maxConcurrency })` in `tools` to set an explicit finite
 concurrency limit. Active subagent turns are unlimited by default.
 
@@ -625,9 +625,50 @@ binding crate at build time and exposed by a small branded JS configuration;
 adding a dynamic component ABI would be a separate feature with a much larger
 contract and runtime cost.
 
-The root owns the task tree. `agent.session.shutdown()` closes every child
-before stopping the root driver; applications do not maintain a parallel JS
-scheduler or reimplement the communication tools.
+The root owns the task tree. Children default to `lifetime: "foreground"` and
+`agent.session.shutdown()` closes them before stopping the root driver. A
+`lifetime: "background"` child requires a durability store. Shutdown checkpoints
+and releases background execution so a later owner can recover it; it does not
+keep an evicted Worker running. Use `Subagents.close(agent, childId)` to explicitly
+cancel and permanently close a background child.
+
+A host alarm or cron handler can reopen the same durable parent, then call the
+public recovery hook. Acquire the current transport credentials on each wake;
+credentials are not restored from the child journal. Keep that runtime alive
+while waiting for work, and schedule another wake when the bounded wait expires:
+
+```js
+import { Agent, Subagents } from "nanocodex/host";
+
+async function onAlarm() {
+  const agent = await Agent.create({
+    module,
+    durability,
+    durabilityId: "customer-agent-123",
+    transport: await currentAuthorizedTransport(),
+    tools,
+  });
+  try {
+    await Subagents.recover(agent); // Repeated calls do not start duplicate turns.
+    const { agents } = await Subagents.list(agent, { includeCompleted: true });
+    const pending = agents.filter(child => child.lifetime === "background"
+      && ["pending", "running"].includes(child.status.state));
+    if (pending.length) {
+      const report = await Subagents.wait(agent, {
+        agentIds: pending.map(child => child.agent_id), timeoutMs: 10_000,
+      });
+      if (report.timed_out || report.agents.some(child => child.status.state === "running")) {
+        await scheduleNextAlarm();
+      }
+    }
+  } finally {
+    await agent.session.shutdown();
+  }
+}
+```
+
+The host owns alarm scheduling and authorization. Rust owns child admission,
+message delivery, cancellation, and replay inside the recovered runtime.
 
 ## Persistent workspaces
 

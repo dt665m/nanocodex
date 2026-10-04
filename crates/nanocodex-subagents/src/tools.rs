@@ -4,11 +4,11 @@
 use super::{
     message::MAX_MESSAGE_BYTES,
     model::{
-        AgentDescriptor, AgentId, AgentStatus, AgentUpdate, MessageId, MessagePriority,
+        AgentDescriptor, AgentLifetime, AgentId, AgentStatus, AgentUpdate, MessageId, MessagePriority,
         MessagePurpose, agent_prompt,
     },
     runtime::{
-        AgentDirectoryEntry, AgentSummary, OutputContract, Registry, SubmissionOutcome,
+        AgentDirectoryEntry, AgentSummary, OutputContract, Registry,
         forward_events,
     },
 };
@@ -39,6 +39,8 @@ const WAIT_AGENT_TOOL: &str = "wait_agent";
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentTask {
+    #[serde(default)]
+    pub lifetime: AgentLifetime,
     pub role: String,
     pub task: String,
     pub output_schema: Value,
@@ -110,6 +112,8 @@ impl OutputContractNode {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SpawnAgentTask {
+    #[serde(default)]
+    lifetime: Option<AgentLifetime>,
     role: String,
     task: String,
     #[serde(default)]
@@ -151,6 +155,7 @@ impl SpawnAgentTask {
         options.validate_harness().map_err(std::io::Error::other)?;
         Ok((
             AgentTask {
+                lifetime: self.lifetime.unwrap_or_default(),
                 role: self.role,
                 task: self.task,
                 output_schema,
@@ -264,6 +269,7 @@ pub async fn start_agents_observed(
     observe_session: impl Fn(&str) + Send + Sync + 'static,
 ) -> AgentToolResult<Vec<AgentStartReport>> {
     registry.register_handle(parent.clone());
+    for task in &tasks { registry.validate_lifetime(session_id, task.lifetime).await?; }
     let prepared = prepare_batch(tasks)?;
     let mut startup = registry.batch_startup();
     let capacities = registry.reserve_turns(prepared.len())?;
@@ -341,6 +347,7 @@ pub async fn start_agents_observed(
     {
         let id = reservation.id;
         let descriptor = AgentDescriptor {
+            lifetime: task.lifetime,
             id,
             session_id: child.session_id().to_string(),
             role: task.role.clone(),
@@ -446,10 +453,12 @@ async fn start_agent_with_host_context(
     }
     registry.register_handle(parent.clone());
     let AgentTask {
+        lifetime,
         role,
         task,
         output_schema,
     } = task;
+    registry.validate_lifetime(session_id, lifetime).await?;
     let contract = OutputContract::compile(&output_schema)?;
     let capacity = registry.reserve_turn()?;
     let reservation = registry.reserve(session_id).await?;
@@ -489,6 +498,7 @@ async fn start_agent_with_host_context(
     }
     let session_id = child.session_id().to_string();
     let descriptor = AgentDescriptor {
+        lifetime,
         id,
         session_id,
         role: role.clone(),
@@ -609,6 +619,7 @@ fn spawn_agent_parameters() -> Value {
     json!({
         "type": "object",
         "properties": {
+            "lifetime": { "type": ["string", "null"], "enum": ["foreground", "background", null], "description": "Foreground closes with its parent. Background survives parent release and requires a durable parent with host recovery scheduling. Null defaults to foreground." },
             "role": { "type": "string", "description": "A short role describing the subagent's specialty." },
             "task": { "type": "string", "description": "A complete, focused task for the subagent." },
             "harness": {
@@ -627,7 +638,7 @@ fn spawn_agent_parameters() -> Value {
             },
             "output_contract": { "$ref": "#/$defs/node" }
         },
-        "required": ["role", "task", "harness", "model", "thinking", "output_contract"],
+        "required": ["role", "task", "harness", "model", "thinking", "output_contract", "lifetime"],
         "additionalProperties": false,
         "$defs": {
             "node": { "anyOf": [

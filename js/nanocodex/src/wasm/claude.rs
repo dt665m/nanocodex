@@ -302,6 +302,7 @@ impl WasmNanoclaude {
                 .ok_or_else(|| js_error("subagents require hostDefinitionId"))?;
             let (registry, control, updates) =
                 nanocodex_subagents::channel(settings.max_concurrency);
+            if durability.is_some() { registry.require_durability(); }
             if config.subagent_routing {
                 registry.set_spawn_router(Arc::new(JavaScriptSpawnRouter {
                     host_definition_id: host,
@@ -425,10 +426,16 @@ impl WasmNanoclaude {
         Ok(())
     }
 
+    #[wasm_bindgen(js_name = recoverSubagents)]
+    pub async fn recover_subagents(&self) -> Result<String, JsValue> {
+        self.subagents.as_ref().ok_or_else(|| js_error("subagents are disabled"))?
+            .recover_report(self.inner.session_id()).await
+    }
+
     pub async fn shutdown(&self) -> Result<(), JsValue> {
         if let Some(subagents) = &self.subagents {
             subagents
-                .close_all(self.inner.session_id())
+                .release_parent(self.inner.session_id())
                 .await
                 .map_err(js_error)?;
         }
@@ -521,7 +528,7 @@ impl Drop for WasmNanoclaude {
             let subagents = subagents.clone();
             let session_id = self.inner.session_id().to_owned();
             wasm_bindgen_futures::spawn_local(async move {
-                let _ = subagents.close_all(&session_id).await;
+                let _ = subagents.release_parent(&session_id).await;
             });
         }
     }

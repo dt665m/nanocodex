@@ -1193,6 +1193,8 @@ struct WasmSubagentsConfig {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct WasmSubagentTask {
+    #[serde(default)]
+    lifetime: nanocodex_subagents::AgentLifetime,
     role: String,
     task: String,
     #[serde(default)]
@@ -1677,6 +1679,23 @@ impl WasmSubagents {
             .map_err(js_error)
     }
 
+    async fn release_parent(&self, session_id: &str) -> std::io::Result<()> {
+        self.registry.release_parent(session_id).await?;
+        // Background drivers remain owned by their registry until a cold host
+        // scheduler acquires a new fenced parent generation.
+        if !self.registry.has_background(session_id).await {
+            release_subagent_scope(self.host_definition_id, &self.sessions, &self.parents, &self.hosts, session_id);
+            self.remove_parent(session_id);
+        }
+        Ok(())
+    }
+
+    async fn recover_report(&self, session_id: &str) -> Result<String, JsValue> {
+        self.registry.recover(self.parent(session_id)?).await.map_err(js_error)?;
+        let agents = self.registry.summaries_all(session_id).await.map_err(js_error)?;
+        serde_json::to_string(&serde_json::json!({ "agents": agents })).map_err(js_error)
+    }
+
     async fn close_all(&self, root_session_id: &str) -> std::io::Result<()> {
         self.control.close_all(root_session_id).await?;
         release_subagent_scope(
@@ -1728,6 +1747,7 @@ impl WasmNanocodex {
         let (factory, subagents) = if let Some(settings) = &config.subagents {
             let (registry, control, updates) =
                 nanocodex_subagents::channel(settings.max_concurrency);
+            if durability.is_some() { registry.require_durability(); }
             if config.subagent_routing {
                 registry.set_spawn_router(Arc::new(JavaScriptSpawnRouter {
                     host_definition_id: config.host_definition_id,
@@ -2103,6 +2123,13 @@ impl WasmNanocodex {
         WasmBrowserVoice::new(self.inner.clone(), voice).map_err(js_error)
     }
 
+    /// Reattaches durable children under this runtime's current host authority.
+    #[wasm_bindgen(js_name = recoverSubagents)]
+    pub async fn recover_subagents(&self) -> Result<String, JsValue> {
+        self.subagents.as_ref().ok_or_else(|| js_error("subagents are disabled"))?
+            .recover_report(self.inner.session_id()).await
+    }
+
     /// Gracefully stops the driver and joins every resource owned by this agent.
     ///
     /// # Errors
@@ -2111,7 +2138,7 @@ impl WasmNanocodex {
     pub async fn shutdown(&self) -> Result<(), JsValue> {
         if let Some(subagents) = &self.subagents {
             subagents
-                .close_all(self.inner.session_id())
+                .release_parent(self.inner.session_id())
                 .await
                 .map_err(js_error)?;
         }
@@ -2148,7 +2175,7 @@ impl Drop for WasmNanocodex {
             let subagents = subagents.clone();
             let session_id = self.inner.session_id().to_owned();
             spawn_local(async move {
-                drop(subagents.close_all(&session_id).await);
+                drop(subagents.release_parent(&session_id).await);
             });
         }
     }
@@ -3647,6 +3674,7 @@ impl WasmSubagents {
             &subagents.registry,
             session_id,
             AgentTask {
+                lifetime: task.lifetime,
                 role: task.role,
                 task: task.task,
                 output_schema: task.output_schema,

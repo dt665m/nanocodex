@@ -9,7 +9,7 @@ use super::{
     harness::{self, HarnessHandle},
     message::MessageThreads,
     model::{
-        AgentDescriptor, AgentId, AgentMessage, AgentMessageUpdate, AgentStatus, AgentThread,
+        AgentDescriptor, AgentLifetime, AgentId, AgentMessage, AgentMessageUpdate, AgentStatus, AgentThread,
         AgentUpdate, MessageDeliveryState, MessageDisposition, MessageId, MessagePriority,
         MessagePurpose, MessageSender, ScopedAgentUpdate, SubagentRuntimeId, ThreadId,
     },
@@ -238,6 +238,7 @@ impl Drop for BatchStartup {
 
 #[derive(Clone, Serialize)]
 pub struct AgentSummary {
+    pub lifetime: AgentLifetime,
     pub agent_id: AgentId,
     pub role: String,
     pub task: String,
@@ -249,6 +250,7 @@ pub struct AgentSummary {
 
 #[derive(Serialize)]
 pub struct AgentDirectoryEntry {
+    pub lifetime: AgentLifetime,
     pub agent_id: AgentId,
     pub role: String,
     pub task: String,
@@ -582,6 +584,7 @@ impl RegistryState {
                     && !matches!(session.status, AgentStatus::Closing | AgentStatus::Closed)
                     && scope.topology.authorize(session_id, id).is_ok();
                 Some(AgentDirectoryEntry {
+                    lifetime: session.descriptor.lifetime,
                     agent_id: id,
                     role: bounded_summary(&session.descriptor.role),
                     task: bounded_summary(&session.descriptor.task),
@@ -2099,6 +2102,7 @@ impl ChildSession {
             self.last_output.clone()
         };
         AgentSummary {
+            lifetime: self.descriptor.lifetime,
             agent_id: self.descriptor.id,
             role: self.descriptor.role.clone(),
             task: self.descriptor.task.clone(),
@@ -2340,6 +2344,7 @@ mod tests {
             });
             registry.set_spawn_router(router.clone());
             let task = || AgentTask {
+                lifetime: Default::default(),
                 role: "worker".to_owned(),
                 task: "work".to_owned(),
                 output_schema: json!({ "type": "object" }),
@@ -2573,6 +2578,7 @@ mod tests {
             .insert(
                 reservation.root_session_id,
                 AgentDescriptor {
+                    lifetime: Default::default(),
                     id: reservation.id,
                     session_id: agent.session_id().to_string(),
                     role: "child".to_owned(),
@@ -2639,6 +2645,7 @@ mod tests {
     ) -> String {
         let session_id = events.request_id().to_owned();
         let descriptor = AgentDescriptor {
+            lifetime: Default::default(),
             id: reservation.id,
             session_id: session_id.clone(),
             role: format!("agent-{}", reservation.id),
@@ -3074,6 +3081,7 @@ mod tests {
                 "main",
                 id,
                 Err(nanocodex_agent::NanocodexError::TurnCancelled),
+                None,
             )
             .await;
         {
@@ -3087,7 +3095,7 @@ mod tests {
             assert_eq!(session.active_instruction_revision, None);
             assert_eq!(session.submitted_output, None);
         }
-        assert_eq!(registry.harness_turn_started("main", id).await, Some(2));
+        assert_eq!(registry.harness_turn_started("main", id).await.unwrap(), Some(2));
         assert_eq!(
             registry
                 .submit_result("child-session", Some(1), json!({"report": "old"}))
