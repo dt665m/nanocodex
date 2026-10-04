@@ -810,7 +810,12 @@ impl Service<ResponsesAttempt> for ResponsesService {
             );
             async move {
                 let queued_at = Instant::now();
-                let mut connection = service.connection.lock().await;
+                // Owned background work must not occupy the foreground socket
+                // or its request lock. The full replay owns its routing state.
+                let independent = request.independent_connection
+                    .then(|| Arc::new(Mutex::new(ConnectionState::new())));
+                let connection_state = independent.as_ref().unwrap_or(&service.connection);
+                let mut connection = connection_state.lock().await;
                 tracing::Span::current().record("request.queue.duration_ns", elapsed_ns(queued_at));
                 connection.enter_logical_turn(request.logical_turn);
                 let transport = request.effective_transport(service.config.responses_transport);

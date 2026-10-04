@@ -74,7 +74,7 @@ where
         let state = ManagedSessionState::new(pending.cutoff.clone());
         let mut history = state.compaction_request();
         history.fit_context_window(factory.profile().prefix(), self.config.context_window_tokens);
-        let request = factory.compaction(pending.after_model_call_index, &history, compaction::trigger(), self.model, self.thinking, self.fast_mode);
+        let request = factory.compaction(pending.after_model_call_index, &history, compaction::trigger(), self.model, self.thinking, self.fast_mode).with_independent_connection();
         self.events.emit(AgentEventKind::ModelCompactionStarted, CompactionStarted {
             after_model_call_index: pending.after_model_call_index,
             active_context_tokens: pending.active_context_tokens,

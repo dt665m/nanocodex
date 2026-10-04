@@ -23,13 +23,17 @@ fn completed(id: &str, text: &str, end_turn: bool, tokens: u64) -> String {
         "output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]}],
         "usage":{"input_tokens":tokens-2,"output_tokens":2,"total_tokens":tokens}
     }});
-    format!("data: {event}\n\ndata: [DONE]\n\n")
+    let created = json!({"type":"response.created","response":{"id":id}});
+    let item = json!({"type":"response.output_item.done","output_index":0,"item":{
+        "id":format!("msg-{id}"),"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]}});
+    format!("data: {created}\n\ndata: {item}\n\ndata: {event}\n\ndata: [DONE]\n\n")
 }
 fn compacted() -> String {
     let item = json!({"type":"response.output_item.done","output_index":0,"item":{
         "id":"cmp-http-exact","type":"compaction","encrypted_content":"opaque-http-summary"}});
     let done = json!({"type":"response.completed","response":{"id":"resp-summary-exact","status":"completed","output":[],"usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}});
-    format!("data: {item}\n\ndata: {done}\n\ndata: [DONE]\n\n")
+    let created = json!({"type":"response.created","response":{"id":"resp-summary-exact"}});
+    format!("data: {created}\n\ndata: {item}\n\ndata: {done}\n\ndata: [DONE]\n\n")
 }
 async fn serve(provider: Provider, Json(body): Json<Value>) -> axum::response::Response {
     let summary = body["input"].as_array().is_some_and(|items| items.iter().any(|item| item["type"] == "compaction_trigger"));
@@ -69,7 +73,7 @@ fn openai(url: &str) -> eyre::Result<OpenAi> {
 async fn arrivals(receiver: &mut mpsc::UnboundedReceiver<(bool,usize)>, wanted: &[(bool,usize)]) {
     let mut seen = Vec::new();
     timeout(Duration::from_secs(10), async {
-        while !wanted.iter().all(|event| seen.contains(event)) { seen.push(receiver.recv().await.unwrap()); }
+        while !wanted.iter().all(|event| seen.contains(event)) { let event = receiver.recv().await.unwrap(); println!("HTTP arrival {event:?}"); seen.push(event); }
     }).await.expect("HTTP provider requests did not overlap");
 }
 
