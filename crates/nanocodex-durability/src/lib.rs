@@ -6,6 +6,8 @@ mod agent;
 #[cfg(feature = "claude")]
 mod claude;
 mod context;
+mod documents;
+pub use documents::{DocumentFork, DocumentForkPolicy, DocumentWrite, SessionDocument};
 mod memory;
 #[cfg(all(feature = "postgres", not(target_family = "wasm")))]
 mod postgres;

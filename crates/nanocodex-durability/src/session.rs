@@ -146,6 +146,29 @@ struct AgentAcquisition {
 }
 
 enum Command {
+    Document {
+        key: String,
+        result: oneshot::Sender<Option<crate::SessionDocument>>,
+    },
+    DocumentFork {
+        boundary: String,
+        result: oneshot::Sender<Result<(EncodedPayload, crate::DocumentFork)>>,
+    },
+    InitializeDocumentFork {
+        caller: Caller,
+        fork: crate::DocumentFork,
+        checkpoint: EncodedPayload,
+        result: oneshot::Sender<Result<()>>,
+    },
+    CompleteDocuments {
+        caller: Caller,
+        operation_id: String,
+        step_id: Option<String>,
+        checkpoint: Option<EncodedPayload>,
+        output: EncodedPayload,
+        writes: Vec<crate::DocumentWrite>,
+        result: oneshot::Sender<Result<()>>,
+    },
     LoadPayloads {
         caller: Option<Caller>,
         payloads: Vec<EncodedPayload>,
@@ -458,6 +481,121 @@ impl Driver {
                         }
                         Ok(operation.map(|operation| operation.status.clone()))
                     });
+                    drop(result.send(outcome));
+                }
+                Command::Document { key, result } => {
+                    drop(result.send(self.state.documents.current.get(&key).cloned()));
+                }
+                Command::DocumentFork { boundary, result } => {
+                    let outcome =
+                        async {
+                            let payload =
+                                self.state.documents.boundaries.get(&boundary).ok_or_else(
+                                    || {
+                                        Error::InvalidState(format!(
+                                            "document boundary `{boundary}` is not retained"
+                                        ))
+                                    },
+                                )?;
+                            let record: crate::documents::Boundary = payload
+                                .load(&mut *self.store, &self.state_id)
+                                .await?
+                                .decode()?;
+                            let checkpoint = record
+                                .checkpoint
+                                .load(&mut *self.store, &self.state_id)
+                                .await?;
+                            let fork = self.state.documents.fork(&boundary, record)?;
+                            Ok((checkpoint, fork))
+                        }
+                        .await;
+                    drop(result.send(outcome));
+                }
+                Command::InitializeDocumentFork {
+                    caller,
+                    fork,
+                    checkpoint,
+                    result,
+                } => {
+                    let outcome = async {
+                        self.authorize(&caller)?;
+                        if self.state.revision() != 0 {
+                            return Err(Error::InvalidState(
+                                "document forks require an empty destination".into(),
+                            ));
+                        }
+                        let mut next = self.state.clone();
+                        next.apply_transition(1, Transition::CheckpointCommitted { checkpoint })?;
+                        for (key, doc) in fork.documents {
+                            if key.trim().is_empty() || key.len() > 256 || doc.version != 1 {
+                                return Err(Error::InvalidState(
+                                    "invalid document fork seed".into(),
+                                ));
+                            }
+                            next.documents.current.insert(key, doc);
+                        }
+                        self.persist(next).await
+                    }
+                    .await;
+                    drop(result.send(outcome));
+                }
+                Command::CompleteDocuments {
+                    caller,
+                    operation_id,
+                    step_id,
+                    checkpoint,
+                    output,
+                    writes,
+                    result,
+                } => {
+                    let terminal = step_id.is_none();
+                    let outcome = async {
+                        self.authorize(&caller)?;
+                        self.require_claimed(&caller, &operation_id)?;
+                        self.require_running(&operation_id)?;
+                        let revision =
+                            self.state.revision().checked_add(1).ok_or_else(|| {
+                                Error::InvalidState("state revision overflow".into())
+                            })?;
+                        let mut next = self.state.clone();
+                        match step_id {
+                            Some(step_id) => {
+                                next.apply_transition(
+                                    revision,
+                                    Transition::StepCompleted {
+                                        operation_id: operation_id.clone(),
+                                        step_id,
+                                        output,
+                                    },
+                                )?;
+                                next.documents.write(writes)?;
+                            }
+                            None => {
+                                let checkpoint = checkpoint.ok_or_else(|| {
+                                    Error::InvalidState(
+                                        "document completion requires checkpoint".into(),
+                                    )
+                                })?;
+                                next.apply_transition(
+                                    revision,
+                                    Transition::OperationCompleted {
+                                        operation_id: operation_id.clone(),
+                                        checkpoint: checkpoint.clone(),
+                                        output,
+                                    },
+                                )?;
+                                next.documents.commit(&operation_id, checkpoint, writes)?;
+                            }
+                        }
+                        if let Some(limit) = self.terminal_receipt_limit {
+                            let _ = next.retain_terminal_receipts(limit);
+                        }
+                        self.persist(next).await
+                    }
+                    .await;
+                    if terminal && finishing_attempt_releases_claim(&outcome) {
+                        self.release_claim_if_owned(&caller, &operation_id);
+                    }
                     drop(result.send(outcome));
                 }
                 Command::State { result } => drop(result.send(self.state.clone())),
@@ -1911,6 +2049,99 @@ impl DurableSession {
         })
         .await?;
         receive(receiver).await
+    }
+
+    /// Reads a session-owned document. Missing keys return `None`.
+    pub async fn document(&self, key: impl Into<String>) -> Result<Option<crate::SessionDocument>> {
+        let (result, receiver) = oneshot::channel();
+        self.send(Command::Document {
+            key: key.into(),
+            result,
+        })
+        .await?;
+        receiver.await.map_err(|_| Error::DriverStopped)
+    }
+
+    /// Selects documents and the checkpoint at a retained completed-operation boundary.
+    /// Historical boundaries survive terminal receipt pruning. No external effect is copied.
+    pub async fn document_fork(
+        &self,
+        boundary: impl Into<String>,
+    ) -> Result<(EncodedPayload, crate::DocumentFork)> {
+        let (result, receiver) = oneshot::channel();
+        self.send(Command::DocumentFork {
+            boundary: boundary.into(),
+            result,
+        })
+        .await?;
+        receive(receiver).await
+    }
+
+    /// Atomically initializes an empty destination with a policy-selected fork and checkpoint.
+    pub async fn initialize_document_fork<C: Serialize + ?Sized>(
+        &self,
+        fork: crate::DocumentFork,
+        checkpoint: &C,
+    ) -> Result<()> {
+        let (result, receiver) = oneshot::channel();
+        self.send(Command::InitializeDocumentFork {
+            caller: Caller::Direct(self.caller_id.clone()),
+            fork,
+            checkpoint: EncodedPayload::encode(checkpoint)?,
+            result,
+        })
+        .await?;
+        receive(receiver).await
+    }
+
+    /// Commits the step receipt and document writes in one fenced store replacement.
+    /// A successful external effect must supply its own stable provider idempotency key.
+    pub async fn complete_step_with_documents<O: Serialize + ?Sized>(
+        &self,
+        operation_id: impl Into<String>,
+        step_id: impl Into<String>,
+        output: &O,
+        writes: Vec<crate::DocumentWrite>,
+    ) -> Result<()> {
+        let (result, receiver) = oneshot::channel();
+        self.send(Command::CompleteDocuments {
+            caller: Caller::Direct(self.caller_id.clone()),
+            operation_id: operation_id.into(),
+            step_id: Some(step_id.into()),
+            checkpoint: None,
+            output: EncodedPayload::encode(output)?,
+            writes,
+            result,
+        })
+        .await?;
+        receive(receiver).await
+    }
+
+    /// Atomically commits documents, checkpoint and result, and retains a historical fork boundary.
+    /// Validation or a definitely uncommitted store failure leaves every document unchanged.
+    pub async fn complete_with_documents<C: Serialize + ?Sized, O: Serialize + ?Sized>(
+        &self,
+        operation_id: impl Into<String>,
+        checkpoint: &C,
+        output: &O,
+        writes: Vec<crate::DocumentWrite>,
+    ) -> Result<()> {
+        let (result, receiver) = oneshot::channel();
+        self.send(Command::CompleteDocuments {
+            caller: Caller::Direct(self.caller_id.clone()),
+            operation_id: operation_id.into(),
+            step_id: None,
+            checkpoint: Some(EncodedPayload::encode(checkpoint)?),
+            output: EncodedPayload::encode(output)?,
+            writes,
+            result,
+        })
+        .await?;
+        let outcome = receive(receiver).await;
+        if finishing_attempt_releases_claim(&outcome) {
+            self.release_one_claim();
+        }
+        outcome
     }
 
     /// Atomically terminalizes an operation with its checkpoint and result.

@@ -446,6 +446,7 @@ impl OperationState {
 /// Complete state reduced from an complete retained state.
 #[derive(Clone, Debug, Default)]
 pub struct DurableState {
+    pub(crate) documents: crate::documents::Documents,
     revision: u64,
     operations: BTreeMap<String, OperationState>,
     latest_checkpoint: Option<(u64, EncodedPayload)>,
@@ -454,6 +455,8 @@ pub struct DurableState {
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DurableCheckpoint {
+    #[serde(default)]
+    documents: crate::documents::Documents,
     format: u8,
     operations: BTreeMap<String, OperationState>,
     latest_checkpoint: Option<EncodedPayload>,
@@ -467,6 +470,7 @@ pub(crate) struct RetainedCheckpoint {
 
 #[derive(serde::Serialize)]
 struct DurableCheckpointRef<'a> {
+    documents: &'a crate::documents::Documents,
     format: u8,
     operations: &'a BTreeMap<String, OperationState>,
     latest_checkpoint: Option<&'a EncodedPayload>,
@@ -480,6 +484,9 @@ struct RetainedCheckpointRef<'a> {
 impl DurableState {
     pub(crate) fn stage_records(&mut self) -> Vec<crate::StoreRecord> {
         let mut records = Vec::new();
+        for boundary in self.documents.boundaries.values_mut() {
+            boundary.stage(&mut records);
+        }
         for operation in self.operations.values_mut() {
             operation.input.stage(&mut records);
             if let Some(value) = &mut operation.continuation {
@@ -572,6 +579,7 @@ impl DurableState {
         serde_json::to_string(&RetainedCheckpointRef {
             nanocodex_durable_state: DurableCheckpointRef {
                 format: STATE_FORMAT,
+                documents: &self.documents,
                 operations: &self.operations,
                 latest_checkpoint: self.latest_checkpoint(),
             },
@@ -744,6 +752,7 @@ impl DurableState {
         let state = Self {
             revision,
             operations: checkpoint.operations,
+            documents: checkpoint.documents,
             latest_checkpoint,
         };
         for (operation_id, operation) in &state.operations {
