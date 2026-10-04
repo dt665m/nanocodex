@@ -1,9 +1,9 @@
 import type { ToolActivity } from "nanocodex-react/agent";
 import { decodeVaultEntries, type VaultEntryKind } from "./vaultEntries.ts";
 
-export type VaultIntake = Readonly<{ operation: "create" | "authorize_origin" | "browser_verification" | "browser_takeover" | "browser_login"; request_id?: string; allowed_origins?: readonly string[]; vault_id?: string; challenge_id?: string; agent_id?: string; kind: VaultEntryKind; name?: string; origin?: string }>;
+export type VaultIntake = Readonly<{ operation: "create" | "browser_verification" | "browser_takeover" | "browser_login"; request_id?: string; allowed_origins?: readonly string[]; vault_id?: string; challenge_id?: string; agent_id?: string; kind: VaultEntryKind; name?: string; origin?: string }>;
 export function decodeVaultIntake(tool: ToolActivity): VaultIntake | undefined {
-  if (tool.name.split(".").at(-1) === "request_browser_login" && tool.status === "completed" && tool.output) {
+  if (["request_browser_login", "request_browser_login_input"].includes(tool.name.split(".").at(-1) ?? "") && tool.status === "completed" && tool.output) {
     try {
       const v = JSON.parse(tool.output);
       const validOrigin = (origin: unknown): origin is string => {
@@ -44,9 +44,10 @@ export function decodeVaultIntake(tool: ToolActivity): VaultIntake | undefined {
     || Object.keys(record).some(key => !["type", "status", "operation", "vault_id", "kind", "name", "origin", "challenge_id", "agent_id"].includes(key))
     || (record.name !== undefined && (typeof record.name !== "string" || !record.name.trim() || record.name.length > 120 || /[\u0000-\u001f\u007f]/.test(record.name)))) return;
   const operation = record.operation ?? "create";
-  if (operation !== "create" && operation !== "authorize_origin" && operation !== "browser_verification") return;
+  // Legacy website-approval requests no longer require an input form.
+  if (operation !== "create" && operation !== "browser_verification") return;
   if (operation === "create" && record.vault_id !== undefined) return;
-  if ((operation === "authorize_origin" || operation === "browser_verification") && (record.kind !== "login" || typeof record.vault_id !== "string" || !/^[A-Za-z0-9_-]{22,64}$/.test(record.vault_id) || record.origin === undefined)) return;
+  if (operation === "browser_verification" && (record.kind !== "login" || typeof record.vault_id !== "string" || !/^[A-Za-z0-9_-]{22,64}$/.test(record.vault_id) || record.origin === undefined)) return;
   if (operation === "browser_verification") {
     if (typeof record.challenge_id !== "string" || !/^[A-Za-z0-9_-]{22,256}$/.test(record.challenge_id)
       || typeof record.agent_id !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(record.agent_id)) return;
@@ -121,10 +122,12 @@ export async function browserTakeover(intake: VaultIntake, action: BrowserTakeov
       || typeof form.document_id !== "string" || !/^[0-9a-f-]{36}$/.test(form.document_id)
       || !Array.isArray(form.fields) || form.fields.length < 1 || form.fields.length > 32
       || !form.fields.every(f => f && typeof f === "object" && !Array.isArray(f)
-        && Object.keys(f).every(k => ["ref", "label", "type", "multiline"].includes(k))
+        && Object.keys(f).every(k => ["ref", "label", "type", "multiline", "autocomplete", "inputmode"].includes(k))
         && typeof f.ref === "string" && /^[0-9a-f-]{36}$/.test(f.ref)
         && typeof f.label === "string" && f.label.length <= 160 && !/[\u0000-\u001f\u007f]/.test(f.label)
-        && keyboard({type:f.type,multiline:f.multiline}))
+        && keyboard({type:f.type,multiline:f.multiline})
+        && (f.autocomplete === undefined || ["username", "current-password", "new-password", "one-time-code", "email", "tel", "cc-number", "cc-exp", "cc-exp-month", "cc-exp-year", "cc-csc", "name", "given-name", "family-name", "street-address", "postal-code"].includes(f.autocomplete))
+        && (f.inputmode === undefined || ["text", "email", "url", "tel", "numeric", "decimal", "search"].includes(f.inputmode)))
       || new Set(form.fields.map(f => f.ref)).size !== form.fields.length) throw new Error("Invalid native form");
   }
   return { status: "active", image: v.image, width: v.width, height: v.height, ...(typeof v.origin === "string" ? {origin:v.origin} : {}), ...(v.keyboard === undefined ? {} : { keyboard: v.keyboard as BrowserKeyboard }), ...(v.inputs === undefined ? {} : { inputs: v.inputs as BrowserInputRegion[] }) };
