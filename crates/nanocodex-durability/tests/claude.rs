@@ -2025,19 +2025,19 @@ async fn paused_server_cursor_replays_across_store_failure_without_terminalizing
         let _ = agent.shutdown().await;
         drop((agent, events));
 
-        let builder = Nanocodex::builder(Claude::new(client, "different-model"));
-        let builder = if retain_authority {
-            builder.server_tool(nanocodex_claude::ServerToolDefinition::code_execution_current())
-        } else {
-            builder
-        };
-        let (agent, events) = builder
-            .durability(reopen(&path).await)
-            .await
-            .unwrap()
-            .build()
-            .unwrap();
         for _ in 0..2 {
+            let builder = Nanocodex::builder(Claude::new(client.clone(), "different-model"));
+            let builder = if retain_authority {
+                builder.server_tool(nanocodex_claude::ServerToolDefinition::code_execution_current())
+            } else {
+                builder
+            };
+            let (agent, events) = builder
+                .durability(reopen(&path).await)
+                .await
+                .unwrap()
+                .build()
+                .unwrap();
             let result = agent.prompt(request()).await.unwrap().result().await;
             if after_commit {
                 assert_eq!(result.unwrap().final_message(), "recovered prepared server turn");
@@ -2049,10 +2049,10 @@ async fn paused_server_cursor_replays_across_store_failure_without_terminalizing
                 "unknown server effects and completed receipts must not redispatch HTTP, including revoked authority");
             assert_eq!(effects.load(Ordering::SeqCst), 1,
                 "the provider mutation must execute exactly once");
+            let _ = agent.shutdown().await;
+            drop((agent, events));
         }
         println!("Claude HTTP recovery after_commit={after_commit} retain_authority={retain_authority}: requests=2 effects=1");
-        agent.shutdown().await.unwrap();
-        drop((agent, events));
         let log = requests.lock().unwrap();
         assert!(
             log.iter()
