@@ -88,6 +88,13 @@ async function journey(t, { sdk = 'node', journal = true, source, expected, over
   let worker;
   const messages = [];
   const waiters = [];
+  const workerFailures = new Map();
+  // Surface a failed recovery owner instead of waiting for a model request
+  // that can never arrive (and hiding the original failure in a timeout).
+  const nextModel = (reader, owner) => Promise.race([reader.next(),
+    workerFailures.get(owner).then(message => {
+      throw new Error(`Recovery owner ${owner} stopped before its next model request: ${message.error?.message ?? message.error}`);
+    })]);
   const push = value => { messages.push(value); for (const waiter of [...waiters]) waiter(); };
   function until(predicate) {
     return new Promise(resolve => {
@@ -101,12 +108,17 @@ async function journey(t, { sdk = 'node', journal = true, source, expected, over
       workerData: { sdk, journal, cellJournal: journal, direct, reusedProviderIds, queuedProviderIds: queuedProviderIds && owner > 1, url: server.url, cancellation, evaluator, databasePath: join(directory, 'recovery.sqlite') },
     });
     const started = worker;
+    let reportFailure;
+    workerFailures.set(owner, new Promise(resolve => { reportFailure = resolve; }));
     workers.push(worker);
-    worker.on('error', error => { console.error('Recovery worker error', error); push({ type: 'worker-error', error }); });
+    worker.on('error', error => { console.error('Recovery worker error', error); reportFailure({ error }); push({ owner, type: 'worker-error', error }); });
     worker.on('message', async message => {
       trace.push({ owner, ...message });
       if (process.env.NANOCODEX_RECOVERY_DEBUG) console.error('worker', owner, message.type, message.method ?? message.error ?? '');
-      if (message.type !== 'rpc') { push({ owner, ...message }); return; }
+      if (message.type !== 'rpc') {
+        if (message.type === 'failure') reportFailure(message);
+        push({ owner, ...message }); return;
+      }
       if (message.method === 'effect') push({ type: 'dispatch', owner, kind: message.args[0] });
       try {
         const result = await boundary.run(owner, message.method, message.args);
@@ -172,7 +184,7 @@ async function journey(t, { sdk = 'node', journal = true, source, expected, over
     owner = start();
     socket = await server.nextConnection();
     reader = messageReader(socket);
-    const recoveredRequest = await reader.next();
+    const recoveredRequest = await nextModel(reader, owner);
     trace.push({ owner, type: 'recovered-model-request', request: recoveredRequest });
     const cellOutput = recoveredRequest.input.find(item => item.type === (direct ? "function_call_output" : "custom_tool_call_output") && item.call_id === (direct ? "owned-tool" : "owned-cell"));
     assert.ok(cellOutput, "real Rust transport received the recovered cell receipt");
@@ -215,13 +227,13 @@ async function journey(t, { sdk = 'node', journal = true, source, expected, over
     }
     sendFinal(socket, 'synthetic-recovered', 'RECOVERED');
     assert.equal((await until(message => message.owner === owner && message.type === 'result')).finalMessage, 'RECOVERED');
-    const followRequest = await reader.next();
+    const followRequest = await nextModel(reader, owner);
     trace.push({ owner, type: 'follow-on-model-request', request: followRequest });
     async function reusedCall(kind, responseId) {
       sendCompleted(socket, responseId, direct
         ? [{ type: 'function_call', call_id: 'owned-tool', name: 'effect', arguments: JSON.stringify({ kind }) }]
         : [{ type: 'custom_tool_call', call_id: 'owned-cell', name: 'exec', input: `text(await tools.effect({kind:'${kind}'}));` }]);
-      const request = await reader.next();
+      const request = await nextModel(reader, owner);
       trace.push({ owner, type: 'reused-provider-call-output', kind, request });
       const output = request.input.filter(item => item.type === (direct ? 'function_call_output' : 'custom_tool_call_output')
         && item.call_id === (direct ? 'owned-tool' : 'owned-cell')).at(-1);
@@ -233,7 +245,7 @@ async function journey(t, { sdk = 'node', journal = true, source, expected, over
     sendFinal(socket, 'synthetic-follow', 'FOLLOW_ON_OK');
     assert.equal((await until(message => message.owner === owner && message.type === 'follow-on')).finalMessage, 'FOLLOW_ON_OK');
     if (reusedProviderIds) {
-      trace.push({ owner, type: 'third-turn-model-request', request: await reader.next() });
+      trace.push({ owner, type: 'third-turn-model-request', request: await nextModel(reader, owner) });
       await reusedCall('read-two', 'synthetic-reused-different');
       sendFinal(socket, 'synthetic-third', 'THIRD_TURN_OK');
       assert.equal((await until(message => message.owner === owner && message.type === 'third-on')).finalMessage, 'THIRD_TURN_OK');
