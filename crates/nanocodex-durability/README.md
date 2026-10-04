@@ -206,6 +206,10 @@ original persisted permission and its current permission are `Safe`. Otherwise
 The agent adapters turn this into a failed tool result visible to the model;
 they never silently redispatch the handler.
 
+Custom execution policies must implement `begin_step_with_replay`; the default
+fails closed, including for currently safe effects whose original intent policy
+cannot be established. The crate-provided adapters implement the full contract.
+
 Tools default to `Unsafe`. Parallel safety does not imply replay safety. Native
 tools opt in with `Tool::is_replay_safe`, dynamic providers with the corresponding
 named method, and Claude callbacks with `.tool_replay_safety(name, ReplaySafety::Safe)`.

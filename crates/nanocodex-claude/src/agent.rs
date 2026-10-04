@@ -531,6 +531,9 @@ impl ClaudeBuilder {
             let definition: ToolDefinition = serde_json::from_value(schema)
                 .expect("built-in Claude task schema must remain valid");
             let name = definition.name.clone();
+            // Restored session-local state and receipt commit together; no external effect.
+            self.tool_replay_safety
+                .insert(name.clone(), nanocodex_agent::ReplaySafety::Safe);
             let tasks = tasks.clone();
             self = self.tool(definition, move |input| {
                 let tasks = tasks.clone();

@@ -58,13 +58,19 @@ pub trait ClaudeExecutionPolicy: Send + Sync {
     /// permissions must be safe before an interrupted effect can run again.
     fn begin_step_with_replay(
         &self,
-        id: String,
-        step_id: String,
-        kind: String,
-        input: Value,
+        _id: String,
+        _step_id: String,
+        _kind: String,
+        _input: Value,
         _replay_safety: nanocodex_agent::ReplaySafety,
     ) -> PolicyFuture<'_, Step> {
-        self.begin_step(id, step_id, kind, input)
+        Box::pin(async {
+            Err(
+                nanocodex_agent::NanocodexError::ExecutionPolicyCapabilityUnsupported {
+                    capability: "effect replay safety",
+                },
+            )
+        })
     }
     fn complete_step(&self, id: String, step_id: String, output: Value) -> PolicyFuture<'_, ()>;
     fn complete(&self, id: String, checkpoint: Value, output: Value) -> PolicyFuture<'_, ()>;

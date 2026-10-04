@@ -1740,6 +1740,25 @@ async fn execution_policy_authority_defaults_fail_closed() -> Result<()> {
             capability: "cancel"
         })
     ));
+    for safety in [
+        nanocodex_agent::ReplaySafety::Unsafe,
+        nanocodex_agent::ReplaySafety::Safe,
+    ] {
+        assert!(matches!(
+            policy
+                .begin_step_with_replay(
+                    "turn".into(),
+                    "effect".into(),
+                    "tool".into(),
+                    "{}".into(),
+                    safety
+                )
+                .await,
+            Err(NanocodexError::ExecutionPolicyCapabilityUnsupported {
+                capability: "effect replay safety"
+            })
+        ));
+    }
     assert_eq!(releases.load(Ordering::SeqCst), 0);
     assert_eq!(generations.load(Ordering::SeqCst), 0);
 

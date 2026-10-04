@@ -291,13 +291,17 @@ pub trait ExecutionPolicy: Send + Sync {
     /// retain this with intent and require both old and current `Safe` to retry.
     fn begin_step_with_replay<'a>(
         &'a self,
-        operation_id: String,
-        step_id: String,
-        kind: String,
-        input_json: String,
+        _operation_id: String,
+        _step_id: String,
+        _kind: String,
+        _input_json: String,
         _replay_safety: crate::ReplaySafety,
     ) -> ExecutionFuture<'a, Result<ExecutionStepAdmission>> {
-        self.begin_step(operation_id, step_id, kind, input_json)
+        Box::pin(async {
+            Err(NanocodexError::ExecutionPolicyCapabilityUnsupported {
+                capability: "effect replay safety",
+            })
+        })
     }
 
     /// Commits the output of one executed effect.
@@ -508,13 +512,17 @@ pub trait ExecutionPolicy: Send + Sync {
     /// retain this with intent and require both old and current `Safe` to retry.
     fn begin_step_with_replay<'a>(
         &'a self,
-        operation_id: String,
-        step_id: String,
-        kind: String,
-        input_json: String,
+        _operation_id: String,
+        _step_id: String,
+        _kind: String,
+        _input_json: String,
         _replay_safety: crate::ReplaySafety,
     ) -> ExecutionFuture<'a, Result<ExecutionStepAdmission>> {
-        self.begin_step(operation_id, step_id, kind, input_json)
+        Box::pin(async {
+            Err(NanocodexError::ExecutionPolicyCapabilityUnsupported {
+                capability: "effect replay safety",
+            })
+        })
     }
     /// Commits one effect output.
     fn complete_step<'a>(
