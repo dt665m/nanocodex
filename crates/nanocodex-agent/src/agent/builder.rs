@@ -49,6 +49,7 @@ pub(super) struct CodexCompatibility {
     pub(super) instant_tool_steering: bool,
     pub(super) context: ContextSourceConfig,
     pub(super) execution: ExecutionConfig,
+    pub(super) turn_ownership: Option<Arc<dyn execution::TurnOwnership>>,
     pub(super) before_compaction: Option<Arc<dyn execution::BeforeCompaction>>,
     pub(super) spawn_factory: Option<Arc<dyn backend::AgentFactory>>,
     pub(super) host_context: Option<Arc<str>>,
@@ -71,6 +72,30 @@ impl<F> NanocodexBuilder<F> {
     #[must_use]
     pub fn before_compaction(mut self, hook: impl execution::BeforeCompaction + 'static) -> Self {
         self.codex.before_compaction = Some(Arc::new(hook));
+        self
+    }
+
+    /// Holds successful terminal publication until owned foreground work is idle.
+    /// Failure and cancellation stop owned foreground work before committing.
+    #[must_use]
+    pub fn turn_ownership(mut self, hook: Arc<dyn execution::TurnOwnership>) -> Self {
+        self.codex.turn_ownership = Some(hook);
+        self
+    }
+
+    /// Composes embedding tools with the caller's existing per-agent tool recipe.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn map_tools_factory<T>(mut self, map: T) -> Self
+    where T: Fn(AgentHandle, Tools) -> std::result::Result<Tools, ToolsBuildError> + Send + Sync + 'static {
+        let previous = self.tools;
+        self.tools = ToolsConfiguration::PerAgent(Arc::new(move |handle| {
+            let tools = match &previous {
+                ToolsConfiguration::Shared(tools) => tools.clone(),
+                ToolsConfiguration::PerAgent(factory) => factory(handle.clone())?,
+            };
+            map(handle, tools)
+        }));
         self
     }
 

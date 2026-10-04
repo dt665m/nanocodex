@@ -1,3 +1,5 @@
+mod ownership;
+pub use ownership::TurnOwnership;
 mod preservation;
 pub use preservation::{
     BeforeCompaction, BeforeCompactionRequest, CompactionMessage, CompactionReceipt,
