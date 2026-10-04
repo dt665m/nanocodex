@@ -4496,17 +4496,23 @@ final class InboxUITests: XCTestCase {
         // catching a transient progress indicator after the request finished.
         XCTAssertTrue(loading.exists || earlier.exists, "Reaching earlier history loads the next page automatically")
         if loading.exists {
-            var visibleAnchor: XCUIElement?
+            var visibleAnchor: (label: String, y: CGFloat)?
             let materialized = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
-                // Filter in the accessibility query before resolving per-element
-                // attributes. Slow CI snapshots can otherwise exhaust the wait
-                // while pagination changes the unfiltered element indices.
-                visibleAnchor = conversation.staticTexts.matching(
-                    NSPredicate(format: "label BEGINSWITH %@", "Progress note ")
-                ).allElementsBoundByIndex.first {
-                    $0.frame.minY >= conversation.frame.minY && $0.isHittable
-                }
-                return visibleAnchor != nil
+                // Capture a stable label and finite coordinate in this same
+                // observation. Re-reading an index-bound element after the
+                // wait can resolve a recycled cell during the prepend.
+                guard loading.exists,
+                      let first = conversation.staticTexts.matching(
+                        NSPredicate(format: "label BEGINSWITH %@", "Progress note ")
+                      ).allElementsBoundByIndex.first(where: {
+                        $0.frame.minY >= conversation.frame.minY && $0.isHittable
+                      }) else { return false }
+                let label = first.label
+                let anchored = conversation.staticTexts[label]
+                let frame = anchored.frame
+                guard frame.minY.isFinite, frame.height > 0, anchored.isHittable else { return false }
+                visibleAnchor = (label, frame.minY)
+                return true
             }, object: nil)
             guard XCTWaiter.wait(for: [materialized], timeout: 10) == .completed,
                   let first = visibleAnchor else {
@@ -4515,7 +4521,7 @@ final class InboxUITests: XCTestCase {
                     + app.staticTexts["conversation-native-scroll-state"].label + "\n" + conversation.debugDescription)
             }
             let firstLabel = first.label
-            let before = first.frame.minY
+            let before = first.y
             gone(loading)
             let retained = conversation.staticTexts[firstLabel]
             XCTAssertTrue(retained.isHittable)
