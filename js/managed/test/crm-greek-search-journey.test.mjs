@@ -10,17 +10,17 @@ import { Miniflare } from "miniflare";
 import { readD1Migrations } from "@cloudflare/vitest-pool-workers";
 import WebSocket from "ws";
 
-// Observable journey: an existing Greek contact is found from the phone's HTTP
+// Observable journey: a synthetic Greek contact is found from the phone's HTTP
 // endpoint and real managed tools with Latin/Greek queries. Pagination, literal
 // punctuation, edits, and another account must retain their normal semantics.
 // Only identity enrollment and the outbound model are fixtures.
 const root = fileURLToPath(new URL("..", import.meta.url));
 const output = join(root, "../../output/crm-greek-search", `${Date.now()}-${process.pid}`);
-const queries = ["Giannis", "yiannis", "Yannis", "Chalepoudis", "xalepoudis", "khalepoudis", "chal", "ΧΑΛΕΠΟΥΔΗΣ", "γιαννης", "Χαλεπούδης", "Γιάννης Χαλεπούδης"];
+const queries = ["Giannis", "yiannis", "Yannis", "Chalkidis", "xalkidis", "khalkidis", "chal", "ΧΑΛΚΙΔΗΣ", "γιαννης", "Χαλκίδης", "Γιάννης Χαλκίδης"];
 const codes = {
-  CRM_SETUP: `text(await tools.crm_save({kind:"person",name:"Γιάννης Χαλεπούδης",tags:["fixture"]})); text(await tools.crm_save({kind:"person",name:"GIANNIS CHALEPOUDIS",tags:["fixture"]})); text(await tools.crm_graph({operation:"save",text:"Γιάννης Χαλεπούδης",metadata:{fixture:true}})); text(await tools.crm_save({kind:"person",name:"Literal [%_*?] \\\\ fixture"})); text(await tools.crm_save({kind:"person",name:"Μαΐος "+"α".repeat(90)}));for(const name of ["Παύλος","Ευάγγελος","Σπύρος"])text(await tools.crm_save({kind:"person",name}));`,
+  CRM_SETUP: `text(await tools.crm_save({kind:"person",name:"Γιάννης Χαλκίδης",tags:["fixture"]})); text(await tools.crm_save({kind:"person",name:"GIANNIS CHALKIDIS",tags:["fixture"]})); text(await tools.crm_graph({operation:"save",text:"Γιάννης Χαλκίδης",metadata:{fixture:true}})); text(await tools.crm_save({kind:"person",name:"Literal [%_*?] \\\\ fixture"})); text(await tools.crm_save({kind:"person",name:"Μαΐος "+"α".repeat(90)}));for(const name of ["Παύλος","Ευάγγελος","Σπύρος"])text(await tools.crm_save({kind:"person",name}));`,
   CRM_SEARCH: `for (const q of ${JSON.stringify(queries)}) { text(await tools.crm_search({q,tag:"fixture",limit:1})); text(await tools.crm_graph({operation:"search",q})); } const p=await tools.crm_graph({operation:"search",q:"giannis",limit:1});text(p);text(await tools.crm_graph({operation:"search",q:"giannis",limit:1,cursor:p.next_cursor}));`,
-  CRM_EDIT: `const p=(await tools.crm_search({q:"Γιάννης Χαλεπούδης",tag:"fixture"})).records;for(const r of p)text(await tools.crm_save({id:r.id,name:"Νίκος Παπαδόπουλος"})); const n=(await tools.crm_graph({operation:"search",q:"giannis"})).nodes;for(const r of n){if(!r.source_managed)text(await tools.crm_graph({operation:"save",id:r.id,text:"Νίκος Παπαδόπουλος"}));}`,
+  CRM_EDIT: `const p=(await tools.crm_search({q:"Γιάννης Χαλκίδης",tag:"fixture"})).records;for(const r of p)text(await tools.crm_save({id:r.id,name:"Νίκος Παπαδόπουλος"})); const n=(await tools.crm_graph({operation:"search",q:"giannis"})).nodes;for(const r of n){if(!r.source_managed)text(await tools.crm_graph({operation:"save",id:r.id,text:"Νίκος Παπαδόπουλος"}));}`,
 };
 const source = `
 import {DurableObject} from 'cloudflare:workers';
@@ -161,6 +161,7 @@ test("Greeklish CRM search through public HTTP and managed tool transport", { ti
     await turn("CRM_EDIT");
     assert.deepEqual((await call("/v1/crm?q=giannis")).records, []);
     assert.deepEqual((await call("/v1/crm?q=nikos")).records.map(r => r.id).sort(), expectedIds);
+    assert.deepEqual((await call("/v1/crm?q=papadopoulos")).records.map(r => r.id).sort(), expectedIds);
     const detail = await call(`/v1/crm/${expectedIds[0]}`);
     assert.deepEqual(detail.identities, [], "normalization must not create aliases");
     const timings = trace.filter(t => t.path === "/v1/crm?q=zzzz-no-such-contact").map(t => t.milliseconds);

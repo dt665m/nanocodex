@@ -862,9 +862,9 @@ production proxy/router/storage run intact.
 persistent private accounts; sessions use the account identity to reach the same
 records. Multiplayer agents and Connect grants do not receive CRM access.
 CRM record names are searchable with Greek or Latin spelling, independent of
-case, tonos, dialytika, or composed/decomposed accents. For example, `Giannis`,
-`Yiannis`, and `Chalepoudis` find `Γιάννης Χαλεπούδης`; `xalepoudis` and
-`khalepoudis` are also accepted. This is query-time normalization: saved names,
+case, tonos, dialytika, or composed/decomposed accents. In a synthetic example, `Giannis`,
+`Yiannis`, and `Chalkidis` find `Γιάννης Χαλκίδης`; `xalkidis` and
+`khalkidis` are also accepted. This is query-time normalization: saved names,
 identities, and source evidence are unchanged. The online CRM screen uses the
 same `/v1/crm` search as `crm_search`; it needs only a managed Worker rollout,
 with no schema migration, backfill, or client release. Offline client filtering
