@@ -175,9 +175,12 @@ impl AgentHandle {
     ) -> Result<(Nanocodex, AgentEvents)> {
         self.native.ensure_available(self.clone()).await?;
         if self.factory.is_some() {
-            self.restore_runtime_with_factory(snapshot, host_context).await
+            self.restore_runtime_with_factory(snapshot, host_context)
+                .await
         } else if snapshot.model().family() == self.harness_family() {
-            self.native.restore(self.clone(), snapshot, host_context).await
+            self.native
+                .restore(self.clone(), snapshot, host_context)
+                .await
         } else {
             Err(NanocodexError::InvalidRequest(
                 "checkpoint family requires a configured child factory".into(),
@@ -439,7 +442,10 @@ impl Nanocodex {
             let session = self.session_id.clone();
             let (send, result) = tokio::sync::watch::channel(None);
             let task = tokio::spawn(async move {
-                let outcome = hook.prepare(&session).await.map_err(|error| error.to_string());
+                let outcome = hook
+                    .prepare(&session)
+                    .await
+                    .map_err(|error| error.to_string());
                 send.send_replace(Some(outcome));
             });
             self.startup = Some(Arc::new(OwnedStartup {
@@ -717,6 +723,7 @@ impl Nanocodex {
     /// Returns a model or driver-stopped error. Rollout writes follow the same
     /// retry-on-[`Self::flush_rollout`] contract as prompt turns.
     pub async fn compact(&self) -> Result<()> {
+        self.ready().await?;
         self.backend.compact().await
     }
 

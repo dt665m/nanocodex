@@ -116,9 +116,20 @@ Hosted agents with durability configure a separate native `DurableSession` for
 each child and reconstruct the registry before returning replayed capabilities.
 A completed spawn receipt therefore refers to the original child. Root and child
 owners remain separate, and reconstruction uses the current host's authorization.
-Saved tool context does not grant new authority. Embeddings that construct native
-agents directly must supply the durable child factory and registry; copying the
-parent's execution policy into a child is not supported.
+Saved tool context does not grant new authority. The native `nanocodex::DurableAgentExt` facade installs the registry, same-family
+child factory, per-child execution journals, and foreground ownership barrier for
+both OpenAI and Claude builders. Caller tools and callback recipes are retained.
+An already configured spawn factory is rejected before identity or child-tree
+mutation; embeddings with custom routing can attach the core
+`nanocodex_durability::DurableAgentExt` adapter and supply their own durable child
+factory and registry. Copying the parent's execution policy into a child is not
+supported.
+
+Native facade builds begin owner-bound reconstruction immediately, including
+pending background work when the root operation already completed. Await
+`agent.ready()` to observe startup completion or its retained recovery error; no
+root prompt or operation is fabricated. New prompts also await readiness.
+Shutdown and dropping the last handle cancel unfinished startup recovery.
 
 Background children require a durable parent. Managed recovery alarms reopen
 unfinished background work even after the parent turn has settled. Completed

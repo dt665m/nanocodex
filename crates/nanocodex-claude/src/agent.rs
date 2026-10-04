@@ -18,10 +18,10 @@ use nanocodex_agent::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-mod durable;
 mod background;
 #[cfg(all(feature = "code-mode", not(target_family = "wasm")))]
 mod code_mode;
+mod durable;
 use crate::execution::{Admission, ClaudeExecutionPolicy, Step};
 use durable::{Cursor, Effect, Snapshot};
 use std::{
@@ -283,10 +283,14 @@ impl ClaudeBuilder {
     }
     /// Whether embedding-owned child construction has already been configured.
     #[doc(hidden)]
-    pub fn has_spawn_factory(&self) -> bool { self.spawn_factory.is_some() }
+    pub fn has_spawn_factory(&self) -> bool {
+        self.spawn_factory.is_some()
+    }
     /// Returns a caller-configured native identity before attaching durability.
     #[doc(hidden)]
-    pub fn configured_session_id(&self) -> Option<&str> { self.session_id.as_deref() }
+    pub fn configured_session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
+    }
     /// Derives an independent recipe without the root's execution ownership.
     #[doc(hidden)]
     pub fn fresh_child(mut self) -> Self {
@@ -297,9 +301,11 @@ impl ClaudeBuilder {
         #[cfg(all(feature = "tools", not(target_family = "wasm")))]
         if self.task_board.is_some() {
             let names = nanocodex_claude_tools::tasks::ClaudeTasks::definitions()
-                .into_iter().filter_map(|value| value.get("name").and_then(Value::as_str).map(str::to_owned))
+                .into_iter()
+                .filter_map(|value| value.get("name").and_then(Value::as_str).map(str::to_owned))
                 .collect::<HashSet<_>>();
-            self.tools.retain(|(definition, _)| !names.contains(&definition.name));
+            self.tools
+                .retain(|(definition, _)| !names.contains(&definition.name));
             self = self.tasks(Arc::new(nanocodex_claude_tools::tasks::ClaudeTasks::new()));
         }
         self
@@ -310,7 +316,10 @@ impl ClaudeBuilder {
         self
     }
     /// Holds successful terminal publication until owned foreground work is idle.
-    pub fn turn_ownership(mut self, hook: Arc<dyn nanocodex_agent::execution::TurnOwnership>) -> Self {
+    pub fn turn_ownership(
+        mut self,
+        hook: Arc<dyn nanocodex_agent::execution::TurnOwnership>,
+    ) -> Self {
         self.turn_ownership = Some(hook);
         self
     }
@@ -1853,12 +1862,19 @@ impl State {
         });
     }
     fn emit_accepted_input(&self, request: &BackendPrompt) {
-        let turn_id = request.events.turn_id().unwrap_or(request.events.request_id());
-        self.emit(&request.events, AgentEventKind::InputAccepted, json!({
-            "session_id": request.events.request_id(), "turn_id": turn_id,
-            "item_id": format!("{turn_id}:prompt"), "kind": "prompt",
-            "request_id": request.request_id, "input": request.prompt.instruction,
-        }));
+        let turn_id = request
+            .events
+            .turn_id()
+            .unwrap_or(request.events.request_id());
+        self.emit(
+            &request.events,
+            AgentEventKind::InputAccepted,
+            json!({
+                "session_id": request.events.request_id(), "turn_id": turn_id,
+                "item_id": format!("{turn_id}:prompt"), "kind": "prompt",
+                "request_id": request.request_id, "input": request.prompt.instruction,
+            }),
+        );
     }
     fn model(&self) -> String {
         self.model
@@ -2030,22 +2046,40 @@ impl State {
             return Err(NanocodexError::TurnCancelled.into());
         }
         if let Some(effect) = &context.effect {
-            match effect.begin_with_replay(
-                "model", client.durable_request(&request).map_err(provider_error)?,
-                // Provider tools can mutate remote state. Missing settlement
-                // must not automatically repeat an effect or uncertain charge.
-                if request.tool_choice.as_ref().is_some_and(|choice| choice["type"] == "none")
-                    || !request.tools.iter().any(|tool| matches!(tool, ClaudeToolSpec::Server(_))) {
-                    nanocodex_agent::ReplaySafety::Safe
-                } else { nanocodex_agent::ReplaySafety::Unsafe },
-            ).await? {
+            match effect
+                .begin_with_replay(
+                    "model",
+                    client.durable_request(&request).map_err(provider_error)?,
+                    // Provider tools can mutate remote state. Missing settlement
+                    // must not automatically repeat an effect or uncertain charge.
+                    if request
+                        .tool_choice
+                        .as_ref()
+                        .is_some_and(|choice| choice["type"] == "none")
+                        || !request
+                            .tools
+                            .iter()
+                            .any(|tool| matches!(tool, ClaudeToolSpec::Server(_)))
+                    {
+                        nanocodex_agent::ReplaySafety::Safe
+                    } else {
+                        nanocodex_agent::ReplaySafety::Unsafe
+                    },
+                )
+                .await?
+            {
                 Step::Replay(value) => {
-                    let response = serde_json::from_value(value).map_err(durable::recovery_error)?;
+                    let response =
+                        serde_json::from_value(value).map_err(durable::recovery_error)?;
                     completed(&response, 0, 0, None);
                     return Ok(response);
                 }
-                Step::OutcomeUnknown => return Err(durable::recovery_error(
-                    "provider model effect outcome is unknown; reconcile before dispatch").into()),
+                Step::OutcomeUnknown => {
+                    return Err(durable::recovery_error(
+                        "provider model effect outcome is unknown; reconcile before dispatch",
+                    )
+                    .into());
+                }
                 Step::Execute => {}
             }
         }
@@ -2175,8 +2209,10 @@ impl State {
             if let Some(ownership) = &self.turn_ownership {
                 ownership.prepare(&self.session_id).await?;
             }
-            self.run_locked(&mut conversation, &request, speed, &cancel).await
-        }.await;
+            self.run_locked(&mut conversation, &request, speed, &cancel)
+                .await
+        }
+        .await;
         if let Some(ownership) = &self.turn_ownership {
             if result.is_ok() {
                 let settled = tokio::select! {
@@ -2185,7 +2221,7 @@ impl State {
                     settled = ownership.settle(&self.session_id, true) => Some(settled),
                 };
                 match settled {
-                    Some(Ok(())) => {},
+                    Some(Ok(())) => {}
                     Some(Err(error)) => result = Err(error),
                     None => {
                         ownership.settle(&self.session_id, false).await?;
@@ -2367,7 +2403,9 @@ impl State {
             CompactionMode::Automatic if context.rounds_since_compaction < 3 => {
                 context.rapid_compactions.saturating_add(1)
             }
-            CompactionMode::Automatic | CompactionMode::Background | CompactionMode::ContextRecovery => 1,
+            CompactionMode::Automatic
+            | CompactionMode::Background
+            | CompactionMode::ContextRecovery => 1,
             CompactionMode::Manual => 0,
         };
         context.rounds_since_compaction = 0;
@@ -2459,8 +2497,10 @@ impl State {
                 .clone()
                 .unwrap_or_else(|| events.turn_id().unwrap_or(events.request_id()).to_owned()),
             call_id: id.to_owned(),
-            journal_scope: cursor.operation.as_ref().map(|operation|
-                json!([operation, format!("tool-{index}-{id}")]).to_string()),
+            journal_scope: cursor
+                .operation
+                .as_ref()
+                .map(|operation| json!([operation, format!("tool-{index}-{id}")]).to_string()),
             instruction_revision: cursor.instruction_revision,
             host_context: self.host_context.clone(),
         };
@@ -2579,13 +2619,19 @@ impl State {
             if cancel.flag.load(Ordering::SeqCst) && self.policy.is_none() {
                 return Err(NanocodexError::TurnCancelled);
             }
-            if cursor.background.is_none() && conversation.allows_auto_compaction()
+            if cursor.background.is_none()
+                && conversation.allows_auto_compaction()
                 && conversation.active_context_tokens >= cursor.threshold.saturating_mul(4) / 5
-                && conversation.active_context_tokens < cursor.threshold && !pending.is_empty() {
+                && conversation.active_context_tokens < cursor.threshold
+                && !pending.is_empty()
+            {
                 let mut cutoff = conversation.clone();
                 cutoff.messages = pending.clone();
                 cutoff.summary.clear();
-                cursor.background = Some(background::PendingSummary { cutoff, step: format!("background-summary-{index}") });
+                cursor.background = Some(background::PendingSummary {
+                    cutoff,
+                    step: format!("background-summary-{index}"),
+                });
                 self.advance_cursor(&mut cursor, conversation).await?;
             }
             if background.is_none() {
@@ -2621,12 +2667,12 @@ impl State {
                 cursor.usage = usage.clone();
                 self.advance_cursor(&mut cursor, conversation).await?;
             }
-            let prepared_template = self.prepare_policy_request(
-                conversation, &mut cursor, &pending, index).await?;
+            let prepared_template = self
+                .prepare_policy_request(conversation, &mut cursor, &pending, index)
+                .await?;
             let discovered = self.discovered.lock().await.clone();
             let response = {
-            let foreground = self
-                .response(
+                let foreground = self.response(
                     pending.clone(),
                     prepared_template.tools.clone(),
                     cancel,
@@ -2640,17 +2686,16 @@ impl State {
                         wire_profile: cursor.wire_profile.as_ref(),
                         effect: cursor.effect(self, &format!("model-{index}")),
                     },
-                )
-                ;
-            tokio::pin!(foreground);
-            loop {
-                tokio::select! {
-                    result = &mut foreground => break result,
-                    result = background::progress(&mut background) => {
-                        if let Some(work) = &mut background { work.result = Some(result); }
+                );
+                tokio::pin!(foreground);
+                loop {
+                    tokio::select! {
+                        result = &mut foreground => break result,
+                        result = background::progress(&mut background) => {
+                            if let Some(work) = &mut background { work.result = Some(result); }
+                        }
                     }
                 }
-            }
             };
             let response = match response {
                 Ok(response) => response,
@@ -3002,7 +3047,16 @@ impl State {
                 } else {
                     background::poll(&mut background);
                 }
-                if self.install_summary(&mut cursor, &mut background, conversation, &mut pending, &mut usage).await? {
+                if self
+                    .install_summary(
+                        &mut cursor,
+                        &mut background,
+                        conversation,
+                        &mut pending,
+                        &mut usage,
+                    )
+                    .await?
+                {
                     previous_message_id = None;
                 }
                 cursor.index = index + 1;
@@ -3032,7 +3086,16 @@ impl State {
                 } else {
                     background::poll(&mut background);
                 }
-                if self.install_summary(&mut cursor, &mut background, conversation, &mut pending, &mut usage).await? {
+                if self
+                    .install_summary(
+                        &mut cursor,
+                        &mut background,
+                        conversation,
+                        &mut pending,
+                        &mut usage,
+                    )
+                    .await?
+                {
                     previous_message_id = None;
                 }
                 cursor.index = index + 1;
@@ -3101,7 +3164,16 @@ impl State {
                 } else {
                     background::poll(&mut background);
                 }
-                if self.install_summary(&mut cursor, &mut background, conversation, &mut pending, &mut usage).await? {
+                if self
+                    .install_summary(
+                        &mut cursor,
+                        &mut background,
+                        conversation,
+                        &mut pending,
+                        &mut usage,
+                    )
+                    .await?
+                {
                     previous_message_id = None;
                 }
                 cursor.index = index + 1;
@@ -3146,7 +3218,16 @@ impl State {
                 } else {
                     background::poll(&mut background);
                 }
-                if self.install_summary(&mut cursor, &mut background, conversation, &mut pending, &mut usage).await? {
+                if self
+                    .install_summary(
+                        &mut cursor,
+                        &mut background,
+                        conversation,
+                        &mut pending,
+                        &mut usage,
+                    )
+                    .await?
+                {
                     previous_message_id = None;
                 }
                 cursor.index = index + 1;
@@ -3170,7 +3251,14 @@ impl State {
                 .saturating_add(response.usage.output_tokens);
             background::wait(&mut background).await;
             let mut completed = conversation.packed_messages();
-            self.install_summary(&mut cursor, &mut background, conversation, &mut completed, &mut usage).await?;
+            self.install_summary(
+                &mut cursor,
+                &mut background,
+                conversation,
+                &mut completed,
+                &mut usage,
+            )
+            .await?;
             // Keep the terminal foreground receipt until settle commits the
             // result. A lost acknowledgement must replay this same response.
             return Ok(TurnResult::from_backend(
