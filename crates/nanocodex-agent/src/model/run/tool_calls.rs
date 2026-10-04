@@ -514,7 +514,11 @@ where
 
     fn unknown_tool_call(active: &ActiveToolCall) -> CompletedToolCall {
         let output = ToolOutputBody::Text("Tool execution interrupted; outcome unknown. The prior attempt may have run. Do not automatically repeat it; reconcile using its existing operation identity.".to_owned());
-        let structured_result = output.structured_result();
+        let structured_result = serde_json::json!({
+            "outcome": "unknown",
+            "code": "TOOL_OUTCOME_UNKNOWN",
+            "message": "The prior attempt may have run. Reconcile using its existing operation identity before retrying.",
+        });
         let duration_ns = elapsed_ns(active.started_at);
         record_tool_span_terminal(&active.span, "failed", "ERROR", duration_ns, &output);
         let response_item = match active.kind {
