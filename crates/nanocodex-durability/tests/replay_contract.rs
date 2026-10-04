@@ -134,3 +134,42 @@ fn process_crash_recovery_never_repeats_unclassified_effects() -> eyre::Result<(
     }
     Ok(())
 }
+
+#[test]
+fn legacy_pending_tool_does_not_gain_replay_permission_during_upgrade() -> eyre::Result<()> {
+    let dir = tempfile::tempdir()?;
+    worker(dir.path(), "crash-pending", "unsafe", 73)?;
+    {
+        // Retain the exact pre-policy head shape used by format 4, then open it
+        // through today's public session API in another process.
+        let db = rusqlite::Connection::open(dir.path().join("state.sqlite"))?;
+        let head: String = db.query_row(
+            "SELECT payload FROM nanocodex_durable_states WHERE state_id = 'session'",
+            [],
+            |row| row.get(0),
+        )?;
+        let mut head: serde_json::Value = serde_json::from_str(&head)?;
+        head["nanocodex_durable_state"]["format"] = 4.into();
+        head["nanocodex_durable_state"]["operations"]["operation"]["steps"]["effect"]
+            .as_object_mut()
+            .unwrap()
+            .remove("replay_safety");
+        db.execute(
+            "UPDATE nanocodex_durable_states SET payload = ?1 WHERE state_id = 'session'",
+            [serde_json::to_string(&head)?],
+        )?;
+    }
+    let trace = worker(dir.path(), "reopen", "safe", 0)?;
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("outcome"))?,
+        "unknown"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("invocations"))?
+            .lines()
+            .count(),
+        1
+    );
+    println!("legacy format 4 tool intent retained unknown outcome without redispatch\n{trace}");
+    Ok(())
+}
