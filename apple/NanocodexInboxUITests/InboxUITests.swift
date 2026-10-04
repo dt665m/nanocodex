@@ -350,10 +350,15 @@ final class InboxUITests: XCTestCase {
         // Removing password fields can present iOS's save prompt. Dismiss the
         // system interruption explicitly so the next tap reaches the sheet.
         for owner in [app, XCUIApplication(bundleIdentifier: "com.apple.springboard")] {
-            let prompt = owner.alerts["Save Password?"]
-            if prompt.waitForExistence(timeout: 2) {
-                prompt.buttons["Not Now"].tap()
-                return
+            // iOS 26 exposes this system panel as a Sheet; older versions use
+            // Alert. Match only that named prompt, never arbitrary interruptions.
+            for prompt in [owner.sheets["Save Password?"], owner.alerts["Save Password?"]] {
+                if prompt.waitForExistence(timeout: 2) {
+                    prompt.buttons["Not Now"].tap()
+                    let dismissed = expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: prompt)
+                    wait(for: [dismissed], timeout: 5)
+                    return
+                }
             }
         }
     }
