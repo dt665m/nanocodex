@@ -273,7 +273,9 @@ export function createManagedCodeEffectJournal(storage: DurableObjectStorage): C
           }
           return { status: "execute" as const, entries: readEntries("cell:" + cellKey, true) };
         }
-        if (storage.sql.exec("SELECT 1 FROM managed_code_store_blobs WHERE blob_key = ?", "cell:" + cellKey).toArray().length) {
+        const retainedCellKeys = ["cell:" + cellKey, "receipt:" + cellKey];
+        if (storage.sql.exec("SELECT 1 FROM managed_code_store_blobs WHERE blob_key IN (?, ?) LIMIT 1", ...retainedCellKeys).toArray().length
+          || storage.sql.exec("SELECT 1 FROM managed_code_store_chunks WHERE blob_key IN (?, ?) LIMIT 1", ...retainedCellKeys).toArray().length) {
           throw codeEffectUnknown("Code Mode cell store identity is missing");
         }
         // Never guess a fresh starting store for an already dispatched legacy
@@ -330,7 +332,8 @@ export function createManagedCodeEffectJournal(storage: DurableObjectStorage): C
       storage.transactionSync(() => {
         assertOwner();
         if (storage.sql.exec("SELECT 1 FROM managed_code_cells WHERE session_id = ? LIMIT 1", sessionId).toArray().length
-          || storage.sql.exec("SELECT 1 FROM managed_code_store_blobs WHERE blob_key = ? LIMIT 1", "session:" + sessionId).toArray().length) {
+          || storage.sql.exec("SELECT 1 FROM managed_code_store_blobs WHERE blob_key = ? LIMIT 1", "session:" + sessionId).toArray().length
+          || storage.sql.exec("SELECT 1 FROM managed_code_store_chunks WHERE blob_key = ? LIMIT 1", "session:" + sessionId).toArray().length) {
           throw codeEffectUnknown("Code Mode fork destination already exists");
         }
         writeEntries("session:" + sessionId, entries);

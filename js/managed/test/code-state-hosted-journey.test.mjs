@@ -34,6 +34,7 @@ export class CodeSession extends DurableObject {
         const terminated = JSON.parse(await this.runtime.waitCodeObserved(JSON.stringify({cell_id:cellId, terminate:true}), input.session, input.cell+'-wait'));
         return Response.json({first,terminated});
       }
+      if (input.action === 'snapshot-summary') return Response.json((await this.journal.snapshotStore(input.session)).map(([key,value])=>[key,typeof value==='string'?value.length:value]));
       if (input.action === 'snapshot') return Response.json(await this.journal.snapshotStore(input.session));
       if (input.action === 'fork') {
         await this.journal.restoreStore(input.destination, await this.journal.snapshotStore(input.session));
@@ -43,9 +44,16 @@ export class CodeSession extends DurableObject {
       if (input.action === 'inspect') return Response.json({effects:this.ctx.storage.sql.exec('SELECT count FROM fixture_effects').one().count,
         cells:this.ctx.storage.sql.exec('SELECT cell_key,writes_hash FROM managed_code_cells ORDER BY cell_key').toArray(),
         blobs:this.ctx.storage.sql.exec('SELECT blob_key,chunks,bytes FROM managed_code_store_blobs ORDER BY blob_key').toArray()});
+      if (input.action === 'orphan-cell') {
+        const key=input.kind+':'+JSON.stringify([input.session,'fixture-operation',1,input.cell]);
+        this.ctx.storage.sql.exec("INSERT INTO managed_code_store_chunks VALUES (?,0,'[]')",key);
+        await this.ctx.storage.sync(); return Response.json({corrupted:key});
+      }
       if (input.action === 'corrupt') {
         const key='session:'+input.session;
-        if(input.kind==='missing') this.ctx.storage.sql.exec('DELETE FROM managed_code_store_blobs WHERE blob_key=?',key);
+        if(input.kind==='orphan') {
+          this.ctx.storage.sql.exec("INSERT INTO managed_code_store_chunks VALUES (?,0,'[]')",key);
+        } else if(input.kind==='missing') this.ctx.storage.sql.exec('DELETE FROM managed_code_store_blobs WHERE blob_key=?',key);
         else if(input.kind==='gap') this.ctx.storage.sql.exec('UPDATE managed_code_store_chunks SET chunk_index=100 WHERE blob_key=? AND chunk_index=0',key);
         else if(input.kind==='hash') this.ctx.storage.sql.exec("UPDATE managed_code_store_chunks SET value_json=replace(value_json,'seed','evil') WHERE blob_key=?",key);
         else if(input.kind==='oversized') this.ctx.storage.sql.exec('UPDATE managed_code_store_chunks SET value_json=? WHERE blob_key=? AND chunk_index=0','x'.repeat(8*1024*1024+1),key);
@@ -110,8 +118,20 @@ test('hosted Code Mode retains terminal state across cold workerd, rolls back fa
     assert.match(JSON.stringify((await exec('fork','fork-cold','text(load("memo"));')).output),/fork-only/);
     assert.deepEqual((await request({action:'snapshot',session:'root'})).value,[['memo',{label:'newer',count:2}]]);
     assert.equal((await request({action:'fork',session:'root',destination:'fork'})).status,409);
+    await request({action:'corrupt',session:'orphan-destination',kind:'orphan'});
+    assert.equal((await request({action:'fork',session:'root',destination:'orphan-destination'})).status,409);
+    for (const kind of ['cell','receipt']) {
+      const cell='orphan-'+kind;
+      await request({action:'orphan-cell',session:'root',cell,kind});
+      const fenced=await exec('root',cell,'await tools.effect({});');
+      assert.equal(fenced.success,false); assert.match(fenced.output,/store identity is missing/);
+    }
     const tooLarge = await request({action:'restore',session:'too-large',entries:[['large','x'.repeat(8*1024*1024+1)]]});
     assert.equal(tooLarge.status,409); assert.match(tooLarge.value.error,/exceeds/);
+    assert.equal((await request({action:'restore',session:'aggregate',entries:[['large','x'.repeat(5*1024*1024)]]})).status,200);
+    const overflow=await exec('aggregate','overflow','store("second","y".repeat(4*1024*1024));');
+    assert.equal(overflow.success,false); assert.match(overflow.output,/exceeds/);
+    assert.deepEqual((await request({action:'snapshot-summary',session:'aggregate'})).value,[['large',5*1024*1024]]);
     for (const kind of ['missing','gap','hash','oversized']) {
       const session='corrupt-'+kind;
       assert.equal((await exec(session,'seed','store("memo","seed");')).success,true);
@@ -123,6 +143,8 @@ test('hosted Code Mode retains terminal state across cold workerd, rolls back fa
     }
     const observed = (await request({action:'inspect'})).value;
     assert.equal(observed.effects,1);
+    assert.equal(observed.cells.find(cell=>cell.cell_key==='["aggregate","fixture-operation",1,"overflow"]').writes_hash,null);
+    assert.equal(observed.blobs.some(blob=>blob.blob_key==='receipt:["aggregate","fixture-operation",1,"overflow"]'),false);
     assert.equal(observed.blobs.some(blob=>blob.blob_key==='session:too-large'||blob.blob_key.startsWith('session:rejected-')),false);
     console.log('HOSTED_CODE_STATE_TRACE',JSON.stringify({output,trace}));
   } finally {
