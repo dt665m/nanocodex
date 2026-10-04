@@ -169,9 +169,11 @@ CHROME_PATH=/path/to/chrome node --experimental-strip-types js/managed/test/brow
 
 It writes its timing and checked outcomes to ignored `output/private-native-fields/`.
 
-Updated native clients retry a rejected capability observation once without the
-capability flag when an older server returns HTTP 400, then retain the legacy
-viewport for that sheet. Fills and other user actions are never retried.
+Updated native clients retry an HTTP 400 capability observation without field
+hints first, then without native fields if the older server still rejects it.
+These read-only capability choices persist for the sheet. A fill is never
+automatically retried; a confirmed fill with an uncertain handback retries only
+the handback receipt.
 
 ## Passkeys
 
@@ -180,8 +182,19 @@ not currently bridge a website's passkey ceremony from its retained remote
 browser to the phone. Ordinary native passkey APIs require an associated domain
 that authorizes the app; an arbitrary third-party relying-party ID is insufficient.
 Apple's [browser public-key credential entitlement](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.developer.web-browser.public-key-credential)
-is a managed capability with browser-app requirements, not an entitlement that
-can be enabled solely by adding it to the project.
+is documented for macOS and Mac Catalyst, not iOS. Do not add it to the iPhone
+app as a supposed passkey fix. The
+[browser credential manager](https://developer.apple.com/documentation/authenticationservices/asauthorizationwebbrowserpublickeycredentialmanager)
+is available on iOS/iPadOS 17.4 and later, but API availability alone does not
+establish that a signed app is authorized to use arbitrary relying parties.
+
+Apple's separate [iOS default-browser requirements](https://developer.apple.com/documentation/xcode/preparing-your-app-to-be-the-default-browser)
+include a managed browser entitlement and restrictions on broad photo-library
+and background Bluetooth permissions. The current Inbox app declares both
+`NSPhotoLibraryUsageDescription` and `NSBluetoothAlwaysUsageDescription`.
+Do not remove existing Hand features or claim browser eligibility merely to
+make a passkey request compile. Signed capability and product eligibility need
+verification independently of the browser transport.
 
 A native remote-browser implementation requires an approved browser capability
 and a trusted remote authentication transport, such as Chrome's
@@ -194,3 +207,22 @@ The normal [cross-device passkey flow](https://fidoalliance.org/passkeys-2/)
 requires proximity; displaying a cloud browser's QR code on a phone does not
 establish that proximity. Do not report passkey support based on native text
 fields, Face ID approval of another action, or a successful handback receipt.
+
+## Namecheap-shaped forms
+
+The browser journey includes a synthetic form based on Namecheap's publicly
+visible login structure: an ASP.NET POST form, hidden duplicate header fields,
+ID-less username/password inputs with placeholder labels, and an input submit
+control. Native discovery excludes hidden duplicates and the offscreen newsletter
+field. Redacted snapshots label an otherwise unnamed submit input `Submit form`
+without reading its value, so the agent can continue after native handback.
+
+The journey uses the same retained browser for native password entry, handback,
+agent submission, another native code request, handback and agent verification.
+The server and second-factor markup are synthetic; this is not a live Namecheap
+account sign-in or passkey test. Namecheap documents password followed by either
+[authenticator-code or device authentication](https://www.namecheap.com/support/knowledgebase/article.aspx/9253/45/how-can-i-enabledisable-twofactor-authentication/).
+Its [WebAuthn/security-key flow](https://www.namecheap.com/support/knowledgebase/article.aspx/10102/45/how-can-i-use-the-u2f-method-for-twofactor-authentication/)
+requires the actual registered authenticator, subject to the passkey limitations
+above. No changes to an account's authentication settings are needed or performed
+by the compatibility test.
