@@ -17,15 +17,32 @@ export class CodeSession extends DurableObject {
     super(ctx, env);
     this.journal = createManagedCodeEffectJournal(ctx.storage);
     ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS fixture_effects (singleton INTEGER PRIMARY KEY, count INTEGER NOT NULL); INSERT OR IGNORE INTO fixture_effects VALUES (1,0)');
+    const evaluate = managedCodeEvaluator();
     this.runtime = createCodeRuntime({ effect: { handler: async () => {
       ctx.storage.sql.exec('UPDATE fixture_effects SET count=count+1');
       await ctx.storage.sync(); return { count: ctx.storage.sql.exec('SELECT count FROM fixture_effects').one().count };
-    }}}, { evaluate: managedCodeEvaluator(), effectJournal: this.journal,
+    }}}, { evaluate: async (source, environment) => {
+      if (source === this.pausedSource) { this.entered(); await this.gate; }
+      return evaluate(source, environment);
+    }, effectJournal: this.journal,
       effectIdentity: () => ({ operationId: 'fixture-operation', modelCallIndex: 1 }) });
   }
   async fetch(request) {
     const input = await request.json();
     try {
+      if (input.action === 'concurrent') {
+        this.pausedSource = input.staleSource;
+        const starting = new Promise(resolve => { this.entered = resolve; });
+        let release;
+        this.gate = new Promise(resolve => { release = resolve; });
+        const stale = this.runtime.executeCode(input.staleSource, input.session, 'stale');
+        await starting;
+        try {
+          const admitted = JSON.parse(await this.runtime.executeCode(input.admittedSource, input.session, 'admitted'));
+          release();
+          return Response.json({admitted, stale:JSON.parse(await stale)});
+        } finally { release(); this.pausedSource = undefined; }
+      }
       if (input.action === 'execute') return new Response(await this.runtime.executeCode(input.source, input.session, input.cell), { headers: { 'content-type': 'application/json' } });
       if (input.action === 'abort') {
         const first = JSON.parse(await this.runtime.executeCodeObserved(input.source, input.session, input.cell));
@@ -42,7 +59,8 @@ export class CodeSession extends DurableObject {
       }
       if (input.action === 'restore') { await this.journal.restoreStore(input.session,input.entries); return Response.json({restored:true}); }
       if (input.action === 'inspect') return Response.json({effects:this.ctx.storage.sql.exec('SELECT count FROM fixture_effects').one().count,
-        cells:this.ctx.storage.sql.exec('SELECT cell_key,writes_hash FROM managed_code_cells ORDER BY cell_key').toArray(),
+        cells:this.ctx.storage.sql.exec('SELECT cell_key,writes_hash,expected_version FROM managed_code_cells ORDER BY cell_key').toArray(),
+        versions:this.ctx.storage.sql.exec('SELECT session_id,version FROM managed_code_store_versions ORDER BY session_id').toArray(),
         blobs:this.ctx.storage.sql.exec('SELECT blob_key,chunks,bytes FROM managed_code_store_blobs ORDER BY blob_key').toArray()});
       if (input.action === 'orphan-cell') {
         const key=input.kind+':'+JSON.stringify([input.session,'fixture-operation',1,input.cell]);
@@ -146,6 +164,36 @@ test('hosted Code Mode retains terminal state across cold workerd, rolls back fa
     assert.equal(observed.cells.find(cell=>cell.cell_key==='["aggregate","fixture-operation",1,"overflow"]').writes_hash,null);
     assert.equal(observed.blobs.some(blob=>blob.blob_key==='receipt:["aggregate","fixture-operation",1,"overflow"]'),false);
     assert.equal(observed.blobs.some(blob=>blob.blob_key==='session:too-large'||blob.blob_key.startsWith('session:rejected-')),false);
+    // Both real guests read 41 from durable overlapping snapshots. Only the
+    // admitted increment may commit; the stale increment and its second key
+    // remain unknown even after a cold workerd and a newer committed update.
+    assert.equal((await exec('concurrent','seed','store("counter",41);')).success,true);
+    const staleSource = 'const count=load("counter"); text(await tools.effect({})); store("counter",count+1); store("staleOnly",true); text(count);';
+    const admittedSource = 'const count=load("counter"); text(await tools.effect({})); store("counter",count+1); text(count);';
+    const concurrent = await request({action:'concurrent',session:'concurrent',staleSource,admittedSource});
+    assert.equal(concurrent.status,200);
+    assert.equal(concurrent.value.admitted.success,true);
+    assert.equal(concurrent.value.stale.success,false);
+    assert.match(concurrent.value.stale.output,/version conflict.*outcome unknown/);
+    assert.deepEqual(concurrent.value.admitted.output.at(-1),{type:'input_text',text:'41'});
+    assert.deepEqual((await request({action:'snapshot',session:'concurrent'})).value,[['counter',42]]);
+    await mf.dispose(); mf = start();
+    assert.equal((await exec('concurrent','newer','store("counter",load("counter")+1);')).success,true);
+    const retainedUnknown = await exec('concurrent','stale',staleSource);
+    assert.equal(retainedUnknown.success,false);
+    assert.match(retainedUnknown.output,/version conflict.*outcome unknown/);
+    assert.deepEqual(await exec('concurrent','admitted',admittedSource),concurrent.value.admitted);
+    assert.deepEqual((await request({action:'snapshot',session:'concurrent'})).value,[['counter',43]]);
+    const afterConflict = (await request({action:'inspect'})).value;
+    assert.equal(afterConflict.effects,3);
+    const staleKey = '["concurrent","fixture-operation",1,"stale"]';
+    assert.deepEqual(afterConflict.cells.find(cell=>cell.cell_key===staleKey),{cell_key:staleKey,writes_hash:null,expected_version:1});
+    assert.equal(afterConflict.blobs.some(blob=>blob.blob_key==='receipt:'+staleKey),false);
+    assert.deepEqual(afterConflict.versions.find(row=>row.session_id==='concurrent'),{session_id:'concurrent',version:3});
+    assert.equal((await exec('empty','read','text(load("missing")===undefined);')).success,true);
+    await mf.dispose(); mf = start();
+    assert.deepEqual((await request({action:'snapshot',session:'empty'})).value,[]);
+    assert.equal((await exec('empty','read-again','text(load("missing")===undefined);')).success,true);
     console.log('HOSTED_CODE_STATE_TRACE',JSON.stringify({output,trace}));
   } finally {
     await writeFile(output+'/trace.json',JSON.stringify(trace,null,2));

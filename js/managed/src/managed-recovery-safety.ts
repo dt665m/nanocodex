@@ -123,6 +123,9 @@ export function createManagedCodeEffectJournal(storage: DurableObjectStorage): C
   storage.sql.exec(`CREATE TABLE IF NOT EXISTS managed_code_cells (
     cell_key TEXT PRIMARY KEY, source_hash TEXT NOT NULL, writes_hash TEXT, session_id TEXT NOT NULL, generation TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS managed_code_store_versions (
+    session_id TEXT PRIMARY KEY, version INTEGER NOT NULL
+  );
   CREATE TABLE IF NOT EXISTS managed_code_store_blobs (
     blob_key TEXT PRIMARY KEY, chunks INTEGER NOT NULL, bytes INTEGER NOT NULL, hash TEXT NOT NULL
   );
@@ -130,7 +133,7 @@ export function createManagedCodeEffectJournal(storage: DurableObjectStorage): C
     blob_key TEXT NOT NULL, chunk_index INTEGER NOT NULL, value_json TEXT NOT NULL,
     PRIMARY KEY (blob_key, chunk_index)
   )`);
-  addScopeColumns(storage, "managed_code_cells", [["generation", "TEXT NOT NULL DEFAULT ''"]]);
+  addScopeColumns(storage, "managed_code_cells", [["generation", "TEXT NOT NULL DEFAULT ''"], ["expected_version", "INTEGER NOT NULL DEFAULT -1"]]);
   // Preserve older live schemas without assigning their unscoped receipts to
   // a guessed operation. Old three-tuple keys remain conservative unknowns.
   addScopeColumns(storage, "managed_code_effects", [
@@ -217,8 +220,13 @@ export function createManagedCodeEffectJournal(storage: DurableObjectStorage): C
     ).toArray()[0];
     if (!metadata) {
       const orphaned = storage.sql.exec("SELECT 1 FROM managed_code_store_chunks WHERE blob_key = ? LIMIT 1", key).toArray().length;
+      // Read-only terminal cells do not initialize session state. A version
+      // row proves state was written/restored; pre-CAS cells always wrote a
+      // session blob, including empty writes, so preserve their loss fence.
       const committedSession = key.startsWith("session:") && storage.sql.exec(
-        "SELECT 1 FROM managed_code_cells WHERE session_id = ? AND writes_hash IS NOT NULL LIMIT 1", key.slice(8),
+        `SELECT 1 FROM managed_code_store_versions WHERE session_id = ?
+          UNION ALL SELECT 1 FROM managed_code_cells WHERE session_id = ?
+          AND writes_hash IS NOT NULL AND expected_version < 0 LIMIT 1`, key.slice(8), key.slice(8),
       ).toArray().length;
       if (required || orphaned || committedSession) throw codeEffectUnknown("Code Mode starting store snapshot is missing");
       return [];
@@ -242,6 +250,15 @@ export function createManagedCodeEffectJournal(storage: DurableObjectStorage): C
     catch { throw codeEffectUnknown("Code Mode store snapshot is corrupt"); }
     encodeEntries(entries);
     return entries;
+  };
+  const storeVersion = (sessionId: string): number => {
+    const version = storage.sql.exec<{ version: number }>(
+      "SELECT version FROM managed_code_store_versions WHERE session_id = ?", sessionId,
+    ).toArray()[0]?.version ?? 0;
+    if (!Number.isSafeInteger(version) || version < 0 || version >= Number.MAX_SAFE_INTEGER) {
+      throw codeEffectUnknown("Code Mode store version is invalid or exhausted");
+    }
+    return version;
   };
   const writeEntries = (key: string, entries: Entries) => {
     const encoded = encodeEntries(entries);
@@ -286,8 +303,9 @@ export function createManagedCodeEffectJournal(storage: DurableObjectStorage): C
           throw codeEffectUnknown("Code Mode legacy cell has no retained starting store snapshot");
         }
         const starting = readEntries("session:" + context.sessionId, false);
+        const version = storeVersion(context.sessionId);
         writeEntries("cell:" + cellKey, starting);
-        storage.sql.exec("INSERT INTO managed_code_cells (cell_key, source_hash, writes_hash, session_id, generation) VALUES (?, ?, NULL, ?, ?)", cellKey, hash, context.sessionId, generation);
+        storage.sql.exec("INSERT INTO managed_code_cells (cell_key, source_hash, writes_hash, session_id, generation, expected_version) VALUES (?, ?, NULL, ?, ?, ?)", cellKey, hash, context.sessionId, generation, version);
         return { status: "execute" as const, entries: starting };
       });
       await storage.sync();
@@ -302,19 +320,30 @@ export function createManagedCodeEffectJournal(storage: DurableObjectStorage): C
       const writesHash = digest(encodeEntries([["writes", writes], ["receipt", receipt]]));
       storage.transactionSync(() => {
         assertOwner();
-        const existing = storage.sql.exec<{ source_hash: string; writes_hash: string | null }>(
-          "SELECT source_hash, writes_hash FROM managed_code_cells WHERE cell_key = ?", cellKey,
+        const existing = storage.sql.exec<{ source_hash: string; writes_hash: string | null; expected_version: number }>(
+          "SELECT source_hash, writes_hash, expected_version FROM managed_code_cells WHERE cell_key = ?", cellKey,
         ).toArray()[0];
         if (!existing || existing.source_hash !== hash) throw codeEffectUnknown("Code Mode cell store lost its original intent");
         if (existing.writes_hash !== null) {
           if (existing.writes_hash !== writesHash) throw codeEffectUnknown("Code Mode replay store writes conflict");
           return; // Replay must not overwrite a newer cell's committed writes.
         }
-        const merged = new Map(readEntries("session:" + context.sessionId, false));
-        for (const [key, value] of writes) merged.set(key, value);
+        // Match the native document expected-version contract. A delta cannot
+        // safely merge after another writer changes the snapshot it read:
+        // concurrent same-key read/modify/write would lose an admitted update.
+        if (writes.length > 0) {
+          const version = storeVersion(context.sessionId);
+          if (!Number.isSafeInteger(existing.expected_version) || existing.expected_version < 0 || existing.expected_version !== version) {
+            throw codeEffectUnknown("Code Mode store version conflict; stale cell writes were not committed");
+          }
+          const merged = new Map(readEntries("session:" + context.sessionId, false));
+          for (const [key, value] of writes) merged.set(key, value);
+          writeEntries("session:" + context.sessionId, [...merged]);
+          storage.sql.exec(`INSERT INTO managed_code_store_versions VALUES (?, ?)
+            ON CONFLICT(session_id) DO UPDATE SET version = excluded.version`, context.sessionId, version + 1);
+        }
         // State and the exact result are one SQLite transaction. Neither is
         // visible when validation/encoding or receipt persistence fails.
-        writeEntries("session:" + context.sessionId, [...merged]);
         writeEntries("receipt:" + cellKey, [["receipt", receipt]]);
         storage.sql.exec("UPDATE managed_code_cells SET writes_hash = ? WHERE cell_key = ?", writesHash, cellKey);
       });
@@ -333,10 +362,12 @@ export function createManagedCodeEffectJournal(storage: DurableObjectStorage): C
         assertOwner();
         if (storage.sql.exec("SELECT 1 FROM managed_code_cells WHERE session_id = ? LIMIT 1", sessionId).toArray().length
           || storage.sql.exec("SELECT 1 FROM managed_code_store_blobs WHERE blob_key = ? LIMIT 1", "session:" + sessionId).toArray().length
-          || storage.sql.exec("SELECT 1 FROM managed_code_store_chunks WHERE blob_key = ? LIMIT 1", "session:" + sessionId).toArray().length) {
+          || storage.sql.exec("SELECT 1 FROM managed_code_store_chunks WHERE blob_key = ? LIMIT 1", "session:" + sessionId).toArray().length
+          || storage.sql.exec("SELECT 1 FROM managed_code_store_versions WHERE session_id = ? LIMIT 1", sessionId).toArray().length) {
           throw codeEffectUnknown("Code Mode fork destination already exists");
         }
         writeEntries("session:" + sessionId, entries);
+        storage.sql.exec("INSERT INTO managed_code_store_versions VALUES (?, 1)", sessionId);
       });
       await storage.sync();
       assertOwner();
