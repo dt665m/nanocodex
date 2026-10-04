@@ -155,20 +155,14 @@ impl AgentHandle {
         host_context: Option<Arc<str>>,
     ) -> Result<(Nanocodex, AgentEvents)> {
         self.native.ensure_available(self.clone()).await?;
-        if snapshot.model().family() == self.harness_family() {
-            self.native
-                .restore(self.clone(), snapshot, host_context)
-                .await
+        if self.factory.is_some() {
+            self.restore_runtime_with_factory(snapshot, host_context).await
+        } else if snapshot.model().family() == self.harness_family() {
+            self.native.restore(self.clone(), snapshot, host_context).await
         } else {
-            self.factory
-                .as_ref()
-                .ok_or_else(|| {
-                    NanocodexError::InvalidRequest(
-                        "checkpoint family requires a configured child factory".into(),
-                    )
-                })?
-                .restore(self.clone(), snapshot, host_context)
-                .await
+            Err(NanocodexError::InvalidRequest(
+                "checkpoint family requires a configured child factory".into(),
+            ))
         }
     }
     /// Restores a retained child through the embedding's configured factory.
