@@ -8,6 +8,7 @@ pub struct ToolRuntime {
     pub(super) registry: Arc<ToolRegistry>,
     exposure: Option<ToolExposure>,
     deferred_tools_guidance_enabled: bool,
+    inline_docs_token_budget: usize,
     code_mode: code_mode::CodeModeRuntime,
     sessions: Arc<ShellSessions>,
     current_turn: Arc<AtomicU64>,
@@ -114,6 +115,7 @@ impl ToolRuntime {
             registry: Arc::new(ToolRegistry::from_ordered(handlers)),
             exposure: None,
             deferred_tools_guidance_enabled: false,
+            inline_docs_token_budget: 3000,
             code_mode: code_mode::CodeModeRuntime::new_with_turn(
                 code_mode_workspace,
                 Arc::clone(&current_turn),
@@ -127,6 +129,7 @@ impl ToolRuntime {
 
     fn with_tools(mut self, tools: &Tools) -> Self {
         tools.start_providers();
+        self.inline_docs_token_budget = tools.inline_docs_token_budget;
         let registry = Arc::make_mut(&mut self.registry);
         if self.exposure.is_none() {
             let exposure = tools.exposure();
@@ -222,6 +225,7 @@ impl ToolRuntime {
                 &provider_summaries,
                 self.deferred_tools_guidance_enabled,
                 self.exposure.unwrap_or_default() == ToolExposure::CodeModeOnly,
+                self.inline_docs_token_budget,
             ),
             code_mode::wait_spec(),
         ];

@@ -174,6 +174,8 @@ impl ToolSource for crate::mcp::Mcp {
 #[derive(Clone)]
 pub struct Tools {
     exposure: ToolExposure,
+    #[cfg(feature = "code-mode")]
+    pub(crate) inline_docs_token_budget: usize,
     workspace: bool,
     web_search: bool,
     image_generation: bool,
@@ -206,6 +208,8 @@ impl Default for Tools {
     fn default() -> Self {
         Self {
             exposure: ToolExposure::default(),
+            #[cfg(feature = "code-mode")]
+            inline_docs_token_budget: 3000,
             workspace: true,
             web_search: true,
             image_generation: true,
@@ -493,6 +497,18 @@ impl ToolsBuilder {
     #[must_use]
     pub const fn exposure(mut self, exposure: ToolExposure) -> Self {
         self.tools.exposure = exposure;
+        self
+    }
+
+    /// Sets the budget for inline Code Mode tool documentation (default 3000).
+    ///
+    /// Estimated tokens are UTF-8 bytes divided by four, rounded up. The fixed
+    /// execution instructions are excluded. Zero omits all inline tool docs;
+    /// omitted tools remain callable and discoverable from the admitted catalog.
+    #[must_use]
+    #[cfg(feature = "code-mode")]
+    pub const fn inline_docs_token_budget(mut self, tokens: usize) -> Self {
+        self.tools.inline_docs_token_budget = tokens;
         self
     }
 

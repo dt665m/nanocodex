@@ -271,7 +271,10 @@ fn run_execution_in_context<'js>(
         .catch(ctx)
         .map_err(|error| format!("failed to evaluate shared tool facade: {error}"))?;
     let create_discovery = ctx
-        .eval::<Function<'js>, _>(format!("({})", CODE_DISCOVERY.replacen("export function", "function", 1)))
+        .eval::<Function<'js>, _>(format!(
+            "({})",
+            CODE_DISCOVERY.replacen("export function", "function", 1)
+        ))
         .catch(ctx)
         .map_err(|error| format!("failed to evaluate shared tool discovery: {error}"))?;
     let values_factory = CODE_VALUES

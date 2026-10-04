@@ -98,6 +98,8 @@ export declare namespace create {
   type Options = Readonly<{
     /** Observer-only instant steering; disabled unless explicitly enabled. */
     instantToolSteering?: boolean | undefined;
+    /** Inline Code Mode tool docs budget; default 3000 estimated tokens. */
+    inlineDocsTokenBudget?: AgentOptions["inlineDocsTokenBudget"];
     /** Awaited host preservation barrier; scoped to this root, never inherited by children. */
     beforeCompaction?: AgentOptions["beforeCompaction"];
     /** Stable portable state identity. It cannot change after first construction or import. */

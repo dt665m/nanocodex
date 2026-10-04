@@ -330,6 +330,10 @@ export function toWasmConfig(options = {}) {
   copy(config, "reasoning_mode", options.reasoningMode);
   copy(config, "fast_mode", options.fastMode);
   copy(config, "instant_tool_steering", options.instantToolSteering);
+  if (options.inlineDocsTokenBudget !== undefined && (!Number.isSafeInteger(options.inlineDocsTokenBudget) || options.inlineDocsTokenBudget < 0)) {
+    throw new TypeError("inlineDocsTokenBudget must be a non-negative safe integer");
+  }
+  copy(config, "inline_docs_token_budget", options.inlineDocsTokenBudget);
   copy(config, "stateless_http", options.stateless);
   copy(config, "subagent_routing", options.subagentRouting);
   copy(config, "websocket_warmup", options.websocketWarmup);
