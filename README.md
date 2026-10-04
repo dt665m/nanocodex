@@ -684,6 +684,14 @@ Streaming, history, queued prompts, steering and cancellation share the same
 agent controller. Connect grants continue to define authorization and visibility;
 embedding a component never grants additional access.
 
+For native apps, [the Swift SDK](apple/NanocodexConnectEmbed/README.md) exposes
+`NanocodexConnectEmbed` through the repository's root Swift Package Manager
+manifest. Compose host-styled conversations on iOS 17+ and macOS 14+, with the
+virtualized transcript engine on iOS 18+. The native Nanocodex and DJ Booth
+integrations share these components while retaining their authorization and
+transport ownership. A [standalone iOS example](apple/NanocodexConnectEmbed/Examples/SDKConsumer)
+consumes the public package product.
+
 ### Bring any terminal or product interface
 
 To attach to a running `nanocodex` or `nanocodex2` TUI, use
