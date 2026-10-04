@@ -161,7 +161,7 @@ function createIframeInstance(host) {
       `publickey-credentials-create ${dialogOrigin}`,
       "payment",
     ].join("; ");
-    frame.style.cssText = "border:0;width:min(440px,calc(100vw - 24px));height:min(720px,calc(100vh - 24px));background:#161616";
+    frame.style.cssText = "border:0;width:min(808px,100vw);height:min(780px,100dvh);background:transparent";
     frame.style.display = "none";
     modal.append(frame);
     document.body.append(modal);
@@ -319,7 +319,7 @@ function createIframeInstance(host) {
 function createPopupInstance(host, options) {
   const source = host;
   const targetName = options.target ?? "nanocodex-connect";
-  const features = options.features ?? "popup=yes,width=440,height=720,resizable=yes,scrollbars=yes";
+  const features = options.features ?? "popup=yes,width=808,height=780,resizable=yes,scrollbars=yes";
   let walletWindow;
 
   function showWallet() {

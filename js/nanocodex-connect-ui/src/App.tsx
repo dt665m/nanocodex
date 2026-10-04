@@ -1338,12 +1338,7 @@ export function ConnectOnboarding({
       data-request={request.type}
       data-testid={wizard ? "device-connect-wizard" : "remote-connect-dialog"}
     >
-      {!wizard ? <header className="dialog-header">
-        <span className="wordmark">Nanocodex Connect</span>
-          <span className="secure-label"><span aria-hidden="true" /> {hostPrincipalRequest
-            ? "Host identity"
-            : "Account"}</span>
-      </header> : null}
+      {!wizard && request.type !== "walletConnect" ? <header className="dialog-header"><span className="wordmark">Nanocodex Connect</span></header> : null}
 
       {request.type === "walletConnect" ? (
         <>
@@ -1399,7 +1394,7 @@ export function ConnectOnboarding({
                   || (pendingApproval !== undefined && !connectedAccessReady)}
                 onClick={pendingApproval ? approveConnectedAccess : () => void approve()}
               >
-                {!pendingApproval || connectedAccessReady ? "Approve access" : "Connect requested accounts"}
+                Allow access
               </button>
             ) : null}
           </div>}
@@ -1613,15 +1608,16 @@ function ConnectionWizard({
     : undefined;
   const deferredChatGptImport = request.connectPolicy.chatGptCredentialImport;
   const requester = presentation === "wizard" ? "Nanocodex CLI" : request.app.name;
-  const hostedAuthorization = request.auth.resources.includes(hostedAuthorizationResource);
   if (!request.hostPrincipalExchange && !connectorStatuses && !accountAddress) {
     return (
       <AccountChooser
         authOrigin={nanocodexOriginFor(request.apiUrl)}
         confirmationCode={confirmationCode}
+        appName={requester}
+        appOrigin={request.app.origin}
         description={reauthenticationRequired
           ? `Your session expired. Sign in to continue to ${requester}. You’ll review its requested access next.`
-          : `Sign in to continue to ${requester}. You’ll review its requested access next.`}
+          : `Connect your Nanocodex account to ${requester}.`}
         disabled={disabled}
         onCancel={onCancel}
         onChooseAccount={onChooseAccount}
@@ -1631,14 +1627,13 @@ function ConnectionWizard({
 
   return (
     <AccountConnectionSurface
+      requester={requester}
+      origin={request.app.origin}
+      accountLabel={selectedAccount?.label ?? (accountAddress ? shortAddress(accountAddress) : undefined)}
       confirmationCode={confirmationCode}
       description={completed && deferredChatGptImport
         ? <DeferredChatGptImportStatus approved />
-        : <>{accountAddress
-            ? `Signed in as ${shortAddress(accountAddress)}. `
-            : selectedAccount
-              ? `${selectedAccount.mode === "register" ? "Create" : "Use"} ${selectedAccount.label}. `
-            : ""}{focused
+        : <>{focused
                 ? focused.id === "chatgpt" && deferredChatGptImport
                   ? <DeferredChatGptImportStatus approved={false} />
                   : focusedControl?.connected
@@ -1655,22 +1650,22 @@ function ConnectionWizard({
                       ? `Continue in ${focusedMcp.name}. You’ll return here when it is connected.`
                       : request.hostPrincipalExchange ? "Approve with your host identity." : "Continue with SMS verification."
                 : presentation === "dialog"
-                  ? `Connect any missing accounts, then approve ${requester}’s requested access.`
+                  ? "Review what you share with this app."
                   : `Review ${requester}’s hosted access.`}</>}
       footer={completed && presentation === "wizard" ? (
         <div className="completion-actions">
           <a href="/connect">Connect more accounts</a>
         </div>
       ) : undefined}
-      title={focused ? `Connect ${connectorProviderLabel(requiredConnectorProvider(focused.id))}` : focusedMcp ? `Connect ${focusedMcp.name}` : `Authorize ${requester}`}
+      title={focused ? `Connect ${connectorProviderLabel(requiredConnectorProvider(focused.id))}` : focusedMcp ? `Connect ${focusedMcp.name}` : `Connect to ${requester}`}
     >
         {request.permission.connectors.length ? <AccountConnectionSection
           eyebrow="Service"
-          meta={focused ? `Requested by ${requester}` : `${request.permission.connectors.length} requested by ${requester}`}
-          title={focusedProvider ? connectorProviderLabel(focusedProvider) : "Connections"}
+          meta={undefined}
+          title={focusedProvider ? connectorProviderLabel(focusedProvider) : "Account access"}
           titleId="wizard-services-heading"
         >
-          <p>{requester} and its agents can read and make changes through the services you approve here, using only the selected accounts and each service’s permissions.</p>
+          <p className="section-description">Let this app and its agents read and make changes within each account’s granted permissions.</p>
           <WizardConnectorList connectorAction={connectorAction} connectorStatuses={connectorStatuses} disabled={disabled} onConnectConnector={onConnectConnector} request={request} />
           {deviceCode ? (
             <a className="wizard-device-code" href={deviceCode.url} rel="noreferrer" target="_blank">
@@ -1697,10 +1692,8 @@ function ConnectionWizard({
 
         {!focused && !focusedMcp ? <AccountConnectionSection
           eyebrow="Access"
-          meta={hostedAuthorization
-            ? "No delegated key"
-            : request.accessKey ? "30-day key" : "Active key"}
-          title={`${requester} access`}
+          meta={undefined}
+          title="App permissions"
           titleId="wizard-access-heading"
         >
           <WizardRequestSummary appVisibility={appVisibility} request={request} />
@@ -1794,6 +1787,7 @@ function WizardRequestSummary({ appVisibility, request }: Readonly<{
     <section className="wizard-request-summary" aria-labelledby="wizard-request-heading">
       <h2 className="sr-only" id="wizard-request-heading">Installation capabilities</h2>
       <div className="wizard-visibility" role="list" aria-label="App sees">
+        {request.auth.resources.includes("urn:nanocodex:agent:run") ? <div role="listitem"><span aria-hidden="true">✓</span><div><strong>Run an agent</strong><small>Start tasks using the access approved here.</small></div></div> : null}
         <AppVisibilityPermissions permissions={appVisibility} />
         {request.mpp ? (
           <div role="listitem">
@@ -2411,14 +2405,9 @@ function connectorControlDetail(
     }
   }
   if (control.provider === "google") {
-    const granted = connected.length
-      ? connected.map(connectorCapabilityLabel).join(", ")
-      : "None yet";
-    const remainder = missing.length
-      ? ` Still needed: ${missing.map(connectorCapabilityLabel).join(", ")}.`
-      : "";
-    const identities = labels.length ? ` ${labels.join(" · ")}.` : "";
-    return `Granted: ${granted}.${remainder}${identities}`;
+    const granted = connected.length ? `${connected.map(connectorCapabilityLabel).join(", ")} connected` : "";
+    const remainder = missing.length ? `${missing.map(connectorCapabilityLabel).join(", ")} requested` : "";
+    return [...labels, granted, remainder].filter(Boolean).join(" · ");
   }
   if (connected.length === 0) return control.detail;
   if (control.provider === "slack") {

@@ -2,7 +2,7 @@ import { expect, test, type Page, type TestInfo } from "@playwright/test";
 import { mkdir, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
-const evidence = resolve(process.cwd(), "../../output/connect-native-modal");
+const evidence = resolve(process.cwd(), "../../output/connect-modal-v2");
 const sizes = [
   { name: "desktop", width: 1280, height: 900 },
   { name: "mobile", width: 390, height: 844 },
@@ -99,9 +99,9 @@ for (const theme of ["light", "dark"] as const) {
       await phone.press("Enter");
       await code.fill("123456");
       await code.press("Enter");
-      const approve = page.getByRole("button", { name: "Approve access" });
+      const approve = page.getByRole("button", { name: "Allow access" });
       await expect(approve).toBeEnabled();
-      await expect(page.getByRole("heading", { name: "Authorize Atlas Workspace" })).toBeFocused();
+      await expect(page.getByRole("heading", { name: "Connect to Atlas Workspace" })).toBeFocused();
       expect(await page.locator(".dialog-content").evaluate(el => el.scrollTop)).toBe(0);
       expect(await page.evaluate(() => (window as any).__hostReceipt)).toBeUndefined();
       const geometry = await contained(page);
@@ -135,7 +135,7 @@ test("cancel and Escape never approve access", async ({ page }) => {
   await page.getByRole("button", { name: "Text me a code" }).click();
   await page.getByRole("textbox", { name: "6-digit code" }).fill("123456");
   await page.getByRole("button", { name: "Continue", exact: true }).click();
-  await expect(page.getByRole("button", { name: "Approve access" })).toBeEnabled();
+  await expect(page.getByRole("button", { name: "Allow access" })).toBeEnabled();
   await page.getByRole("button", { name: "Cancel", exact: true }).click();
   await expect(page.getByRole("status")).toHaveText("Request cancelled");
   expect(await page.evaluate(() => (window as any).__hostReceipt.kind)).toBe("cancelled");
@@ -143,9 +143,11 @@ test("cancel and Escape never approve access", async ({ page }) => {
 
 for (const variant of [
   { theme: "light" as const, width: 1280, height: 900 },
+  { theme: "dark" as const, width: 1280, height: 900 },
+  { theme: "light" as const, width: 390, height: 844 },
   { theme: "dark" as const, width: 390, height: 844 },
 ]) {
-  test(`${variant.theme} requested connection groups`, async ({ page }, info) => {
+  test(`${variant.theme} ${variant.width > 620 ? "desktop" : "mobile"} requested connection groups`, async ({ page }, info) => {
     await page.setViewportSize(variant);
     await page.emulateMedia({ colorScheme: variant.theme });
     await page.goto("/?connections=1");
@@ -153,18 +155,37 @@ for (const variant of [
     await page.getByRole("button", { name: "Text me a code" }).click();
     await page.getByRole("textbox", { name: "6-digit code" }).fill("123456");
     await page.getByRole("button", { name: "Continue", exact: true }).click();
-    await expect(page.getByRole("heading", { name: "Authorize Atlas Workspace" })).toBeFocused();
+    await expect(page.getByRole("heading", { name: "Connect to Atlas Workspace" })).toBeFocused();
     await expect(page.getByRole("button", { name: /GitHub.*Connected/ })).toBeDisabled();
     const connection = page.getByRole("button", { name: /Google Workspace.*Connect/ });
     await expect(connection).toBeEnabled();
-    await expect(page.getByRole("button", { name: "Connect requested accounts", exact: true })).toBeDisabled();
+    await expect(page.getByRole("button", { name: "Allow access", exact: true })).toBeDisabled();
+    await contained(page);
+    await screenshot(page, info, "connections");
     await page.keyboard.press("Tab");
     await expect(connection).toBeFocused();
     expect(await connection.evaluate(el => getComputedStyle(el).outlineOffset)).toBe("-3px");
-    await contained(page);
-    await screenshot(page, info, "connections");
     expect(await page.evaluate(() => (window as any).__hostReceipt)).toBeUndefined();
     await page.getByRole("button", { name: "Cancel", exact: true }).click();
     await expect(page.getByRole("status")).toHaveText("Request cancelled");
   });
 }
+
+test("SDK popup presents the desktop authorization layout", async ({ page }) => {
+  await page.goto("/launcher.html");
+  const opened = page.waitForEvent("popup");
+  await page.getByRole("button", { name: "Connect account" }).click();
+  const popup = await opened;
+  await popup.getByRole("textbox", { name: "Mobile number" }).fill("+12025550100");
+  await popup.getByRole("button", { name: "Text me a code" }).click();
+  await popup.getByRole("textbox", { name: "6-digit code" }).fill("123456");
+  await popup.getByRole("button", { name: "Continue", exact: true }).click();
+  await expect(popup.getByRole("heading", { name: "Connect to Atlas Workspace" })).toBeFocused();
+  const intro = await popup.locator(".wizard-review-page > .wizard-intro").boundingBox();
+  const access = await popup.locator(".wizard-review-page > .wizard-sections").boundingBox();
+  expect(access!.x).toBeGreaterThan(intro!.x + intro!.width);
+  await contained(popup);
+  await popup.getByRole("button", { name: "Cancel", exact: true }).click();
+  await expect(popup.getByRole("status")).toHaveText("Request cancelled");
+  await popup.close();
+});

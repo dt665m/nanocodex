@@ -17,10 +17,14 @@ export function Approval({ host, request }) {
 The package owns browser presentation and ceremony orchestration. It does not
 issue grants or enforce server-side Connect authority.
 
-The Connect sheet follows the native Swift account surfaces: adaptive neutral
-colors from `ChatPalette`, system typography, inset grouped connections, and
-persistent approval actions. It follows the system appearance unless the
-standalone host sets `data-theme="light"` or `data-theme="dark"`. Styles stay
-scoped to `.connect-onboarding`; the containing application owns the backdrop.
-Long permission descriptions wrap, the sheet content scrolls independently of
-its actions, and reduced-motion preferences disable control transitions.
+The Connect UI separates sign-in from authorization. Sign-in stays compact;
+authorization pairs the requesting app and its origin with a review of accounts
+and permissions. Desktop uses a two-column review; mobile stacks the same
+information above persistent actions. The requester mark is an initial derived
+from the validated app name, and Nanocodex uses its canonical mark.
+
+The standalone host follows system appearance unless `data-theme="light"` or
+`data-theme="dark"` is set. Styles remain scoped to `.connect-onboarding`.
+The containing application owns the backdrop. Reduced-motion preferences disable
+control transitions. See the Connect dialog browser journeys for reproducible
+light/dark mobile and desktop checks.
