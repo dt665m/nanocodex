@@ -6,6 +6,8 @@ use super::*;
 struct CurrentExecution {
     phase: ExecutionPhase,
     #[serde(default)]
+    request_policy: Value,
+    #[serde(default)]
     instruction_revision: Option<u64>,
     workspace: String,
     canonical_context: ResponseItem,
@@ -108,6 +110,7 @@ where
         } else {
             ConversationState::resume(saved.canonical_context, history)?
         };
+        session.conversation.request_policy = saved.request_policy;
         session
             .conversation
             .managed
@@ -196,6 +199,7 @@ where
         self.record_transport();
         let steps = self.execution_steps.as_ref().expect("durable execution");
         let saved = CurrentExecution {
+            request_policy: session.conversation.request_policy.clone(),
             phase,
             instruction_revision: self.instruction_revision,
             workspace: session.workspace.clone(),
@@ -242,6 +246,7 @@ mod tests {
     #[test]
     fn execution_accounting_basis_roundtrips_and_defaults_for_legacy_records() {
         let saved = CurrentExecution {
+            request_policy: Value::Null,
             phase: ExecutionPhase::Generate,
             instruction_revision: None,
             workspace: ".".into(),

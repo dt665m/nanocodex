@@ -77,6 +77,15 @@ pub struct ExecutionContinuation {
     pub prefix: Vec<nanocodex_oai_api::responses::ResponseItem>,
 }
 
+/// Provider request and branch policy state prepared before external dispatch.
+#[derive(Clone, Deserialize, Serialize)]
+pub struct RequestPreparation {
+    /// Exact provider-native body excluding credentials.
+    pub request: serde_json::Value,
+    /// Branch-local configuration and routing checkpoint.
+    pub state: serde_json::Value,
+}
+
 /// One live steering input retained for deterministic operation recovery.
 #[derive(Clone, Debug)]
 pub struct ExecutionSteer {
@@ -110,6 +119,14 @@ pub struct ExecutionOutput {
 /// without becoming a dependency of `nanocodex-agent`.
 #[cfg(not(target_family = "wasm"))]
 pub trait ExecutionPolicy: Send + Sync {
+    /// Optionally freezes a native provider request before transport authentication.
+    /// The returned state is retained with the native conversation checkpoint.
+    fn prepare_request<'a>(&'a self, _operation: String, _request_id: String,
+        _continuation: bool, _state: serde_json::Value, _request: serde_json::Value,
+        _authorized: serde_json::Value) -> ExecutionFuture<'a, Result<Option<RequestPreparation>>> {
+        Box::pin(async { Ok(None) })
+    }
+
     /// Resolves a failed attempt against the authoritative operation state.
     /// A pending operation must return a retry/reopen disposition, even when
     /// its original failure was not a transport or storage error.
@@ -355,6 +372,14 @@ pub trait ExecutionPolicy: Send + Sync {
 /// guarantees on every target.
 #[cfg(target_family = "wasm")]
 pub trait ExecutionPolicy: Send + Sync {
+    /// Optionally freezes a native provider request before transport authentication.
+    /// The returned state is retained with the native conversation checkpoint.
+    fn prepare_request<'a>(&'a self, _operation: String, _request_id: String,
+        _continuation: bool, _state: serde_json::Value, _request: serde_json::Value,
+        _authorized: serde_json::Value) -> ExecutionFuture<'a, Result<Option<RequestPreparation>>> {
+        Box::pin(async { Ok(None) })
+    }
+
     /// Resolves a failed attempt against the authoritative operation state.
     /// Pending work must remain recoverable regardless of the original error.
     fn recover_failure<'a>(
@@ -1005,6 +1030,13 @@ pub(crate) enum ExecutionStep<O> {
 }
 
 impl ExecutionSteps {
+    pub(crate) async fn prepare_request(&self, request_id: String, continuation: bool,
+        state: serde_json::Value, request: serde_json::Value, authorized: serde_json::Value)
+        -> Result<Option<RequestPreparation>> {
+        self.policy.prepare_request(self.operation_id.clone(), request_id, continuation,
+            state, request, authorized).await
+    }
+
     pub(crate) fn operation_id(&self) -> &str {
         &self.operation_id
     }

@@ -457,6 +457,18 @@ impl ResponsesService {
         request: &ResponsesAttempt,
         transport: ResponsesTransport,
     ) -> Result<EncodedRequest, ResponsesServiceError> {
+        if let Some(prepared) = &request.prepared_request {
+            let mut body = (**prepared).clone();
+            if transport == ResponsesTransport::WebSocket {
+                body["type"] = "response.create".into();
+                body["client_metadata"]["responses_lite"] = "true".into();
+                if let Some(state) = connection.turn_state.as_deref() {
+                    body["client_metadata"]["turn_state"] = state.into();
+                }
+            }
+            return EncodedRequest::new(&body).map_err(|error|
+                ResponsesServiceError::responses(error, FailurePhase::Encode, connection.generation));
+        }
         let encoded = match request.kind {
             ResponsesAttemptKind::Warmup => EncodedRequest::new(&ResponseCreate::warmup(
                 &self.config,

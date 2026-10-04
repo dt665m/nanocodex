@@ -830,7 +830,7 @@ where
                 transport_continuation_valid,
                 server_reasoning_included,
             } = self
-                .perform_model_call(call_index, &session.conversation, &session.factory)
+                .perform_model_call(call_index, &mut session.conversation, &session.factory, &session.tools)
                 .await?;
             let TurnResult {
                 id,

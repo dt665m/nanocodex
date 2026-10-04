@@ -25,11 +25,30 @@ where
     pub(super) async fn perform_model_call(
         &mut self,
         call_index: u32,
-        conversation: &ConversationState,
+        conversation: &mut ConversationState,
         factory: &ResponsesAttemptFactory,
+        tools: &ToolRuntime,
     ) -> Result<ModelCallOutcome> {
         let step_id = format!("model-{call_index}");
-        let model = self.model;
+        let mut request = factory.generation(call_index, &conversation.managed.generation_request(),
+            self.model, self.thinking, self.fast_mode);
+        let mut model = self.model;
+        if let Some(steps) = &self.execution_steps {
+            let original = request.native_request(&self.config).map_err(NanocodexError::ExecutionPayload)?;
+            let current = self.attempt_factory(tools)?;
+            let authorized = current.generation(call_index, &conversation.managed.generation_request(),
+                self.model, self.thinking, self.fast_mode).native_request(&self.config)
+                .map_err(NanocodexError::ExecutionPayload)?;
+            let request_id = format!("{}/model-{call_index}", steps.operation_id());
+            if let Some(prepared) = steps.prepare_request(request_id, call_index > 1,
+                conversation.request_policy.clone(), original, authorized).await? {
+                model = prepared.request["model"].as_str().ok_or_else(||
+                    NanocodexError::InvalidExecutionPolicy("prepared model is missing".into()))?
+                    .parse::<Model>().map_err(NanocodexError::InvalidExecutionPolicy)?;
+                conversation.request_policy = prepared.state;
+                request = request.with_prepared_request(prepared.request, model);
+            }
+        }
         let thinking = self.thinking;
         let reasoning_mode = self.config.reasoning_mode;
         let fast_mode = self.fast_mode;
@@ -47,7 +66,7 @@ where
                 previous_response_id,
             },
         )?;
-        let request = factory.generation(call_index, &request_history, model, thinking, fast_mode);
+
         let (input_item_count, input_bytes, input_content) = trace_model_input(&request);
         let span = model_call_span(
             call_index,
