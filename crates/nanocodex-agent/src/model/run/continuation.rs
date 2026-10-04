@@ -34,6 +34,8 @@ struct CurrentExecution {
     warmup_cost: Option<nanocodex_oai_api::pricing::EstimatedUsdCost>,
     context_window_tokens: u64,
     force_compaction: bool,
+    #[serde(default)]
+    background_compaction: Option<background::PendingCompaction>,
     tool_call_indices: HashMap<Box<str>, u32>,
 }
 
@@ -85,6 +87,8 @@ where
         config.store_responses = saved.store_responses;
         config.context_window_tokens = saved.context_window_tokens;
         self.force_compaction = saved.force_compaction;
+        self.background_compaction = saved.background_compaction;
+        self.background_work = None;
         self.instruction_revision = saved.instruction_revision;
         session.factory = session
             .factory
@@ -216,6 +220,7 @@ where
             warmup_cost: self.stats.warmup_usage.estimated_cost.clone(),
             context_window_tokens: self.config.context_window_tokens,
             force_compaction: self.force_compaction,
+            background_compaction: self.background_compaction.clone(),
             tool_call_indices: self.tool_call_indices.clone(),
         };
         steps
@@ -266,6 +271,7 @@ mod tests {
             warmup_cost: None,
             context_window_tokens: 272000,
             force_compaction: false,
+            background_compaction: None,
             tool_call_indices: HashMap::new(),
         };
         let mut encoded = serde_json::to_value(saved).unwrap();

@@ -79,7 +79,19 @@ where
         let (recorded_result, transport_continuation_valid) = if let Some(output) = recovered {
             (output, false)
         } else {
-            let success = match self.client.execute(request).instrument(span.clone()).await {
+            let result = {
+            let foreground = self.client.execute(request).instrument(span.clone());
+            tokio::pin!(foreground);
+            loop {
+                tokio::select! {
+                    result = &mut foreground => break result,
+                    result = background::progress(&mut self.background_work) => {
+                        if let Some(work) = &mut self.background_work { work.result = Some(result); }
+                    }
+                }
+            }
+            };
+            let success = match result {
                 Ok(success) => success,
                 Err(error) => {
                     span.record("status", "failed");

@@ -803,7 +803,6 @@ where
             })
             .collect::<VecDeque<_>>();
         *model_call_index.lock().await = next_call;
-        let mut first_batch = true;
         loop {
             let call_index = self.stats.model_calls + 1;
             if can_drain_steers {
@@ -814,11 +813,12 @@ where
                 self.drain_steers(&mut session.conversation, &mut pending_steers, call_index)
                     .await?;
             }
-            if !first_batch {
-                self.retain_execution(session, ExecutionPhase::Generate)
-                    .await?;
+            self.retain_execution(session, ExecutionPhase::Generate).await?;
+            self.start_background(&session.factory).await?;
+            self.poll_background().await;
+            if self.install_background(&mut session.conversation, &session.factory)?.is_some() {
+                self.retain_execution(session, ExecutionPhase::Generate).await?;
             }
-            first_batch = false;
             Self::publish_fork_snapshot(session, fork_snapshots, self.global_instructions.as_ref());
             let ModelCallOutcome {
                 request,
@@ -898,6 +898,11 @@ where
                     continue;
                 }
                 if let Some(message) = final_message {
+                    // Owned work settles before the foreground operation becomes terminal.
+                    self.retain_execution(session, ExecutionPhase::Generate).await?;
+                    self.start_background(&session.factory).await?;
+                    self.wait_background().await;
+                    self.install_background(&mut session.conversation, &session.factory)?;
                     return Ok(if message.trim().is_empty() {
                         "The model completed without emitting assistant text.".to_owned()
                     } else {
