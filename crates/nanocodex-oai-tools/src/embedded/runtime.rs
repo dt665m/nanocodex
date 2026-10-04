@@ -278,6 +278,12 @@ impl EmbeddedToolRuntime {
         (model_definitions, code_mode_tool_names)
     }
 
+    /// Whether the embedding host durably reconciles interrupted Code Mode cells.
+    #[must_use]
+    pub fn code_replay_safe(&self) -> bool {
+        self.host.as_ref().is_some_and(|host| host.code_replay_safe())
+    }
+
     /// Returns `false`; embedded definitions execute inside one Code Mode cell.
     ///
     /// The embedding host owns any concurrency policy below that cell.

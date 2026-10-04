@@ -916,6 +916,8 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
       });
     },
     router,
+    codeReplaySafe: () => ["begin", "complete", "beginCell", "completeCell"].every(
+      method => typeof extras.effectJournal?.[method] === "function"),
     executeCode,
     executeCodeObserved,
     waitCodeObserved,
