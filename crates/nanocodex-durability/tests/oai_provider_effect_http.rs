@@ -22,7 +22,7 @@ impl Tool for NativeSearch {
         ToolDefinition::tool_search(
             "server",
             "Provider-executed synthetic capability",
-            json!({"type":"object"}).into(),
+            json!({"type":"object"}),
         )
     }
     async fn execute(&self, _: ToolInput, _: ToolContext<'_>) -> ToolResult {
