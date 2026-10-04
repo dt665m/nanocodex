@@ -780,6 +780,9 @@ async fn every_sqlite_write_recovers_before_commit_and_after_lost_acknowledgemen
     // Learn the write boundaries by running the public journey, without coupling
     // fault positions to private state layouts or hard-coded revision numbers.
     let count = transaction_recovery(None, false, CompactionJourney::Automatic).await;
+    println!(
+        "Claude automatic compaction: {count} write boundaries, precommit and lost-ACK crash at each"
+    );
     for after_commit in [false, true] {
         for ordinal in 0..count {
             transaction_recovery(Some(ordinal), after_commit, CompactionJourney::Automatic).await;
@@ -794,6 +797,10 @@ async fn context_exhaustion_recovers_across_every_sqlite_write() {
         CompactionJourney::ExhaustionAfterRecovery,
     ] {
         let count = transaction_recovery(None, false, journey).await;
+        println!(
+            "Claude context recovery repeated_exhaustion={}: {count} write boundaries, precommit and lost-ACK crash at each",
+            matches!(journey, CompactionJourney::ExhaustionAfterRecovery)
+        );
         for after_commit in [false, true] {
             for ordinal in 0..count {
                 transaction_recovery(Some(ordinal), after_commit, journey).await;

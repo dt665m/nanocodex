@@ -188,18 +188,18 @@ async fn provider_tool_http_effect_is_never_redispatched_after_uncertain_settlem
         assert_eq!(effects.load(Ordering::SeqCst), 1);
         let _ = agent.shutdown().await;
         drop((agent, events));
-        for _ in 0..2 {
+        for attempt in 0..2 {
             let state = DurableSession::open(
                 RecoveryStore {
                     inner: SqliteStore::open(&path)?,
                     armed: Arc::new(AtomicBool::new(false)),
                     after_commit: false,
-                    format4,
+                    format4: format4 && attempt == 0,
                 },
                 "oai-native-effect",
             )
             .await?;
-            if format4 {
+            if format4 && attempt == 0 {
                 let saved = state.state().await?;
                 let pending_models: Vec<_> = saved
                     .pending_operations()
