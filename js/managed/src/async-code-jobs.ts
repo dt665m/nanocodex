@@ -134,6 +134,11 @@ export class AsyncCodeJobs {
     return this.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM managed_async_code_jobs WHERE state='running'").one().n > 0;
   }
   hasPending(): boolean { return this.pending().length > 0; }
+  hasPendingContinuation(): boolean {
+    return this.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM managed_async_code_jobs j
+      JOIN managed_turns t ON t.id=j.delivery_turn_id
+      WHERE j.state='delivered' AND t.id='async:'||j.id AND t.state IN ('accepted','cancelling')`).one().n > 0;
+  }
   bindDelivery(id: string, turnId: string): void {
     this.storage.sql.exec("UPDATE managed_async_code_jobs SET delivery_turn_id=?,updated_at=? WHERE id=? AND state='terminal' AND delivery_turn_id IS NULL", turnId, Date.now(), id);
     if (this.get(id)?.delivery_turn_id !== turnId) throw new Error("async job delivery target conflict");
@@ -145,7 +150,7 @@ export class AsyncCodeJobs {
   delivered(id: string, turnId: string): void {
     this.storage.sql.exec("UPDATE managed_async_code_jobs SET state='delivered',updated_at=? WHERE id=? AND state='terminal' AND delivery_turn_id=?", Date.now(), id, turnId);
     // Keep identity tombstones. Payload pruning cannot make an old call executable.
-    this.storage.sql.exec("DELETE FROM managed_async_code_results WHERE job_id IN (SELECT id FROM managed_async_code_jobs WHERE state='delivered' AND updated_at<?)", Date.now() - 7 * 86400000);
-    this.storage.sql.exec("UPDATE managed_async_code_jobs SET result_json=NULL WHERE state='delivered' AND updated_at<?", Date.now() - 7 * 86400000);
+    this.storage.sql.exec("DELETE FROM managed_async_code_results WHERE job_id IN (SELECT id FROM managed_async_code_jobs WHERE state='delivered' AND updated_at<? AND NOT EXISTS (SELECT 1 FROM managed_turns t WHERE t.id=managed_async_code_jobs.delivery_turn_id AND t.state IN ('accepted','cancelling')))", Date.now() - 7 * 86400000);
+    this.storage.sql.exec("UPDATE managed_async_code_jobs SET result_json=NULL WHERE state='delivered' AND updated_at<? AND NOT EXISTS (SELECT 1 FROM managed_turns t WHERE t.id=managed_async_code_jobs.delivery_turn_id AND t.state IN ('accepted','cancelling'))", Date.now() - 7 * 86400000);
   }
 }

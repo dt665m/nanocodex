@@ -3659,6 +3659,7 @@ export class DurableAgentSession extends DurableComputerObject {
   #runtimePendingCalls = new Map<string, Set<string>>();
   #asyncToolOrigin = new AsyncLocalStorage<CodeJob>();
   #asyncDeliveryTask?: Promise<void>;
+  #asyncDeliveryAgain = false;
   #operations: SessionOperations;
   #connectInputs: ConnectInputs;
   #brainStorage?: R2Bucket;
@@ -10648,10 +10649,19 @@ export class DurableAgentSession extends DurableComputerObject {
   }
 
   #drainAsyncCodeJobs(): Promise<void> {
-    if (this.#asyncDeliveryTask) return this.#asyncDeliveryTask;
-    const task = this.#deliverAsyncCodeJobs();
+    if (this.#asyncDeliveryTask) {
+      this.#asyncDeliveryAgain = true;
+      return this.#asyncDeliveryTask;
+    }
+    const task = (async () => {
+      try {
+        do {
+          this.#asyncDeliveryAgain = false;
+          await this.#deliverAsyncCodeJobs();
+        } while (this.#asyncDeliveryAgain);
+      } finally { this.#asyncDeliveryTask = undefined; }
+    })();
     this.#asyncDeliveryTask = task;
-    void task.finally(() => { if (this.#asyncDeliveryTask === task) this.#asyncDeliveryTask = undefined; }).catch(() => {});
     return task;
   }
 
@@ -12161,8 +12171,9 @@ export class DurableAgentSession extends DurableComputerObject {
     retainTerminalTurns?: number,
   ): Promise<ManagedTurnSealResult> {
     if (this.#deleting) return Promise.reject(new Error("agent deletion fenced turn archival"));
-    // Pending jobs retain their origin and receiving-turn authorization rows.
-    if (this.#asyncCodeJobs.hasRunning() || this.#asyncCodeJobs.hasPending())
+    // Receipt admission does not end a continuation's need for its origin row.
+    if (this.#asyncCodeJobs.hasRunning() || this.#asyncCodeJobs.hasPending()
+      || this.#asyncCodeJobs.hasPendingContinuation())
       return Promise.resolve({ archived_bytes: 0, archived_receipts: 0, objects: 0, sealed: false });
     const active = this.#turnArchiveTask;
     if (active) {

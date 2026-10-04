@@ -53,9 +53,10 @@ export class FixtureModel extends DurableObject {
       console.info({type:'fixture.model',index:call,child:childSocket,input:body.input,tools:body.tools});
       const outputs=(body.input??[]).filter(item=>item.type==='custom_tool_call_output'||item.type==='function_call_output'); this.collected.push(...outputs);
       const terminal=JSON.stringify(this.collected).includes(['chain','same-turn'].includes(scenario.name)?'CHAIN_EFFECT_DONE':'ASYNC_EFFECT_DONE');
-      const output=childSocket?(childCall===1?[{type:'custom_tool_call',name:'exec',call_id:'call_child_sync',input:'text("CHILD_NORMAL_OK");'}]:childCall===2?[{type:'function_call',name:'submit_result',call_id:'child_submit',arguments:JSON.stringify({output:'CHILD_NORMAL_OK'})}]:[{type:'message',role:'assistant',content:[{type:'output_text',text:'CHILD_NORMAL_OK'}]}]):call===1?[{type:'custom_tool_call',name:'exec',call_id:'call_async_once',input:scenario.script}]:(scenario.name==='chain'&&call===3||scenario.name==='same-turn'&&call===2)?[{type:'custom_tool_call',name:'exec',call_id:'call_async_once',input:'await new Promise(resolve => setTimeout(resolve, 1200)); text(await tools.exec_command({cmd:"printf CHAIN_EFFECT_DONE"}));'}]
+      const interrupted=JSON.stringify(outputs).includes('interrupted before a terminal receipt');
+      const output=interrupted?[{type:'message',role:'assistant',content:[{type:'output_text',text:'ASYNC_INTERRUPTED_OK'}]}]:childSocket?(childCall===1?[{type:'custom_tool_call',name:'exec',call_id:'call_child_sync',input:'text("CHILD_NORMAL_OK");'}]:childCall===2?[{type:'function_call',name:'submit_result',call_id:'child_submit',arguments:JSON.stringify({output:'CHILD_NORMAL_OK'})}]:[{type:'message',role:'assistant',content:[{type:'output_text',text:'CHILD_NORMAL_OK'}]}]):call===1?[{type:'custom_tool_call',name:'exec',call_id:'call_async_once',input:scenario.script}]:(scenario.name==='chain'&&call===3||scenario.name==='same-turn'&&call===2)?[{type:'custom_tool_call',name:'exec',call_id:'call_async_once',input:'await new Promise(resolve => setTimeout(resolve, 1200)); text(await tools.exec_command({cmd:"printf CHAIN_EFFECT_DONE"}));'}]
         :[{type:'message',role:'assistant',content:[{type:'output_text',text:terminal?'ASYNC_DELIVERED_OK':'JOB_STARTED_OK'}]}];
-      const send=()=>server.send(JSON.stringify({type:'response.completed',response:{id:'resp_async_'+call,status:'completed',end_turn:childSocket?childCall>2:call>1&&!(scenario.name==='chain'&&call===3||scenario.name==='same-turn'&&call===2),output,usage:{input_tokens:1,output_tokens:1,total_tokens:2}}}));
+      const send=()=>server.send(JSON.stringify({type:'response.completed',response:{id:'resp_async_'+call,status:'completed',end_turn:interrupted||childSocket?interrupted||childCall>2:call>1&&!(scenario.name==='chain'&&call===3||scenario.name==='same-turn'&&call===2),output,usage:{input_tokens:1,output_tokens:1,total_tokens:2}}}));
       if((scenario.name==='active'||scenario.name==='active-stop')&&call===3) setTimeout(send,1800);else send();
     }); return new Response(null,{status:101,webSocket:client});
   }
@@ -77,6 +78,7 @@ const chunkLength=Buffer.alloc(4);chunkLength.writeUInt32BE(textChunk.length-4);
 const chunkCrc=Buffer.alloc(4);chunkCrc.writeUInt32BE(crc32(textChunk));
 const largePng="data:image/png;base64,"+Buffer.concat([tinyPng.subarray(0,-12),chunkLength,textChunk,chunkCrc,tinyPng.subarray(-12)]).toString("base64");
 const scenarios=[
+  {name:"cold",script:'await new Promise(resolve => setTimeout(resolve, 5000)); text(await tools.exec_command({cmd:"printf MUST_NOT_REPLAY"}));'},
   {name:"default-off",script:'text("ASYNC_EFFECT_DONE");'},
   {name:"missing-target",script:'await new Promise(resolve => setTimeout(resolve, 1500)); text("ASYNC_EFFECT_DONE");'},
   {name:"unsupported",script:'text("ASYNC_EFFECT_DONE");'},
@@ -117,12 +119,13 @@ for(const scenario of scenarios) test("managed async journey: "+scenario.name, {
     await writeFile(join(output,"source-resolution.json"),JSON.stringify({selectedRouter,router_sha256:hash(routerBytes),host_router_sha256:hash(await readFile(join(repo,"js/nanocodex-tools/runtime/tool-router.mjs"))),worker_sha256:hash(bundle.outputFiles[0].text),hashes,routerLoads,bundleInputs:Object.keys(bundle.metafile.inputs),wasm:assets.map(asset=>({path:asset.path,sha256:hash(asset.contents),bytes:asset.contents.length}))},null,2));
     await writeFile(join(output,"worker.mjs"),bundle.outputFiles[0].text);
     const date="2026-07-30";
-    mf=new Miniflare({port:0,unsafeLocalExplorer:true,unsafeObservability:true,handleRuntimeStdio(stdout,stderr){createInterface({input:stdout}).on("line",capture);createInterface({input:stderr}).on("line",capture);},durableObjectsPersist:join(output,"sqlite"),workers:[
+    const miniflareOptions={port:0,unsafeLocalExplorer:true,unsafeObservability:true,handleRuntimeStdio(stdout,stderr){createInterface({input:stdout}).on("line",capture);createInterface({input:stderr}).on("line",capture);},durableObjectsPersist:join(output,"sqlite"),workers:[
       {name:"managed",compatibilityDate:date,compatibilityFlags:["nodejs_compat","enable_request_signal"],modules:[{type:"ESModule",path:"worker.mjs",contents:bundle.outputFiles[0].text},...assets],bindings:{AGENT_IDLE_TIMEOUT_MS:"60000"},
         durableObjects:{NANOCODEX_SESSIONS:{className:"FixtureSession",useSQLite:true},NANOCODEX_ACCOUNT_TOOLS:{className:"AccountHostedTools",useSQLite:true},NANOCODEX_MEMORY:{className:"FixtureModel",useSQLite:true},MODEL:{className:"FixtureModel",useSQLite:true}},serviceBindings:{NANOCODEX:"provider"},r2Buckets:["NANOCODEX_HISTORY","NANOCODEX_WORKSPACES"]},
-      {name:"provider",compatibilityDate:date,modules:true,script:"export default {fetch(request,env){return env.MODEL.getByName('fixture-model').fetch(request)}}",durableObjects:{MODEL:{className:"FixtureModel",scriptName:"managed",useSQLite:true}}}]});
+      {name:"provider",compatibilityDate:date,modules:true,script:"export default {fetch(request,env){return env.MODEL.getByName('fixture-model').fetch(request)}}",durableObjects:{MODEL:{className:"FixtureModel",scriptName:"managed",useSQLite:true}}}]};
+    mf=new Miniflare(miniflareOptions);
 
-    const base=await mf.ready;
+    let base=await mf.ready;
     const headers={"x-nanocodex-owner-id":owner,"x-nanocodex-session-organization-id":organization,"x-nanocodex-session-team-id":team,"x-nanocodex-authorization-epoch":"1","x-nanocodex-capabilities":JSON.stringify(["agents:read","agents:write","tools:use"]),"content-type":"application/json"};
     const request=async(path,init={})=>{const response=await fetch(new URL(path,base),{...init,headers:{...headers,...init.headers},signal:AbortSignal.timeout(10000)}),body=await response.text();http.push({path,status:response.status,body});return {status:response.status,value:body?JSON.parse(body):undefined};};
     assert.equal((await request("/__seed",{method:"POST"})).status,204);
@@ -148,10 +151,29 @@ for(const scenario of scenarios) test("managed async journey: "+scenario.name, {
         assert.equal((await request(`/v1/agents/${thread}/turns`,{method:"POST",body:JSON.stringify({id:"00000000-0000-7000-8000-000000000076",input:"Keep this request active until the retained job completes."})})).status,202);
       }
       if(scenario.name==="active-stop"&&activeSubmitted&&records.filter(row=>row.type==="fixture.model").length>=3) break;
-      if(JSON.stringify(events).includes(["stop","revoke","terminal-target","missing-target"].includes(scenario.name)?"JOB_STARTED_OK":"ASYNC_DELIVERED_OK")) break;
+      if(JSON.stringify(events).includes(["cold","stop","revoke","terminal-target","missing-target"].includes(scenario.name)?"JOB_STARTED_OK":"ASYNC_DELIVERED_OK")) break;
       await delay(20);
     }
     assert.equal(events.status,200);
+    if(scenario.name==="cold") {
+      assert.match(JSON.stringify(events),/JOB_STARTED_OK/);
+      await mf.dispose();
+      mf=new Miniflare(miniflareOptions);
+      base=await mf.ready;
+      await request("/__alarm",{method:"POST"});
+      for(let i=0;i<300;i++) {
+        events=await request(`/v1/agents/${thread}/events/history?limit=256`);
+        if(JSON.stringify(events).includes("ASYNC_INTERRUPTED_OK")) break;
+        await delay(20);
+      }
+      assert.match(JSON.stringify(events),/ASYNC_INTERRUPTED_OK/);
+      const retained=await request("/__inspect");
+      assert.equal(retained.value.jobs.length,1);
+      assert.equal(retained.value.jobs[0].state,"delivered",JSON.stringify(retained));
+      assert.equal(retained.value.effects.length,0,"eviction must never replay unfinished guest code");
+      console.log(JSON.stringify({evidence:output,command,scenario:scenario.name,observed:retained.value}));
+      return;
+    }
     if(["stop","revoke","active-stop","terminal-target","missing-target"].includes(scenario.name)) {
       assert.match(JSON.stringify(events),/JOB_STARTED_OK/);
       if(scenario.name==="active-stop") assert.equal((await request(`/v1/agents/${thread}/turns/00000000-0000-7000-8000-000000000076/cancel`,{method:"POST"})).status,202);
