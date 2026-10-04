@@ -326,12 +326,32 @@ impl Harness {
         if !command.wait_for_commit().await {
             return;
         }
-        let steer = if priority == MessagePriority::Urgent && self.active.is_some() {
+        let durable = self.registry.upgrade().is_some_and(|registry| registry.durable_replay());
+        if let (Some(registry), Some(agent)) = (self.registry.upgrade(), self.agent.as_ref()) {
+            if let Some(operation) = registry.message_steer_operation(&self.root_session_id, command.message.id).await {
+                match agent.has_steer_receipt(operation, format!("child-message:{}", command.message.id)).await {
+                    Ok(true) => {
+                        self.admit(command.message.id, command.response, MessageDisposition::Steered).await;
+                        return;
+                    }
+                    Err(error) => { self.reject(command, error.to_string()).await; return; }
+                    Ok(false) => {}
+                }
+            }
+        }
+        // Backends without atomic steering receipts retain urgent messages in
+        // the durable mailbox until the current turn reaches its boundary.
+        let can_steer = !durable || self.agent.as_ref().is_some_and(Nanocodex::durable_steering);
+        let steer = if priority == MessagePriority::Urgent && self.active.is_some() && can_steer {
             match self.registry.upgrade() {
                 Some(registry) => {
-                    registry
-                        .begin_turn_steer(&self.root_session_id, self.id)
-                        .await
+                    match registry.begin_turn_steer(&self.root_session_id, self.id, command.message.id).await {
+                        Ok(steer) => steer,
+                        Err(error) => {
+                            let _ = command.response.send(Err(error));
+                            return;
+                        }
+                    }
                 }
                 None => None,
             }
@@ -345,17 +365,16 @@ impl Harness {
                 command.message.prompt(),
                 completion_instructions(&self.output_schema)
             );
-            let result = self
-                .active
-                .as_ref()
-                .expect("steering requires an active turn")
-                .control
-                .steer(Prompt::new(prompt).with_instruction_revision(steer.revision()))
-                .await;
+            let control = &self.active.as_ref().expect("steering requires an active turn").control;
+            let input = Prompt::new(prompt).with_instruction_revision(steer.revision());
+            let result = if durable {
+                control.steer_with_id(format!("child-message:{}", command.message.id), input).await
+            } else { control.steer(input).await };
             if let Some(registry) = self.registry.upgrade() {
-                registry
-                    .finish_turn_steer(&self.root_session_id, steer, result.is_ok())
-                    .await;
+                if let Err(error) = registry.finish_turn_steer(&self.root_session_id, steer, result.is_ok()).await {
+                    let _ = command.response.send(Err(error));
+                    return;
+                }
             }
             match result {
                 Ok(()) => {

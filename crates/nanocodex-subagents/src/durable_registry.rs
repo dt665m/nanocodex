@@ -77,6 +77,7 @@ impl Registry {
         if let Some(record) = journal.load::<ChildTreeRecord>().await.map_err(std::io::Error::other)? {
             if record.version != 1 { return Err(std::io::Error::other("unsupported child tree journal version")); }
             scope.calls = record.calls;
+            scope.steer_intents = record.steer_intents;
             scope.topology = record.topology;
             scope.messages = record.messages;
             scope.closing = record.closing;
@@ -202,9 +203,10 @@ impl Registry {
     }
 
     pub async fn summaries_all(&self, session: &str) -> std::io::Result<Vec<AgentSummary>> {
-        let state = self.state.lock().await;
-        let root = state.root_session_id(session);
-        let Some(scope) = state.scopes.get(root) else { return Ok(Vec::new()); };
+        let mut state = self.state.lock().await;
+        let root = state.root_session_id(session).to_owned();
+        let Some(scope) = state.scopes.get_mut(&root) else { return Ok(Vec::new()); };
+        scope.persist().await?;
         let mut ids = scope.topology.ids();
         ids.sort_unstable();
         state.summaries(session, &ids)
@@ -277,7 +279,9 @@ impl Registry {
             (revision, prompt, None)
         };
         let cancel_on_admission = child.interrupted;
-        child.active_instruction_revision = Some(revision);
+        // The prompt revision identifies the original native admission. Accepted
+        // steering advances completion authority without changing that input.
+        child.active_instruction_revision = Some(child.active_instruction_revision.unwrap_or(revision));
         child.active = true;
         child.status = AgentStatus::Running;
         child.steering = false;

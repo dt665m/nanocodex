@@ -720,6 +720,16 @@ struct StandaloneCompactionBase {
 }
 
 impl Execution {
+    pub(crate) fn durable_steering(&self) -> bool {
+        self.policy.as_ref().is_some_and(|policy| policy.supports_steer_receipts())
+    }
+
+    pub(crate) async fn has_steer_receipt(&self, operation_id: String, id: String) -> Result<bool> {
+        let Some(policy) = &self.policy else { return Ok(false); };
+        Ok(policy.retained_identified_steers(operation_id).await?
+            .iter().any(|(message_id, _)| message_id.as_deref() == Some(id.as_str())))
+    }
+
     pub(crate) async fn accepted_input(
         &self,
         events: &nanocodex_oai_api::__private::EventSink,

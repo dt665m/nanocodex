@@ -894,7 +894,7 @@ impl Tool for ListAgents {
         json_output(&AgentDirectory {
             agents: registry
                 .directory(context.session_id(), include_completed, include_self)
-                .await,
+                .await?,
         })
     }
 }

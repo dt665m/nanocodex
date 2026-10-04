@@ -180,6 +180,14 @@ pub trait LifecycleBackend: Send + Sync + 'static {
         })
     }
 
+    /// Whether identified steering retains receipts in the execution journal.
+    fn durable_steering(&self) -> bool { false }
+
+    /// Reconciles identified input even after its native turn has settled.
+    fn has_steer_receipt(&self, _operation_id: String, _id: String) -> BackendFuture<Result<bool>> {
+        Box::pin(async { Ok(false) })
+    }
+
     /// Withdraws the latest steer if it has not reached a model boundary.
     fn withdraw_steer(&self, _key: BackendTurnKey, _id: String) -> BackendFuture<Result<bool>> {
         Box::pin(async {
@@ -514,6 +522,13 @@ impl LifecycleBackend for LocalLifecycle {
             })
             .await
         })
+    }
+
+    fn durable_steering(&self) -> bool { self.execution.durable_steering() }
+
+    fn has_steer_receipt(&self, operation_id: String, id: String) -> BackendFuture<Result<bool>> {
+        let execution = self.execution.clone();
+        Box::pin(async move { execution.has_steer_receipt(operation_id, id).await })
     }
 
     fn steer_with_id(

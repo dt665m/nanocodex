@@ -376,6 +376,14 @@ impl Nanocodex {
         self.backend.set_harness_model(model).await
     }
 
+    /// Whether this native driver atomically retains identified steering receipts.
+    pub fn durable_steering(&self) -> bool { self.backend.durable_steering() }
+
+    /// Checks a retained steering admission without restarting its operation.
+    pub async fn has_steer_receipt(&self, operation_id: String, id: String) -> Result<bool> {
+        self.backend.has_steer_receipt(operation_id, id).await
+    }
+
     /// Captures a provider-native in-memory residency checkpoint.
     pub async fn runtime_snapshot(&self) -> Result<ChildSnapshot> {
         self.backend.runtime_snapshot().await
