@@ -267,7 +267,10 @@ GraphQL analytics, and D1 SQL queries. D1 SQL may write and requires the user's
 requested action. Credential management, secret exports, deployment, and live-tail
 URLs are unavailable. Redirects and reflected credentials remain blocked by the
 shared connector protections. Exact connection IDs and Connect grants apply.
-A Connect app can use an existing approved connection but cannot enroll a token.
+A Connect app can use an existing approved connection through the server request
+route but cannot enroll a token. Cloudflare has no settings OAuth button or Connect
+dialog provider card in this change; enrollment and discovery use the account tools.
+No external MCP server registration or native-app UI update is included.
 
 Select token permissions for the requested work. In particular, even historical
 telemetry reads require

@@ -23,6 +23,14 @@ function setup() {
 }
 
 describe("connected service discovery and requests", () => {
+  it("exposes Cloudflare in account environment metadata only for an authorized connection", async () => {
+    const fetch = async () => Response.json({ connectors: { cloudflare: { connected: true, connections: [{ id: ID, label: "Cloudflare API token", account_id: "c".repeat(32), capabilities: ["cloudflare"] }] } } });
+    const info = await accountInfo({ fetch }, "user", { enabled: true });
+    expect(info.connectorTools.cloudflare).toMatchObject({ tool: "cloudflare_request" });
+    expect(projectAccountInfo(info, ["cloudflare"], { cloudflare: [OTHER] }).connectorTools).toEqual({});
+    expect(projectAccountInfo(info, ["cloudflare"], { cloudflare: [ID] }).connectorTools.cloudflare).toMatchObject({ tool: "cloudflare_request" });
+  });
+
   it("discovers and routes Cloudflare telemetry through an exact granted connection", async () => {
     const { router, fetch, revoke } = setup();
     const discovery = await router.execute("tool_search", { query: "Cloudflare Workers logs traces", limit: 20 }, context);
