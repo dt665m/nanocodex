@@ -537,3 +537,206 @@ async fn completed_summary_and_foreground_receipt_recover_without_http_redispatc
     drop((agent, events));
     server.abort();
 }
+
+// Observe the real SQLite rejection so the held foreground cannot race the
+// stale summary receipt. This wrapper does not inject a store failure.
+struct ObserveFencedSummaryStore {
+    inner: SqliteStore,
+    rejected_summary: Arc<Notify>,
+}
+
+impl StateStore for ObserveFencedSummaryStore {
+    fn read_record<'a>(
+        &'a mut self,
+        id: &'a str,
+        key: &'a str,
+    ) -> nanocodex_durability::StoreFuture<
+        'a,
+        Result<Option<String>, nanocodex_durability::StoreError>,
+    > {
+        self.inner.read_record(id, key)
+    }
+
+    fn acquire<'a>(
+        &'a mut self,
+        id: &'a str,
+        owner: nanocodex_durability::OwnerId,
+    ) -> nanocodex_durability::StoreFuture<
+        'a,
+        Result<nanocodex_durability::OwnedState, nanocodex_durability::StoreError>,
+    > {
+        self.inner.acquire(id, owner)
+    }
+
+    fn replace<'a>(
+        &'a mut self,
+        id: &'a str,
+        owner: &'a nanocodex_durability::OwnerToken,
+        revision: u64,
+        payload: &'a str,
+        records: &'a [nanocodex_durability::StoreRecord],
+    ) -> nanocodex_durability::StoreFuture<'a, Result<u64, nanocodex_durability::StoreError>> {
+        Box::pin(async move {
+            let summary = records.iter().any(|record| record.value.contains(SUMMARY));
+            let result = self.inner.replace(id, owner, revision, payload, records).await;
+            if summary && matches!(&result, Err(nanocodex_durability::StoreError::Fenced)) {
+                self.rejected_summary.notify_one();
+            }
+            result
+        })
+    }
+}
+
+fn sqlite_execution_head(path: &std::path::Path) -> (u64, String, Vec<(String, String)>) {
+    // A new session's state() is a cached head. Read the authoritative database
+    // directly to prove late work changed neither that head nor immutable records.
+    let connection = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let (revision, payload) = connection
+        .query_row(
+            "SELECT revision, payload FROM nanocodex_durable_states WHERE state_id = ?1",
+            ["claude-background-http"],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let mut statement = connection
+        .prepare(
+            "SELECT key, value FROM nanocodex_durable_records WHERE state_id = ?1 ORDER BY key",
+        )
+        .unwrap();
+    let records = statement
+        .query_map(["claude-background-http"], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    (revision, payload, records)
+}
+
+#[tokio::test]
+async fn sqlite_owner_takeover_fences_held_summary_and_foreground_then_recovers() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.sqlite");
+    let fixture = Fixture::new(3, 3, false, Arc::new(AtomicBool::new(false)));
+    let (client, server) = server(fixture.clone()).await;
+    let rejected_summary = Arc::new(Notify::new());
+    let session = DurableSession::open(
+        ObserveFencedSummaryStore {
+            inner: SqliteStore::open(&path).unwrap(),
+            rejected_summary: rejected_summary.clone(),
+        },
+        "claude-background-http",
+    )
+    .await
+    .unwrap();
+    let effects = Arc::new(AtomicUsize::new(0));
+    let counter = effects.clone();
+    let request = || {
+        PromptRequest::new("retain original constraint through owner takeover")
+            .request_id("owner-takeover")
+    };
+    let (older, older_events) = Nanocodex::builder(Claude::new(client.clone(), "test"))
+        .auto_compact_window_tokens(100_000)
+        .tool_blocks(tool(), move |input| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            async move { Ok(receipt(input["round"].as_u64().unwrap() as usize)) }
+        })
+        .durability(session)
+        .await
+        .unwrap()
+        .build()
+        .unwrap();
+    let old_turn = older.prompt(request()).await.unwrap();
+    fixture.wait_for(3, 1).await;
+    assert_eq!(effects.load(Ordering::SeqCst), 2);
+
+    // A separate connection and DurableSession atomically replace store authority;
+    // cloning the live session would exercise only in-process ownership.
+    let authoritative = reopen(&path).await;
+    let head = sqlite_execution_head(&path);
+    assert!(
+        head.2.iter().all(|(_, value)| !value.contains(SUMMARY)),
+        "held summary must not already have a durable receipt"
+    );
+    fixture.summary_gate.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(10), rejected_summary.notified())
+        .await
+        .expect("late summary must attempt and fail its real SQLite receipt write");
+    assert_eq!(
+        sqlite_execution_head(&path),
+        head,
+        "a fenced summary must not publish any head or immutable payload mutation"
+    );
+    assert_eq!(fixture.foreground.load(Ordering::SeqCst), 3);
+    fixture.foreground_gate.add_permits(1);
+    let error = tokio::time::timeout(Duration::from_secs(10), old_turn.result())
+        .await
+        .unwrap()
+        .expect_err("the old turn must fail after independent SQLite owner takeover");
+    assert_eq!(
+        error.execution_policy_disposition(),
+        Some(nanocodex_agent::execution::ExecutionPolicyDisposition::Reopen),
+        "{error}"
+    );
+    assert!(error.to_string().contains("fenced"), "{error}");
+    assert_eq!(
+        sqlite_execution_head(&path),
+        head,
+        "late foreground and stale failure handling must also leave authority unchanged"
+    );
+    assert_eq!(effects.load(Ordering::SeqCst), 2);
+    let _ = older.shutdown().await;
+    drop((older, older_events));
+
+    let counter = effects.clone();
+    let (recovered, recovered_events) = Nanocodex::builder(Claude::new(client, "test"))
+        .auto_compact_window_tokens(100_000)
+        .tool_blocks(tool(), move |input| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            async move { Ok(receipt(input["round"].as_u64().unwrap() as usize)) }
+        })
+        .durability(authoritative)
+        .await
+        .unwrap()
+        .build()
+        .unwrap();
+    fixture.summary_gate.add_permits(1);
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        recovered.prompt(request()).await.unwrap().result(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(result.final_message(), "completed once");
+    assert_eq!(
+        effects.load(Ordering::SeqCst),
+        2,
+        "new owner must replay both completed effects and reject the old late tool response"
+    );
+    let log = fixture.requests();
+    let foreground = foreground_requests(&log);
+    assert_eq!(foreground.len(), 4);
+    assert_eq!(
+        foreground[3], foreground[2],
+        "new owner must resend the exact frozen pending foreground HTTP request"
+    );
+    assert_eq!(fixture.summaries.load(Ordering::SeqCst), 2);
+    let snapshot = serde_json::to_value(recovered.snapshot().await.unwrap()).unwrap();
+    let history = snapshot["history"].to_string();
+    for retained in [SUMMARY, "signed-1", "signed-2", "committed effect 1", "committed effect 2"] {
+        assert!(history.contains(retained), "missing {retained}: {history}");
+    }
+    assert!(!history.contains("signed-3"), "stale foreground tool response leaked into recovery");
+    let calls = log.len();
+    let replay = recovered.prompt(request()).await.unwrap().result().await.unwrap();
+    assert_eq!(replay.final_message(), result.final_message());
+    assert_eq!(replay.usage(), result.usage());
+    assert_eq!(fixture.requests().len(), calls, "terminal receipt must replay without HTTP");
+    println!("sqlite_owner_takeover=true stale_summary_write_fenced=true authoritative_head_and_records_unchanged=true frozen_foreground_replayed=true completed_effects_replayed=true");
+    recovered.shutdown().await.unwrap();
+    drop((recovered, recovered_events));
+    server.abort();
+}
