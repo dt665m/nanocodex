@@ -150,7 +150,7 @@ where
         }
         let tail = history.into_iter().skip(pending.cutoff.len()).collect::<Vec<_>>();
         conversation.observe_server_reasoning(output.server_reasoning_included);
-        conversation.managed.install_compaction(output.item, tail, factory.profile().prefix());
+        conversation.managed.install_compaction_with_tail(output.item, &pending.cutoff, tail, factory.profile().prefix());
         // Installing a summary discards the foreground continuation chain.
         // Terminal commit must preserve this full-replay baseline as well.
         self.stats.last_response_id = None;
