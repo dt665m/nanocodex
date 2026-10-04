@@ -18,13 +18,13 @@ pub(super) async fn progress(work: &mut Option<SummaryWork<'_>>) -> Result<(Conv
     }
 }
 pub(super) fn poll(work: &mut Option<SummaryWork<'_>>) {
-    if let Some(work) = work {
-        if work.result.is_none() { work.result = work.future.as_mut().now_or_never(); }
+    if let Some(work) = work && work.result.is_none() {
+        work.result = work.future.as_mut().now_or_never();
     }
 }
 pub(super) async fn wait(work: &mut Option<SummaryWork<'_>>) {
-    if let Some(work) = work {
-        if work.result.is_none() { work.result = Some(work.future.as_mut().await); }
+    if let Some(work) = work && work.result.is_none() {
+        work.result = Some(work.future.as_mut().await);
     }
 }
 impl State {

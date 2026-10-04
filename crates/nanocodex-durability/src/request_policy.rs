@@ -31,11 +31,10 @@ pub(crate) fn contains_opaque(value: &Value) -> bool {
 }
 
 fn native_tools(request: &Value) -> Vec<Value> {
-    if let Some(items) = request["input"].as_array() {
-        if let Some(item) = items.iter().find(|item| item["type"] == "additional_tools") {
+    if let Some(items) = request["input"].as_array()
+        && let Some(item) = items.iter().find(|item| item["type"] == "additional_tools") {
             return item["tools"].as_array().cloned().unwrap_or_default();
         }
-    }
     request["tools"].as_array().cloned().unwrap_or_default()
 }
 

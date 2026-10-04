@@ -410,7 +410,7 @@ impl RegistryState {
         if let Some(accepted) = &session.submitted_output {
             if scope.journal.is_some() {
                 let (candidate, decoded_json_text) =
-                    validate_submitted_output(&session.output_validator, output.clone())?;
+                    validate_submitted_output(&session.output_validator, output)?;
                 if accepted == &candidate {
                     return Ok(SubmissionOutcome::Accepted { decoded_json_text });
                 }

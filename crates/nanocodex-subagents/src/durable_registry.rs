@@ -64,7 +64,8 @@ impl Registry {
     /// Configure a per-child durable native factory before calling `recover`.
     pub async fn enable_durability(
         &self,
-        store: impl StateStore + Send + 'static,
+        #[cfg(not(target_family = "wasm"))] store: impl StateStore + 'static,
+        #[cfg(target_family = "wasm")] store: impl StateStore + Send + 'static,
         root_session_id: &str,
     ) -> std::io::Result<()> {
         self.require_durability();

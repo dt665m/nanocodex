@@ -458,11 +458,10 @@ async fn start_agent_with_host_context(
     call: Option<(String, Value)>,
 ) -> AgentToolResult<AgentStartReport> {
     let _spawn = registry.spawn_lock.lock().await;
-    if let Some((key, input)) = &call {
-        if let Some(report) = registry.replay_spawn(session_id, key, input).await? {
+    if let Some((key, input)) = &call
+        && let Some(report) = registry.replay_spawn(session_id, key, input).await? {
             return Ok(report);
         }
-    }
     registry.register_handle(parent.clone());
     let AgentTask {
         lifetime,
@@ -1257,6 +1256,28 @@ fn agent_status_schema() -> Value {
     json!({ "oneOf": variants })
 }
 
+// Store callbacks can be isolate-local on WASM; tools retain a Send receipt.
+// The abort guard ties local admission to cancellation of the calling tool.
+#[cfg(target_family = "wasm")]
+fn platform_receipt<T: Send + 'static>(
+    future: impl std::future::Future<Output = std::io::Result<T>> + 'static,
+) -> impl std::future::Future<Output = std::io::Result<T>> + Send {
+    let pending = super::platform::spawn(future);
+    let cancel = pending.abort_on_drop();
+    async move {
+        let _cancel = cancel;
+        pending
+            .await
+            .map_err(|_| std::io::Error::other("child operation cancelled"))?
+    }
+}
+#[cfg(not(target_family = "wasm"))]
+async fn platform_receipt<T>(
+    future: impl std::future::Future<Output = std::io::Result<T>> + Send,
+) -> std::io::Result<T> {
+    future.await
+}
+
 #[cfg(test)]
 mod strict_spawn_tests {
     use super::*;
@@ -1414,26 +1435,4 @@ mod strict_spawn_tests {
                 .is_none()
         );
     }
-}
-
-// Store callbacks can be isolate-local on WASM; tools retain a Send receipt.
-// The abort guard ties local admission to cancellation of the calling tool.
-#[cfg(target_family = "wasm")]
-fn platform_receipt<T: Send + 'static>(
-    future: impl std::future::Future<Output = std::io::Result<T>> + 'static,
-) -> impl std::future::Future<Output = std::io::Result<T>> + Send {
-    let pending = super::platform::spawn(future);
-    let cancel = pending.abort_on_drop();
-    async move {
-        let _cancel = cancel;
-        pending
-            .await
-            .map_err(|_| std::io::Error::other("child operation cancelled"))?
-    }
-}
-#[cfg(not(target_family = "wasm"))]
-async fn platform_receipt<T>(
-    future: impl std::future::Future<Output = std::io::Result<T>> + Send,
-) -> std::io::Result<T> {
-    future.await
 }

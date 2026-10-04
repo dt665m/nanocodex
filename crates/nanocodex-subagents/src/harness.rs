@@ -331,8 +331,8 @@ impl Harness {
             .registry
             .upgrade()
             .is_some_and(|registry| registry.durable_replay());
-        if let (Some(registry), Some(agent)) = (self.registry.upgrade(), self.agent.as_ref()) {
-            if let Some(operation) = registry
+        if let (Some(registry), Some(agent)) = (self.registry.upgrade(), self.agent.as_ref())
+            && let Some(operation) = registry
                 .message_steer_operation(&self.root_session_id, command.message.id)
                 .await
             {
@@ -356,7 +356,6 @@ impl Harness {
                     Ok(false) => {}
                 }
             }
-        }
         // Backends without atomic steering receipts retain urgent messages in
         // the durable mailbox until the current turn reaches its boundary.
         let can_steer = !durable || self.agent.as_ref().is_some_and(Nanocodex::durable_steering);
@@ -399,15 +398,14 @@ impl Harness {
             } else {
                 control.steer(input).await
             };
-            if let Some(registry) = self.registry.upgrade() {
-                if let Err(error) = registry
+            if let Some(registry) = self.registry.upgrade()
+                && let Err(error) = registry
                     .finish_turn_steer(&self.root_session_id, steer, result.is_ok())
                     .await
                 {
                     let _ = command.response.send(Err(error));
                     return;
                 }
-            }
             match result {
                 Ok(()) => {
                     self.admit(
