@@ -106,7 +106,11 @@ export class ManagedRecoverySafety {
 /** Account-private host journal: guest source cannot select or clear receipts.
  * Scope to the original session/operation/model/cell/ordinal, never projected turn identities.
  * Retain unknown intents and receipts after settlement for reconciliation. */
-export function createManagedCodeEffectJournal(storage: DurableObjectStorage): CodeEffectJournal {
+export function createManagedCodeEffectJournal(storage: DurableObjectStorage, options: {
+  /** Stage committed guest data in the active Rust operation before exposing its
+   * receipt. Recovered terminal cells repeat staging without repeating effects. */
+  onStoreCommitted?: (context: CodeEffectContext, entries: readonly (readonly [string, unknown])[]) => Promise<void>;
+} = {}): CodeEffectJournal {
   storage.sql.exec(`CREATE TABLE IF NOT EXISTS managed_code_effect_runtime (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1), generation TEXT NOT NULL
   );
@@ -270,6 +274,20 @@ export function createManagedCodeEffectJournal(storage: DurableObjectStorage): C
       ON CONFLICT(blob_key) DO UPDATE SET chunks=excluded.chunks, bytes=excluded.bytes, hash=excluded.hash`,
     key, count, new TextEncoder().encode(encoded).byteLength, digest(encoded));
   };
+  // Preserve SQLite commit order while asynchronous Rust document staging is
+  // in flight. A later cell must not have its snapshot replaced by an older
+  // callback merely because host acknowledgements arrive out of order.
+  let staging = Promise.resolve();
+  const publishStore = (context: CodeEffectContext, entries: Entries): Promise<void> => {
+    const next = staging.then(async () => {
+      await storage.sync();
+      assertOwner();
+      await options.onStoreCommitted?.(context, entries);
+      assertOwner();
+    });
+    staging = next.catch(() => {});
+    return next;
+  };
   return {
     async beginCell(context) {
       const { cellKey, hash, operation, index, parentScope } = cellIdentity(context);
@@ -310,6 +328,12 @@ export function createManagedCodeEffectJournal(storage: DurableObjectStorage): C
       });
       await storage.sync();
       assertOwner();
+      if (decision.status === "replay" && options.onStoreCommitted) {
+        // A cell may have committed immediately before host loss and before its
+        // document staging acknowledged. The original Rust operation is still
+        // pending; retry only staging its current committed data.
+        await publishStore(context, readEntries("session:" + context.sessionId, false));
+      }
       return decision;
     },
     async completeCell(context, writes, receipt) {
@@ -318,7 +342,7 @@ export function createManagedCodeEffectJournal(storage: DurableObjectStorage): C
         || !(typeof receipt.output === "string" || Array.isArray(receipt.output))
         || (!receipt.success && writes.length !== 0)) throw codeEffectUnknown("invalid Code Mode terminal cell receipt/writes");
       const writesHash = digest(encodeEntries([["writes", writes], ["receipt", receipt]]));
-      storage.transactionSync(() => {
+      const committed = storage.transactionSync(() => {
         assertOwner();
         const existing = storage.sql.exec<{ source_hash: string; writes_hash: string | null; expected_version: number }>(
           "SELECT source_hash, writes_hash, expected_version FROM managed_code_cells WHERE cell_key = ?", cellKey,
@@ -326,7 +350,7 @@ export function createManagedCodeEffectJournal(storage: DurableObjectStorage): C
         if (!existing || existing.source_hash !== hash) throw codeEffectUnknown("Code Mode cell store lost its original intent");
         if (existing.writes_hash !== null) {
           if (existing.writes_hash !== writesHash) throw codeEffectUnknown("Code Mode replay store writes conflict");
-          return; // Replay must not overwrite a newer cell's committed writes.
+          return readEntries("session:" + context.sessionId, false); // Replay preserves newer writes.
         }
         // Match the native document expected-version contract. A delta cannot
         // safely merge after another writer changes the snapshot it read:
@@ -346,9 +370,10 @@ export function createManagedCodeEffectJournal(storage: DurableObjectStorage): C
         // visible when validation/encoding or receipt persistence fails.
         writeEntries("receipt:" + cellKey, [["receipt", receipt]]);
         storage.sql.exec("UPDATE managed_code_cells SET writes_hash = ? WHERE cell_key = ?", writesHash, cellKey);
+        return readEntries("session:" + context.sessionId, false);
       });
-      await storage.sync();
-      assertOwner();
+      // Queue before yielding, so staging follows SQLite transaction order.
+      await publishStore(context, committed);
     },
     async snapshotStore(sessionId) {
       return storage.transactionSync(() => {
