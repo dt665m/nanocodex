@@ -147,8 +147,13 @@ export function AccountChooser({
     <div className="wizard-page wizard-account-page">
       <section className="sms-auth-panel" aria-labelledby={`${phoneId}-heading`}>
         <header className="wizard-intro">
+          <div className="auth-symbol" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+              {challenge ? <><path d="M7 4h10a4 4 0 0 1 4 4v6a4 4 0 0 1-4 4h-6l-5 3v-3a4 4 0 0 1-3-4V8a4 4 0 0 1 4-4Z" /><path d="M8 9h8M8 13h5" /></> : <><rect x="6" y="2" width="12" height="20" rx="3" /><path d="M10 5h4M11 19h2" /></>}
+            </svg>
+          </div>
           <div className="wizard-app">
-            <span>Nanocodex account · Step {challenge ? "2" : "1"} of 2</span>
+            <span>{challenge ? "Verify your number" : "Sign in to Nanocodex"}</span>
             <h1 id={`${phoneId}-heading`}>{challenge ? "Enter your code" : "Enter your phone number"}</h1>
             <p>{challenge
               ? "Use the six-digit code from the text message to finish signing in."
@@ -168,7 +173,7 @@ export function AccountChooser({
         {requestContext ? <div className="wizard-sections">{requestContext}</div> : null}
 
         {!challenge ? (
-          <form className="sms-otp-form" noValidate onSubmit={(event) => {
+          <form key="phone" className="sms-otp-form" aria-busy={operation === "send"} noValidate onSubmit={(event) => {
           event.preventDefault();
           void sendCode();
         }}>
@@ -199,7 +204,7 @@ export function AccountChooser({
           <p>By continuing, you agree to receive an automated one-time account code. Message and data rates may apply.</p>
         </form>
       ) : (
-        <form className="sms-otp-form" noValidate onSubmit={(event) => {
+        <form key="code" className="sms-otp-form" aria-busy={operation === "verify"} noValidate onSubmit={(event) => {
           event.preventDefault();
           void verifyCode();
         }}>
@@ -242,7 +247,7 @@ export function AccountChooser({
       )}
         <div className="sms-auth-security" aria-label="Security note">
           <span aria-hidden="true">✓</span>
-          <p>Your wallet key stays encrypted in your account vault.</p>
+          <p>Your account key stays encrypted in your vault.</p>
         </div>
         {onCancel ? (
           <button className="wizard-cancel" disabled={unavailable} onClick={onCancel} type="button">Cancel</button>

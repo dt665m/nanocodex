@@ -1341,8 +1341,8 @@ export function ConnectOnboarding({
       {!wizard ? <header className="dialog-header">
         <span className="wordmark">Nanocodex Connect</span>
           <span className="secure-label"><span aria-hidden="true" /> {hostPrincipalRequest
-            ? "host identity"
-            : "SMS account"}</span>
+            ? "Host identity"
+            : "Account"}</span>
       </header> : null}
 
       {request.type === "walletConnect" ? (

@@ -1,4 +1,4 @@
-import { useId, useState, type FormEvent, type ReactNode } from "react";
+import { useEffect, useId, useRef, useState, type FormEvent, type ReactNode } from "react";
 
 import { ConnectionLogo } from "./ConnectionLogo.js";
 import type { McpConnection, McpConnectionStatus } from "./connectTypes.js";
@@ -22,11 +22,18 @@ export function AccountConnectionSurface({
   footer?: ReactNode;
   title: string;
 }>) {
+  const heading = useRef<HTMLHeadingElement>(null);
+  useEffect(() => {
+    const content = heading.current?.closest(".dialog-content");
+    if (!content) return;
+    content.scrollTop = 0;
+    heading.current?.focus({ preventScroll: true });
+  }, []);
   return (
     <div className="wizard-page wizard-review-page">
       <header className="wizard-intro">
         <div className="wizard-app">
-          <h1>{title}</h1>
+          <h1 ref={heading} tabIndex={-1}>{title}</h1>
           <p>{description}</p>
         </div>
         {confirmationCode ? (

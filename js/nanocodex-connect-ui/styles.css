@@ -3,8 +3,8 @@
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
-  --surface: light-dark(#fff, #212121);
-  --surface-raised: light-dark(#f4f4f4, #303030);
+  --surface: light-dark(#f7f7f8, #171719);
+  --surface-raised: light-dark(#ffffff, #303030);
   --surface-subtle: light-dark(#f9f9f9, #191919);
   --text: light-dark(#262626, #ececec);
   --text-inverse: light-dark(#fff, #212121);
@@ -82,15 +82,15 @@
 @scope (.connect-onboarding) {
 :scope.dialog-shell {
   display: flex;
-  width: min(440px, calc(100vw - 24px));
-  max-height: min(696px, calc(100dvh - 24px));
+  width: min(460px, calc(100vw - 24px));
+  max-height: min(760px, calc(100dvh - 24px));
   min-height: 0;
   margin: 0 auto;
   overflow: hidden;
-  border: 1px solid var(--border-strong);
-  border-radius: 24px;
+  border: 1px solid var(--border);
+  border-radius: 28px;
   background: var(--surface);
-  box-shadow: 0 28px 80px rgba(0, 0, 0, 0.55);
+  box-shadow: 0 24px 72px light-dark(rgb(0 0 0 / 0.16), rgb(0 0 0 / 0.4));
 }
 
 :scope.dialog-shell[data-request="machineUsdFund"] {
@@ -112,7 +112,7 @@
 
 .dialog-header {
   flex: 0 0 auto;
-  min-height: 60px;
+  min-height: 56px;
   padding: 0 24px;
   border-bottom: 1px solid var(--border);
 }
@@ -120,7 +120,7 @@
 .wordmark {
   font-size: 13px;
   font-weight: 600;
-  letter-spacing: -0.03em;
+  letter-spacing: -0.015em;
 }
 
 .secure-label {
@@ -141,6 +141,8 @@
   flex: 1 1 auto;
   min-height: 0;
   padding: 0 24px 24px;
+  overscroll-behavior: contain;
+  scroll-padding-block: 16px;
   overflow-x: hidden;
   overflow-y: auto;
   scrollbar-color: var(--border-strong) transparent;
@@ -180,16 +182,16 @@
 
 .consent-hero h1 {
   font-size: 17px;
-  font-weight: 500;
+  font-weight: 600;
   line-height: 1.2;
-  letter-spacing: -0.045em;
+  letter-spacing: -0.025em;
 }
 
 .consent-hero div > span {
   display: block;
   margin-top: 2px;
   color: var(--faint);
-  font-size: 11px;
+  font-size: 12px;
   text-transform: uppercase;
   letter-spacing: 0.06em;
 }
@@ -207,7 +209,7 @@
 
 .terminal-code span {
   color: var(--muted);
-  font-size: 11px;
+  font-size: 12px;
 }
 
 .terminal-code strong {
@@ -226,9 +228,9 @@
 
 .request-title h1 {
   font-size: 18px;
-  font-weight: 500;
+  font-weight: 600;
   line-height: 1.18;
-  letter-spacing: -0.045em;
+  letter-spacing: -0.025em;
 }
 
 .request-copy {
@@ -358,7 +360,7 @@
   background: var(--surface-raised);
   color: var(--muted);
   content: attr(data-tooltip);
-  font-size: 11px;
+  font-size: 12px;
   line-height: 1.5;
   opacity: 0;
   pointer-events: none;
@@ -394,7 +396,7 @@
   border: 1px solid var(--surface);
   background: var(--positive);
   color: #0b0b0b;
-  font-size: 11px;
+  font-size: 12px;
   font-style: normal;
   font-weight: 700;
 }
@@ -427,7 +429,7 @@
   padding: 7px 0 0;
   overflow: visible;
   color: var(--faint);
-  font-size: 11px;
+  font-size: 12px;
   line-height: 1;
   white-space: nowrap;
 }
@@ -457,7 +459,7 @@
   background: var(--surface-raised);
   color: var(--muted);
   content: attr(data-tooltip);
-  font-size: 11px;
+  font-size: 12px;
   line-height: 1.4;
   opacity: 0;
   pointer-events: none;
@@ -504,7 +506,7 @@
   border: 1px solid var(--surface);
   background: var(--surface-raised);
   color: var(--muted);
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 700;
 }
 
@@ -521,7 +523,7 @@
   padding: 10px 1px;
   border-bottom: 1px solid var(--border);
   color: var(--muted);
-  font-size: 11px;
+  font-size: 12px;
   text-decoration: none;
 }
 
@@ -572,7 +574,7 @@
 .mcp-connection-copy strong {
   overflow: hidden;
   font-size: 13px;
-  font-weight: 500;
+  font-weight: 600;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -581,7 +583,7 @@
 .mcp-connection-copy small,
 .mcp-connection-state {
   color: var(--muted);
-  font-size: 11px;
+  font-size: 12px;
 }
 
 .mcp-connection-actions {
@@ -600,7 +602,7 @@
   border: 1px solid var(--border-strong);
   background: transparent;
   cursor: pointer;
-  font-size: 11px;
+  font-size: 12px;
 }
 
 .mcp-connection-card button:disabled {
@@ -618,17 +620,17 @@
 
 .grant-boundary > span {
   color: var(--muted);
-  font-size: 11px;
+  font-size: 12px;
 }
 
 .grant-boundary strong {
   font-size: 14px;
-  font-weight: 500;
+  font-weight: 600;
 }
 
 .grant-boundary small {
   color: var(--faint);
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 400;
 }
 
@@ -644,9 +646,9 @@
 
 .connection-preview {
   border: 1px solid var(--border-strong);
-  background:
-    linear-gradient(180deg, rgba(115, 216, 155, 0.04), transparent 42%),
-    var(--surface-subtle);
+  background: var(--surface-raised);
+  border-radius: 16px;
+  overflow: hidden;
 }
 
 .preview-header {
@@ -690,20 +692,20 @@
 
 .preview-header strong {
   font-size: 13px;
-  font-weight: 500;
+  font-weight: 600;
 }
 
 .preview-header div > span {
   overflow: hidden;
   color: var(--faint);
-  font-size: 11px;
+  font-size: 12px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .preview-state {
   color: var(--positive);
-  font-size: 11px;
+  font-size: 12px;
   letter-spacing: 0.05em;
   text-transform: uppercase;
 }
@@ -735,7 +737,7 @@
   font-weight: 600;
   width: 28px;
   height: 28px;
-  font-size: 11px;
+  font-size: 12px;
 }
 
 .preview-service strong {
@@ -743,14 +745,14 @@
   min-width: 0;
   align-items: center;
   gap: 5px;
-  font-size: 11px;
-  font-weight: 500;
+  font-size: 12px;
+  font-weight: 600;
   line-height: 1.25;
 }
 
 .preview-service > span {
   color: var(--positive);
-  font-size: 11px;
+  font-size: 12px;
   letter-spacing: 0.05em;
   text-transform: uppercase;
 }
@@ -778,12 +780,12 @@
 
 .section-heading h2 {
   font-size: 13px;
-  font-weight: 500;
+  font-weight: 600;
 }
 
 .section-heading > span {
   color: var(--faint);
-  font-size: 11px;
+  font-size: 12px;
   letter-spacing: 0.06em;
   text-transform: uppercase;
 }
@@ -815,14 +817,14 @@
 .permission-row strong {
   color: var(--text);
   font-size: 12px;
-  font-weight: 500;
+  font-weight: 600;
   text-align: right;
 }
 
 .period-note {
   margin-top: 8px;
   color: var(--faint);
-  font-size: 11px;
+  font-size: 12px;
   line-height: 1.45;
 }
 
@@ -876,7 +878,7 @@ dd {
   padding: 10px 11px;
   border-top: 1px solid var(--border);
   color: var(--faint);
-  font-size: 11px;
+  font-size: 12px;
   list-style: none;
 }
 
@@ -894,7 +896,7 @@ dd {
   border-top: 1px solid var(--border);
   color: var(--muted);
   font: inherit;
-  font-size: 11px;
+  font-size: 12px;
   white-space: pre-wrap;
   word-break: break-word;
 }
@@ -902,16 +904,16 @@ dd {
 .signature-note {
   padding: 10px 1px 0;
   color: var(--faint);
-  font-size: 11px;
+  font-size: 12px;
   line-height: 1.5;
 }
 
 .dialog-actions {
   display: grid;
   flex: 0 0 auto;
-  grid-template-columns: 0.65fr 1.35fr;
-  gap: 7px;
-  padding: 16px 24px 20px;
+  grid-template-columns: 1fr 1.6fr;
+  gap: 12px;
+  padding: 16px 24px max(20px, env(safe-area-inset-bottom));
   border-top: 1px solid var(--border);
   background: var(--surface);
 }
@@ -967,7 +969,7 @@ dd {
 
 .card-method {
   color: var(--positive);
-  font-size: 11px;
+  font-size: 12px;
   letter-spacing: 0.05em;
   text-transform: uppercase;
 }
@@ -975,7 +977,7 @@ dd {
 .funding-amount {
   margin: 18px 0 4px;
   font-size: 32px;
-  font-weight: 500;
+  font-weight: 600;
   letter-spacing: -0.06em;
 }
 
@@ -1028,19 +1030,19 @@ dd {
 
 .passkey-note strong {
   font-size: 12px;
-  font-weight: 500;
+  font-weight: 600;
 }
 
 .passkey-note p {
   margin-top: 3px;
   color: var(--muted);
-  font-size: 11px;
+  font-size: 12px;
   line-height: 1.5;
 }
 
 .wizard-page {
   width: 100%;
-  padding-top: 18px;
+  padding-top: 24px;
 }
 
 .wizard-intro {
@@ -1056,7 +1058,7 @@ dd {
 
 .wizard-app h1 {
   font-size: 18px;
-  font-weight: 500;
+  font-weight: 600;
   letter-spacing: -0.04em;
 }
 
@@ -1079,17 +1081,17 @@ dd {
 .wizard-section-title span,
 .wizard-section-title small {
   color: var(--faint);
-  font-size: 11px;
+  font-size: 12px;
 }
 
 .wizard-terminal-code strong {
   font-size: 13px;
-  font-weight: 500;
+  font-weight: 600;
   letter-spacing: 0.09em;
 }
 
 .wizard-sections {
-  border-top: 1px solid var(--border);
+  border-top: 0;
 }
 
 .wizard-section {
@@ -1112,7 +1114,7 @@ dd {
 
 .wizard-section-title h2 {
   font-size: 13px;
-  font-weight: 500;
+  font-weight: 600;
 }
 
 .wizard-account-chooser {
@@ -1131,12 +1133,12 @@ dd {
 
 .sms-otp-form > label {
   font-size: 13px;
-  font-weight: 500;
+  font-weight: 600;
 }
 
 .sms-otp-form > p {
   color: var(--muted);
-  font-size: 11px;
+  font-size: 12px;
   line-height: 1.5;
 }
 
@@ -1184,15 +1186,15 @@ dd {
   background: transparent;
   color: var(--muted);
   cursor: pointer;
-  font-size: 11px;
+  font-size: 12px;
 }
 
 .wizard-account-choice {
   display: grid;
   width: 100%;
-  min-height: 62px;
+  min-height: 68px;
   align-items: center;
-  padding: 10px;
+  padding: 12px;
   border: 0;
   border-bottom: 1px solid var(--border);
   background: transparent;
@@ -1212,7 +1214,7 @@ dd {
 
 .wizard-account-choice:hover:not(:disabled),
 .wizard-account-choice:focus-visible {
-  background: rgba(255, 255, 255, 0.035);
+  background: color-mix(in srgb, var(--text) 5%, transparent);
 }
 
 .wizard-account-choice:disabled {
@@ -1249,17 +1251,17 @@ dd {
 
 .wizard-account-copy strong {
   font-size: 13px;
-  font-weight: 500;
+  font-weight: 600;
 }
 
 .wizard-account-copy small {
   color: var(--muted);
-  font-size: 11px;
+  font-size: 12px;
 }
 
 .wizard-account-arrow {
   color: var(--faint);
-  font-size: 11px;
+  font-size: 12px;
 }
 
 .wizard-account-create-form {
@@ -1339,14 +1341,14 @@ dd {
 
 .wizard-connectors .connection-card-copy strong {
   font-size: 12px;
-  font-weight: 500;
+  font-weight: 600;
 }
 
 .wizard-connectors .connection-card-copy > span,
 .wizard-connectors .connection-card-action {
   overflow: hidden;
   color: var(--muted);
-  font-size: 11px;
+  font-size: 12px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -1372,7 +1374,7 @@ dd {
 
 .wizard-visibility > div > span {
   color: var(--positive);
-  font-size: 11px;
+  font-size: 12px;
 }
 
 .wizard-visibility > div > div {
@@ -1382,13 +1384,13 @@ dd {
 .wizard-visibility strong,
 .wizard-visibility small {
   overflow: hidden;
-  font-size: 11px;
+  font-size: 12px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .wizard-visibility strong {
-  font-weight: 500;
+  font-weight: 600;
 }
 
 .wizard-visibility small {
@@ -1401,7 +1403,7 @@ dd {
   justify-content: space-between;
   padding: 9px 0;
   color: var(--muted);
-  font-size: 11px;
+  font-size: 12px;
 }
 
 .wizard-device-code strong {
@@ -1486,9 +1488,9 @@ dd {
   .sms-otp-input-row { grid-template-columns: minmax(0, 1fr); }
   .sms-otp-input-row input { font-size: 16px; }
   .request-title, .consent-hero { padding-block: 24px 20px; }
-  .request-title h1, .wizard-app h1 { font-size: 24px; line-height: 1.2; letter-spacing: -.035em; }
+  .request-title h1, .wizard-app h1 { font-size: 26px; font-weight: 650; line-height: 1.2; letter-spacing: -.025em; }
   .wordmark { font-size: 15px; letter-spacing: -.025em; }
-  .wizard-section { padding-block: 18px; }
+  .wizard-section { padding-block: 18px; border-bottom: 0; }
   .app-sees, .capability-logos { flex-wrap: wrap; }
   .wizard-section-title { flex-wrap: wrap; }
   .wizard-account-copy small { line-height: 1.5; }
@@ -1512,7 +1514,7 @@ dd {
   }
 
   .sms-auth-panel .sms-otp-form > p {
-    font-size: 12px;
+    font-size: 13px;
   }
 
   .sms-auth-security {
@@ -1532,5 +1534,87 @@ dd {
     width: 100%;
     min-height: 44px;
     margin-top: 8px;
+  }
+}
+
+/* Mirrors ChatPalette and the inset Form sections in the Swift account sheets. */
+@scope (.connect-onboarding) {
+  .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
+  .auth-symbol { display: grid; place-items: center; width: 56px; height: 56px; border-radius: 18px; background: var(--surface-raised); color: var(--text); }
+  .auth-symbol svg { width: 28px; height: 28px; }
+  :scope.connect-wizard .auth-symbol { margin-bottom: 16px; }
+  .wizard-section > p { margin-top: 8px; color: var(--muted); font-size: 13px; line-height: 1.5; }
+  .dialog-header { gap: 8px; }
+  .secure-label { flex-shrink: 0; }
+  .wizard-intro { gap: 16px; padding-bottom: 24px; }
+  .wizard-app { gap: 8px; }
+  .wizard-app h1[tabindex="-1"]:focus { outline: none; }
+  .wizard-app p, .request-copy { font-size: 15px; line-height: 1.5; }
+  .wizard-section-title h2 { font-size: 15px; }
+  .wizard-section-title > div { min-width: 0; }
+  .wizard-account-chooser, .permission-rows, .wizard-connectors {
+    background: var(--surface-raised);
+    border: 0;
+    border-radius: 16px;
+  }
+  .wizard-connectors { gap: 0; overflow: hidden; }
+  .wizard-connectors .connection-card {
+    min-height: 68px;
+    padding: 12px;
+    gap: 12px;
+    border: 0;
+    border-radius: 0;
+  }
+  .wizard-connectors .connection-card:focus-visible { outline-offset: -3px; }
+  .wizard-connector-card + .wizard-connector-card { border-top: 1px solid var(--border); }
+  .wizard-connectors .connection-card-copy strong, .wizard-account-copy strong { font-size: 15px; }
+  .wizard-connectors .connection-card-copy > span,
+  .wizard-connectors .connection-card-action,
+  .wizard-account-copy small {
+    white-space: normal;
+    overflow-wrap: anywhere;
+    font-size: 13px;
+    line-height: 1.4;
+  }
+  .wizard-connectors .connection-card-action { max-width: 96px; text-align: right; }
+  .wizard-connectors .connection-card:not(:disabled):hover { background: color-mix(in srgb, var(--text) 5%, transparent); }
+  .connector-logo, .wizard-account-avatar { border: 0; background: var(--surface-subtle); }
+  .wizard-visibility { gap: 0; border: 0; padding: 0; margin-top: 12px; }
+  .wizard-visibility > div { grid-template-columns: 18px minmax(0, 1fr); align-items: start; padding-block: 10px; gap: 10px; }
+  .wizard-visibility > div > div { display: grid; gap: 3px; }
+  .wizard-visibility strong, .wizard-visibility small { white-space: normal; overflow: visible; line-height: 1.45; font-size: 13px; }
+  .permission-row { min-height: 48px; padding: 12px 14px; }
+  .permission-row span, .permission-row strong { font-size: 13px; overflow-wrap: anywhere; min-width: 0; }
+  .dialog-actions button { font-size: 15px; min-height: 48px; border: 0; border-radius: 14px; background: var(--surface-raised); }
+  .dialog-actions button:last-child { background: var(--text); color: var(--surface); }
+  .sms-otp-form > label { font-size: 15px; }
+  .sms-otp-input-row { gap: 16px; }
+  .sms-otp-input-row input { min-height: 52px; padding-inline: 16px; border: 1px solid var(--border); border-radius: 14px; }
+  .sms-otp-input-row button { min-height: 48px; font-size: 15px; font-weight: 600; border-radius: 14px; }
+  input[autocomplete="one-time-code"] { font-size: 24px; font-variant-numeric: tabular-nums; letter-spacing: .25em; text-align: center; }
+  .sms-auth-security { margin-top: 24px; line-height: 1.5; }
+  .account-failure, .dialog-error { padding: 12px 14px; margin-bottom: 16px; border: 0; border-radius: 14px; background: color-mix(in srgb, var(--negative) 8%, var(--surface)); color: var(--negative); font-size: 13px; line-height: 1.5; }
+  .account-mode { padding: 3px; gap: 3px; border: 0; border-radius: 12px; background: color-mix(in srgb, var(--text) 6%, transparent); }
+  .account-mode button { min-height: 38px; border-radius: 9px; }
+  .account-mode button[aria-pressed="true"] { background: var(--surface-raised); box-shadow: 0 1px 3px rgb(0 0 0 / .1); }
+  .advanced-details summary, .mcp-connection-card button, .wizard-cancel { min-height: 44px; }
+  .advanced-details summary { display: list-item; align-content: center; }
+  .dialog-header, .dialog-actions { background: var(--surface); }
+  button { touch-action: manipulation; transition: background-color 120ms ease, opacity 120ms ease; }
+  button:active:not(:disabled) { opacity: .72; }
+  @media (max-width: 440px) {
+    .dialog-header, .dialog-content { padding-inline: 20px; }
+    .dialog-actions { padding-inline: 20px; }
+    .wordmark { font-size: 14px; }
+    .secure-label { font-size: 11px; }
+  }
+  @media (max-height: 520px) {
+    .dialog-header { min-height: 44px; }
+    .wizard-page { padding-top: 16px; }
+    .wizard-intro { padding-bottom: 16px; }
+    .dialog-actions { padding-block: 10px; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    button { transition: none; }
   }
 }
