@@ -130,7 +130,7 @@ where
                 if self.force_compaction || active_context_tokens >= auto_compact_token_limit {
                     self.wait_background().await;
                 }
-                if let Some(installed) = self.install_background(conversation, factory)? {
+                if let Some(installed) = self.install_background(conversation, factory).await? {
                     if installed {
                         self.force_compaction = false;
                         return Ok(true);

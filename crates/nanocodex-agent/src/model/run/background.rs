@@ -132,8 +132,13 @@ where
         }
     }
 
-    pub(super) fn install_background(&mut self, conversation: &mut ConversationState, factory: &ResponsesAttemptFactory) -> Result<Option<bool>> {
+    pub(super) async fn install_background(&mut self, conversation: &mut ConversationState, factory: &ResponsesAttemptFactory) -> Result<Option<bool>> {
         if !self.background_work.as_ref().is_some_and(|work| work.result.is_some()) { return Ok(None); }
+        // Completion can have preceded a foreground await. Recheck the durable
+        // owner before swapping the live context, even for a replayed receipt.
+        if let Some(steps) = &self.execution_steps {
+            steps.continuation::<serde_json::Value>().await?;
+        }
         let mut work = self.background_work.take().expect("completed work");
         let pending = self.background_compaction.take().expect("owned cutoff");
         let output = work.result.take().expect("completed result")?;

@@ -39,6 +39,12 @@ impl State {
     }
     pub(super) async fn install_summary(&self, cursor: &mut Cursor, work: &mut Option<SummaryWork<'_>>, context: &mut Conversation, pending: &mut Vec<Message>, usage: &mut Usage) -> Result<bool> {
         if !work.as_ref().is_some_and(|work| work.result.is_some()) { return Ok(false); }
+        // Acquire shared discovery state before the ownership fence so the
+        // context and discoveries swap without yielding after that fence.
+        let mut discovered = self.discovered.lock().await;
+        if let (Some(policy), Some(operation)) = (&self.policy, &cursor.operation) {
+            policy.continuation(operation.clone()).await?;
+        }
         let mut work = work.take().expect("completed work");
         let input = cursor.background.take().expect("owned cutoff");
         let (summary, cost) = work.result.take().expect("completed result")?;
@@ -59,7 +65,7 @@ impl State {
         context.active_context_tokens = estimate_text_tokens(&json!({"system":cursor.template.system,"tools":cursor.template.tools,"messages":pending}).to_string());
         if cursor.tool_search {
             let references = client_discovered_tools(pending);
-            self.discovered.lock().await.retain(|name| references.contains(name.as_str()));
+            discovered.retain(|name| references.contains(name.as_str()));
         }
         Ok(true)
     }

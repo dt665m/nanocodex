@@ -816,7 +816,7 @@ where
             self.retain_execution(session, ExecutionPhase::Generate).await?;
             self.start_background(&session.factory).await?;
             self.poll_background().await;
-            if self.install_background(&mut session.conversation, &session.factory)?.is_some() {
+            if self.install_background(&mut session.conversation, &session.factory).await?.is_some() {
                 self.retain_execution(session, ExecutionPhase::Generate).await?;
             }
             Self::publish_fork_snapshot(session, fork_snapshots, self.global_instructions.as_ref());
@@ -902,7 +902,7 @@ where
                     self.retain_execution(session, ExecutionPhase::Generate).await?;
                     self.start_background(&session.factory).await?;
                     self.wait_background().await;
-                    self.install_background(&mut session.conversation, &session.factory)?;
+                    self.install_background(&mut session.conversation, &session.factory).await?;
                     return Ok(if message.trim().is_empty() {
                         "The model completed without emitting assistant text.".to_owned()
                     } else {
