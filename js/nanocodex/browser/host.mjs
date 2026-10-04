@@ -652,6 +652,7 @@ export function createBrowserHost(options = {}) {
     next,
     close,
     sleep: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+    codeReplaySafe: code.codeReplaySafe,
     executeCode: traceTool === undefined ? code.executeCodeObserved
       : (source, sessionId = "default", callId = "exec", model = "unknown", turnId) =>
         traceToolInvocation(traceTool, "exec", {
