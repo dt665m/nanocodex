@@ -12,13 +12,24 @@ depend on orchestration policy:
 - `interrupt_agent`
 - `close_agent`
 
-Subagents are ephemeral and exist only within the running parent runtime. Completed
-or interrupted children can receive more work while that runtime remains alive.
-Idle child drivers may be evicted and rehydrated from in-memory snapshots to
-limit resident resources; those snapshots are never persisted. Restarting the
-parent runtime drops the task tree, child history, messages, and results. A fresh
-registry starts empty. Historical agent IDs do not identify recovered children;
-use `list_agents` to discover the current live registry before addressing agents.
+A durable task tree retains child identities, ownership, mailboxes, accepted
+results, and per-child execution checkpoints. Reopening the same tree recovers
+its existing children and reconciles admitted work through the child journals.
+A completed spawn receipt therefore continues to identify the original child.
+Current host capabilities and authorization are applied again on reconstruction.
+
+The JavaScript hosts configure child durability when the root has a durability
+store. Native embedders use `Registry::enable_durability` with the existing
+`StateStore`, install a per-child durable harness factory, and call `recover`
+before admitting work. An ordinary `channel()` without this configuration stays
+in memory. Idle drivers can be unloaded in either mode; durable execution history
+belongs to each child's session rather than the resident driver.
+
+Children select a `foreground` or `background` lifetime. Background work requires
+a durable tree. The managed host retains a scheduler wakeup so admitted background
+work can resume after the foreground turn ends or its runtime disappears.
+Explicit interrupt and close requests retain their own recovery state. A process
+exit is not an implicit cancellation of durable work.
 
 `send_agent_message` keeps message intent (`purpose`) separate from thread
 correlation (`in_reply_to`). Referencing a message continues its existing two-party
