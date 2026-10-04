@@ -578,7 +578,10 @@ impl StateStore for ObserveFencedSummaryStore {
     ) -> nanocodex_durability::StoreFuture<'a, Result<u64, nanocodex_durability::StoreError>> {
         Box::pin(async move {
             let summary = records.iter().any(|record| record.value.contains(SUMMARY));
-            let result = self.inner.replace(id, owner, revision, payload, records).await;
+            let result = self
+                .inner
+                .replace(id, owner, revision, payload, records)
+                .await;
             if summary && matches!(&result, Err(nanocodex_durability::StoreError::Fenced)) {
                 self.rejected_summary.notify_one();
             }
@@ -590,11 +593,9 @@ impl StateStore for ObserveFencedSummaryStore {
 fn sqlite_execution_head(path: &std::path::Path) -> (u64, String, Vec<(String, String)>) {
     // A new session's state() is a cached head. Read the authoritative database
     // directly to prove late work changed neither that head nor immutable records.
-    let connection = rusqlite::Connection::open_with_flags(
-        path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .unwrap();
+    let connection =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
     let (revision, payload) = connection
         .query_row(
             "SELECT revision, payload FROM nanocodex_durable_states WHERE state_id = ?1",
@@ -608,7 +609,9 @@ fn sqlite_execution_head(path: &std::path::Path) -> (u64, String, Vec<(String, S
         )
         .unwrap();
     let records = statement
-        .query_map(["claude-background-http"], |row| Ok((row.get(0)?, row.get(1)?)))
+        .query_map(["claude-background-http"], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
@@ -677,7 +680,7 @@ async fn sqlite_owner_takeover_fences_held_summary_and_foreground_then_recovers(
         .expect_err("the old turn must fail after independent SQLite owner takeover");
     assert_eq!(
         error.execution_policy_disposition(),
-        Some(nanocodex_agent::execution::ExecutionPolicyDisposition::Reopen),
+        Some(nanocodex_agent::ExecutionPolicyDisposition::Reopen),
         "{error}"
     );
     assert!(error.to_string().contains("fenced"), "{error}");
@@ -726,16 +729,37 @@ async fn sqlite_owner_takeover_fences_held_summary_and_foreground_then_recovers(
     assert_eq!(fixture.summaries.load(Ordering::SeqCst), 2);
     let snapshot = serde_json::to_value(recovered.snapshot().await.unwrap()).unwrap();
     let history = snapshot["history"].to_string();
-    for retained in [SUMMARY, "signed-1", "signed-2", "committed effect 1", "committed effect 2"] {
+    for retained in [
+        SUMMARY,
+        "signed-1",
+        "signed-2",
+        "committed effect 1",
+        "committed effect 2",
+    ] {
         assert!(history.contains(retained), "missing {retained}: {history}");
     }
-    assert!(!history.contains("signed-3"), "stale foreground tool response leaked into recovery");
+    assert!(
+        !history.contains("signed-3"),
+        "stale foreground tool response leaked into recovery"
+    );
     let calls = log.len();
-    let replay = recovered.prompt(request()).await.unwrap().result().await.unwrap();
+    let replay = recovered
+        .prompt(request())
+        .await
+        .unwrap()
+        .result()
+        .await
+        .unwrap();
     assert_eq!(replay.final_message(), result.final_message());
     assert_eq!(replay.usage(), result.usage());
-    assert_eq!(fixture.requests().len(), calls, "terminal receipt must replay without HTTP");
-    println!("sqlite_owner_takeover=true stale_summary_write_fenced=true authoritative_head_and_records_unchanged=true frozen_foreground_replayed=true completed_effects_replayed=true");
+    assert_eq!(
+        fixture.requests().len(),
+        calls,
+        "terminal receipt must replay without HTTP"
+    );
+    println!(
+        "sqlite_owner_takeover=true stale_summary_write_fenced=true authoritative_head_and_records_unchanged=true frozen_foreground_replayed=true completed_effects_replayed=true"
+    );
     recovered.shutdown().await.unwrap();
     drop((recovered, recovered_events));
     server.abort();
