@@ -32,6 +32,32 @@ const packages = new URL('../../../node_modules/.pnpm/', import.meta.url);
 const entry = readdirSync(packages).find(name => /^playwright-core@/.test(name));
 const { chromium } = await import(new URL(`${entry}/node_modules/playwright-core/index.mjs`, packages));
 const temp = mkdtempSync(join(tmpdir(), 'private-touch-'));
+// Synthetic localhost fixture only. Ubuntu CI restricts unprivileged user
+// namespaces; this does not configure production browser sessions.
+const testChromeFlags = process.platform === 'linux' ? ['--no-sandbox'] : [];
+async function debuggingEndpoint(child, profile) {
+  for (let i = 0; i < 100; i++) {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      throw new Error(`Synthetic Chromium exited during startup (${child.signalCode ?? child.exitCode})`);
+    }
+    try { return readFileSync(join(profile, 'DevToolsActivePort'), 'utf8').trim().split('\n'); }
+    catch { await new Promise(resolve => setTimeout(resolve, 100)); }
+  }
+  throw new Error('Synthetic Chromium did not start within 10 seconds');
+}
+async function stopChrome(child) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return;
+  let timer;
+  const ended = new Promise(resolve => child.once('exit', resolve));
+  child.kill();
+  await Promise.race([ended, new Promise(resolve => { timer = setTimeout(resolve, 3000); })]);
+  clearTimeout(timer);
+  if (child.exitCode === null && child.signalCode === null) {
+    child.kill('SIGKILL');
+    await Promise.race([ended, new Promise(resolve => { timer = setTimeout(resolve, 3000); })]);
+    clearTimeout(timer);
+  }
+}
 const namecheapFixture=createNamecheapFixture();
 const requireAccount=createRequire(new URL('../../account/package.json',import.meta.url));
 const requireManaged=createRequire(new URL('../package.json',import.meta.url));
@@ -80,12 +106,8 @@ try {
   await new Promise(resolve => server.listen(0,'127.0.0.1',resolve));
   const origin = `https://127.0.0.1:${server.address().port}`;
   chrome = spawn(process.env.CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-    ['--headless','--ignore-certificate-errors','--no-first-run','--no-default-browser-check','--remote-debugging-port=0',`--user-data-dir=${join(temp,'profile')}`,'about:blank'],{stdio:'ignore'});
-  for (let i=0; i<100; i++) {
-    try { readFileSync(join(temp,'profile','DevToolsActivePort')); break; }
-    catch { await new Promise(resolve => setTimeout(resolve,100)); }
-  }
-  const [port, endpoint] = readFileSync(join(temp,'profile','DevToolsActivePort'),'utf8').trim().split('\n');
+    [...testChromeFlags,'--headless','--ignore-certificate-errors','--no-first-run','--no-default-browser-check','--remote-debugging-port=0',`--user-data-dir=${join(temp,'profile')}`,'about:blank'],{stdio:'ignore'});
+  const [port, endpoint] = await debuggingEndpoint(chrome, join(temp, 'profile'));
   browser = await chromium.connectOverCDP(`http://127.0.0.1:${port}`);
   const context = await browser.newContext({ignoreHTTPSErrors:true});
   const page = await context.newPage();
@@ -198,9 +220,8 @@ try {
   // before Target.createTarget races its debugger-paused auto-attachment with
   // the runtime's Page.navigate. Attach the observer after creation/navigation.
   runtimeChrome=spawn(process.env.CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-    ['--headless','--ignore-certificate-errors','--no-first-run','--no-default-browser-check','--remote-debugging-port=0',`--user-data-dir=${join(temp,'runtime-profile')}`,'about:blank'],{stdio:'ignore'});
-  for(let i=0;i<100;i++){try{readFileSync(join(temp,'runtime-profile','DevToolsActivePort'));break;}catch{await new Promise(resolve=>setTimeout(resolve,100));}}
-  const [runtimePort,runtimeEndpoint]=readFileSync(join(temp,'runtime-profile','DevToolsActivePort'),'utf8').trim().split('\n');
+    [...testChromeFlags,'--headless','--ignore-certificate-errors','--no-first-run','--no-default-browser-check','--remote-debugging-port=0',`--user-data-dir=${join(temp,'runtime-profile')}`,'about:blank'],{stdio:'ignore'});
+  const [runtimePort,runtimeEndpoint] = await debuggingEndpoint(runtimeChrome, join(temp, 'runtime-profile'));
   let allocations=0;
   const binding={create:async()=>{allocations++;return {sessionId:'native-fields-fixture'};},delete:async()=>{},fetch:async()=>{
     const socket=new WebSocket(`ws://127.0.0.1:${runtimePort}${runtimeEndpoint}`);
@@ -609,12 +630,9 @@ try {
   await loginRuntime?.close();
   privateCdp?.close();
   await loginBrowser?.close();
-  if(runtimeChrome && runtimeChrome.exitCode===null){const ended=new Promise(resolve=>runtimeChrome.once("exit",resolve));runtimeChrome.kill();await ended;}
+  await stopChrome(runtimeChrome);
   await browser?.close();
-  if (chrome && chrome.exitCode === null) {
-    const closed = new Promise(resolve => chrome.once('exit',resolve));
-    chrome.kill(); await closed;
-  }
-  if(server) await new Promise(resolve=>server.close(resolve));
+  await stopChrome(chrome);
+  if(server) { server.closeAllConnections(); await new Promise(resolve=>server.close(resolve)); }
   rmSync(temp,{recursive:true,force:true,maxRetries:5,retryDelay:100});
 }
