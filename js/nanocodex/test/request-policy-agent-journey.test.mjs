@@ -35,7 +35,7 @@ async function server(t, respond) {
       requests.push(record);
       const response = await respond(record, requests.length);
       res.writeHead(response.status, Object.fromEntries(response.headers));
-      for await (const chunk of response.body) res.write(chunk);
+      if (response.body) for await (const chunk of response.body) res.write(chunk);
       res.end();
     } catch (error) { res.destroy(error); }
   });
@@ -227,4 +227,25 @@ test('public browser and Node managed transports deny client policy before harne
     }
   }
   evidence('managed-guard', { families: ['codex', 'claude'], surfaces: ['browser', 'node'], dispatched: 0 });
+});
+
+test('public host HTTPS rejects redirects without following provider credentials', { timeout: 20_000 }, async t => {
+  const fixture = await server(t, ({ path }, count) => {
+    assert.equal(path, '/v1/responses');
+    return count === 1 ? final('HOST_HTTPS_OK', 'host-https')
+      : new Response(null, { status: 307, headers: { location: `${fixture.base}/redirect-target` } });
+  });
+  const agent = await HostAgent.create({ module, model: 'gpt-6.1-sol', thinking: 'low',
+    transport: HostTransport.hostManaged({ apiBaseUrl: fixture.base, stateless: true,
+      createResponse: (endpoint, _sessionId, request) => fetch(endpoint, { method: 'POST',
+        headers: { authorization: 'Bearer synthetic-redirect', 'content-type': 'application/json' },
+        body: request.body, signal: request.signal, redirect: 'manual' }) }),
+    tools: {}, toolMode: 'direct' });
+  try {
+    assert.equal((await agent.turn.prompt({ input: 'Normal HTTPS' }).result()).finalMessage, 'HOST_HTTPS_OK');
+    await assert.rejects(agent.turn.prompt({ input: 'Reject redirect' }).result(), /redirects are not allowed/);
+    assert.ok(fixture.requests.length >= 2);
+    assert.ok(fixture.requests.every(request => request.path === '/v1/responses'));
+    evidence('host-redirect', { requests: fixture.requests.length, followed: 0, credentials: 'synthetic', policy: 'manual and reject' });
+  } finally { await agent.session.shutdown(); }
 });

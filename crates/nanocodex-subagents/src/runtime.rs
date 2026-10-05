@@ -3348,7 +3348,8 @@ mod tests {
                 Err(nanocodex_agent::NanocodexError::TurnCancelled),
                 None,
             )
-            .await;
+            .await
+            .unwrap();
         {
             let state = registry.state.lock().await;
             let session = &state.scopes["main"].sessions[&id];

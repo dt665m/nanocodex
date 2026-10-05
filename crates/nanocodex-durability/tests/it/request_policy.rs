@@ -437,7 +437,7 @@ async fn request_policy_public_openai_and_claude_http_survive_270_boundaries_and
         eprintln!(
             "native-policy evidence: provider={} turns={} router_calls={} immutable_preparations={} max_head_bytes={} recent_receipts<=16 terminal_receipts<=8 retained_replay=no_HTTP",
             model.as_str(),
-            log.len(),
+            requests.lock().unwrap().len(),
             route_calls.load(Ordering::SeqCst),
             audit.prepared.len(),
             audit.max_head_bytes
