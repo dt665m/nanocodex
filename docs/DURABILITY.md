@@ -492,20 +492,21 @@ stores, and Cloudflare Durable Object integration. A backend-specific failure
 must map into the same store result meanings; it must not invent recovery
 policy.
 
-## Relationship to Pi `dev`
+## Relationship to Pi 1.0 and Pi Durable
 
 The execution core deliberately follows Pi's harness boundaries: a complete
 current restart state after every transition, separate acceptance and driving,
 fenced single ownership, intent/effect/settlement, durable cancellation, and
 atomic terminal checkpoint/result publication.
 
-This crate is not a clone of Pi's complete session database. Pi also defines
-immutable conversation entries, mutable bound values/lists, an append-only
-usage ledger, assistant-frame persistence, lanes/navigation, and operation
-cleanup. Nanocodex keeps conversation data inside its typed agent checkpoint
-and scopes this crate to execution recovery. Claiming those storage subsystems
-were copied would be false; the shared durability invariants are the part
-implemented here.
+The alignment reference is Pi v1.0.0. Session documents, historical document
+forks, owned children, replay policy, background compaction and configuration
+history share the contracts described above. Nanocodex retains typed agent
+checkpoints and its existing journals rather than adopting Pi's complete session
+database. Its generic bound values/lists, lanes/navigation and assistant-frame
+storage are not interchangeable APIs. Account-wide application and CRM records
+remain independent transactions; session documents provide the explicit
+co-commit boundary for conversation-owned state.
 
 Pi's `outcome_ready` state is necessary because finalized parallel tool output
 is staged separately before source-ordered entry placement. Nanocodex has no
@@ -545,3 +546,31 @@ after success. Failed uploads retain their SQLite source and deadline across
 object reconstruction. Alarms and new events cannot bypass that backoff, and
 archival never blocks admission or cancellation recovery. Explicit export and
 seal requests still report their own storage failures to their caller.
+
+
+## Reproducing the recovery journeys
+
+Run these from the repository root after installing the documented Rust and
+JavaScript toolchains and workspace dependencies:
+
+```sh
+cargo test --locked -p nanocodex-durability --features sqlite,claude
+cargo test --locked -p nanocodex -p nanocodex-subagents --features nanocodex/claude
+cargo test --locked -p nanocodex-bin --test cli_durable_tree -- --nocapture
+pnpm --filter nanocodex run build
+pnpm --filter nanocodex test
+pnpm --filter nanocodex-managed-service run test:durability
+```
+
+The CLI and managed journeys use the shipped transports, SQLite and workerd;
+external inference uses deterministic local HTTP fixtures. They terminate
+processes, cold-reopen existing stores, and check stable child identities,
+accepted mailboxes, exact effect receipts, current authorization, historical
+forks and completed outputs. Native lifetime witnesses and WASM memory checks
+also exercise cleanup without discarding persisted work. Standalone helper
+process tests are invoked by their parent journeys, not independently.
+
+Journey logs print their evidence directories under `output/`. Preserve those
+traces alongside the command and tested revision; a skipped process helper is
+not a substitute for running its parent journey. These local checks remain
+necessary when the repository's general CI tests are paused.
