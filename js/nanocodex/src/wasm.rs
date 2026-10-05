@@ -1711,7 +1711,10 @@ impl WasmSubagents {
                 );
                 for session in retired {
                     self.remove_parent(&session);
-                    self.hosts.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&session);
+                    self.hosts
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(&session);
                 }
             }
             return Err(error);
