@@ -1906,13 +1906,7 @@ final class InboxModel: ObservableObject {
         guard !Task.isCancelled else { return }
         guard generation == account, controller.account == account else { controller.cancel(); return }
         guard let client, connected, !isDemo, controller.link.agentID == focused?.id else { controller.suspend(); return }
-        var configuration = URLSessionConfiguration.ephemeral
-        #if DEBUG && targetEnvironment(simulator)
-        if ProcessInfo.processInfo.arguments.contains("--whatsapp-link-ui-fixture") {
-            configuration = WhatsAppLinkUITransport.configuration
-        }
-        #endif
-        await controller.refresh(client: client, account: account, configuration: configuration)
+        await controller.refresh(client: client, account: account)
         guard !Task.isCancelled else { return }
         guard generation == account else { controller.cancel(); return }
         guard connected, !isDemo, controller.link.agentID == focused?.id else { controller.suspend(); return }
@@ -1928,14 +1922,6 @@ final class InboxModel: ObservableObject {
         pending.append(message); busy.insert(agentID); persist()
         Task { await submit(message, epoch: account) }
     }
-    #if DEBUG && targetEnvironment(simulator)
-    func configureWhatsAppLinkUIFixture(client: ManagedClient) {
-        self.client = client
-        cards = [AgentCard(id: "fixture", title: "Link WhatsApp"), AgentCard(id: "other", title: "Other conversation")]
-        deck.reconcile(cards.map(\.id)); deck.focus("fixture")
-        connected = true
-    }
-    #endif
     var vaultIntakeAccount: UUID { generation }
     func cancelSecureInput(_ intake: SecureInputRequest, account: UUID) async throws -> SecureInputReceipt {
         guard let client, connected, !isDemo, generation == account else { throw APIError.invalidCredential }
