@@ -135,9 +135,11 @@ export function destroy(owner) {
         stateId,
       );
       storage.sql.exec("DELETE FROM nanocodex_durable_states WHERE state_id = ?", stateId);
-      storage.sql.exec("DELETE FROM nanocodex_durable_state_chunks WHERE state_id = ?", stateId);
-      storage.sql.exec("DELETE FROM nanocodex_durable_chunk_heads WHERE state_id = ?", stateId);
     }
+    // These pre-record-store tables exist only in legacy databases. The DO
+    // owns every state, so remove their schema along with any retained data.
+    storage.sql.exec("DROP TABLE IF EXISTS nanocodex_durable_state_chunks");
+    storage.sql.exec("DROP TABLE IF EXISTS nanocodex_durable_chunk_heads");
     storage.sql.exec("DROP TABLE IF EXISTS nanocodex_cloudflare_fork_resume");
     clearCloudflareEventSocket(context);
   });

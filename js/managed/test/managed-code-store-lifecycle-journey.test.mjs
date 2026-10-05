@@ -1,6 +1,7 @@
 // Real managed HTTP, account authorization, broker, SQLite and shipped WASM.
-// Fixtures bootstrap synthetic accounts and answer external model HTTP. A
-// read-only route observes cleanup; all store/fork/import/export/delete behavior
+// Fixtures bootstrap synthetic accounts, answer external model HTTP, and acknowledge
+// cleanup of a container that was never provisioned. A read-only route observes
+// cleanup; all store/fork/import/export/delete behavior
 // uses the shipped worker and public API, including actual SQLite and R2.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
@@ -14,11 +15,21 @@ import { Miniflare } from 'miniflare';
 const repo = fileURLToPath(new URL('../../../', import.meta.url));
 const evidence = resolve(repo, process.env.NANOCODEX_CODE_STORE_EVIDENCE_DIR ?? 'output/managed-code-store-lifecycle');
 const owner = '11111111-1111-4111-8111-111111111155';
-const command = 'PATH=/srv/nanocodex/workspace/toolchain/node-v24.21.0-linux-x64/bin:$PATH node --test js/managed/test/managed-code-store-lifecycle-journey.test.mjs';
+const command = 'node --test js/managed/test/managed-code-store-lifecycle-journey.test.mjs';
 const bootstrap = `
 import managed, { DurableAgentSession } from './src/index.ts';
 export * from './src/index.ts';
 import { ensureAccount, createApiKey } from './src/account-auth.ts';
+import { DurableObject } from 'cloudflare:workers';
+// Cloudflare Containers is an external platform dependency. No container is
+// provisioned in this journey; cleanup still crosses the actual DO RPC boundary.
+export class EmptyContainerFixture extends DurableObject {
+  async configure() {}
+  async clearRemoteDesktop() { await this.ctx.storage.put('desktopCleared', true); }
+  async destroy() { await this.ctx.storage.put('destroyed', true); }
+  async fetch() { return Response.json(Object.fromEntries(await this.ctx.storage.list())); }
+}
+
 export class DocumentFixtureSession extends DurableAgentSession {
   async fetch(request) {
     if(new URL(request.url).pathname === '/__fixture/inspect') {
@@ -40,6 +51,7 @@ export default {async fetch(request,env,ctx) {
     return Response.json(await createApiKey(env,{kind:'api_key',userId:user,...auth.grant,...(capabilities?{capabilities}:{}),subjectId:'fixture:'+user,credentialId:'fixture'},'synthetic-historical-document-fork'));
   }
   if(path==='/__fixture/openai') return env.NANOCODEX.fetch('https://broker.internal/users/${owner}/credentials/openai',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({api_key:'sk-synthetic-document-fork'})});
+  if(path.startsWith('/__fixture/sandbox/')) return env.NANOCODEX_SANDBOXES.getByName('nanocodex-'+path.split('/')[3]).fetch('https://sandbox.internal/inspect');
   const fixture=path.startsWith('/__fixture/inspect/') ? path.split('/') : null;
   if(fixture) return env.NANOCODEX_SESSIONS.getByName(fixture[3]).fetch(new Request('https://session.internal/__fixture/inspect',request));
   return managed.fetch(request,env,ctx);
@@ -100,8 +112,8 @@ test('managed Code Mode rejects lossy portability before fencing, forks 5 MiB co
         const marker=Object.keys(cells).find(key=>prompt.includes('"'+key+'"'));
         let output=[{type:'message',role:'assistant',content:[{type:'output_text',text:'STORE_JOURNEY_OK'}]}];
         if(marker) {
-          const callId='store-journey-'+marker;
-          const result=body.input.slice(lastUser+1).find(row=>row.type==='custom_tool_call_output'&&row.call_id===callId);
+          const callId='store-journey-'+marker+'-'+modelCalls;
+          const result=body.input.slice(lastUser+1).find(row=>row.type==='custom_tool_call_output'&&row.call_id.startsWith('store-journey-'+marker+'-'));
           if(result) {
             const encoded=JSON.stringify(result);
             if(marker==='OVERFLOW') assert.match(encoded,/exceeds 8 MiB/);
@@ -121,10 +133,10 @@ test('managed Code Mode rejects lossy portability before fencing, forks 5 MiB co
   const egress=await bundle(`export * from './src/egress.ts'; export {default} from './src/egress.ts';`,resolve(repo,'js/egress'),'egress');
   const persistence=resolve(evidence,'sqlite-'+crypto.randomUUID());
   const date='2026-07-29',flags=['nodejs_compat','enable_request_signal'];
-  const options={durableObjectsPersist:persistence,r2Persist:resolve(persistence,'r2'),workers:[
+  const options={durableObjectsPersist:persistence,r2Persist:resolve(persistence,'r2'),cachePersist:resolve(persistence,'cache'),workers:[
     {name:'managed',modulesRoot:'/',modules:managed,compatibilityDate:date,compatibilityFlags:flags,bindings:{MANAGED_AGENT_DIRECT_CREDENTIALS:'true'},
       serviceBindings:{NANOCODEX:'egress',NANOCODEX_SESSION_MODEL_EGRESS:{name:'egress',entrypoint:'SessionModelEgress'}},
-      durableObjects:Object.fromEntries([['NANOCODEX_AUTH','NonceStorage'],['NANOCODEX_USERS','UserAccount'],['NANOCODEX_ORGANIZATIONS','Organization'],['NANOCODEX_API_KEYS','ApiKeyRecord'],['NANOCODEX_SESSIONS','DocumentFixtureSession'],['NANOCODEX_ACCOUNT_TOOLS','AccountHostedTools'],['NANOCODEX_VM_HOST_POOLS','VmHostPool'],['NANOCODEX_MEMORY','MemoryScope']].map(([binding,className])=>[binding,{className,useSQLite:true}])),r2Buckets:['NANOCODEX_HISTORY','NANOCODEX_WORKSPACES'],outboundService:'external-provider'},
+      durableObjects:Object.fromEntries([['NANOCODEX_SANDBOXES','EmptyContainerFixture'],['NANOCODEX_AUTH','NonceStorage'],['NANOCODEX_USERS','UserAccount'],['NANOCODEX_ORGANIZATIONS','Organization'],['NANOCODEX_API_KEYS','ApiKeyRecord'],['NANOCODEX_SESSIONS','DocumentFixtureSession'],['NANOCODEX_ACCOUNT_TOOLS','AccountHostedTools'],['NANOCODEX_VM_HOST_POOLS','VmHostPool'],['NANOCODEX_MEMORY','MemoryScope']].map(([binding,className])=>[binding,{className,useSQLite:true}])),r2Buckets:['NANOCODEX_HISTORY','NANOCODEX_WORKSPACES'],outboundService:'external-provider'},
     {name:'egress',modulesRoot:'/',modules:egress,compatibilityDate:date,compatibilityFlags:flags,bindings:{ENVIRONMENT:'test',CREDENTIAL_ENCRYPTION_KEY:'MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY'},serviceBindings:{MANAGED_AGENT_OWNERSHIP:{name:'managed',entrypoint:'ManagedAgentOwnership'}},
       durableObjects:Object.fromEntries([['USER_CREDENTIALS','UserCredentialBroker'],['AGENT_SUBJECTS','AgentSubjectDirectory'],['USER_CONNECTORS','UserConnectorBroker'],['MCP_CONNECTIONS','McpConnectionDirectory'],['SPOTIFY_RATE_LIMITS','SpotifyRateLimit'],['GMAIL_PUSH_MAILBOXES','GmailPushMailbox']].map(([binding,className])=>[binding,{className,useSQLite:true}])),outboundService:'external-provider'},
     {name:'external-provider',script:externalProvider,modules:true,compatibilityDate:date,compatibilityFlags:flags,serviceBindings:{CONTROL:provider}}]};
@@ -133,7 +145,7 @@ test('managed Code Mode rejects lossy portability before fencing, forks 5 MiB co
     const response=await mf.dispatchFetch('https://nanocodex.example'+path,{method,headers:{authorization:'Bearer '+token,'content-type':'application/json',origin:'https://nanocodex.example',...headers},...(body===undefined?{}:{body:JSON.stringify(body)})});
     const text=await response.text();let value;try{value=JSON.parse(text);}catch{value=text;}
     trace.push({path,method,status:response.status,value:path==='/__fixture'?{private_fields:'redacted'}:value});
-    assert.equal(response.status,status,`${method} ${path}: ${text}`);return value;
+    assert.ok((Array.isArray(status)?status:[status]).includes(response.status),`${method} ${path}: ${response.status} ${text}`);return value;
   };
   const turn=async(agent,input,id)=>{
     const receipt=await call(`/v1/agents/${agent}/turns`,'POST',{id,input},202);
@@ -165,7 +177,13 @@ test('managed Code Mode rejects lossy portability before fencing, forks 5 MiB co
     // pointer-only archive rejection without replacing importer behavior.
     const portable=(await call('/v1/agents','POST',{settings},201)).agent_id;
     await turn(portable,'NO_STORE','portable');await restart();
-    const archive=await call(`/v1/agents/${portable}/durability`,'POST');
+    let archive;
+    for(let n=0;n<40;n++){
+      archive=await call(`/v1/agents/${portable}/durability`,'POST',undefined,[200,202]);
+      if(archive.stage!=='exporting')break;
+      await new Promise(resolve=>setTimeout(resolve,1000));
+    }
+    assert.ok(archive.durability,'portable export must finish');
     const legacy=structuredClone(archive);
     const payload=JSON.parse(legacy.durability.payload);
     assert.ok(payload.nanocodex_durable_state.documents.current);
@@ -179,12 +197,13 @@ test('managed Code Mode rejects lossy portability before fencing, forks 5 MiB co
     const pristine=(await call('/v1/agents','POST',{durability:archive},201,{'idempotency-key':'legacy-refusal'})).agent_id;
     await restart();await turn(pristine,'NO_STORE','imported');
     const beforeDelete=await inspect(child);assert.ok(Object.values(beforeDelete.counts).every(count=>count>0));
-    await call(`/v1/agents/${child}`,'DELETE');await restart();
+    await call(`/v1/agents/${child}`,'DELETE',undefined,204);await restart();
+    assert.deepEqual(await call('/__fixture/sandbox/'+child),{desktopCleared:true,destroyed:true});
     const afterDelete=await inspect(child);assert.ok(Object.values(afterDelete.counts).every(count=>count===0));
     await call(`/v1/agents/${child}`,'GET',undefined,404);
     await turn(parent,'PARENT_READ','surviving-parent');
     assert.deepEqual(failures,[]);
-    assert.equal(journalChecks.length,11);
+    assert.deepEqual(journalChecks.map(check=>check.marker),['STORE_LARGE','READ_LARGE','READ_LARGE','OVERFLOW','PARENT_READ','CHILD_WRITE','CHILD_READ','PARENT_READ','PARENT_READ']);
     outcomes={parent,child,pristine,memoBytes:5*1024*1024,preFenceExportRefusal:true,continuedAfterRefusal:true,legacyImportPristineRefusal:true,overflowRolledBack:true,coldForkIsolated:true,beforeDelete,afterDelete};
     t.diagnostic(JSON.stringify({outcomes,restarts,modelCalls,journalChecks}));
   }finally {

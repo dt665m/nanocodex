@@ -56,6 +56,10 @@ class MemoryStorage {
       this.subagents.clear();
     } else if (statement === "DROP TABLE IF EXISTS nanocodex_cloudflare_subagent_checkpoints") {
       this.subagentCheckpoints.clear();
+    } else if (statement === "DROP TABLE IF EXISTS nanocodex_durable_state_chunks") {
+      this.chunks = [];
+    } else if (statement === "DROP TABLE IF EXISTS nanocodex_durable_chunk_heads") {
+      this.chunkHeads.clear();
     } else if (statement.startsWith("PRAGMA table_info")) {
       rows = durabilityPragmaRows(statement);
     } else if (statement.startsWith("INSERT OR IGNORE INTO nanocodex_cloudflare_event_meta")) {
