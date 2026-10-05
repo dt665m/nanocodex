@@ -53,7 +53,7 @@
     "test:whatsapp": "node --test test/whatsapp-public-journey.test.mjs",
     "test:permissions": "node --test test/permission-requests-journey.test.mjs test/permission-tool-journey.test.mjs",
     "test:crm-search": "node scripts/prepare-code-evaluator.mjs && node scripts/prepare-just-bash-lazy.mjs && node --test test/crm-greek-search-journey.test.mjs",
-    "test:durability": "node --test test/historical-document-fork-journey.test.mjs test/durable-children-scheduler-journey.test.mjs test/code-state-hosted-journey.test.mjs",
+    "test:durability": "node --test test/historical-document-fork-journey.test.mjs test/durable-children-scheduler-journey.test.mjs test/code-state-hosted-journey.test.mjs test/managed-code-store-lifecycle-journey.test.mjs",
     "test:vault-requests": "node --test test/vault-request-journey.test.mjs"
   },
   "dependencies": {

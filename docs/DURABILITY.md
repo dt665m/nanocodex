@@ -296,6 +296,20 @@ the rejection occurs before acquiring or fencing any owner. An empty registry
 alone does not block export. `CloudflareAgent.destroy(owner)` requires an inactive
 lifecycle and fences and deletes the root, registry, and descendant journals.
 
+Managed Code Mode memo snapshots use an 8 MiB bound shared by their SQLite
+journal and account-owned R2 document references. Forks copy the selected
+snapshot into the new native session's journal; cold reopen retains branch
+writes without changing the parent. Aggregate writes that exceed the bound
+are rejected before committing the new journal state.
+
+The managed portability archive does not carry that colocated journal or its
+account-owned R2 objects. `POST /v1/agents/:id/durability` therefore returns
+`409 code_mode_store_not_portable` for stored Code Mode state before sealing
+the source. The source remains usable. Import rejects older pointer-only
+Code Mode archives with the same error before creating a destination. Delete
+clears the session's cells, store versions, blob metadata, and chunks along
+with its other managed state.
+
 Archives can contain conversation and tool state and are not encrypted by this
 API. Applications own transport encryption, access control, retention, and
 deletion. An unconfirmed destination commit must be reconciled by loading the
