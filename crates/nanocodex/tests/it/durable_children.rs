@@ -148,10 +148,14 @@ impl Fixture {
                             ordinal,
                         )
                     } else if prompt.contains("queue-followup") {
-                        function("send_agent_message", json!({
-                            "agent_id":1, "message":"gated-child-followup",
-                            "priority":"deferred", "purpose":"coordinate"
-                        }), ordinal)
+                        function(
+                            "send_agent_message",
+                            json!({
+                                "agent_id":1, "message":"gated-child-followup",
+                                "priority":"deferred", "purpose":"coordinate"
+                            }),
+                            ordinal,
+                        )
                     } else if prompt.contains("directory") {
                         function(
                             "list_agents",
@@ -235,7 +239,19 @@ impl Fixture {
         self.parent_with_state(state).await
     }
 
-    async fn parent_with_state(&self, state: DurableSession) -> (Nanocodex, nanocodex::AgentEvents) {
+    async fn parent_with_state(
+        &self,
+        state: DurableSession,
+    ) -> (Nanocodex, nanocodex::AgentEvents) {
+        self.parent_capturing_handle(state, None).await
+    }
+
+    async fn parent_capturing_handle(
+        &self,
+        state: DurableSession,
+        capture: Option<tokio::sync::oneshot::Sender<nanocodex::agent::AgentHandle>>,
+    ) -> (Nanocodex, nanocodex::AgentEvents) {
+        let capture = Arc::new(Mutex::new(capture));
         #[cfg(feature = "claude")]
         if self.claude {
             let client = nanocodex::claude::ClaudeClient::new(
@@ -244,6 +260,12 @@ impl Fixture {
                 "synthetic-key",
             );
             return Nanocodex::builder(nanocodex::Claude::new(client, "claude-sonnet-5-5"))
+                .map_tools_factory(move |handle, tools| {
+                    if let Some(capture) = capture.lock().unwrap().take() {
+                        let _ = capture.send(handle);
+                    }
+                    Ok(tools)
+                })
                 .durability(state)
                 .await
                 .unwrap()
@@ -253,6 +275,12 @@ impl Fixture {
         Nanocodex::builder(self.openai())
             .workspace(&self.workspace)
             .tools(Tools::builder().without_defaults().build().unwrap())
+            .map_tools_factory(move |handle, tools| {
+                if let Some(capture) = capture.lock().unwrap().take() {
+                    let _ = capture.send(handle);
+                }
+                Ok(tools)
+            })
             .durability(state)
             .await
             .unwrap()
@@ -545,55 +573,99 @@ async fn child_owner_departure(claude: bool, shutdown: bool, background: bool, q
             _witness: owned,
         },
         "configured-native-root",
-    ).await.unwrap();
+    )
+    .await
+    .unwrap();
     let (parent, events) = fixture.parent_with_state(state).await;
     let root_session = parent.session_id().to_owned();
     let turn = parent
-        .prompt(PromptRequest::new(if background { "spawn-background" } else { "spawn-foreground" }).request_id("child"))
-        .await.unwrap();
-    tokio::time::timeout(DEADLINE, fixture.child_started.notified()).await.unwrap();
-    if !background { fixture.child_release.notify_one(); }
-    tokio::time::timeout(DEADLINE, turn.result()).await.unwrap().unwrap();
+        .prompt(
+            PromptRequest::new(if background {
+                "spawn-background"
+            } else {
+                "spawn-foreground"
+            })
+            .request_id("child"),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(DEADLINE, fixture.child_started.notified())
+        .await
+        .unwrap();
     if !background {
-        let directory: Value = serde_json::from_str(&answer(&parent, "directory", "before-departure").await).unwrap();
+        fixture.child_release.notify_one();
+    }
+    tokio::time::timeout(DEADLINE, turn.result())
+        .await
+        .unwrap()
+        .unwrap();
+    if !background {
+        let directory: Value =
+            serde_json::from_str(&answer(&parent, "directory", "before-departure").await).unwrap();
         assert_eq!(directory["agents"][0]["status"]["state"], "completed");
-        assert_eq!(directory["agents"][0]["status"]["output"], "native-child-result");
+        assert_eq!(
+            directory["agents"][0]["status"]["output"],
+            "native-child-result"
+        );
     }
     if queued {
-        let receipt: Value = serde_json::from_str(&answer(&parent, "queue-followup", "queue-followup").await).unwrap();
+        let receipt: Value =
+            serde_json::from_str(&answer(&parent, "queue-followup", "queue-followup").await)
+                .unwrap();
         assert_eq!(receipt["disposition"], "queued");
     }
     let retained = parent.clone();
     drop(parent);
     assert!(weak.upgrade().is_some(), "live root clone retains owner");
-    if shutdown { retained.shutdown().await.unwrap(); }
+    if shutdown {
+        retained.shutdown().await.unwrap();
+    }
     drop((retained, events));
     if background {
         // No root facade remains; accepted work still owns its registry.
-        assert!(weak.upgrade().is_some(), "pending background must retain owner");
+        assert!(
+            weak.upgrade().is_some(),
+            "pending background must retain owner"
+        );
         fixture.child_release.notify_one();
-        tokio::time::timeout(DEADLINE, fixture.child_finished.notified()).await
+        tokio::time::timeout(DEADLINE, fixture.child_finished.notified())
+            .await
             .expect("background result submission must survive root departure");
         if queued {
-            tokio::time::timeout(DEADLINE, fixture.child_started.notified()).await
+            tokio::time::timeout(DEADLINE, fixture.child_started.notified())
+                .await
                 .expect("queued follow-up starts after first child settles");
-            assert!(weak.upgrade().is_some(), "queued follow-up must retain registry");
+            assert!(
+                weak.upgrade().is_some(),
+                "queued follow-up must retain registry"
+            );
             fixture.child_release.notify_one();
-            tokio::time::timeout(DEADLINE, fixture.child_finished.notified()).await
+            tokio::time::timeout(DEADLINE, fixture.child_finished.notified())
+                .await
                 .expect("queued follow-up result must settle after root departure");
         }
     }
     tokio::time::timeout(Duration::from_secs(2), async {
-        while weak.upgrade().is_some() { tokio::task::yield_now().await; }
-    }).await.expect("completed child tree must release its store after final root departure");
+        while weak.upgrade().is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("completed child tree must release its store after final root departure");
     let (reopened, events) = fixture.parent().await;
     reopened.ready().await.unwrap();
     assert_eq!(reopened.session_id(), root_session);
-    let directory: Value = serde_json::from_str(&answer(&reopened, "directory", "after-departure").await).unwrap();
+    let directory: Value =
+        serde_json::from_str(&answer(&reopened, "directory", "after-departure").await).unwrap();
     assert_eq!(directory["agents"].as_array().unwrap().len(), 1);
     assert_eq!(directory["agents"][0]["status"]["state"], "completed");
-    assert_eq!(directory["agents"][0]["status"]["output"], "native-child-result");
-    println!("CHILD_OWNER_RELEASE claude={claude} shutdown={shutdown} background={background} queued={queued}: live clone/pending work retained, final settlement released store, completed result survived reopen");
+    assert_eq!(
+        directory["agents"][0]["status"]["output"],
+        "native-child-result"
+    );
+    println!(
+        "CHILD_OWNER_RELEASE claude={claude} shutdown={shutdown} background={background} queued={queued}: live clone/pending work retained, final settlement released store, completed result survived reopen"
+    );
     reopened.shutdown().await.unwrap();
     drop((reopened, events));
 }
@@ -948,5 +1020,174 @@ async fn startup_recovery_errors_are_observable_without_root_model_work() {
         println!(
             "NATIVE_STARTUP_ERROR claude={claude}: ready/clone/prompt report recovery failure, zero root operations or HTTP"
         );
+    }
+}
+
+#[tokio::test]
+async fn native_direct_spawn_survives_root_drop() {
+    direct_spawn_departure(false, false).await;
+}
+
+#[tokio::test]
+async fn native_direct_spawn_survives_root_shutdown() {
+    direct_spawn_departure(false, true).await;
+}
+
+#[cfg(feature = "claude")]
+#[tokio::test]
+async fn claude_direct_spawn_survives_root_drop() {
+    direct_spawn_departure(true, false).await;
+}
+
+#[cfg(feature = "claude")]
+#[tokio::test]
+async fn claude_direct_spawn_survives_root_shutdown() {
+    direct_spawn_departure(true, true).await;
+}
+
+async fn direct_spawn_departure(claude: bool, shutdown: bool) {
+    for capability in [false, true] {
+        let fixture = Fixture::start_family(
+            &format!("direct-spawn-{shutdown}-{capability}"),
+            claude,
+            None,
+        )
+        .await;
+        let owned = Arc::new(());
+        let weak = Arc::downgrade(&owned);
+        let state = DurableSession::open(
+            super::durable_owner_drop::WitnessStore {
+                inner: SqliteStore::open(fixture.workspace.join("children.sqlite")).unwrap(),
+                _witness: owned,
+            },
+            "configured-native-root",
+        )
+        .await
+        .unwrap();
+        let (capture, captured) = tokio::sync::oneshot::channel();
+        let (root, events) = fixture.parent_capturing_handle(state, Some(capture)).await;
+        let handle = captured.await.unwrap();
+        root.ready().await.unwrap();
+        let (child, child_events) = if capability {
+            handle.spawn().await.unwrap()
+        } else {
+            root.spawn().await.unwrap()
+        };
+        child.ready().await.unwrap();
+        assert_ne!(root.session_id(), child.session_id());
+        assert_eq!(fixture.calls(), 0, "construction starts no model turn");
+        if shutdown {
+            root.shutdown().await.unwrap();
+        }
+        drop((root, events));
+        tokio::time::timeout(DEADLINE, async {
+            while handle.ensure_available().await.is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("root driver must stop independently of the sibling");
+        assert!(
+            handle.spawn().await.is_err(),
+            "departed root capability stays weak"
+        );
+        drop(handle);
+        let retained = child.clone();
+        drop(child);
+        assert_eq!(
+            answer(&retained, "direct sibling", "direct").await,
+            "durable native answer"
+        );
+        let (descendant, descendant_events) = retained.spawn().await.unwrap();
+        descendant.ready().await.unwrap();
+        retained.shutdown().await.unwrap();
+        drop((retained, child_events));
+        assert_eq!(
+            answer(&descendant, "independent descendant", "descendant").await,
+            "durable native answer"
+        );
+        descendant.shutdown().await.unwrap();
+        drop((descendant, descendant_events));
+        tokio::time::timeout(DEADLINE, async {
+            while weak.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("final direct caller departure must release its store");
+        println!(
+            "DIRECT_SPAWN claude={claude} shutdown={shutdown} capability={capability}: root stopped; cloned sibling and descendant answered independently; final caller released store"
+        );
+    }
+}
+
+#[tokio::test]
+async fn native_direct_forks_survive_caller_departure() {
+    // Durable operation policies already reject forks. Exercise the supported
+    // native fork APIs with the same public registry ownership barrier instead.
+    for fork_kind in ["latest", "completed", "side", "capability"] {
+        let fixture = Fixture::start_family(&format!("direct-fork-{fork_kind}"), false, None).await;
+        let (registry, _, _updates) = nanocodex_subagents::channel(usize::MAX);
+        let weak = Arc::downgrade(&registry);
+        let (capture, captured) = tokio::sync::oneshot::channel();
+        let capture = Arc::new(Mutex::new(Some(capture)));
+        let (child, child_events) = Nanocodex::builder(fixture.openai())
+            .workspace(&fixture.workspace)
+            .tools(Tools::builder().without_defaults().build().unwrap())
+            .turn_ownership(Arc::new(nanocodex_subagents::RegistryOwnership::child(
+                &registry,
+            )))
+            .map_tools_factory(move |handle, tools| {
+                if let Some(capture) = capture.lock().unwrap().take() {
+                    let _ = capture.send(handle);
+                }
+                Ok(tools)
+            })
+            .build()
+            .unwrap();
+        let handle = captured.await.unwrap();
+        child.ready().await.unwrap();
+        drop(registry);
+        let completed = child
+            .prompt("fork boundary")
+            .await
+            .unwrap()
+            .result()
+            .await
+            .unwrap();
+        let (fork, fork_events) = match fork_kind {
+            "latest" => child.fork().await.unwrap(),
+            "completed" => child.fork_from(&completed).await.unwrap(),
+            "side" => child.fork_side_conversation().await.unwrap(),
+            _ => handle.fork().await.unwrap(),
+        };
+        fork.ready().await.unwrap();
+        child.shutdown().await.unwrap();
+        drop((child, child_events, completed, handle));
+        assert_eq!(
+            tokio::time::timeout(DEADLINE, async {
+                fork.prompt("independent fork")
+                    .await
+                    .unwrap()
+                    .result()
+                    .await
+                    .unwrap()
+                    .final_message()
+                    .to_owned()
+            })
+            .await
+            .unwrap(),
+            "durable native answer"
+        );
+        println!("DIRECT_FORK {fork_kind}: fork answered after the original caller departed");
+        fork.shutdown().await.unwrap();
+        drop((fork, fork_events));
+        tokio::time::timeout(DEADLINE, async {
+            while weak.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("final fork caller must release its registry");
     }
 }

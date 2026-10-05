@@ -8,6 +8,9 @@ use crate::rollout::RolloutInfo;
 
 /// Cheap, cloneable command handle for an owned agent driver.
 pub struct Nanocodex {
+    // Only caller-facing handles own this lease. Keeping it out of the backend
+    // and factory capabilities prevents a registry -> harness -> driver cycle.
+    pub(super) caller_ownership: Option<Arc<dyn Send + Sync>>,
     pub(super) backend: Arc<dyn LifecycleBackend>,
     pub(super) events: nanocodex_oai_api::events::AgentEventPublisher,
     pub(super) next_turn: Arc<AtomicU64>,
@@ -24,6 +27,7 @@ pub struct Nanocodex {
 impl Clone for Nanocodex {
     fn clone(&self) -> Self {
         Self {
+            caller_ownership: self.caller_ownership.clone(),
             backend: Arc::clone(&self.backend),
             events: self.events.clone(),
             next_turn: Arc::clone(&self.next_turn),
@@ -439,6 +443,7 @@ impl Nanocodex {
     #[cfg(not(target_family = "wasm"))]
     pub fn with_owned_startup(mut self, hook: Option<Arc<dyn execution::TurnOwnership>>) -> Self {
         if let Some(hook) = hook {
+            self.caller_ownership = hook.caller_ownership();
             let session = self.session_id.clone();
             let (send, result) = tokio::sync::watch::channel(None);
             let task = tokio::spawn(async move {
@@ -453,6 +458,15 @@ impl Nanocodex {
                 task: std::sync::Mutex::new(Some(task)),
             }));
         }
+        self
+    }
+
+    /// Transfers a caller-owned handle to a harness that supplies execution and
+    /// mailbox ownership. This does not stop the driver or change stored state.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn without_caller_ownership(mut self) -> Self {
+        self.caller_ownership = None;
         self
     }
 

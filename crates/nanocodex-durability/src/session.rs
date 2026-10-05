@@ -2537,6 +2537,7 @@ pub(crate) struct DurableOwner {
 }
 
 impl DurableOwner {
+    #[cfg(feature = "claude")]
     pub(crate) async fn document(&self, key: &str) -> Result<Option<crate::SessionDocument>> {
         self.caller()?;
         let (result, receiver) = oneshot::channel();

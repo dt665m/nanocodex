@@ -358,6 +358,7 @@ impl BackendRuntime {
         B: LifecycleBackend,
     {
         Nanocodex {
+            caller_ownership: None,
             backend: Arc::new(backend),
             events: self.events,
             next_turn: Arc::new(AtomicU64::new(1)),
@@ -382,6 +383,7 @@ impl BackendRuntime {
         B: LifecycleBackend,
     {
         Nanocodex {
+            caller_ownership: None,
             backend: Arc::new(backend),
             events: self.events,
             next_turn: Arc::new(AtomicU64::new(1)),

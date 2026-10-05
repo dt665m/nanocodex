@@ -31,8 +31,9 @@ impl TurnOwnership for RegistryOwnership {
 }
 
 impl RegistryOwnership {
-    /// Idle child runtimes must not retain the registry that owns their harness.
-    /// The harness pins it while executing or delivering committed mailbox work.
+    /// Idle managed drivers must not retain the registry that owns their harness.
+    /// Direct caller handles acquire their own lease; the harness replaces it
+    /// with ownership while executing or delivering committed mailbox work.
     pub fn child(registry: &Arc<Registry>) -> impl TurnOwnership + use<> {
         ChildOwnership(Arc::downgrade(registry))
     }
@@ -41,6 +42,12 @@ impl RegistryOwnership {
 struct ChildOwnership(Weak<Registry>);
 
 impl TurnOwnership for ChildOwnership {
+    fn caller_ownership(&self) -> Option<Arc<dyn Send + Sync>> {
+        self.0
+            .upgrade()
+            .map(|registry| registry as Arc<dyn Send + Sync>)
+    }
+
     fn prepare<'a>(&'a self, session_id: &'a str) -> ExecutionFuture<'a, Result<()>> {
         Box::pin(async move {
             let registry = self.0.upgrade().ok_or(NanocodexError::AgentStopped)?;

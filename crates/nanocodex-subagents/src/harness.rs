@@ -223,7 +223,9 @@ pub(super) fn spawn(
         Harness {
             root_session_id,
             id,
-            agent: Some(agent),
+            // Managed children use active-turn and queued-delivery leases, not
+            // the independent caller lease supplied by native construction.
+            agent: Some(agent.without_caller_ownership()),
             active: None,
             commands: receiver,
             deferred: deferred_receiver,

@@ -146,7 +146,7 @@ where
             .session_id(session)
             .map_tools_factory(move |handle, tools| {
                 // Construction holds the registry through build; later native
-                // branches run only while their harness owns an execution lease.
+                // branches are retained by a caller handle or active harness work.
                 let registry = tools_registry
                     .upgrade()
                     .expect("live child construction owns registry");
