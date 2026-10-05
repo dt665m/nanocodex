@@ -45,6 +45,8 @@ enum Journey {
     Subscription,
     SubscriptionRecovery,
     XaiMixed,
+    ProjectContext,
+    ContextRouting,
 }
 
 struct Provider {
@@ -69,8 +71,13 @@ impl Provider {
         .unwrap();
     }
     fn respond(&mut self, family: &str, label: &str, request: Value) -> Reply {
-        let stage = *self.counts.entry(label.into()).or_default();
-        *self.counts.get_mut(label).unwrap() += 1;
+        let key = if self.journey == Journey::ContextRouting {
+            format!("{family}:{label}")
+        } else {
+            label.into()
+        };
+        let stage = *self.counts.entry(key.clone()).or_default();
+        *self.counts.get_mut(&key).unwrap() += 1;
         let reply = self.script(label, stage);
         if matches!(reply, Reply::Pause) {
             self.pauses += 1;
@@ -88,6 +95,39 @@ impl Provider {
     }
 
     fn script(&self, label: &str, stage: usize) -> Reply {
+        if self.journey == Journey::ProjectContext {
+            return match stage {
+                0 => Reply::Read {
+                    path: ".agents/skills/fixture/SKILL.md",
+                },
+                1 => Reply::Write {
+                    path: "context-effect.txt",
+                    content: "context-effect",
+                },
+                _ => Reply::Text("project-context-answer".into()),
+            };
+        }
+        if self.journey == Journey::ContextRouting {
+            return match (label, stage) {
+                ("root", 0) => Reply::Code(format!(
+                    r#"
+for (const family of ['claude', 'xai', 'codex']) {{
+  const child = await tools.spawn_agent({{harness:family,model:null,role:'MIXED_CHILD',task:'MIXED_CHILD',thinking:null,output_contract:{}}});
+  const done = await tools.wait_agent({{agent_ids:[child.agent_id],timeout_ms:20000}});text(done);
+  if(done.timed_out || done.agents[0].status.output.answer !== 'context-child-answer') throw Error('context child failed');
+}}
+text('context-routing-ok');
+"#,
+                    contract()
+                )),
+                ("child", 0) => Reply::Code(
+                    "text(await tools.submit_result({output:{answer:'context-child-answer'}}));"
+                        .into(),
+                ),
+                ("root", _) => Reply::Text("context-routing-answer".into()),
+                _ => Reply::Text("context child finished".into()),
+            };
+        }
         if self.journey == Journey::XaiMixed {
             return match (label, stage) {
                 ("root", 0) | ("child", 0) => {
@@ -266,6 +306,9 @@ text(await tools.submit_result({output:{answer:'grandchild-answer'}}));
 }
 
 enum Reply {
+    Read {
+        path: &'static str,
+    },
     Code(String),
     Text(String),
     Write {
@@ -277,6 +320,7 @@ enum Reply {
 impl Reply {
     fn value(&self) -> Value {
         match self {
+            Self::Read { path } => json!({"tool":"Read","file_path":path}),
             Self::Code(code) => json!({"code":code}),
             Self::Text(text) => json!({"text":text}),
             Self::Write { path, content } => {
@@ -293,7 +337,9 @@ impl Reply {
             Self::Text(text) => {
                 json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]})
             }
-            Self::Write { .. } => unreachable!("native Claude Write cannot route to Responses"),
+            Self::Read { .. } | Self::Write { .. } => {
+                unreachable!("native file tools cannot route to Codex Responses")
+            }
             Self::Pause => unreachable!("paused generation has no terminal response"),
         };
         json!({"type":"response.completed","response":{"id":id,"status":"completed","output":[output],
@@ -311,6 +357,11 @@ impl Reply {
             }
         };
         let (block, delta, stop) = match self {
+            Self::Read { path } => (
+                json!({"type":"tool_use","id":id,"name":tool_name("Read"),"input":{}}),
+                json!({"type":"input_json_delta","partial_json":json!({"file_path":path}).to_string()}),
+                "tool_use",
+            ),
             Self::Code(code) => (
                 json!({"type":"tool_use","id":id,"name":tool_name("exec"),"input":{}}),
                 json!({"type":"input_json_delta","partial_json":json!({"code":code}).to_string()}),
@@ -637,6 +688,7 @@ async fn subscription_servers_with_recovery(
             let output = match reply {
                 Reply::Code(code) => json!({"type":"function_call","name":"exec","call_id":id,"arguments":json!({"code":code}).to_string()}),
                 Reply::Text(text) => json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]}),
+                Reply::Read { path } => json!({"type":"function_call","name":"read_file","call_id":id,"arguments":json!({"target_file":path}).to_string()}),
                 Reply::Write { path, content } => json!({"type":"function_call","name":"write","call_id":id,"arguments":json!({"file_path":path,"content":content}).to_string()}),
                 Reply::Pause => panic!("mixed xAI smoke journey must not pause"),
             };
@@ -1051,6 +1103,8 @@ async fn journey(family: &'static str, kind: Journey) -> Result<()> {
         Journey::Subscription => "subscription-native-answer",
         Journey::SubscriptionRecovery => "subscription-recovery-answer",
         Journey::XaiMixed => "xai-mixed-root-answer",
+        Journey::ProjectContext => "project-context-answer",
+        Journey::ContextRouting => "context-routing-answer",
     };
     if kind == Journey::Smoke {
         run_tui(command, &artifact, answer).await?;
@@ -2470,5 +2524,349 @@ async fn xai_cli_model_defaults_select_supported_hosted_search() -> Result<()> {
         serde_json::to_vec_pretty(&*requests)?,
     )?;
     task.abort();
+    Ok(())
+}
+
+// Extract transmitted instruction data, independently of provider framing.
+fn wire_instructions(request: &Value) -> String {
+    if let Some(system) = request.get("system") {
+        return match system {
+            Value::String(text) => text.clone(),
+            Value::Array(blocks) => blocks
+                .iter()
+                .filter_map(|b| b["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => String::new(),
+        };
+    }
+    if let Some(text) = request["instructions"].as_str() {
+        return text.into();
+    }
+    // Codex carries its primary instruction in the first developer message.
+    // Later developer messages retain independent host permissions/project data.
+    if let Some(message) = request["input"].as_array().and_then(|items| {
+        items
+            .iter()
+            .find(|item| item["role"] == "developer" && item["type"] == "message")
+    }) {
+        return message["content"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|block| block["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    request["input"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| item["role"] == "system")
+        .map(|item| item["content"].as_str().unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn context_files(workspace: &Path) -> Result<()> {
+    std::fs::create_dir_all(workspace.join(".claude/skills/claude-fixture"))?;
+    std::fs::create_dir_all(workspace.join(".agents/skills/fixture"))?;
+    std::fs::write(workspace.join("AGENTS.md"), "fixture-agents-context\n")?;
+    std::fs::write(workspace.join("CLAUDE.md"), "fixture-claude-context\n")?;
+    std::fs::write(
+        workspace.join(".claude/CLAUDE.md"),
+        "fixture-dotclaude-context\n",
+    )?;
+    std::fs::write(
+        workspace.join(".agents/skills/fixture/SKILL.md"),
+        "fixture-lazy-skill-body\n",
+    )?;
+    std::fs::write(
+        workspace.join(".claude/skills/claude-fixture/SKILL.md"),
+        "fixture-claude-skill-body\n",
+    )?;
+    // These files must never enter native automatic workspace context.
+    std::fs::write(
+        workspace.parent().unwrap().join("AGENTS.md"),
+        "fixture-ancestor-denied",
+    )?;
+    std::fs::write(workspace.join("home/CLAUDE.md"), "fixture-home-denied")?;
+    std::fs::create_dir_all(workspace.join("nested"))?;
+    std::fs::write(workspace.join("nested/CLAUDE.md"), "fixture-nested-denied")?;
+    Ok(())
+}
+
+fn context_command(workspace: &Path, servers: &Servers, family: &str) -> Command {
+    if family == "xai" {
+        let mut invocation = xai_command(workspace, &servers.xai);
+        invocation.args(["--rollouts", "false", "--web-search", "false"]);
+        invocation
+    } else {
+        command(workspace, servers, family, true, true, false)
+    }
+}
+
+#[tokio::test]
+async fn native_cli_project_context_is_bounded_lazy_and_explicitly_replaceable() -> Result<()> {
+    for family in ["claude", "xai"] {
+        let artifact = artifact(&format!("{family}-project-context"))?;
+        let workspace = artifact.join("workspace");
+        context_files(&workspace)?;
+        let provider = Arc::new(Mutex::new(Provider {
+            root: family,
+            journey: Journey::ProjectContext,
+            counts: HashMap::new(),
+            log: vec![],
+            artifact: artifact.clone(),
+            pauses: 0,
+            cancellations: 0,
+            connections: vec![],
+        }));
+        let servers = servers(Arc::clone(&provider)).await?;
+        let mut invocation = context_command(&workspace, &servers, family);
+        invocation.arg("PROJECT_CONTEXT_ROOT");
+        let output = run(invocation, &artifact, "workspace context transmitted; skill body loaded only by native Read/read_file; native Write/write creates context-effect.txt").await?;
+        success(&output, &artifact, "project-context-answer")?;
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("context-effect.txt"))?,
+            "context-effect"
+        );
+        {
+            let provider = provider.lock().unwrap();
+            let initial = &provider.log[0]["request"];
+            let system = wire_instructions(initial);
+            assert!(system.contains("fixture-agents-context"));
+            assert_eq!(
+                system.contains("fixture-claude-context"),
+                family == "claude"
+            );
+            assert_eq!(
+                system.contains("fixture-dotclaude-context"),
+                family == "claude"
+            );
+            assert!(system.contains(".agents/skills/fixture/SKILL.md"));
+            assert_eq!(
+                system.contains(".claude/skills/claude-fixture/SKILL.md"),
+                family == "claude"
+            );
+            for excluded in [
+                "fixture-lazy-skill-body",
+                "fixture-claude-skill-body",
+                "fixture-ancestor-denied",
+                "fixture-home-denied",
+                "fixture-nested-denied",
+            ] {
+                assert!(
+                    !system.contains(excluded),
+                    "automatic context leaked {excluded}"
+                );
+            }
+            assert!(
+                provider.log[1]["tool_result"]
+                    .to_string()
+                    .contains("fixture-lazy-skill-body")
+            );
+            let names = initial["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|tool| tool["name"].as_str())
+                .collect::<Vec<_>>();
+            assert!(names.contains(&if family == "claude" {
+                "Read"
+            } else {
+                "read_file"
+            }));
+            assert!(!initial["tools"].as_array().unwrap().iter().any(|tool| {
+                tool["type"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .starts_with("web_search")
+            }));
+        }
+        // New process with an exact caller replacement, including enabled subagents.
+        let override_path = artifact.join("override");
+        std::fs::create_dir_all(&override_path)?;
+        let mut invocation = context_command(&workspace, &servers, family);
+        invocation.args([
+            "--instructions",
+            "fixture-explicit-instructions",
+            "OVERRIDE_ROOT",
+        ]);
+        let output = run(invocation, &override_path, "explicit instructions replace all default prompt modules and automatic context; tool catalog remains usable").await?;
+        success(&output, &override_path, "project-context-answer")?;
+        assert_eq!(
+            wire_instructions(&provider.lock().unwrap().log.last().unwrap()["request"]),
+            "fixture-explicit-instructions"
+        );
+
+        // Truncation is visible on the wire, and large skill bodies stay lazy.
+        let bounded_path = artifact.join("bounded");
+        std::fs::create_dir_all(&bounded_path)?;
+        std::fs::write(
+            workspace.join("AGENTS.md"),
+            format!(
+                "fixture-bounded-start{}fixture-bounded-end",
+                "a".repeat(20_000)
+            ),
+        )?;
+        for n in 0..40 {
+            let skill = workspace.join(format!(".agents/skills/bounded-{n:02}"));
+            std::fs::create_dir_all(&skill)?;
+            std::fs::write(skill.join("SKILL.md"), "fixture-unloaded-skill-body")?;
+        }
+        let mut invocation = context_command(&workspace, &servers, family);
+        invocation.arg("BOUNDED_ROOT");
+        let output = run(invocation, &bounded_path, "8 KiB project excerpt with truncation flag, at most 32 indexed skills, no skill bodies").await?;
+        success(&output, &bounded_path, "project-context-answer")?;
+        let system = wire_instructions(&provider.lock().unwrap().log.last().unwrap()["request"]);
+        assert!(system.contains("fixture-bounded-start"));
+        assert!(!system.contains("fixture-bounded-end"));
+        assert!(system.contains("\"truncated\":true"));
+        assert_eq!(system.matches("/SKILL.md").count(), 32);
+        assert!(!system.contains("fixture-unloaded-skill-body"));
+        assert!(system.len() < 40_000);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn native_cli_project_context_rejects_symlinks_and_special_files() -> Result<()> {
+    use std::os::unix::fs::symlink;
+    let artifact = artifact("native-project-context-symlinks")?;
+    let workspace = artifact.join("workspace");
+    let outside = artifact.join("outside");
+    std::fs::create_dir_all(outside.join("skills/escaped"))?;
+    std::fs::write(outside.join("AGENTS.md"), "fixture-symlink-secret")?;
+    std::fs::write(outside.join("CLAUDE.md"), "fixture-symlink-secret")?;
+    std::fs::write(
+        outside.join("skills/escaped/SKILL.md"),
+        "fixture-symlink-skill-secret",
+    )?;
+    symlink(outside.join("AGENTS.md"), workspace.join("AGENTS.md"))?;
+    symlink(&outside, workspace.join(".claude"))?;
+    std::fs::create_dir_all(workspace.join(".agents/skills"))?;
+    symlink(
+        outside.join("skills/escaped"),
+        workspace.join(".agents/skills/escaped"),
+    )?;
+    nix::unistd::mkfifo(&workspace.join("CLAUDE.md"), nix::sys::stat::Mode::S_IRUSR)?;
+    let provider = Arc::new(Mutex::new(Provider {
+        root: "claude",
+        journey: Journey::Smoke,
+        counts: HashMap::new(),
+        log: vec![],
+        artifact: artifact.clone(),
+        pauses: 0,
+        cancellations: 0,
+        connections: vec![],
+    }));
+    let servers = servers(Arc::clone(&provider)).await?;
+    for family in ["claude", "xai"] {
+        let path = artifact.join(family);
+        std::fs::create_dir_all(&path)?;
+        let mut invocation = context_command(&workspace, &servers, family);
+        invocation.arg("SYMLINK_ROOT");
+        let output = run(invocation, &path, "symlinked file/directory/skill and FIFO excluded; CLI reaches provider and completes without blocking").await?;
+        success(&output, &path, "claude-only-answer")?;
+        let system = wire_instructions(&provider.lock().unwrap().log.last().unwrap()["request"]);
+        assert!(!system.contains("fixture-symlink"));
+        assert!(!system.contains("escaped/SKILL.md"));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_cli_cross_family_children_resolve_defaults_and_preserve_explicit_override()
+-> Result<()> {
+    let mut defaults = HashMap::<String, String>::new();
+    for family in ["claude", "xai"] {
+        for custom in [false, true] {
+            let artifact = artifact(&format!("{family}-context-routing-{custom}"))?;
+            let workspace = artifact.join("workspace");
+            context_files(&workspace)?;
+            let provider = Arc::new(Mutex::new(Provider {
+                root: family,
+                journey: Journey::ContextRouting,
+                counts: HashMap::new(),
+                log: vec![],
+                artifact: artifact.clone(),
+                pauses: 0,
+                cancellations: 0,
+                connections: vec![],
+            }));
+            let servers = servers(Arc::clone(&provider)).await?;
+            let mut invocation = context_command(&workspace, &servers, family);
+            if family == "xai" {
+                invocation.args([
+                    "--api-key",
+                    "synthetic-openai-key",
+                    "--claude-api-key",
+                    "synthetic-anthropic-key",
+                    "--claude-messages-url",
+                    &servers.claude,
+                    "--websocket-url",
+                    &servers.codex,
+                ]);
+            } else {
+                invocation.args([
+                    "--xai-api-key",
+                    "synthetic-xai-key",
+                    "--xai-responses-url",
+                    &servers.xai,
+                ]);
+            }
+            if custom {
+                invocation.args(["--instructions", "fixture-cross-family-override"]);
+            }
+            invocation.arg("CONTEXT_ROUTING_ROOT");
+            let output = run(invocation, &artifact, "native root spawns Claude, xAI and Codex children; family defaults independent of parent, explicit replacement inherited without context").await?;
+            success(&output, &artifact, "context-routing-answer")?;
+            let provider = provider.lock().unwrap();
+            assert!(
+                provider.log.last().unwrap()["tool_result"]
+                    .to_string()
+                    .contains("context-routing-ok")
+            );
+            for target in ["claude", "xai", "codex"] {
+                let call = provider
+                    .log
+                    .iter()
+                    .find(|call| call["family"] == target && call["label"] == "child")
+                    .expect("missing child dispatch");
+                let system = wire_instructions(&call["request"]);
+                if custom {
+                    assert_eq!(system, "fixture-cross-family-override");
+                } else if target != "codex" {
+                    assert!(system.contains("fixture-agents-context"));
+                    assert_eq!(
+                        system.contains("fixture-claude-context"),
+                        target == "claude"
+                    );
+                    if let Some(previous) = defaults.insert(target.into(), system.clone()) {
+                        assert_eq!(
+                            system, previous,
+                            "child defaults changed with parent family"
+                        );
+                    }
+                    if target == family {
+                        assert_eq!(
+                            system,
+                            wire_instructions(&provider.log[0]["request"]),
+                            "same-family child lost root defaults"
+                        );
+                    }
+                } else {
+                    assert!(!system.contains("fixture-claude-context"));
+                    assert_ne!(
+                        system,
+                        wire_instructions(&provider.log[0]["request"]),
+                        "Codex inherited native root defaults"
+                    );
+                }
+            }
+        }
+    }
     Ok(())
 }

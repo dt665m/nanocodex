@@ -60,6 +60,14 @@ export type Options = Readonly<{
   /** Automatic compaction trigger as percent of context capacity, 1..100. */
   autoCompactThresholdPercent?: number;
   maxSteps?: number;
+  /** Retries of explicit transient HTTP rejections; 0 disables retries. Default 3.
+   * Interrupted streams and uncertain tool effects are never automatically replayed. */
+  maxRetries?: number;
+  /** Maximum executions of identical tool name/arguments in one turn. Default 3. */
+  repetitionLimit?: number;
+  /** Desired recent native item count to retain during compaction. Default 8.
+   * Complete user/tool boundaries can retain more; even 0 retains the latest user turn. */
+  compactionKeepTail?: number;
   requestTimeoutMs?: number;
   terminalReceiptRetention?: number;
   /** Compiled browser WASM module for this exact package. */

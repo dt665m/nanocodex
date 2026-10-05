@@ -7,6 +7,42 @@ with the default-off `xai` feature, `nanocodex::Xai`, and
 as Nanoclaude. The implementation runs in process and does not require an
 installed `grok` executable.
 
+## Native CLI prompt and workspace context
+
+The shipped CLI selects this backend with `--harness xai`. Its original modular
+default instructions cover coding workflow, native `read_file`, `write`,
+`search_replace`, `list_dir`, `glob`, `grep`, foreground `run_terminal_cmd`, and
+the retained `exec`/`wait`/`tool_search` bridge. Hosted web-search guidance follows
+the selected model and `--web-search`; delegation guidance follows `--subagents`.
+Additional host capabilities must be discovered from the current catalog.
+
+For default instructions, native xAI builders load only `AGENTS.md` at the
+canonical selected workspace root, capped at 8 KiB of source bytes and marked
+when truncated. The excerpt is lower-authority JSON reference data. Claude's
+`CLAUDE.md` files are not loaded into xAI. A lazy workspace-only
+`.agents/skills/*/SKILL.md` index includes paths, not skill bodies: at most 128
+immediate entries are scanned, and at most 32 paths / 8 KiB are included. Relevant
+bodies can subsequently be read with `read_file`. Nonregular/unreadable files and
+symlinks (including directory components) are skipped. Unix automatic content
+reads use directory handles and no-follow flags. There is no home/ancestor
+search, recursive discovery, import expansion or automatic skill execution.
+These checks are not a substitute for OS isolation against hostile concurrent
+filesystem changes.
+
+`--instructions TEXT` replaces default modules and automatic project/skill
+context, including delegation guidance. An explicit replacement is inherited by
+children; without it, each child receives its selected family's defaults. A
+Claude child receives Claude-native guidance and Claude project files, and a
+Codex child retains the Codex builder's standard instructions. Prompt text does
+not grant tools or permissions. Native restored checkpoints retain their saved
+instructions. Library embeddings remain explicitly configured and do not inherit
+CLI filesystem discovery.
+
+The [native CLI context journeys](CLAUDE_RUNTIME.md#native-cli-instructions-and-project-context)
+exercise actual tool effects, transmitted context, bounded reads, symlink
+exclusion and cross-family override boundaries using the shipped binary and
+loopback providers. This is not full Grok Build or Claude Code application parity.
+
 ## Construction
 
 From this checkout, an application can depend on the facade with
@@ -150,7 +186,11 @@ Compaction events make success and failure observable.
 
 `.max_retries(...)` enables bounded retries for explicit transient HTTP
 rejections; its default is three retries. It does not grant permission to replay an
-interrupted stream or an uncertain tool effect. `.repetition_limit(...)` limits
+interrupted stream or an uncertain tool effect. Recovery classifies the actual
+HTTP status and exact recognized context error code, never a matching substring
+inside provider text. A truncated HTTP rejection is uncertain. An empty
+`max_prompt_tokens` terminal permits context recovery only when the stream has
+not already emitted output, tool activity or unknown events. `.repetition_limit(...)` limits
 identical name/argument calls within a turn (default three executions).
 
 These are portable policies, not every Grok Build recovery mechanism. The
@@ -219,11 +259,17 @@ agent.dispose();
 ```
 
 Options include `instructions`, `thinking`, `contextWindowTokens`,
-`autoCompactThresholdPercent`, `maxSteps`, `requestTimeoutMs`, host `tools`,
+`autoCompactThresholdPercent`, `maxSteps`, `maxRetries`, `repetitionLimit`,
+`compactionKeepTail`, `requestTimeoutMs`, host `tools`,
 provider-owned `serverTools`, and paired `durability`/`durabilityId`.
 `subagents` opts into shared task routing; `harnesses` explicitly supplies
 alternate-family configurations. The host/browser entry points use the current
-isolate. Host authentication and tool callbacks remain outside serialized
+isolate. `maxRetries` defaults to three; zero disables retries of explicit rejections.
+`repetitionLimit` defaults to three executions of an identical tool call per turn
+and must be positive. `compactionKeepTail` defaults to eight native items; complete
+user/tool boundaries can retain more, and even zero preserves the latest user
+turn. These controls share the Rust backend's policies and never enable replay
+of uncertain effects. Host authentication and tool callbacks remain outside serialized
 configuration. The result's `.snapshot()` is unsupported; durable state belongs
 to the selected store.
 

@@ -10,7 +10,7 @@ import { createXaiHost } from './xai-host.mjs';
 const OPTION_KEYS = new Set([
   'auth', 'fetch', 'endpoint', 'model', 'instructions', 'sessionId', 'tools',
   'harness', 'harnesses', 'subagents', 'serverTools', 'durability', 'durabilityId', 'module', 'workspace',
-  'thinking', 'contextWindowTokens', 'autoCompactThresholdPercent', 'maxSteps', 'requestTimeoutMs', 'terminalReceiptRetention',
+  'thinking', 'contextWindowTokens', 'autoCompactThresholdPercent', 'maxSteps', 'maxRetries', 'repetitionLimit', 'compactionKeepTail', 'requestTimeoutMs', 'terminalReceiptRetention',
 ]);
 export function toXaiConfig(options = {}) {
   if (!options || typeof options !== 'object' || Array.isArray(options)) throw new TypeError('Xai options must be an object');
@@ -26,6 +26,10 @@ export function toXaiConfig(options = {}) {
   if ((options.durability === undefined) !== (options.durabilityId === undefined)) throw new TypeError('durability and durabilityId must be supplied together');
   for (const key of ['sessionId', 'durabilityId']) if (options[key] !== undefined && (typeof options[key] !== 'string' || !options[key].trim())) throw new TypeError(`Xai ${key} must be non-empty`);
   for (const key of ['contextWindowTokens', 'maxSteps', 'requestTimeoutMs', 'autoCompactThresholdPercent']) if (options[key] !== undefined && (!Number.isSafeInteger(options[key]) || options[key] < 1)) throw new TypeError(`Xai ${key} must be a positive safe integer`);
+  for (const key of ['maxRetries', 'repetitionLimit', 'compactionKeepTail']) {
+    const minimum = key === 'repetitionLimit' ? 1 : 0;
+    if (options[key] !== undefined && (!Number.isSafeInteger(options[key]) || options[key] < minimum || options[key] > 0xffff_ffff)) throw new TypeError(`Xai ${key} must be an integer from ${minimum} through 4294967295`);
+  }
   if (options.autoCompactThresholdPercent > 100) throw new TypeError('autoCompactThresholdPercent must be 1..100');
   for (const key of ['instructions', 'workspace']) if (options[key] !== undefined && typeof options[key] !== 'string') throw new TypeError(`Xai ${key} must be a string`);
   if (options.thinking !== undefined && !['low', 'medium', 'high', 'xhigh'].includes(options.thinking)) throw new TypeError('unsupported Xai thinking');

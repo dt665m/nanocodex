@@ -12,6 +12,7 @@ const options: Options = {
     return { output: 'synthetic contents', success: true } satisfies ToolResult;
   } }],
   thinking: 'xhigh', autoCompactThresholdPercent: 80,
+  maxRetries: 0, repetitionLimit: 1, compactionKeepTail: 0,
 };
 NodeXai.create(options).then(async agent => {
   const turn = agent.turn.prompt({ input: 'text' });

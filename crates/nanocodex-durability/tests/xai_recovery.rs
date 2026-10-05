@@ -916,3 +916,78 @@ async fn recovered_tool_repetition_budget_covers_prior_rounds_and_replayed_recei
         );
     }
 }
+
+#[tokio::test]
+async fn streamed_hosted_effect_prevents_context_recovery_even_after_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("streamed-effect.sqlite");
+    let (client, requests, server) = server(|index, _| {
+        if index == 2 {
+            let effect = json!({"type":"response.output_item.done","output_index":0,
+                "item":{"type":"web_search_call","id":"hosted-effect","status":"completed"}});
+            let terminal = json!({"type":"response.incomplete","response":{"status":"incomplete",
+                "output":[],"incomplete_details":{"reason":"max_prompt_tokens"}}});
+            return format!("data: {effect}\n\ndata: {terminal}\n\n");
+        }
+        answer()
+    })
+    .await;
+    let (agent, _) = Xai::new(client.clone(), "grok-4.6")
+        .web_search()
+        .compaction_keep_tail(0)
+        .durability(reopen(&path).await)
+        .await
+        .unwrap()
+        .build()
+        .unwrap();
+    result(&agent, "history", &"retained violet history ".repeat(200))
+        .await
+        .unwrap();
+    let failure = result(&agent, "interrupted", "continue the task")
+        .await
+        .unwrap_err();
+    assert!(failure.to_string().contains("incomplete"), "{failure}");
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        2,
+        "observed hosted effect forbids recovery sampling"
+    );
+    agent.shutdown().await.unwrap();
+    drop(agent);
+    let (agent, _) = Xai::new(client, "grok-4.6")
+        .durability(reopen(&path).await)
+        .await
+        .unwrap()
+        .build()
+        .unwrap();
+    let replayed = result(&agent, "interrupted", "continue the task")
+        .await
+        .unwrap_err();
+    assert!(replayed.to_string().contains("incomplete"));
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        2,
+        "reopen replays the failure without provider calls"
+    );
+    result(&agent, "followup", "explicitly continue")
+        .await
+        .unwrap();
+    let log = requests.lock().unwrap().clone();
+    assert_eq!(log.len(), 3);
+    assert!(
+        log[2]["input"]
+            .to_string()
+            .contains("retained violet history")
+    );
+    evidence(
+        "streamed-effect-no-retry",
+        &log,
+        0,
+        "streamed hosted effect followed by empty prompt-limit terminal fails without compaction; SQLite reopen replays failure; only explicit followup sends another request",
+    );
+    agent.shutdown().await.unwrap();
+    server.abort();
+    println!(
+        "SQLite+SSE journey: observed hosted effect cannot trigger context recovery; failed receipt replay sends no HTTP; explicit followup succeeds (3 requests)"
+    );
+}

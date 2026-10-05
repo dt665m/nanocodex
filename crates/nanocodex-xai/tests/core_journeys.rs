@@ -556,3 +556,76 @@ async fn native_child_model_switch_defaults_effort_and_custom_models_restore() {
         "HTTP journey: Grok46 xhigh -> Grok45 child defaults high; custom native model identity/history survive restore"
     );
 }
+
+#[tokio::test]
+async fn recovery_requires_an_explicit_rejection_without_observed_output() {
+    for (scenario, status, code) in [
+        ("misleading-transient-code", 401, "HTTP 503"),
+        (
+            "misleading-context-code",
+            400,
+            "not_context_length_exceeded",
+        ),
+        ("streamed-hosted-effect", 200, ""),
+        ("streamed-text", 200, ""),
+    ] {
+        let (client, trace, server) = serve_fixture(move |index, _| {
+            if index == 2 {
+                if status != 200 {
+                    return (status, json!({"error":{"code":code}}).to_string());
+                }
+                let observed = if scenario == "streamed-hosted-effect" {
+                    json!({"type":"response.output_item.done","output_index":0,
+                        "item":{"type":"web_search_call","id":"hosted-effect","status":"completed"}})
+                } else {
+                    json!({"type":"response.output_text.delta","output_index":0,
+                        "item_id":"partial","content_index":0,"delta":"partial output"})
+                };
+                return (200, format!("data: {observed}\n\ndata: {}\n\n",
+                    json!({"type":"response.incomplete","response":{"status":"incomplete",
+                        "output":[],"incomplete_details":{"reason":"max_prompt_tokens"}}})));
+            }
+            (200, response(vec![message("committed answer")]))
+        }).await;
+        let (agent, _) = Xai::new(client, "grok-4.6")
+            .web_search()
+            .compaction_keep_tail(0)
+            .max_retries(1)
+            .build()
+            .unwrap();
+        ask(&agent, "retained earlier context ".repeat(200)).await;
+        let failure = agent
+            .prompt("continue the task")
+            .await
+            .unwrap()
+            .result()
+            .await;
+        assert!(
+            failure.is_err(),
+            "{scenario} must fail without another request"
+        );
+        assert_eq!(
+            trace.lock().unwrap().len(),
+            2,
+            "{scenario}: provider text or observed output must not authorize recovery"
+        );
+        assert_eq!(
+            ask(&agent, "explicit followup").await.final_message(),
+            "committed answer"
+        );
+        let log = trace.lock().unwrap().clone();
+        assert_eq!(log.len(), 3);
+        assert!(
+            log[2]["input"]
+                .to_string()
+                .contains("retained earlier context")
+        );
+        assert!(!log[2]["input"].to_string().contains("partial output"));
+        evidence(scenario, &trace);
+        agent.shutdown().await.unwrap();
+        server.abort();
+        println!(
+            "HTTP/SSE recovery guard: {scenario}, 2 requests before explicit followup, retained committed history"
+        );
+    }
+}

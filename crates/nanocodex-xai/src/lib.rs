@@ -499,7 +499,7 @@ impl State {
                 .map_err(|e| error(e.without_url()))?;
             if !response.status().is_success() {
                 let status = response.status();
-                let detail = response.text().await.unwrap_or_default();
+                let detail = response.text().await.map_err(|e| error(e.without_url()))?;
                 let code = serde_json::from_str::<Value>(&detail)
                     .ok()
                     .and_then(|v| v["error"]["code"].as_str().map(str::to_owned))
@@ -510,6 +510,7 @@ impl State {
             }
             let mut bytes = response.bytes_stream();
             let mut decoder = stream::Decoder::default();
+            let mut rejection_only = true;
             while let Some(chunk) = bytes.next().await {
                 for event in decoder
                     .push(&chunk.map_err(|e| error(e.without_url()))?)
@@ -521,9 +522,22 @@ impl State {
                         Some("response.reasoning_summary_text.delta"|"response.reasoning_text.delta") if phase == "generation"=>self.emit(events,AgentEventKind::ReasoningSummaryDelta,json!({"model_call_index":index,"text":event["delta"]})),
                         _=>{},
                     }
-                    // A prompt-limit terminal is a known rejection only when
-                    // the provider reports no output (including hosted effects).
-                    if event["type"] == "response.incomplete"
+                    // A terminal's empty output does not erase already observed
+                    // output or hosted effects. Only status-only preludes permit
+                    // prompt-limit recovery; unknown events fail closed too.
+                    rejection_only &= matches!(
+                        event["type"].as_str(),
+                        Some(
+                            "response.created"
+                                | "response.queued"
+                                | "response.in_progress"
+                                | "response.incomplete"
+                        )
+                    ) && !event["response"]["output"]
+                        .as_array()
+                        .is_some_and(|output| !output.is_empty());
+                    if rejection_only
+                        && event["type"] == "response.incomplete"
                         && event["response"]["incomplete_details"]["reason"] == "max_prompt_tokens"
                         && event["response"]["output"]
                             .as_array()

@@ -35,6 +35,7 @@ use crate::subagents::{self, ChildAgents, DEFAULT_MAX_SUBAGENTS, SubagentToolSet
 use crate::vm::{ConfiguredVm, VmArgs};
 
 mod claude;
+mod instructions;
 mod xai;
 
 pub(crate) struct ConfiguredAgent {
@@ -652,9 +653,7 @@ impl AgentArgs {
             harness_builder,
             xai::XaiConnection::new(self.xai_api_key, self.xai_responses_url),
             session.workspace.clone(),
-            self.instructions
-                .clone()
-                .unwrap_or_else(xai::default_instructions),
+            self.instructions.clone(),
             claude_tools.clone(),
             self.model_policy.web_search,
             subagent_runtime
@@ -662,15 +661,21 @@ impl AgentArgs {
                 .map(|(registry, _, _)| Arc::clone(registry)),
         );
         let harness = claude::register_claude_recipe(
-            harness_builder, claude::ClaudeConnection::new(
-                self.claude_auth, self.claude_api_key, self.claude_messages_url,
+            harness_builder,
+            claude::ClaudeConnection::new(
+                self.claude_auth,
+                self.claude_api_key,
+                self.claude_messages_url,
             ),
-            session.workspace.clone(), self.instructions.clone().unwrap_or_else(||
-                "You are a coding agent. Use native Claude file tools and Bash for the workspace; use exec for shared MCP and subagent capabilities.".to_owned()),
+            session.workspace.clone(),
+            self.instructions.clone(),
             claude_tools,
             web_search,
-            subagent_runtime.as_ref().map(|(registry, _, _)| Arc::clone(registry)),
-        ).build();
+            subagent_runtime
+                .as_ref()
+                .map(|(registry, _, _)| Arc::clone(registry)),
+        )
+        .build();
         let mut builder = Nanocodex::builder(openai)
             .model(model)
             .reasoning_mode(self.reasoning_mode)

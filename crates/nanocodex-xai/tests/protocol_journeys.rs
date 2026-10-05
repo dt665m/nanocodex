@@ -536,3 +536,99 @@ async fn cancellation_acknowledges_a_started_tool_only_after_its_receipt_is_reta
     );
     server.abort();
 }
+
+#[tokio::test]
+async fn truncated_http_rejection_is_not_retried() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let received = requests.clone();
+    let app = Router::new().route(
+        "/v1/responses",
+        post(move |Json(body): Json<Value>| {
+            let received = received.clone();
+            async move {
+                let ordinal = {
+                    let mut log = received.lock().unwrap();
+                    log.push(body);
+                    log.len()
+                };
+                if ordinal != 2 {
+                    return sse(completed("committed response", ordinal));
+                }
+                let body = stream::once(async { Ok::<_, std::io::Error>("{\"error\":") }).chain(
+                    stream::once(async {
+                        // Ensure the status and partial body reach the actual HTTP client
+                        // before the external provider disconnects mid-response.
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        Err(std::io::Error::other("synthetic provider disconnect"))
+                    }),
+                );
+                Response::builder()
+                    .status(503)
+                    .header("content-type", "application/json")
+                    .body(Body::from_stream(body))
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (agent, _) = Xai::new(
+        XaiClient::new(
+            reqwest::Client::new(),
+            format!("http://{address}/v1/responses"),
+            "synthetic",
+        ),
+        "grok-4.6",
+    )
+    .max_retries(1)
+    .build()
+    .unwrap();
+    agent
+        .prompt("remember committed context")
+        .await
+        .unwrap()
+        .result()
+        .await
+        .unwrap();
+    let failure = tokio::time::timeout(
+        DEADLINE,
+        agent
+            .prompt("interrupted rejection")
+            .await
+            .unwrap()
+            .result(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        failure.is_err(),
+        "partial HTTP rejection must not authorize retry"
+    );
+    assert_eq!(requests.lock().unwrap().len(), 2);
+    assert_eq!(
+        agent
+            .prompt("explicit followup")
+            .await
+            .unwrap()
+            .result()
+            .await
+            .unwrap()
+            .final_message(),
+        "committed response"
+    );
+    let log = requests.lock().unwrap().clone();
+    assert_eq!(log.len(), 3);
+    assert!(
+        log[2]["input"]
+            .to_string()
+            .contains("remember committed context")
+    );
+    record("truncated-http-rejection.json", &log);
+    agent.shutdown().await.unwrap();
+    server.abort();
+    println!(
+        "HTTP journey: disconnected 503 body fails once; explicit followup retains committed context (3 requests)"
+    );
+}

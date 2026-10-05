@@ -26,16 +26,34 @@ pub(crate) fn estimate(history: &[Value]) -> u64 {
 pub(crate) fn should_compact(config: &Xai, history: &[Value], last: u64) -> bool {
     estimate(history).max(last) >= threshold(config)
 }
+// Receipts retain their existing wire format, including after a durable reopen.
+// Only the transport-owned status prefix and an exact provider code authorize
+// recovery; a diagnostic code containing "HTTP 503" is not an HTTP rejection.
+fn http_rejection(message: &str) -> Option<(u16, &str)> {
+    let (status, code) = message
+        .strip_prefix("xAI Responses HTTP ")?
+        .split_once("; code=")?;
+    let status = status.split_whitespace().next()?.parse().ok()?;
+    Some((status, code))
+}
 pub(crate) fn context_limit(message: &str) -> bool {
-    message.contains("context_length_exceeded")
-        || message.contains("context_window_exceeded")
-        || message.contains("maximum context length")
-        || message.contains("HTTP 413")
+    if message == "xAI context_length_exceeded: max_prompt_tokens" {
+        return true;
+    }
+    matches!(http_rejection(message), Some((413, _)))
+        || matches!(
+            http_rejection(message),
+            Some((
+                400 | 422,
+                "context_length_exceeded" | "context_window_exceeded"
+            ))
+        )
 }
 pub(crate) fn retryable(message: &str) -> bool {
-    ["HTTP 429", "HTTP 500", "HTTP 502", "HTTP 503", "HTTP 504"]
-        .iter()
-        .any(|code| message.contains(code))
+    matches!(
+        http_rejection(message),
+        Some((429 | 500 | 502 | 503 | 504, _))
+    )
 }
 fn pinned(v: &Value) -> bool {
     matches!(v["role"].as_str(), Some("system" | "developer"))

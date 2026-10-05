@@ -15,7 +15,7 @@ async function acceptance() {
   const module = await (await fetch('/nanocodex_bg.wasm')).arrayBuffer();
   const store = createMemoryDurabilityStore('chromium-xai');
   let authCalls=0,effects=0;
-  const options={module,model:'grok-4.6',endpoint:location.origin+'/v1/responses',requestTimeoutMs:5000,durability:store,durabilityId:'chromium-xai',
+  const options={module,model:'grok-4.6',endpoint:location.origin+'/v1/responses',requestTimeoutMs:5000,maxRetries:0,repetitionLimit:1,compactionKeepTail:0,durability:store,durabilityId:'chromium-xai',
     auth:{headers(){authCalls++;return {authorization:'Bearer synthetic-browser-only'}}},
     tools:[{name:'read_file',description:'Synthetic explicit browser file',handler(input,ctx){if(!ctx.callId||!ctx.turnId||!ctx.signal)throw Error('missing invocation context');effects++;return 'BROWSER_RECEIPT'}}]};
   let agent=await create(options);

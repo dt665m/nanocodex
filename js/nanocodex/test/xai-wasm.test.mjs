@@ -146,6 +146,8 @@ test('invalid auth configuration and thinking are rejected and thrown auth callb
   const { Xai } = await import('../node/index.mjs');
   await assert.rejects(Xai.create({ model: 'grok-4.6', auth: { apiKey: 'secret', headers() {} } }), /exactly one/);
   await assert.rejects(Xai.create({ model: 'grok-4.6', auth: { apiKey: 'secret' }, thinking: 'max' }), /thinking/);
+  await assert.rejects(Xai.create({ model: 'grok-4.6', auth: { apiKey: 'synthetic' }, maxRetries: -1 }), /maxRetries/);
+  await assert.rejects(Xai.create({ model: 'grok-4.6', auth: { apiKey: 'synthetic' }, repetitionLimit: 0 }), /repetitionLimit/);
   const agent = await Xai.create({ model: 'grok-4.6', requestTimeoutMs: 1000, auth: { headers() { throw Error('private-token-marker'); } } });
   try { await assert.rejects(run(agent, 'hello'), error => /auth/i.test(String(error)) && !String(error).includes('private-token-marker')); }
   finally { await agent.session.shutdown(); agent.dispose(); }
@@ -282,4 +284,71 @@ test('durable rejected provider turn replays its failure event without authentic
     assert.doesNotMatch(JSON.stringify(events), /private-rejection-marker|replay must not authenticate/);
     t.diagnostic(JSON.stringify({ providerRequests: requests, replayRequests: 0, replayFailureEvent: true }));
   } finally { watcher.off(); await agent.session.shutdown(); agent.dispose(); }
+});
+
+test('xAI retry policy distinguishes explicit rejections from interrupted streams in actual WASM', { timeout: 15_000 }, async t => {
+  const { Xai } = await import('../node/index.mjs');
+  const evidence = [];
+  for (const maxRetries of [0, 1]) {
+    let requests = 0;
+    const agent = await Xai.create({ model: 'grok-4.6', auth: { apiKey: 'synthetic' }, maxRetries, requestTimeoutMs: 3000,
+      fetch: async () => ++requests === 1 ? new Response('unavailable', { status: 503 })
+        : new Response(sse([text('RECOVERED')]), { headers: { 'content-type': 'text/event-stream' } }),
+    });
+    try {
+      if (maxRetries === 0) await assert.rejects(run(agent, 'known rejection'), /503/);
+      else assert.equal((await run(agent, 'known rejection')).finalMessage, 'RECOVERED');
+      assert.equal(requests, maxRetries + 1);
+      evidence.push({ maxRetries, requests });
+    } finally { await agent.session.shutdown(); agent.dispose(); }
+  }
+  let requests = 0, effects = 0;
+  const agent = await Xai.create({ model: 'grok-4.6', auth: { apiKey: 'synthetic' }, maxRetries: 4, requestTimeoutMs: 3000,
+    tools: [{ name: 'effect', description: 'Count a synthetic side effect', handler() { effects++; return 'done'; } }],
+    fetch: async () => { requests++; return new Response(`data: ${JSON.stringify({ type: 'response.output_item.done', item: { type: 'function_call', call_id: 'interrupted-effect', name: 'effect', arguments: '{}' } })}\n\n`, { headers: { 'content-type': 'text/event-stream' } }); },
+  });
+  try {
+    await assert.rejects(run(agent, 'interrupted response'));
+    assert.equal(requests, 1); assert.equal(effects, 0);
+    evidence.push({ interruptedRequests: requests, effects });
+  } finally { await agent.session.shutdown(); agent.dispose(); }
+  const output = new URL('../../../output/xai/journeys/recovery-policy.json', import.meta.url);
+  await mkdir(new URL('./', output), { recursive: true });
+  await writeFile(output, JSON.stringify(evidence, null, 2));
+  t.diagnostic(JSON.stringify(evidence));
+});
+
+test('xAI SDK applies tool repetition and compaction tail limits at the native runtime boundary', { timeout: 15_000 }, async t => {
+  const { Xai } = await import('../node/index.mjs');
+  let effects = 0;
+  const { endpoint, requests } = await fixture(t, (body, index) => {
+    if (index < 3) return sse([{ type: 'function_call', call_id: `repeat-${index}`, name: 'effect', arguments: '{}' }]);
+    if (body.tools?.length === 0) return sse([text('SUMMARY_RETAINED')]);
+    return sse([text('BOUNDED_OK')]);
+  });
+  const agent = await Xai.create({ model: 'grok-4.6', endpoint, auth: { apiKey: 'synthetic' }, requestTimeoutMs: 3000,
+    repetitionLimit: 1, compactionKeepTail: 0, instructions: 'CALLER_POLICY_RETAINED',
+    tools: [{ name: 'effect', description: 'Count a synthetic side effect', handler() { effects++; return 'EFFECT_RECEIPT'; } }],
+  });
+  try {
+    assert.equal((await run(agent, `EARLIEST_ONLY ${'a'.repeat(1000)}`)).finalMessage, 'BOUNDED_OK');
+    assert.equal(effects, 1);
+    const receipts = requests[2].body.input.filter(item => item.type === 'function_call_output');
+    assert.equal(receipts.length, 2);
+    assert.equal(receipts[0].output, 'EFFECT_RECEIPT');
+    assert.match(receipts[1].output, /repetition limit/i);
+    await run(agent, `MIDDLE_ONLY ${'b'.repeat(1000)}`);
+    await run(agent, 'LATEST_RETAINED');
+    await agent.session.compact();
+    const history = JSON.stringify((await agent.session.context()).history);
+    assert.match(history, /SUMMARY_RETAINED/);
+    assert.match(history, /CALLER_POLICY_RETAINED/);
+    assert.match(history, /LATEST_RETAINED/);
+    assert.doesNotMatch(history, /EARLIEST_ONLY|MIDDLE_ONLY|EFFECT_RECEIPT/);
+    const summary = requests.at(-1).body;
+    assert.equal(summary.tools.length, 0);
+    assert.match(JSON.stringify(summary.input), /EARLIEST_ONLY/);
+    assert.match(JSON.stringify(summary.input), /MIDDLE_ONLY/);
+    t.diagnostic(JSON.stringify({ actualWasm: true, repetitionLimit: 1, effects, compactionKeepTail: 0, retainedLatestTurn: true }));
+  } finally { await agent.session.shutdown(); agent.dispose(); }
 });

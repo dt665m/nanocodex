@@ -129,9 +129,7 @@ impl AgentArgs {
         let tool_registry = registry
             .as_ref()
             .map(|(registry, _, _)| Arc::clone(registry));
-        let instructions = self.instructions.unwrap_or_else(|| {
-            "You are a coding agent. Use the native Claude workspace tools to inspect and change the authorized workspace. Bash runs foreground commands through the retained workspace host. Use exec for MCP and shared subagent tools.".to_owned()
-        });
+        let instructions = self.instructions;
         let codex_auth = self.auth;
         let codex_tools = tools
             .clone()
@@ -193,6 +191,7 @@ impl AgentArgs {
                     let client = openai.build().map_err(|error| {
                         nanocodex::NanocodexError::InvalidRequest(error.to_string())
                     })?;
+                    let registry_enabled = registry.is_some();
                     let mut builder = Nanocodex::builder(client)
                         .workspace(workspace)
                         .codex_home(codex_home)
@@ -201,7 +200,6 @@ impl AgentArgs {
                         .reasoning_mode(reasoning_mode)
                         .fast_mode(fast_mode)
                         .host_context(request.host_context)
-                        .instructions(instructions)
                         .spawn_factory(request.spawn_factory)
                         .tools_factory(move |parent| {
                             if let Some(registry) = &registry {
@@ -214,6 +212,14 @@ impl AgentArgs {
                                 Ok(tools.clone())
                             }
                         });
+                    if instructions.is_none()
+                        && let Some(extra) = session_instructions(None, registry_enabled, false)
+                    {
+                        builder = builder.additional_instructions(extra);
+                    }
+                    if let Some(instructions) = instructions {
+                        builder = builder.instructions(instructions);
+                    }
                     if let Some(checkpoint) = request.snapshot {
                         builder = builder.restore_runtime(checkpoint)?;
                     }
@@ -308,15 +314,18 @@ fn configured_claude_builder(
     thinking: Thinking,
     workspace: PathBuf,
     files: Arc<ClaudeWorkspaceFiles>,
-    mut instructions: String,
+    instructions: Option<String>,
     tools: Tools,
     web_search: bool,
     registry: Option<Arc<nanocodex_subagents::Registry>>,
 ) -> nanocodex::claude::ClaudeBuilder {
-    if registry.is_some() && !instructions.contains(SUBAGENT_INSTRUCTIONS) {
-        instructions.push_str("\n\n");
-        instructions.push_str(SUBAGENT_INSTRUCTIONS);
-    }
+    let instructions = super::instructions::native(
+        HarnessFamily::Claude,
+        instructions,
+        &workspace,
+        web_search,
+        registry.is_some(),
+    );
     let mut builder = Nanocodex::builder(Claude::new(client, model.as_str()))
         .workspace(workspace.to_string_lossy().into_owned())
         .system(instructions)
@@ -343,7 +352,7 @@ pub(super) fn register_claude_recipe(
     harness: nanocodex::HarnessBuilder,
     connection: ClaudeConnection,
     workspace: PathBuf,
-    instructions: String,
+    instructions: Option<String>,
     tools: Tools,
     web_search: bool,
     registry: Option<Arc<nanocodex_subagents::Registry>>,

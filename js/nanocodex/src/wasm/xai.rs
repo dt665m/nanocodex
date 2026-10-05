@@ -47,6 +47,9 @@ pub(super) struct XaiConfig {
     context_window_tokens: Option<u64>,
     auto_compact_threshold_percent: Option<u32>,
     max_steps: Option<usize>,
+    max_retries: Option<usize>,
+    repetition_limit: Option<usize>,
+    compaction_keep_tail: Option<usize>,
     request_timeout_ms: Option<u64>,
     instructions: Option<String>,
     workspace: Option<String>,
@@ -87,6 +90,7 @@ impl XaiConfig {
         }
         if self.context_window_tokens == Some(0)
             || self.max_steps == Some(0)
+            || self.repetition_limit == Some(0)
             || self.request_timeout_ms == Some(0)
         {
             return Err("Xai limits must be positive");
@@ -531,6 +535,15 @@ pub(super) async fn build_xai(
     }
     if let Some(steps) = config.max_steps {
         builder = builder.max_steps(steps);
+    }
+    if let Some(retries) = config.max_retries {
+        builder = builder.max_retries(retries);
+    }
+    if let Some(limit) = config.repetition_limit {
+        builder = builder.repetition_limit(limit);
+    }
+    if let Some(items) = config.compaction_keep_tail {
+        builder = builder.compaction_keep_tail(items);
     }
     if let Some(ms) = config.request_timeout_ms {
         builder = builder.request_timeout(std::time::Duration::from_millis(ms));

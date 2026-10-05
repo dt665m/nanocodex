@@ -52,10 +52,6 @@ impl XaiConnection {
     }
 }
 
-pub(super) fn default_instructions() -> String {
-    "You are a coding agent. Use the native xAI workspace file and shell tools to inspect and change the authorized workspace. Use exec for host MCP, browser/computer and shared subagent capabilities.".into()
-}
-
 async fn install_computer_tools(tools: Tools) -> Result<Tools> {
     let mut builder = tools.into_builder();
     if let Some(config) = nanocodex_computer::ComputerConfig::discover_or_install()
@@ -146,7 +142,7 @@ impl AgentArgs {
             .map(|(registry, _, _)| Arc::clone(registry));
         // The same CUA host catalog used by Codex remains available through exec.
         let tools = install_computer_tools(tools).await?;
-        let instructions = self.instructions.unwrap_or_else(default_instructions);
+        let instructions = self.instructions;
         let codex_auth = self.auth;
         let codex_tools = tools
             .clone()
@@ -208,6 +204,7 @@ impl AgentArgs {
                     let client = openai.build().map_err(|error| {
                         nanocodex::NanocodexError::InvalidRequest(error.to_string())
                     })?;
+                    let registry_enabled = registry.is_some();
                     let mut builder = Nanocodex::builder(client)
                         .workspace(workspace)
                         .codex_home(codex_home)
@@ -216,7 +213,6 @@ impl AgentArgs {
                         .reasoning_mode(reasoning_mode)
                         .fast_mode(fast_mode)
                         .host_context(request.host_context)
-                        .instructions(instructions)
                         .spawn_factory(request.spawn_factory)
                         .tools_factory(move |parent| {
                             if let Some(registry) = &registry {
@@ -229,6 +225,14 @@ impl AgentArgs {
                                 Ok(tools.clone())
                             }
                         });
+                    if instructions.is_none()
+                        && let Some(extra) = session_instructions(None, registry_enabled, false)
+                    {
+                        builder = builder.additional_instructions(extra);
+                    }
+                    if let Some(instructions) = instructions {
+                        builder = builder.instructions(instructions);
+                    }
                     if let Some(checkpoint) = request.snapshot {
                         builder = builder.restore_runtime(checkpoint)?;
                     }
@@ -356,16 +360,19 @@ fn configured_xai_builder(
     model: HarnessModel,
     thinking: Thinking,
     workspace: PathBuf,
-    mut instructions: String,
+    instructions: Option<String>,
     tools: Tools,
     web_search: Option<bool>,
     registry: Option<Arc<nanocodex_subagents::Registry>>,
 ) -> nanocodex::agent::Result<Xai> {
     let web_search = xai_web_search(model, web_search)?;
-    if registry.is_some() && !instructions.contains(SUBAGENT_INSTRUCTIONS) {
-        instructions.push_str("\n\n");
-        instructions.push_str(SUBAGENT_INSTRUCTIONS);
-    }
+    let instructions = super::instructions::native(
+        HarnessFamily::Xai,
+        instructions,
+        &workspace,
+        web_search,
+        registry.is_some(),
+    );
     let mut builder = Nanocodex::builder(Xai::new(client, model.as_str()))
         .thinking(thinking)
         .workspace(workspace.to_string_lossy().into_owned())
@@ -402,7 +409,7 @@ pub(super) fn register_xai_recipe(
     harness: nanocodex::HarnessBuilder,
     connection: XaiConnection,
     workspace: PathBuf,
-    instructions: String,
+    instructions: Option<String>,
     tools: Tools,
     web_search: Option<bool>,
     registry: Option<Arc<nanocodex_subagents::Registry>>,

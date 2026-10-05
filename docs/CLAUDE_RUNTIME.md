@@ -2,6 +2,66 @@
 
 `nanocodex-claude` implements a separate Messages-based backend behind the common `nanocodex-agent` lifecycle. Tool registration is explicit; it never imports the OpenAI tool catalog or Claude Code credentials. Embeddings supply authentication and host-authorized capabilities.
 
+## Native CLI instructions and project context
+
+The shipped CLI (`nanocodex --claude` or `--harness claude`) composes original
+coding instructions from shared workflow, native Claude tools, and retained-host
+modules. It describes the installed `Read`, `Glob`, `Grep`, `Edit`, `Write`,
+foreground `Bash`, `exec`, `wait`, and `tool_search` surfaces. Hosted search and
+shared delegation guidance are included only when enabled. Host integrations
+must be discovered from the live catalog; the prompt does not assume browser,
+computer, account, or other Claude Code tools are available.
+
+Without `--instructions`, a new native CLI builder loads `AGENTS.md`, `CLAUDE.md`
+and `.claude/CLAUDE.md` directly beneath the canonical `--cwd` (or current
+working directory). Each regular readable file contributes at most 8 KiB of
+source bytes, with its relative path and an explicit truncation flag. Excerpts
+are JSON-encoded lower-authority project reference data. Missing, unreadable,
+nonregular and symlinked files are skipped. Directory symlinks are also excluded;
+Unix content reads traverse directory handles with no-follow flags. These
+workspace tools and discovery checks do not replace OS isolation against a
+concurrent hostile process.
+
+Discovery never walks parents, the home directory or nested project directories,
+expands `@` imports, or loads `.claude/rules`. A bounded lazy index lists only
+workspace `.agents/skills/*/SKILL.md` and `.claude/skills/*/SKILL.md` paths. It
+examines at most 128 immediate entries per skill root and includes at most 32
+paths within an 8 KiB serialized index. Symlinked roots, skill directories and
+skill files are excluded. Bodies and supporting files are not preloaded: the
+agent must use a native file tool when a skill is relevant. The index has no
+slash-command registration, frontmatter semantics, automatic invocation,
+plugin installation, or skill-specific permissions.
+
+`--instructions TEXT` is an explicit replacement for the CLI defaults, including
+automatic project context, skill discovery, and optional delegation guidance.
+The replacement propagates to children. Otherwise, cross-family children resolve
+their own family's defaults and native tool guidance; Codex children keep the
+Codex builder's standard instructions. Capabilities remain controlled by tool
+configuration, not by prompt text. Snapshot/durable restoration retains its
+provider-native instruction state. Library embeddings still supply their own
+instructions; this discovery is CLI-only.
+
+The behavior is intentionally narrower than Claude Code's documented
+[memory hierarchy](https://code.claude.com/docs/en/memory) and
+[skills system](https://code.claude.com/docs/en/skills). No full Claude Code
+prompt, context-management or application parity is claimed.
+
+Reproduce the CLI context journeys with
+`cargo test --locked -p nanocodex-bin --test harness_routing native_cli_ -- --nocapture`.
+They run the actual executable against loopback Messages/Responses providers,
+inspect transmitted project data and exact caller overrides, read a lazy skill
+through native tools, verify a file-write effect, exercise mixed-family children,
+and reject symlink/special-file context. Request transcripts, CLI JSONL and
+commands are retained under ignored `output/harness-routing/`. These synthetic
+providers establish runtime boundaries, not live-model instruction-following.
+
+The modular design follows the capability, context and verification distinctions
+in the [OrcaRouter discussion](https://x.com/OrcaRouter/status/2105364729422344549)
+and its [versioned prompt archive](https://github.com/Continuum-AI-Corp/OrcaPromptVault/tree/33ce5a020cfcb5fe747d40d0a89e84743fabdd40/Claude-Code).
+The instructions here are independently authored for Nanocodex's actual tools;
+no captured vendor prompt, product identity or environment is bundled. Captured
+prompt differences are research context, not evidence of improved model performance.
+
 ## Native harness composition
 
 The facade's `Harness::builder().register(family, recipe).build()` is a reusable
@@ -102,6 +162,15 @@ These checkpoints currently encode whole provider-native JSON snapshots and cont
 The active estimate starts from the latest reported input, cache-read, cache-write and output usage. Newly queued text and tool receipts add a UTF-16 text estimate until the next provider response supplies an updated usage anchor. The configured automatic window is a trigger, not a guarantee that the preserved payload fits that size. The current reserve remains 20k output plus 13k headroom for supported coding models.
 
 Compaction summarizes the earlier prefix while preserving a pending assistant/tool round, including its signed thinking, opaque fields and complete tool results. Paused server-tool content retains the whole current assistant turn, including earlier calls whose results arrive in a later pause; no client results are fabricated. If this is the first tool round, the original user task is the summary prefix. A prior summary participates in later compaction, including repeated manual compaction with no intervening turn.
+
+The summary contract requests current task scope, latest user corrections,
+authorization boundaries, verified work, unresolved actions with available IDs,
+and concrete next steps. It preserves source distinctions and uncertainty.
+Continuation frames the generated summary as lossy historical context, and a new
+user message remains a separate later message rather than being folded into that
+summary. Structured pending rounds and recovery notices remain authoritative
+runtime evidence; summary prose does not grant permissions or prove completion.
+Protocol journeys verify these boundaries, not a live model's semantic fidelity.
 
 Summary requests retain the tool catalog for caching but set `tool_choice: {"type":"none"}` to prevent provider-side tool execution. A summary is validated before replacing context. Failed summaries retain the original state; a successful summary is checkpointed before continuation. Automatic summary usage contributes to the successful turn's usage totals. Rebuilt context receives an estimate for the summary, retained messages, system context and tools.
 
