@@ -529,7 +529,16 @@ export function registerDefinitionHost(host, cloudflareReservation) {
 }
 
 export function releaseDefinitionHost(id) {
+  const host = definitionHosts.get(id);
+  if (host === undefined) return;
   definitionHosts.delete(id);
+  // Rust drops may release child sessions after their definition has gone.
+  // Retire every registration owned by the final definition here; pointer
+  // checks in releaseHostSessions preserve sessions rebound to a successor.
+  for (const owner of definitionHosts.values()) {
+    if (owner === host) return;
+  }
+  releaseHostSessions(host);
 }
 
 const hostBridge = Object.freeze({
