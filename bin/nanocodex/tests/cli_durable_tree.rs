@@ -358,11 +358,21 @@ async fn shipped_cli_http_roots_replay_and_restore_history_for_both_families() -
                 "replay",
             )
             .await?;
-        success(&replay, "durable-http-answer");
+        // The JSONL replay contract emits only its terminal receipt; the
+        // next turn below proves the retained answer and conversation.
+        success(&replay, "run.completed");
         let replay_events = events(&replay)?;
-        assert_eq!(replay_events.len(), 1);
-        assert_eq!(replay_events[0]["type"], "run.completed");
-        assert_eq!(replay_events[0]["payload"]["model_calls"], 0);
+        // Native Claude acknowledges prompt admission before its replay receipt.
+        // Neither family's replay may publish generation or tool events.
+        assert!(replay_events.iter().all(|event| {
+            event["type"] == "input.accepted" || event["type"] == "run.completed"
+        }));
+        let terminals: Vec<_> = replay_events
+            .iter()
+            .filter(|event| event["type"] == "run.completed")
+            .collect();
+        assert_eq!(terminals.len(), 1);
+        assert_eq!(terminals[0]["payload"]["model_calls"], 0);
         assert_eq!(
             fixture.requests.lock().unwrap().len(),
             count,
@@ -464,7 +474,9 @@ async fn cold_child(family: &str) -> Result<()> {
             "cold-recovery",
         )
         .await?;
-    success(&resumed, "owned-root-answer");
+    // Codex already journaled its answer before the process was killed at
+    // the ownership barrier. Recovery publishes the retained terminal receipt.
+    success(&resumed, "run.completed");
     assert_eq!(
         std::fs::read_to_string(&effect)?,
         "x",
