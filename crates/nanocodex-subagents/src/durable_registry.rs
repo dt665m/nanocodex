@@ -283,7 +283,14 @@ impl Registry {
         let (root, ids, harnesses, supporting) = {
             let mut state = self.state.lock().await;
             let root = state.root_session_id(session).to_owned();
-            let Some(scope) = state.scopes.get(&root) else { return Ok(()); };
+            let Some(scope) = state.scopes.get(&root) else {
+                // Tool installation registers the parent's factory before its
+                // first child creates a scope. Retire that capability even for
+                // an unused parent: an embedding factory can own this registry,
+                // so keeping its handle here would form an ownership cycle.
+                self.session_handles.write().expect("session handles poisoned").remove(&root);
+                return Ok(());
+            };
             let owner = scope.topology.agent_for_session(session);
             let background = scope.sessions.iter().filter_map(|(&id, child)| {
                 (owner.is_none_or(|owner| scope.topology.is_descendant(id, owner)) && child.descriptor.lifetime == AgentLifetime::Background
