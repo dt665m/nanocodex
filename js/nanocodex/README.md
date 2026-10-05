@@ -901,6 +901,24 @@ This covers direct application tools (`toolMode: "direct"`) as well as tools
 invoked by Code Mode. Direct contexts use `parentCallId = callId` and
 `source = "host-tool:" + name`; nested contexts use the exact guest source
 and a stable cell/ordinal.
+Adapters can additionally implement `beginCell(context)` and
+`commitStore(context, writes)` together to persist Code Mode `store()` state.
+Before evaluation, `beginCell` durably pins the cell's immutable starting entries;
+recovery returns those same entries even when later cells changed session state.
+The context has `name: "code-cell"`, `callId: parentCallId`, and `input: null`.
+`commitStore` atomically merges only the cell's writes, once per original cell
+identity. A completed-cell replay must not overwrite newer committed writes.
+Completed failed scripts also commit their writes; interrupted/aborted cells do
+not. Session stores remain isolated and entry snapshots are bounded to 8 MiB and
+32,768 nodes. Hosts must fail closed when prior effects exist but their original
+starting snapshot is missing, corrupt, or cannot be proved during an upgrade.
+Without these optional methods, stores remain local to a runtime instance.
+
+Deterministic adapter conflicts and corruption should throw an error with
+`code: "CODE_EFFECT_UNKNOWN"`. These errors and invalid replay receipts settle
+as failed unknown outcomes, without admitting further effects. Storage/transport
+exceptions remain host interruptions so genuinely transient failures can recover.
+
 Return `execute` for a new retained intent, `replay` with its exact completed
 receipt, or `unknown` for an intent without a durable outcome. `complete` must
 acknowledge storage before either direct tool output or a nested guest result is
@@ -1459,3 +1477,33 @@ against the Connect Worker with fixture provider responses, covering reads,
 writes, pagination, rate limits, and revoked grants. Worker tests cover routing
 and service denial for all 13 API connectors. SDKs that hardcode their API host need a custom transport instead of only
 a base URL setting.
+
+
+## Connect dialog appearance
+
+Pass visual tokens when creating an embedded or popup Connect dialog:
+
+```js
+import { Client, Dialog } from "nanocodex/connect";
+
+const appearance = {
+  theme: "system",
+  accentColor: "#635bff",
+  fontFamily: '"Open Sans", system-ui, sans-serif',
+  borderRadius: 12,
+};
+const client = Client.create({
+  appId: "your-app-id",
+  dialog: Dialog.iframe({ appearance }),
+});
+// Dialog.popup({ appearance }) accepts the same options for account authorization.
+```
+
+All fields are optional. `theme` accepts `light`, `dark`, or `system`;
+`accentColor` requires six hex digits; `fontFamily` accepts an installed or
+self-hosted font list of at most 160 characters; `borderRadius` is a number from
+0 to 24 pixels. Arbitrary CSS, CSS functions, and unknown options are rejected.
+The SDK snapshots the configuration when the dialog is created and carries it
+in the `nanocodex_appearance` URL parameter to wallet and funding iframes or the
+account popup. The hosted dialog limits the JSON value to 1,024 characters and
+uses native defaults for malformed values. Omit `appearance` for native defaults.

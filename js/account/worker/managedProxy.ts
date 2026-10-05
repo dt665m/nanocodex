@@ -1,3 +1,4 @@
+import { forwardManagedPreview, previewBridgeEnabled, type PreviewBridgeEnv } from "../../managed/src/preview-bridge.ts";
 import { consumeRpcData } from "nanocodex/cloudflare/rpc";
 import { apiKeyDigest, apiKeyPrincipal } from "nanocodex/cloudflare/managed-auth";
 import { nativeLiveRequest, liveAgentSettings, liveAgentFailure, liveAgentRequest, newManagedAgentId } from "nanocodex/cloudflare/managed-live";
@@ -5,7 +6,7 @@ import { durablePlacementOptions, ingressColo } from "nanocodex/cloudflare/durab
 
 import { MANAGED_ACCESS_HEADER, MANAGED_ACCESS_TTL_MS, isHandViewerUpgrade, readManagedAccess, handRequestFailure, handBrokerRequest } from "nanocodex/cloudflare/managed-access";
 
-export type ManagedProxyEnv = {
+export type ManagedProxyEnv = PreviewBridgeEnv & {
   NANOCODEX_BACKEND?: Fetcher;
   NANOCODEX_ACCESS_SECRET?: string;
   NANOCODEX_HAND_BROKER?: DurableObjectNamespace;
@@ -18,6 +19,7 @@ export type ManagedProxyEnv = {
 
 };
 
+const PERMISSION_REQUEST_ROUTE = /^\/v1\/permission-requests(?:\/[A-Za-z0-9_-]{12}\/[0-9a-f-]{36}(?:\/(?:approve|deny))?)?$/;
 const GENERATED_APP_ROUTE = /^\/v1\/apps(?:\/[A-Za-z0-9_-]{1,128}(?:\/(?:data|restore))?)?$/;
 // This forwarding policy also runs in the Node route journeys. Native spans
 // are available only inside Workers; their absence preserves the same policy.
@@ -26,7 +28,7 @@ const nativeTracing = import("nanocodex/cloudflare/tracing").catch(() => undefin
 const MANAGED_ROUTE = /^(?:\/auth(?:\/.*)?|\/webauthn\/.*|\/sandbox-preview\/[^/]+(?:\/.*)?|\/v1\/(?:auth(?:\/.*)?|me|account\/(?:admin|communication|hosted-tool-stats|tool-host|vm-host|hand-hosts(?:\/[0-9a-f-]{36})?|hands(?:\/(?:screens|host|view|renew|ice))?)|hand-hosts\/[0-9a-f-]{36}\/[0-9a-f-]{36}\/hands\/(?:host|ice|renew)|system\/vm-host|vm-host-attachments\/[A-Za-z0-9_-]{43}\/[0-9a-f-]{36}\/(?:tool-host|hands\/(?:host|ice|renew))|wallet(?:\/(?:balance|connect|revoke-access-key))?|egress|data|crm(?:\/[A-Za-z0-9][A-Za-z0-9._:-]{0,127}(?:\/(?:identities|facts|relationships))?)?|router|responses|models|inference(?:\/.*)?|api-keys(?:\/.*)?|credentials(?:\/.*)?|connect(?:\/.*)?|connectors(?:\/.*)?|agents(?:\/.*)?|meetings(?:\/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}(?:\/(?:preview|summarize|audio(?:\/(?:complete|parts\/[1-9]\d*))?))?)?|todo(?:\/(?:snooze|traces|schedule|source-health|items\/[0-9a-fA-F-]{36}(?:\/prepare)?|decisions\/[0-9a-fA-F-]{36}(?:\/(?:respond|prepare))?|mail\/(?:accounts|threads(?:\/[A-Za-z0-9_-]+(?:\/modify)?)?|drafts(?:\/[0-9a-fA-F-]{36})?|send|suggest|messages\/[A-Za-z0-9_-]+\/attachments\/[A-Za-z0-9_-]+)))?|rooms(?:\/.*)?|history(?:\/.*)?|memories\/(?:list|read|search|add_ad_hoc_note|write|status)|markdown-memory\/(?:get|search|write|status)|organization(?:\/.*)?))$/;
 
 export function isManagedRoutePath(pathname: string): boolean {
-  return GENERATED_APP_ROUTE.test(pathname) || pathname === "/api/router" || pathname === "/v1/agent-runs" || MANAGED_ROUTE.test(pathname) || /^\/v1\/shared\/[0-9a-f-]{36}(?:\/(?:events(?:\/history)?|turns))?$/.test(pathname) || /^\/v1\/phone\/bridge\/(?:health|check|calls(?:\/[0-9a-f-]{36}(?:\/(?:hangup|steer))?)?|status\/[0-9a-f-]{36}|media\/[0-9a-f-]{36}\/|internal\/(?:state|setup))$/.test(pathname);
+  return pathname === "/v1/vault/request" || PERMISSION_REQUEST_ROUTE.test(pathname) || GENERATED_APP_ROUTE.test(pathname) || pathname === "/api/router" || pathname === "/v1/agent-runs" || MANAGED_ROUTE.test(pathname) || /^\/v1\/shared\/[0-9a-f-]{36}(?:\/(?:events(?:\/history)?|turns))?$/.test(pathname) || /^\/v1\/phone\/bridge\/(?:health|check|calls(?:\/[0-9a-f-]{36}(?:\/(?:hangup|steer))?)?|status\/[0-9a-f-]{36}|media\/[0-9a-f-]{36}\/|internal\/(?:state|setup))$/.test(pathname);
 }
 
 /**
@@ -60,6 +62,14 @@ async function routeMeasuredManaged(
     && url.pathname !== "/v1/responses" && url.pathname !== "/v1/models"
     && url.pathname !== "/v1/inference" && !url.pathname.startsWith("/v1/inference/")) {
     return json({ error: "inference_key_scope" }, { status: 403 });
+  }
+  // Preview routing must precede every production service and foreign-DO fast path.
+  if (previewBridgeEnabled(env)) {
+    if (url.pathname === "/api/router") {
+      const target = new URL(request.url); target.pathname = "/v1/router";
+      request = new Request(target, request);
+    }
+    return forwardManagedPreview(request, env);
   }
   if (!env.NANOCODEX_BACKEND) {
     return json({ error: "managed_service_unavailable" }, { status: 503 });
