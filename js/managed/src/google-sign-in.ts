@@ -4,14 +4,16 @@ const TTL = 300;
 const ID = /^[A-Za-z0-9_-]{43}$/;
 const VERIFIER = /^[A-Za-z0-9._~-]{43,128}$/;
 const COOKIE = "nanocodex_google_";
-const CALLBACK = "/v1/auth/google/callback";
-const TOKEN_URL = "https://oauth2.googleapis.com/token";
+const CALLBACK = "/v1/connectors/google/callback";
+const STATE_PREFIX = "signin.";
+const STATE = /^signin\.[A-Za-z0-9_-]{43}$/;
 const JWKS_URL = "https://www.googleapis.com/oauth2/v3/certs";
 
-type Configuration = { GOOGLE_SIGN_IN_CLIENT_ID?: string; GOOGLE_SIGN_IN_CLIENT_SECRET?: string };
+type Configuration = { GOOGLE_SIGN_IN?: Fetcher };
 type Attempt = {
   mode: "browser" | "native";
   challenge: string;
+  clientId: string;
   origin: string;
   expiresAt: number;
   browserBinding: string;
@@ -24,6 +26,12 @@ type Dependencies = {
   persistentUserId: () => Promise<string | undefined>;
   complete: (userId: string) => Promise<Response>;
 };
+
+// The dot cannot appear in the connector broker's base64url-only state.
+// This only selects the handler; the callback still verifies browser binding and stored state.
+export function isGoogleSignInCallback(url: URL): boolean {
+  return url.pathname === CALLBACK && (url.searchParams.get("state")?.startsWith(STATE_PREFIX) ?? false);
+}
 
 function json(value: unknown, status = 200, headers?: HeadersInit) {
   const result = new Headers(headers);
@@ -43,7 +51,7 @@ function cookie(request: Request, name: string) {
   return request.headers.get("cookie")?.split(";").map((part) => part.trim()).find((part) => part.startsWith(`${name}=`))?.slice(name.length + 1);
 }
 function bindingCookie(id: string, value: string, url: URL, age = TTL) {
-  return `${COOKIE}${id}=${value}; Path=/v1/auth/google; Max-Age=${age}; HttpOnly; SameSite=Lax${url.protocol === "https:" ? "; Secure" : ""}`;
+  return `${COOKIE}${id}=${value}; Path=/v1/; Max-Age=${age}; HttpOnly; SameSite=Lax${url.protocol === "https:" ? "; Secure" : ""}`;
 }
 async function body(request: Request): Promise<Record<string, unknown> | undefined> {
   if (!request.headers.get("content-type")?.toLowerCase().startsWith("application/json")) return;
@@ -67,14 +75,13 @@ async function body(request: Request): Promise<Record<string, unknown> | undefin
 
 /** Login only. Google Workspace connector consent is a separate flow. */
 export async function routeGoogleSignIn(request: Request, env: Configuration, url: URL, deps: Dependencies): Promise<Response> {
-  const operation = url.pathname.slice("/v1/auth/google/".length);
+  const operation = isGoogleSignInCallback(url) ? "callback" : url.pathname.slice("/v1/auth/google/".length);
+  if (operation === "callback" && !isGoogleSignInCallback(url)) return json({ error: "not_found" }, 404);
   if (!["start", "authorize", "callback", "status", "complete", "cancel"].includes(operation)) return json({ error: "not_found" }, 404);
   if (request.method !== (operation === "authorize" || operation === "callback" ? "GET" : "POST")) return json({ error: "method_not_allowed" }, 405);
   if (request.method === "POST" && request.headers.get("origin") !== url.origin) return json({ error: "forbidden_origin" }, 403);
-  const clientId = env.GOOGLE_SIGN_IN_CLIENT_ID;
-  const clientSecret = env.GOOGLE_SIGN_IN_CLIENT_SECRET;
   const { store } = deps;
-  if (!clientId || !clientSecret || !store.create || !store.take) return json({ error: "google_sign_in_unavailable" }, 503);
+  if (!store.create || !store.take) return json({ error: "google_sign_in_unavailable" }, 503);
   const now = Math.floor(Date.now() / 1000);
   if (operation === "start") {
     const input = await body(request);
@@ -88,9 +95,15 @@ export async function routeGoogleSignIn(request: Request, env: Configuration, ur
       if (await store.create(`rate:${ip}:${Math.floor(now / 300)}:${slot}`, true, { ttl: TTL * 2 })) { reserved = true; break; }
     }
     if (!reserved) return json({ error: "rate_limited", retry_after: TTL }, 429, { "retry-after": String(TTL) });
+    let clientId: string;
+    try {
+      const client = await brokerJson(env, "/v1/client");
+      if (typeof client.client_id !== "string" || !client.client_id.trim() || client.client_id.length > 512) throw new Error("invalid client");
+      clientId = client.client_id;
+    } catch { return json({ error: "google_sign_in_unavailable" }, 503); }
     const id = random();
     const binding = random();
-    const attempt: Attempt = { mode: input.mode, challenge: input.code_challenge, origin: url.origin, expiresAt: now + TTL, browserBinding: await hash(binding), ...(linkUserId ? { linkUserId } : {}) };
+    const attempt: Attempt = { mode: input.mode, challenge: input.code_challenge, clientId, origin: url.origin, expiresAt: now + TTL, browserBinding: await hash(binding), ...(linkUserId ? { linkUserId } : {}) };
     await store.set(`attempt:${id}`, attempt, { ttl: TTL });
     await store.set(`active:${id}`, true, { ttl: TTL });
     // Browser start binds the existing browser before it opens the popup. Native
@@ -101,24 +114,24 @@ export async function routeGoogleSignIn(request: Request, env: Configuration, ur
     return json({ attempt_id: id, authorization_url: authorization.toString(), expires_in: TTL }, 200,
       attempt.mode === "browser" ? { "set-cookie": bindingCookie(id, binding, url) } : undefined);
   }
-  if (operation === "callback") return callback(request, clientId, clientSecret, url, deps, now);
+  if (operation === "callback") return callback(request, env, url, deps, now);
   const input = operation === "authorize" ? undefined : await body(request);
   const id = operation === "authorize" ? url.searchParams.get("attempt_id") : input?.attempt_id;
   if (typeof id !== "string" || !ID.test(id)) return json({ error: "invalid_google_attempt" }, 400);
   const attempt = await store.get<Attempt>(`attempt:${id}`);
-  if (!attempt || attempt.origin !== url.origin || attempt.expiresAt <= now) return json({ error: "invalid_or_expired_google_attempt" }, 400);
+  if (!attempt || !attempt.clientId || attempt.origin !== url.origin || attempt.expiresAt <= now) return json({ error: "invalid_or_expired_google_attempt" }, 400);
   if (operation === "authorize") {
     if (!await store.get(`active:${id}`)) return json({ error: "invalid_or_expired_google_attempt" }, 400);
     const nativeBinding = attempt.mode === "native" ? await store.take<string>(`native-binding:${id}`) : undefined;
     const binding = nativeBinding ?? cookie(request, `${COOKIE}${id}`);
     if (!binding || await hash(binding) !== attempt.browserBinding) return json({ error: "invalid_google_browser" }, 400);
     if (!await store.create(`authorized:${id}`, true, { ttl: TTL })) return json({ error: "invalid_or_expired_google_attempt" }, 400);
-    const state = random();
+    const state = STATE_PREFIX + random();
     const nonce = random();
     const verifier = random();
     await store.set(`state:${state}`, { attemptId: id, nonce, verifier } satisfies Authorization, { ttl: Math.max(1, attempt.expiresAt - now) });
     const provider = new URL("https://accounts.google.com/o/oauth2/v2/auth");
-    provider.search = new URLSearchParams({ client_id: clientId, redirect_uri: new URL(CALLBACK, url.origin).toString(), response_type: "code", scope: "openid email", state, nonce, code_challenge: await hash(verifier), code_challenge_method: "S256", prompt: "select_account" }).toString();
+    provider.search = new URLSearchParams({ client_id: attempt.clientId, redirect_uri: new URL(CALLBACK, url.origin).toString(), response_type: "code", scope: "openid email", state, nonce, code_challenge: await hash(verifier), code_challenge_method: "S256", prompt: "select_account" }).toString();
     return new Response(null, { status: 302, headers: { location: provider.toString(), "set-cookie": bindingCookie(id, binding, url, Math.max(1, attempt.expiresAt - now)), "cache-control": "no-store", "referrer-policy": "no-referrer" } });
   }
   if (typeof input?.code_verifier !== "string" || !VERIFIER.test(input.code_verifier) || await hash(input.code_verifier) !== attempt.challenge) return json({ error: "invalid_google_attempt" }, 400);
@@ -155,14 +168,14 @@ export async function routeGoogleSignIn(request: Request, env: Configuration, ur
   catch { return json({ error: "google_account_unavailable" }, 503); }
 }
 
-async function callback(request: Request, clientId: string, clientSecret: string, url: URL, { store }: Dependencies, now: number) {
+async function callback(request: Request, env: Configuration, url: URL, { store }: Dependencies, now: number) {
   const state = url.searchParams.get("state");
-  if (!state || !ID.test(state)) return json({ error: "invalid_google_state" }, 400);
+  if (!state || !STATE.test(state)) return json({ error: "invalid_google_state" }, 400);
   const pending = await store.get<Authorization>(`state:${state}`);
   if (!pending) return json({ error: "invalid_google_state" }, 400);
   const attempt = await store.get<Attempt>(`attempt:${pending.attemptId}`);
   const binding = cookie(request, `${COOKIE}${pending.attemptId}`);
-  if (!attempt || attempt.origin !== url.origin || attempt.expiresAt <= now || !binding || await hash(binding) !== attempt.browserBinding || !await store.get(`active:${pending.attemptId}`)) return json({ error: "invalid_google_state" }, 400);
+  if (!attempt || !attempt.clientId || attempt.origin !== url.origin || attempt.expiresAt <= now || !binding || await hash(binding) !== attempt.browserBinding || !await store.get(`active:${pending.attemptId}`)) return json({ error: "invalid_google_state" }, 400);
   // Check browser binding before consuming state, so a stolen URL cannot burn it.
   const authorization = await store.take!<Authorization>(`state:${state}`);
   if (!authorization) return json({ error: "invalid_google_state" }, 400);
@@ -173,8 +186,11 @@ async function callback(request: Request, clientId: string, clientSecret: string
     try {
       const code = url.searchParams.get("code");
       if (!code || code.length > 4096) throw new Error("invalid code");
-      const tokens = await providerJson(TOKEN_URL, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ client_id: clientId, client_secret: clientSecret, redirect_uri: new URL(CALLBACK, attempt.origin).toString(), grant_type: "authorization_code", code, code_verifier: authorization.verifier }) });
-      const sub = await verifyIdToken(tokens.id_token, clientId, authorization.nonce, Math.floor(Date.now() / 1000));
+      const tokens = await brokerJson(env, "/v1/token", {
+        client_id: attempt.clientId, redirect_uri: new URL(CALLBACK, attempt.origin).toString(),
+        code, code_verifier: authorization.verifier,
+      });
+      const sub = await verifyIdToken(tokens.id_token, attempt.clientId, authorization.nonce, Math.floor(Date.now() / 1000));
       completionCode = attempt.mode === "native" ? random() : undefined;
       outcome = { status: "ready", sub, ...(completionCode ? { completionDigest: await hash(completionCode) } : {}) };
     } catch { outcome = { status: "failed", error: "google_authorization_failed" }; }
@@ -194,8 +210,19 @@ async function callback(request: Request, clientId: string, clientSecret: string
   return new Response(`<!doctype html><meta charset="utf-8"><title>Google sign-in</title><p>${outcome.status === "ready" ? "Sign-in confirmed. Return to Nanocodex." : "Google sign-in was not completed. Return to Nanocodex and try again."}</p><script nonce="${scriptNonce}">window.close()</script>`, { headers });
 }
 
-async function providerJson(url: string, init?: RequestInit): Promise<Record<string, unknown>> {
-  const response = await fetch(url, { ...init, redirect: "manual", signal: AbortSignal.timeout(10_000) });
+// Only the connector broker holds the existing Google OAuth client secret.
+// Pin its public client ID at start so rotations cannot change an in-flight login's audience.
+async function brokerJson(env: Configuration, path: "/v1/client" | "/v1/token", input?: Record<string, string>) {
+  if (!env.GOOGLE_SIGN_IN) throw new Error("Google sign-in broker unavailable");
+  return responseJson(await env.GOOGLE_SIGN_IN.fetch(`https://google-sign-in.internal${path}`, {
+    method: input ? "POST" : "GET", redirect: "manual", signal: AbortSignal.timeout(10_000),
+    ...(input ? { headers: { "content-type": "application/json" }, body: JSON.stringify(input) } : {}),
+  }));
+}
+async function providerJson(url: string): Promise<Record<string, unknown>> {
+  return responseJson(await fetch(url, { redirect: "manual", signal: AbortSignal.timeout(10_000) }));
+}
+async function responseJson(response: Response): Promise<Record<string, unknown>> {
   if (!response.ok) { await response.body?.cancel(); throw new Error("provider failed"); }
   const text = await response.text();
   if (text.length > 128 * 1024) throw new Error("provider response too large");

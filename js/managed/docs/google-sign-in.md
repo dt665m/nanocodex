@@ -1,13 +1,14 @@
 # Google account sign-in
 
-Google login uses a dedicated Google OAuth web client. Configure these secrets on the managed Worker:
+Google sign-in reuses the Google OAuth web client already configured for Google Workspace connectors. Its existing `GOOGLE_OAUTH_CLIENT_ID` and `GOOGLE_OAUTH_CLIENT_SECRET` stay on the `nanocodex-egress` broker. No additional client or credential copy is required on the managed Worker.
 
-- `GOOGLE_SIGN_IN_CLIENT_ID`
-- `GOOGLE_SIGN_IN_CLIENT_SECRET`
+The managed Worker's `GOOGLE_SIGN_IN` service binding targets the broker's private `GoogleSignInProvider` entrypoint. It reads the public client ID and exchanges the authorization code there; only the ID token returns to managed auth for signature and claim verification. The broker never returns the client secret or Google access/refresh tokens. Default egress and model HTTP requests do not expose this entrypoint. Deploy the broker before managed; the standard Worker release order already does this.
 
-Register each deployed account origin's exact HTTPS redirect URI in that client, for example `https://account.example/v1/auth/google/callback`. Register development callback origins separately when testing Google interactively. The server derives this URI from the request origin; clients cannot supply a redirect target. Missing configuration returns `google_sign_in_unavailable` (503).
+Sign-in reuses `/v1/connectors/google/callback` on the account origin, already used by the Google connector. No Google Console changes are needed for an origin where that callback is registered. New development or preview origins still need their own exact callback registration. A `signin.` state prefix selects account login; connector states keep their existing handler. The prefix is only a routing marker: login still verifies stored one-use state, browser binding, nonce and PKCE. Its short-lived HttpOnly binding cookie covers `/v1/` so it reaches the shared callback.
 
-This flow requests `openid email`. It does not connect Google Workspace, grant Gmail/Drive/Calendar access, or reuse connector credentials. Google Workspace connector consent remains a separate action. No provider tokens are retained. Identity is the verified Google issuer and subject, never an email address.
+The server derives the callback URI from the request origin; clients cannot supply a redirect target. A missing binding or existing OAuth configuration returns `google_sign_in_unavailable` (503) at start. Each attempt pins the client ID, so changing the OAuth client during a pending login fails closed; start a fresh login after rotation. Ready completions and cancellation do not need another provider exchange.
+
+Sign-in requests `openid email` and does not create a Google Workspace connection. Gmail/Drive/Calendar access remains an explicit connector-consent action using the same OAuth client. No provider tokens are retained by sign-in. Identity is the verified Google issuer and subject, never an email address.
 
 ## HTTP contract
 
@@ -18,7 +19,7 @@ All POSTs require JSON and an Origin header equal to the account API origin; nat
 - `POST /v1/auth/google/status`: `{attempt_id,code_verifier}` returns `{status:"pending"|"ready"|"failed"|"cancelled",error?}`. It never returns an identity, provider token or completion code.
 - `POST /v1/auth/google/complete`: `{attempt_id,code_verifier,completion_code?}` consumes a ready attempt once and returns `{user:{id,address,persistent:true}}` with the standard HttpOnly `nanocodex_account=s_...` cookie. Native mode additionally requires `completion_code` from the native callback. Native clients then use the existing authenticated `/v1/api-keys` endpoint.
 - `POST /v1/auth/google/cancel`: proof as above, returns 204 on cancellation. A cancelled attempt's status remains readable until expiry. Repeating cancel returns 204; completion of a cancelled attempt returns `invalid_or_expired_google_attempt` (400).
-- `GET /v1/auth/google/callback`: registered Google redirect URI. Browser mode displays a closing page; the initiating page polls and completes without losing its Connect dialog. Native success redirects only to `nanocodex://auth/google?attempt_id=...&status=ready&completion_code=...`; failure has `attempt_id` and `status=failed`. The completion code is a random single-use exchange receipt, protected by client PKCE. No account session, API key or Google token is placed in this URL. Native clients must validate the callback scheme/host/path, exact query fields, and attempt ID before exchange.
+- `GET /v1/connectors/google/callback`: existing Google connector redirect URI, dispatched to login only for its namespaced state. Browser mode displays a closing page; the initiating page polls and completes without losing its Connect dialog. Native success redirects only to `nanocodex://auth/google?attempt_id=...&status=ready&completion_code=...`; failure has `attempt_id` and `status=failed`. The completion code is a random single-use exchange receipt, protected by client PKCE. No account session, API key or Google token is placed in this URL. Native clients must validate the callback scheme/host/path, exact query fields, and attempt ID before exchange.
 
 Requiring native callback possession prevents someone from forwarding an authorization URL to another person and using their own pre-held verifier to claim that person's Google login by polling.
 
@@ -26,4 +27,4 @@ Normal sign-in resolves an existing Google subject or creates a new account. It 
 
 Proof failures return `invalid_google_attempt` (400); native callback-proof failure returns `invalid_google_completion` (400). Expired/consumed attempts return `invalid_or_expired_google_attempt` (400). Pending completion returns `google_authorization_pending` (409). Provider denial returns `google_access_denied`; invalid tokens or provider failures return `google_authorization_failed`. Link requests without a persistent browser account return `google_link_requires_account` (401); a changed account at completion returns `google_link_requires_same_account` (403). After an uncertain complete result, restart sign-in rather than retrying a consumed exchange.
 
-Run `pnpm --dir js/managed test:google-sign-in` for a public HTTP journey against the real Worker auth router and durable objects. Only Google token/JWKS and external wallet provisioning are synthetic. The journey signs real RSA JWTs and records status evidence in ignored `output/google-sign-in/http-trace.json`.
+Run `pnpm --dir js/managed test:google-sign-in` for a public HTTP journey against the real Worker auth router, durable objects and named Google provider binding, with OAuth credentials configured only on the broker. Only Google token/JWKS and external wallet provisioning are synthetic. The journey signs real RSA JWTs and records status evidence in ignored `output/google-sign-in/http-trace.json`.

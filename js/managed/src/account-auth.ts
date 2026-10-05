@@ -1,4 +1,4 @@
-import { routeGoogleSignIn } from "./google-sign-in";
+import { isGoogleSignInCallback, routeGoogleSignIn } from "./google-sign-in";
 import { readTodoSourceHealth } from "./todo-source-health";
 import { readTodoCalendarBriefings } from "./todo-calendar-briefings";
 import { backfillTodoPreparation, nextTodoPreparationAlarm, runTodoPreparation, scheduleTodoPreparation } from "./todo-preparation";
@@ -84,8 +84,7 @@ export interface AccountAuthEnv extends IngressPlacement {
   NANOCODEX_ACCESS_SECRET?: string;
   ENVIRONMENT?: string;
   NANOCODEX_MOCK_TWILIO_VERIFY_CODE?: string;
-  GOOGLE_SIGN_IN_CLIENT_ID?: string;
-  GOOGLE_SIGN_IN_CLIENT_SECRET?: string;
+  GOOGLE_SIGN_IN?: Fetcher;
   NANOCODEX_AUTH: DurableObjectNamespace;
   NANOCODEX_USERS: DurableObjectNamespace<UserAccount>;
   NANOCODEX_API_KEYS: DurableObjectNamespace<ApiKeyRecord>;
@@ -455,7 +454,7 @@ export async function routeAccountRequest(
   if (url.pathname === "/auth" || url.pathname.startsWith("/auth/")) {
     return json({ error: "not_found" }, { status: 404 });
   }
-  if (url.pathname.startsWith("/v1/auth/google/")) {
+  if (url.pathname.startsWith("/v1/auth/google/") || isGoogleSignInCallback(url)) {
     return routeGoogleSignIn(request, env, url, {
       store: authStore(env, "google-sign-in"),
       persistentUserId: async () => (await authenticatePersistentAccount(request, env, url))?.userId,

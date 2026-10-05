@@ -34,6 +34,7 @@ async function outbound(request) {
     const fixture = codes.get(form.get("code"));
     assert.ok(fixture,"Provider receives the code issued by its authorization page");
     assert.equal(form.get("client_id"),clientId);
+    assert.equal(form.get("client_secret"),"synthetic-client-secret");
     assert.equal(form.get("redirect_uri"),fixture.redirect);
     assert.equal(createHash("sha256").update(form.get("code_verifier")).digest("base64url"),fixture.challenge);
     codes.delete(form.get("code"));
@@ -62,16 +63,18 @@ export default { async fetch(request,env) { return await routeAccountRequest(req
 `,resolveDir:fileURLToPath(new URL("../../managed",import.meta.url))},bundle:true,write:false,format:"esm",target:"es2022",platform:"browser",external:["cloudflare:workers","node:*"],alias:{"nanocodex-tools/hosted":fileURLToPath(new URL("../../nanocodex-tools/src/hosted/index.ts",import.meta.url)),"node-rsa":fileURLToPath(new URL("../../nanocodex/tools/browser/unsupportedNodeRsa.mjs",import.meta.url))} });
 const edge = await build({ stdin:{contents:`
 import { routeManaged } from "./worker/managedProxy.ts";
+import { routeConnectApi } from "./worker/connectApiProxy.ts";
 export default { async fetch(request,env) {
  const url = new URL(request.url);
  if(url.pathname === "/ui.js") return new Response(env.UI_JS,{headers:{"content-type":"text/javascript"}});
  if(url.pathname === "/ui.css") return new Response(env.UI_CSS,{headers:{"content-type":"text/css"}});
  if(url.pathname === "/") return new Response('<html class="connect-dialog-standalone"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="/ui.css"><div id="root"></div><script src="/ui.js"></script>',{headers:{"content-type":"text/html"}});
- return await routeManaged(request,env,url) ?? new Response(null,{status:404});
+ return await routeConnectApi(request,env,url) ?? await routeManaged(request,env,url) ?? new Response(null,{status:404});
 }};
 `,resolveDir:fileURLToPath(new URL("..",import.meta.url))},bundle:true,write:false,format:"esm",platform:"browser",target:"es2022",external:["cloudflare:workers","node:*"] });
 const broker = await build({stdin:{contents:`
 export { UserCredentialBroker } from "./src/broker.ts";
+export { GoogleSignInProvider } from "./src/google-sign-in-provider.ts";
 export default { fetch(request,env) {
  const match = new URL(request.url).pathname.match(/^\\/users\\/([^/]+)\\/wallet$/);
  if(!match) return new Response(null,{status:404});
@@ -80,12 +83,12 @@ export default { fetch(request,env) {
 `,resolveDir:fileURLToPath(new URL("../../egress",import.meta.url))},bundle:true,write:false,format:"esm",platform:"node",banner:{js:"import { createRequire } from 'node:module'; const require = createRequire('file:///worker.js');"},target:"es2022",external:["cloudflare:*","node:*"],alias:{"nanocodex-tools/hosted":fileURLToPath(new URL("../../nanocodex-tools/src/hosted/index.ts",import.meta.url)),"node-rsa":fileURLToPath(new URL("../../nanocodex/tools/browser/unsupportedNodeRsa.mjs",import.meta.url))},plugins:[{name:"wasm-module",setup(b){if(process.env.NANOCODEX_WASM_PATH) b.onResolve({filter:/pkg-web\/nanocodex\.js$/},()=>({path:process.env.NANOCODEX_WASM_PATH.replace(/nanocodex_bg\.wasm$/,"nanocodex.js")})); b.onResolve({filter:/^nanocodex\/wasm$/},()=>({path:"./nanocodex_bg.wasm",external:true}));}}] });
 const common = {compatibilityDate:"2026-07-29",compatibilityFlags:["nodejs_compat"]};
 const mf = new Miniflare({ workers:[
- {name:"edge",script:edge.outputFiles[0].text,modules:true,...common,bindings:{UI_JS:ui.outputFiles.find(f=>f.path.endsWith(".js")).text,UI_CSS:ui.outputFiles.find(f=>f.path.endsWith(".css"))?.text??""},serviceBindings:{NANOCODEX_BACKEND:"managed"}},
+ {name:"edge",script:edge.outputFiles[0].text,modules:true,...common,bindings:{UI_JS:ui.outputFiles.find(f=>f.path.endsWith(".js")).text,UI_CSS:ui.outputFiles.find(f=>f.path.endsWith(".css"))?.text??""},serviceBindings:{NANOCODEX_BACKEND:"managed",NANOCODEX_CONNECT_API:()=>{throw new Error("Sign-in must not route to Connect-scoped OAuth")}}},
  {name:"managed",script:backend.outputFiles[0].text,modules:true,...common,bindings:{
-   GOOGLE_SIGN_IN_CLIENT_ID:clientId,GOOGLE_SIGN_IN_CLIENT_SECRET:"synthetic-client-secret",NANOCODEX_OTP_HMAC_KEY:"synthetic-otp-key-"+"0".repeat(32),
+   NANOCODEX_OTP_HMAC_KEY:"synthetic-otp-key-"+"0".repeat(32),
    TWILIO_ACCOUNT_SID:"AC"+"0".repeat(32),TWILIO_AUTH_TOKEN:"synthetic-twilio-secret",TWILIO_VERIFY_SERVICE_SID:"VA"+"0".repeat(32)},
-   durableObjects:Object.fromEntries(Object.entries({NANOCODEX_AUTH:"NonceStorage",NANOCODEX_USERS:"UserAccount",NANOCODEX_ORGANIZATIONS:"Organization",NANOCODEX_API_KEYS:"ApiKeyRecord"}).map(([name,className])=>[name,{className,useSQLite:true}])),serviceBindings:{NANOCODEX:"broker"},outboundService:outbound},
- {name:"broker",...common,modules:[{type:"ESModule",path:"worker.js",contents:broker.outputFiles[0].text},{type:"CompiledWasm",path:"nanocodex_bg.wasm",contents:await readFile(process.env.NANOCODEX_WASM_PATH || new URL("../../nanocodex/pkg-web/nanocodex_bg.wasm",import.meta.url))}],bindings:{CREDENTIAL_ENCRYPTION_KEY:Buffer.alloc(32, 7).toString("base64url")},durableObjects:{CREDENTIALS:{className:"UserCredentialBroker",useSQLite:true}},outboundService:outbound},
+   durableObjects:Object.fromEntries(Object.entries({NANOCODEX_AUTH:"NonceStorage",NANOCODEX_USERS:"UserAccount",NANOCODEX_ORGANIZATIONS:"Organization",NANOCODEX_API_KEYS:"ApiKeyRecord"}).map(([name,className])=>[name,{className,useSQLite:true}])),serviceBindings:{NANOCODEX:"broker",GOOGLE_SIGN_IN:{name:"broker",entrypoint:"GoogleSignInProvider"}},outboundService:request=>{assert.notEqual(request.url,"https://oauth2.googleapis.com/token");return outbound(request)}},
+ {name:"broker",...common,modules:[{type:"ESModule",path:"worker.js",contents:broker.outputFiles[0].text},{type:"CompiledWasm",path:"nanocodex_bg.wasm",contents:await readFile(process.env.NANOCODEX_WASM_PATH || new URL("../../nanocodex/pkg-web/nanocodex_bg.wasm",import.meta.url))}],bindings:{ENVIRONMENT:"test",GOOGLE_OAUTH_CLIENT_ID:clientId,GOOGLE_OAUTH_CLIENT_SECRET:"synthetic-client-secret",CREDENTIAL_ENCRYPTION_KEY:Buffer.alloc(32, 7).toString("base64url")},durableObjects:{CREDENTIALS:{className:"UserCredentialBroker",useSQLite:true}},outboundService:outbound},
 ] });
 let browser;
 try {
@@ -93,7 +96,7 @@ try {
  browser = await chromium.launch({headless:true,...(process.env.CHROME_PATH?{executablePath:process.env.CHROME_PATH}:{})});
  async function pageFor(width=1100) {
    const context = await browser.newContext({viewport:{width,height:900}});
-   let proof; context.on("request",request=>{ if(new URL(request.url()).pathname==="/v1/auth/google/status") proof=request.postDataJSON(); if(new URL(request.url()).pathname==="/v1/auth/google/callback") trace.push({callback:request.url()}); });
+   let proof; context.on("request",request=>{ if(new URL(request.url()).pathname==="/v1/auth/google/status") proof=request.postDataJSON(); if(new URL(request.url()).pathname==="/v1/connectors/google/callback") trace.push({callback:request.url()}); });
    await context.tracing.start({screenshots:true,snapshots:true});
    context.on("page",async page=>{
      const cdp=await context.newCDPSession(page);
