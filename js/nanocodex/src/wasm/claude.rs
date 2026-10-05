@@ -359,9 +359,21 @@ impl WasmNanoclaude {
         } else {
             (None, None)
         };
-        let (inner, events, durable_session) = build_claude(config, factory, None, None).await?;
-        if let (Some(subagents), Some(durability)) = (&subagents, durability) {
-            subagents.recover(&inner, durability.route_id).await?;
+        let (inner, events, durable_session) = match build_claude(config, factory, None, None).await
+        {
+            Ok(parts) => parts,
+            Err(error) => {
+                if let Some(subagents) = &subagents {
+                    subagents.retire_unpublished().await;
+                }
+                return Err(error);
+            }
+        };
+        if let (Some(subagents), Some(durability)) = (&subagents, durability)
+            && let Err(error) = subagents.recover(&inner, durability.route_id).await
+        {
+            subagents.retire_unpublished().await;
+            return Err(error);
         }
         let event_forwarding = Rc::new(Cell::new(false));
         forward_events(events, Rc::clone(&event_forwarding));

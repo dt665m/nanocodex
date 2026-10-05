@@ -36,6 +36,7 @@ async function fixture(t, label) {
       const mailboxSubmitted = submissions.some(item => JSON.parse(item.arguments).output?.stage === 'mailbox');
       const row = { type: 'model-request', phase, auth: request.headers.authorization, marker, body };
       trace.push(row); requests.push(row); wake();
+      response.on('close', () => { row.closed = true; wake(); });
       assert.ok(marker, 'model request belongs to a declared synthetic task');
       let tool, args;
       if (marker === 'ROOT_SPAWN') {
@@ -298,4 +299,45 @@ test('public WASM reports the child recovery store error and preserves lost-stee
   assert.ok(resumed.every(row => row.body.input.filter(item => item.type === 'message' && JSON.stringify(item.content).includes('MAILBOX_AFTER_RESTART')).length <= 1), 'failed construction must not admit the mailbox twice');
   assert.equal(f.effects.length, 1, 'the committed effect survives failed recovery without redispatch');
   t.diagnostic(JSON.stringify({ child: child.agent_id, failedOwner: 2, successfulOwner: 3, effectDispatches: 1, underlyingError: 'database or disk is full' }));
+});
+
+
+test('public WASM repeated failed construction retires local generations in the same isolate', { timeout: 90_000 }, async t => {
+  const f = await fixture(t, 'failed-create-same-isolate');
+  const first = await f.start();
+  const foreground = await first.call('spawn', task('FOREGROUND'));
+  const background = await first.call('spawn', task('BACKGROUND', 'background'));
+  await f.until(() => ['FOREGROUND', 'BACKGROUND'].every(marker => f.requests.some(row =>
+    row.marker === marker && JSON.stringify(row.body).includes('DURABLE_CHILD_EFFECT_RECEIPT'))), 'both children retain their committed effects');
+  await first.kill();
+  // Keep one worker/module alive across every rejected create and recovery.
+  const owner = await f.start({ manualCreate: true });
+  const childSession = f.effects.find(row => row.subagent.agentId === String(foreground.agent_id)).sessionId;
+  const fail = async index => {
+    const failed = assert.rejects(owner.call('create', { exhaustChildStorage: childSession, auth: `failed-constructor-${index}` }), /database or disk is full/);
+    // Recovery visits the second child first. Hold the first child's store
+    // acquisition until the recovered sibling has a real request in flight.
+    await f.until(() => f.requests.some(row => row.auth === `Bearer failed-constructor-${index}`), 'partial recovery starts its sibling');
+    await owner.call('releaseAcquire');
+    await failed;
+  };
+  for (let index = 0; index < 8; index++) await fail(index);
+  const warm = (await owner.call('memory')).bytes;
+  for (let index = 8; index < 48; index++) await fail(index);
+  const retained = (await owner.call('memory')).bytes;
+  assert.equal(retained, warm, 'rejected constructors must release their WASM capabilities rather than grow linearly');
+  const oldRequests = f.requests.filter(row => row.auth?.startsWith('Bearer failed-constructor-'));
+  assert.equal(oldRequests.length, 48, 'each failure follows partial sibling recovery');
+  await f.until(() => oldRequests.every(row => row.closed), 'failed generations abort all local model requests');
+  f.phase('resume');
+  await owner.call('create', { auth: 'current-constructor' });
+  await completed(owner, foreground.agent_id, 'foreground');
+  await completed(owner, background.agent_id, 'background');
+  const directory = await owner.call('list', { includeCompleted: true });
+  assert.deepEqual(directory.agents.map(row => row.agent_id).sort(), [foreground.agent_id, background.agent_id].sort());
+  assert.equal(f.effects.length, 2, 'committed effects are not dispatched again');
+  assert.ok(f.requests.filter(row => row.phase === 'resume').every(row => row.auth === 'Bearer current-constructor'));
+  assert.ok(!directory.agents.some(row => row.status.state === 'closed'), 'construction failure must not cancel durable foreground records');
+  t.diagnostic(JSON.stringify({ failedCreatesInOneIsolate: 48, warmBytes: warm, retainedBytes: retained,
+    recoveredIds: directory.agents.map(row => row.agent_id), effectDispatches: f.effects.length, oldRequests: oldRequests.length }));
 });

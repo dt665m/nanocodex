@@ -1703,6 +1703,39 @@ impl WasmSubagents {
             .map_err(js_error)
     }
 
+    // A failed constructor has not published any of this fresh registry's
+    // capabilities. Stop partial recovery without closing durable foreground
+    // records or retaining a healthy-looking background generation.
+    async fn retire_unpublished(&self) {
+        let sessions = self
+            .parents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for session in sessions {
+            let retired = self.registry.retire_unpublished_parent(&session).await;
+            if let Some(root) = retired.first() {
+                release_subagent_scope(
+                    self.host_definition_id,
+                    &self.sessions,
+                    &self.parents,
+                    &self.hosts,
+                    root,
+                );
+            }
+        }
+        self.parents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        self.hosts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+
     async fn release_parent(&self, session_id: &str) -> std::io::Result<()> {
         if let Err(error) = self.registry.release_parent(session_id).await {
             let retired = self.registry.retire_failed_parent(session_id).await;
@@ -1830,9 +1863,20 @@ impl WasmNanocodex {
             (None, None)
         };
         let (inner, events, durable_session) =
-            build_codex(config, auth, factory, None, None).await?;
-        if let (Some(subagents), Some(durability)) = (&subagents, durability) {
-            subagents.recover(&inner, durability.route_id).await?;
+            match build_codex(config, auth, factory, None, None).await {
+                Ok(parts) => parts,
+                Err(error) => {
+                    if let Some(subagents) = &subagents {
+                        subagents.retire_unpublished().await;
+                    }
+                    return Err(error);
+                }
+            };
+        if let (Some(subagents), Some(durability)) = (&subagents, durability)
+            && let Err(error) = subagents.recover(&inner, durability.route_id).await
+        {
+            subagents.retire_unpublished().await;
+            return Err(error);
         }
         let mut agent = Self::from_parts(inner, events, subagents);
         agent.durable_session = durable_session;

@@ -329,18 +329,35 @@ impl Registry {
     /// is retirement after failed persistence, not a durable cancellation.
     /// Returns the root followed by its child session identities for host cleanup.
     pub async fn retire_failed_parent(&self, session: &str) -> Vec<String> {
+        self.retire_local_parent(session, false).await
+    }
+
+    /// Retires a constructor that never published its parent capability. Even a
+    /// healthy tree may have partially recovered before child acquisition failed.
+    /// Abort local tasks only; committed work belongs to the next durable owner.
+    pub async fn retire_unpublished_parent(&self, session: &str) -> Vec<String> {
+        self.retire_local_parent(session, true).await
+    }
+
+    async fn retire_local_parent(&self, session: &str, unpublished: bool) -> Vec<String> {
         let _residency = self.residency_lock.lock().await;
         let _messages = self.message_lock.lock().await;
         let (sessions, tasks) = {
             let mut state = self.state.lock().await;
             let root = state.root_session_id(session).to_owned();
-            let Some(scope) = state.scopes.get_mut(&root) else { return Vec::new(); };
-            // A healthy background tree still owns its live work after its
-            // foreground parent leaves. Only an unusable journal retires it.
-            if scope.observation_error.is_none() { return Vec::new(); }
-            let mut sessions = vec![root];
+            // A published healthy background tree retains its owner. Constructor
+            // failure has no published owner, regardless of journal health.
+            if !unpublished && !state.scopes.get(&root).is_some_and(|scope| scope.observation_error.is_some()) {
+                return Vec::new();
+            }
+            let mut sessions = vec![root.clone()];
+            // enable_durability can fail after installing some identity mappings
+            // but before publishing its scope.
+            if !state.scopes.contains_key(&root) {
+                sessions.extend(state.root_by_session.iter().filter_map(|(session, owner)| (owner == &root).then_some(session.clone())));
+            }
             let mut tasks = Vec::new();
-            for child in scope.sessions.values_mut() {
+            for child in state.scopes.get_mut(&root).into_iter().flat_map(|scope| scope.sessions.values_mut()) {
                 sessions.push(child.descriptor.session_id.clone());
                 for task in child.harness_task.take().into_iter().chain(child.event_task.take()) {
                     task.abort();
@@ -350,10 +367,14 @@ impl Registry {
             }
             let mut handles = self.session_handles.write().expect("session handles poisoned");
             for session in &sessions { handles.remove(session); }
+            if unpublished {
+                state.scopes.remove(&root);
+                state.root_by_session.retain(|_, owner| owner != &root);
+            }
             (sessions, tasks)
         };
         // Do not run normal close callbacks: they would try to publish terminal
-        // outcomes from an owner whose journal has already failed or been fenced.
+        // outcomes from an unpublished owner or an unusable journal.
         for task in tasks { let _ = task.await; }
         self.changed();
         sessions

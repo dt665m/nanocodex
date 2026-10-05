@@ -3,6 +3,7 @@ import { parentPort, workerData } from 'node:worker_threads';
 import { readFile } from 'node:fs/promises';
 import { DatabaseSync } from 'node:sqlite';
 import { Agent, Subagents, Transport } from '../../host/index.mjs';
+import { initializeBrowserEngine } from '../../browser/engine.mjs';
 import { createSqliteDurabilityStore, sqliteDurabilitySchema } from '../../runtime/durability-store.mjs';
 
 const database = new DatabaseSync(workerData.databasePath);
@@ -20,9 +21,12 @@ const store = createSqliteDurabilityStore({ transaction(callback) {
     throw error;
   }
 } });
+let acquisitionFailure;
+let exhaustChildStorage = workerData.exhaustChildStorage;
 let lostAcknowledgement = false, nativeSteerCommitted = false, settlementFailed = false;
-const durability = { ...store, acquire(id, request) {
-  if (id === workerData.exhaustChildStorage) {
+const durability = { ...store, async acquire(id, request) {
+  if (id === exhaustChildStorage) {
+    if (workerData.manualCreate) await new Promise(resolve => { acquisitionFailure = resolve; });
     // A real SQLite capacity error at child recovery, without filling the disk
     // or changing the committed journals. SQLITE_FULL rolls back this probe.
     const limit = database.prepare('PRAGMA max_page_count').get().max_page_count;
@@ -75,13 +79,15 @@ const durability = { ...store, acquire(id, request) {
   return result;
 } };
 let agent;
-try {
+const module = await readFile(new URL('../../pkg-web/nanocodex_bg.wasm', import.meta.url));
+async function create(options = {}) {
+  exhaustChildStorage = options.exhaustChildStorage ?? workerData.exhaustChildStorage;
   agent = await Agent.create({
-    module: await readFile(new URL('../../pkg-web/nanocodex_bg.wasm', import.meta.url)),
+    module,
     model: 'gpt-6.1-sol', thinking: 'low', toolMode: 'direct',
     sessionId: '018f1f9a-7b3c-7a07-8000-000000000077',
     ...(workerData.nonDurable ? {} : { durability, durabilityId: 'durable-children-public' }),
-    transport: Transport.openAi({ apiKey: workerData.auth, apiBaseUrl: workerData.baseUrl, stateless: true }),
+    transport: Transport.openAi({ apiKey: options.auth ?? workerData.auth, apiBaseUrl: workerData.baseUrl, stateless: true }),
     tools: { boundary: { description: 'A pure synthetic model boundary.', parameters: { type: 'object', properties: {}, additionalProperties: false }, handler() { return 'BOUNDARY_RECEIPT'; } }, proof: {
       description: 'Append a synthetic external effect with its public child identity.',
       parameters: { type: 'object', properties: {}, additionalProperties: false },
@@ -93,14 +99,21 @@ try {
     } },
   });
   agent.events.watch({ includeAllSessions: true }).onEvent(event => parentPort.postMessage({ type: 'event', event }));
-  parentPort.postMessage({ type: 'ready', sessionId: agent.session.id });
+  return { sessionId: agent.sessionId };
+}
+try {
+  const result = workerData.manualCreate ? {} : await create();
+  parentPort.postMessage({ type: 'ready', ...result });
 } catch (error) {
   parentPort.postMessage({ type: 'startup-failed', error: { message: error.message, code: error.code } });
 }
 parentPort.on('message', async ({ id, action, args }) => {
   try {
     let result;
-    if (action === 'prompt') result = { finalMessage: (await agent.turn.prompt(args).result()).finalMessage };
+    if (action === 'create') result = await create(args);
+    else if (action === 'releaseAcquire') { acquisitionFailure(); acquisitionFailure = undefined; result = {}; }
+    else if (action === 'memory') result = { bytes: (await initializeBrowserEngine({ module })).memory.buffer.byteLength };
+    else if (action === 'prompt') result = { finalMessage: (await agent.turn.prompt(args).result()).finalMessage };
     else if (action === 'dispose') { agent.dispose(); result = { disposed: true }; }
     else if (action === 'shutdown') { await agent.session.shutdown(); result = { stopped: true }; }
     else if (['interrupt', 'close'].includes(action)) result = await Subagents[action](agent, args.agentId);
