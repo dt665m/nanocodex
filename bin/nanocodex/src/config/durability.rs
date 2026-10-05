@@ -63,6 +63,10 @@ impl CliDurability {
         })
     }
 
+    pub(super) fn codex_session_id(&self) -> Result<SessionId> {
+        self.root_session.parse().map_err(Into::into)
+    }
+
     pub(super) async fn codex_root<F>(
         &self,
         builder: nanocodex::NanocodexBuilder<F>,

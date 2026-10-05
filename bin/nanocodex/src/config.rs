@@ -455,6 +455,26 @@ impl AgentArgs {
         let codex_home = default_codex_home()?;
         let responses_transport = self.responses_transport();
         let mut session = prepare_session_build(self.cwd, self.rollouts, &codex_home, durable)?;
+        let generic_subagents = self.subagents;
+        let subagent_tools = selected_subagent_tools(generic_subagents, tui);
+        let subagent_runtime = subagent_tools.map(|_| subagents::channel(self.max_subagents));
+        let durability = match local_durability {
+            Some(persistence) => Some(
+                durability::CliDurability::open(
+                    persistence,
+                    HarnessFamily::Codex,
+                    session.session_id,
+                    subagent_runtime
+                        .as_ref()
+                        .map(|(registry, _, _)| Arc::clone(registry)),
+                )
+                .await?,
+            ),
+            None => None,
+        };
+        if let Some(durability) = &durability {
+            session.session_id = Some(durability.codex_session_id()?);
+        }
         if self.memory && session.session_id.is_none() {
             session.session_id = Some(SessionId::new());
         }
@@ -569,23 +589,6 @@ impl AgentArgs {
             tools = managed_memory.install(tools);
         }
         let tools = tools.build()?;
-        let generic_subagents = self.subagents;
-        let subagent_tools = selected_subagent_tools(generic_subagents, tui);
-        let subagent_runtime = subagent_tools.map(|_| subagents::channel(self.max_subagents));
-        let durability = match local_durability {
-            Some(persistence) => Some(
-                durability::CliDurability::open(
-                    persistence,
-                    HarnessFamily::Codex,
-                    session.session_id,
-                    subagent_runtime
-                        .as_ref()
-                        .map(|(registry, _, _)| Arc::clone(registry)),
-                )
-                .await?,
-            ),
-            None => None,
-        };
         let claude_tools = tools
             .clone()
             .into_builder()
