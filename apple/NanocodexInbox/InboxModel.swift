@@ -28,6 +28,7 @@ final class InboxModel: ObservableObject {
             let previous = focusedCardCache.card(id: deck.focusedID, in: oldValue)
             focusedCardCache.invalidate()
             let current = focusedCardCache.card(id: deck.focusedID, in: cards)
+            if previous?.id != current?.id { clearWhatsAppClipboard() }
             if previous?.id != current?.id || previous?.activeTurns != current?.activeTurns { queueProjection.invalidate() }
             scheduleAgentNotifications()
         }
@@ -37,7 +38,7 @@ final class InboxModel: ObservableObject {
     @Published var deck = InboxDeck() {
         didSet {
             rosterRevision = UUID()
-            if oldValue.focusedID != deck.focusedID { queueProjection.invalidate() }
+            if oldValue.focusedID != deck.focusedID { queueProjection.invalidate(); clearWhatsAppClipboard() }
         }
     }
     @Published var filter: Filter = .all { didSet { rosterRevision = UUID(); reconcile() } }
@@ -350,7 +351,7 @@ final class InboxModel: ObservableObject {
     private var todoCaptureOperation: (body: String, hint: String, id: UUID)?
     private var todoResponseOperations: [String: UUID] = [:]
     var pendingTodoDecisionCount: Int { todoDecisions.filter { $0.isPreparedForReview }.count }
-    @Published var connected = false
+    @Published var connected = false { didSet { if !connected { clearWhatsAppClipboard() } } }
     @Published private(set) var restoringAccount = true
     @Published private(set) var restorationError: String?
     @Published private(set) var isDemo = false { didSet { queueProjection.invalidate() } }
@@ -1887,6 +1888,40 @@ final class InboxModel: ObservableObject {
               let id = intake.challengeID else { return false }
         return presentedBrowserRequests.insert("\(generation):\(id)").inserted
     }
+    // Tracks only pasteboard ownership, never the copied private value.
+    private var whatsAppClipboard: (operationID: String, change: Int)?
+    func recordWhatsAppClipboard(operationID: String, account: UUID, change: Int) {
+        guard generation == account else { return }
+        whatsAppClipboard = (operationID, change)
+    }
+    func clearWhatsAppClipboard(operationID: String? = nil) {
+        guard let copied = whatsAppClipboard, operationID == nil || operationID == copied.operationID else { return }
+        #if os(iOS)
+        if UIPasteboard.general.changeCount == copied.change { UIPasteboard.general.items = [] }
+        #endif
+        whatsAppClipboard = nil
+    }
+    private var completedWhatsAppLinks: Set<String> = []
+    func refreshWhatsAppLink(_ controller: WhatsAppLinkController, account: UUID) async {
+        guard !Task.isCancelled else { return }
+        guard generation == account, controller.account == account else { controller.cancel(); return }
+        guard let client, connected, !isDemo, controller.link.agentID == focused?.id else { controller.suspend(); return }
+        await controller.refresh(client: client, account: account)
+        guard !Task.isCancelled else { return }
+        guard generation == account else { controller.cancel(); return }
+        guard connected, !isDemo, controller.link.agentID == focused?.id else { controller.suspend(); return }
+    }
+    func publishWhatsAppLinkReceipt(_ controller: WhatsAppLinkController, agentID: String, account: UUID) {
+        guard generation == account, controller.account == account, controller.link.agentID == agentID, connected, !isDemo,
+              focused?.id == agentID, cards.contains(where: { $0.id == agentID }), let receipt = controller.safeReceipt,
+              completedWhatsAppLinks.insert("\(account):\(controller.link.operationID)").inserted else { return }
+        let predecessor = pending.last(where: { $0.agentID == agentID })?.id ?? (focused?.id == agentID ? focusedTurn : "")
+        let message = PendingMessage(agentID: agentID, input: receipt.pretty, predecessor: predecessor,
+                                     id: "whatsapp-link-\(controller.link.operationID)-connected")
+        guard !pending.contains(where: { $0.id == message.id }) else { return }
+        pending.append(message); busy.insert(agentID); persist()
+        Task { await submit(message, epoch: account) }
+    }
     var vaultIntakeAccount: UUID { generation }
     func cancelSecureInput(_ intake: SecureInputRequest, account: UUID) async throws -> SecureInputReceipt {
         guard let client, connected, !isDemo, generation == account else { throw APIError.invalidCredential }
@@ -2139,6 +2174,7 @@ final class InboxModel: ObservableObject {
         meetingLibrary?.activate(scope: nil, client: nil)
         voice.stop(); voice.clearHistory(); accountCredential = nil; unlistedAgents = []; unavailableAgents = []; historyCursors = [:]
         remoteService?.close(); remoteService = nil
+        clearWhatsAppClipboard()
         connectionAttempt = UUID(); generation = UUID(); observation = UUID(); polling?.cancel(); streaming?.cancel(); client?.close(); client = nil
         focusedState?.cancel(); focusedState = nil; focusedHistoryLoaded = false
         focusedHistoryRequest?.cancel(); focusedHistoryRequest = nil

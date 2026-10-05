@@ -447,10 +447,9 @@ export default class Egress extends WorkerEntrypoint<EgressEnv> {
       return { schema: 1, status: 400, data: null, expiresAt: 0 };
     }
     const namespace = component === "catalog" ? this.env.USER_CONNECTORS : this.env.USER_CREDENTIALS;
-    return cachedAccountMetadata(namespace.idFromName(userId).toString(), component, options, async () => {
+    return cachedAccountMetadata(namespace.idFromName(userId).toString(), component, options, async deadline => {
       if (component === "catalog") {
-        const result = await this.readAccountCatalog(userId);
-        return { status: result.status, data: result.catalog };
+        return consumeRpcData(await connectorBroker(this.env, userId).readDiscoveryCatalog(options, deadline));
       }
       const result = await this.readAccountVault(userId);
       return { status: result.status, data: result.vault };
@@ -636,8 +635,24 @@ async function handleMeasuredEgressWithOwner(
     }
     const sponsoredDemo = !accountId && EPHEMERAL_BROWSER_MODEL_SUBJECT.test(subject)
       && operation.id === "responses";
-    let credential = await resolveCredential(env, userId, false, undefined, sponsoredDemo, accountId);
-    const credentialResolvedAt = Date.now();
+    // A retained Session's bounded upload and its live credential lookup are
+    // independent. Start both before waiting; provider dispatch still requires
+    // both to succeed. Other routes retain sponsored admission before body reads.
+    const bodyAbort = sessionModelAuthority && !operation.websocket ? new AbortController() : undefined;
+    let credentialResolvedAt = Date.now();
+    const [initialCredential, preparedBody] = await Promise.all([
+      resolveCredential(env, userId, false, undefined, sponsoredDemo, accountId).then((value) => {
+        credentialResolvedAt = Date.now();
+        return value;
+      }),
+      bodyAbort ? replayableBody(request, operation, bodyAbort.signal) : undefined,
+    ]).catch((error) => {
+      // A denied credential must not leave an unfinished upload draining in the
+      // background. The paired promises already observe either failure.
+      bodyAbort?.abort(error);
+      throw error;
+    });
+    let credential = initialCredential;
     const credentialBrokerMs = credential.broker_ms;
     const credentialBrokerActivationMs = credential.broker_activation_ms;
     const credentialBrokerAgeMs = credential.broker_age_ms;
@@ -658,7 +673,7 @@ async function handleMeasuredEgressWithOwner(
       ? await acquireSponsoredConnection(env, userId)
       : undefined;
     try {
-      const body = await replayableBody(request, operation);
+      const body = preparedBody === undefined ? await replayableBody(request, operation) : preparedBody;
       const upstreamStartedAt = Date.now();
       let upstream = await fetchUpstream(
         env,
@@ -1380,14 +1395,15 @@ function connectorOperation(url: URL): ConnectorOperation | undefined {
 }
 
 function sanitizeUpstreamResponse(upstream: Response): Response {
-  // An upgraded socket must be returned intact. Its peer is the explicitly
-  // trusted provider/relay selected by the fixed rule, never caller input.
-  if (upstream.webSocket) return upstream;
+  // Network response headers are immutable, including upgrades. Own the header
+  // projection before adding private correlation while preserving the exact
+  // provider socket; wrapping a Response does not require a frame proxy.
   const headers = sanitizedUpstreamHeaders(upstream.headers);
-  return new Response(upstream.body, {
+  return new Response(upstream.webSocket ? null : upstream.body, {
     status: upstream.status,
     statusText: upstream.statusText,
     headers,
+    ...(upstream.webSocket ? { webSocket: upstream.webSocket } : {}),
   });
 }
 
@@ -2126,7 +2142,9 @@ async function handleControl(request: Request, url: URL, env: EgressEnv): Promis
       ? `https://credentials.internal/v1/wallet/${operation}`
       : "https://credentials.internal/v1/wallet";
     if (!operation && request.method === "GET") {
-      return userBroker(env, userId).fetch(target, { method: "GET" });
+      const headers = request.headers.get("accept") === "application/vnd.nanocodex.wallet-snapshot+json"
+        ? { accept: "application/vnd.nanocodex.wallet-snapshot+json" } : undefined;
+      return userBroker(env, userId).fetch(target, { method: "GET", ...(headers ? { headers } : {}), signal: request.signal });
     }
     if (!operation && request.method === "PUT") {
       if (await hasRequestPayload(request)) return jsonError(400, "invalid_request");
@@ -3211,7 +3229,7 @@ async function resolveSshIdentity(
   return identity;
 }
 
-async function replayableBody(request: Request, operation: ModelOperation): Promise<Uint8Array | null> {
+async function replayableBody(request: Request, operation: ModelOperation, cancel?: AbortSignal): Promise<Uint8Array | null> {
   if (operation.websocket) return null;
   const declared = request.headers.get("content-length");
   if (declared !== null) {
@@ -3223,11 +3241,15 @@ async function replayableBody(request: Request, operation: ModelOperation): Prom
   }
   if (!request.body) return new Uint8Array();
   const reader = request.body.getReader();
+  const cancelRead = () => { void reader.cancel().catch(() => {}); };
+  cancel?.addEventListener("abort", cancelRead, { once: true });
   const chunks: Uint8Array[] = [];
   let total = 0;
   try {
     while (true) {
+      cancel?.throwIfAborted();
       const { done, value } = await reader.read();
+      cancel?.throwIfAborted();
       if (done) break;
       total += value.byteLength;
       if (total > MAX_MODEL_BODY_BYTES) {
@@ -3236,7 +3258,10 @@ async function replayableBody(request: Request, operation: ModelOperation): Prom
       }
       chunks.push(value);
     }
-  } finally { reader.releaseLock(); }
+  } finally {
+    cancel?.removeEventListener("abort", cancelRead);
+    reader.releaseLock();
+  }
   const body = new Uint8Array(total);
   let offset = 0;
   for (const chunk of chunks) { body.set(chunk, offset); offset += chunk.byteLength; }

@@ -2921,6 +2921,14 @@ private struct ConversationContentView: View {
                     }))
                 }
             }
+            for activity in content.activity where activity.tool?.whatsAppLink != nil {
+                if let link = activity.tool?.whatsAppLink {
+                    rows.append(.init(id: item.id + ":whatsapp:" + activity.id, revision: cellRevision, content: {
+                        AnyView(WhatsAppLinkCard(model: model, link: link)
+                            .id("\(activity.id):\(link.operationID):\(model.vaultIntakeAccount)"))
+                    }))
+                }
+            }
             // Intake prompts remain reachable even when their group is collapsed.
             for activity in content.activity where activity.tool?.vaultIntake != nil {
                 if let intake = activity.tool?.vaultIntake {
@@ -3717,6 +3725,123 @@ private struct PermissionRequestSheet: View {
         .onDisappear { operation?.cancel() }
         .onChange(of: model.vaultIntakeAccount) { _, _ in operation?.cancel(); review = nil; browserURL = nil; dismiss() }
         .onChange(of: model.connected) { _, connected in if !connected { operation?.cancel(); dismiss() } }
+    }
+}
+
+@MainActor private struct WhatsAppLinkCard: View {
+    @ObservedObject var model: InboxModel
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var controller: WhatsAppLinkController
+    @State private var revision = 0
+    @State private var check = 0
+
+    init(model: InboxModel, link: WhatsAppLink) {
+        self.model = model
+        _controller = State(initialValue: WhatsAppLinkController(link: link, account: model.vaultIntakeAccount))
+    }
+    private var eligible: Bool {
+        scenePhase == .active && model.connected && !model.isDemo
+            && controller.account == model.vaultIntakeAccount && controller.link.agentID == model.focused?.id
+    }
+    private struct RefreshIdentity: Equatable { let eligible: Bool; let check: Int }
+    private var refreshIdentity: RefreshIdentity { .init(eligible: eligible, check: check) }
+    private func clearClipboard() {
+        model.clearWhatsAppClipboard(operationID: controller.link.operationID)
+    }
+    private func clearInvalidClipboard() {
+        if controller.account != model.vaultIntakeAccount || !model.connected
+            || controller.link.agentID != model.focused?.id || controller.remainingSeconds() == 0
+            || controller.phase == .connected || controller.phase == .cancelled || controller.phase == .unavailable {
+            clearClipboard()
+        }
+    }
+    private func poll() async {
+        while !Task.isCancelled, controller.shouldPoll {
+            await model.refreshWhatsAppLink(controller, account: controller.account)
+            guard !Task.isCancelled, eligible else { return }
+            revision += 1
+            if controller.code == nil { clearClipboard() }
+            if !controller.shouldPoll { break }
+            try? await Task.sleep(nanoseconds: controller.phase == .retrying ? 5_000_000_000 : 2_000_000_000)
+        }
+    }
+    private var message: String {
+        guard controller.account == model.vaultIntakeAccount else { return "This linking attempt belongs to a previous account session." }
+        guard model.connected else { return "Reconnect to check this linking attempt." }
+        guard controller.link.agentID == model.focused?.id else { return "Return to this conversation to check the linking attempt." }
+        guard scenePhase == .active else { return "The private code is hidden while Nanocodex is inactive." }
+        switch controller.phase {
+        case .waiting: return "Waiting for your linking code…"
+        case .ready: return "In WhatsApp, open Settings → Linked Devices → Link a Device → Link with phone number instead, then enter this code."
+        case .connected: return "The connection was verified."
+        case .expired: return "This code expired. Check whether linking completed, or ask the agent for a new attempt."
+        case .unknown: return "The linking result is unknown. Checking this same attempt…"
+        case .retrying: return "Connection interrupted. Checking this same attempt again…"
+        case .unavailable: return "Couldn’t verify this linking attempt. You can check the same attempt again."
+        case .cancelled: return "This linking attempt is no longer available in this account session."
+        }
+    }
+    var body: some View {
+        let _ = revision
+        VStack(alignment: .leading, spacing: 10) {
+            Label(controller.phase == .connected ? "WhatsApp connected" : "Link WhatsApp", systemImage: "lock.shield").font(.headline)
+            Text(message).font(.subheadline).foregroundStyle(.secondary)
+                .accessibilityIdentifier("whatsapp-link-status")
+            if eligible, controller.active, controller.remainingSeconds() > 0, let code = controller.code {
+                Text(code).font(.system(.title, design: .monospaced)).privacySensitive()
+                    .accessibilityIdentifier("whatsapp-link-code")
+                Button("Copy code") {
+                    guard eligible, controller.shouldPoll, controller.remainingSeconds() > 0,
+                          let current = controller.code else { return }
+                    model.clearWhatsAppClipboard()
+                    UIPasteboard.general.setItems([["public.utf8-plain-text": current]], options: [
+                        .localOnly: true, .expirationDate: Date(timeIntervalSince1970: controller.expiresAt / 1000)
+                    ])
+                    model.recordWhatsAppClipboard(operationID: controller.link.operationID, account: controller.account,
+                                                  change: UIPasteboard.general.changeCount)
+                }.buttonStyle(.bordered).accessibilityIdentifier("whatsapp-link-copy")
+            } else if eligible && controller.shouldPoll { ProgressView() }
+            if eligible && controller.shouldPoll && controller.remainingSeconds() > 0 {
+                Text("Expires in \(controller.remainingSeconds()) seconds").font(.caption).foregroundStyle(.secondary)
+                    .accessibilityIdentifier("whatsapp-link-countdown")
+            }
+            if eligible && !controller.shouldPoll && (controller.phase == .expired || controller.phase == .unavailable) {
+                Button("Check connection") { check += 1 }.buttonStyle(.bordered)
+                    .accessibilityIdentifier("whatsapp-link-check")
+            }
+            if controller.phase != .connected {
+                Text("This private code is never sent to the agent or saved in chat. Switching apps hides it; return here to check the same attempt.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading).padding(16)
+        .background(Ink.surface, in: RoundedRectangle(cornerRadius: 16))
+        .accessibilityIdentifier("whatsapp-link-card")
+        .task(id: refreshIdentity) {
+            guard eligible else { controller.suspend(); clearInvalidClipboard(); revision += 1; return }
+            // Activate before starting both children, including when checking an expired attempt.
+            controller.activate(account: model.vaultIntakeAccount)
+            revision += 1
+            async let polling: Void = poll()
+            // Expiry masking stays responsive while the private HTTP read is in flight.
+            while !Task.isCancelled, controller.shouldPoll {
+                controller.expire(); revision += 1
+                clearInvalidClipboard()
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+            await polling
+            guard !Task.isCancelled, eligible else { return }
+            clearInvalidClipboard()
+            if controller.phase == .connected {
+                model.publishWhatsAppLinkReceipt(controller, agentID: controller.link.agentID, account: controller.account)
+            }
+        }
+        .onChange(of: eligible) { _, active in
+            if !active { controller.suspend(); clearInvalidClipboard(); revision += 1 }
+        }
+        .onChange(of: model.vaultIntakeAccount) { _, _ in controller.cancel(); clearClipboard(); revision += 1 }
+        // Keep a valid local expiring copy available for pasting into WhatsApp after switching apps.
+        .onDisappear { controller.suspend(); clearInvalidClipboard() }
     }
 }
 

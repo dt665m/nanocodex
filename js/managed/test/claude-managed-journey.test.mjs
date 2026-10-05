@@ -10,13 +10,19 @@ import { fileURLToPath } from 'node:url';
 import { resolve, dirname, basename } from 'node:path';
 import { build } from 'esbuild';
 import { builtinModules } from 'node:module';
-import { Miniflare } from 'miniflare';
+import { Miniflare, Response as FixtureResponse, WebSocketPair } from 'miniflare';
 import { claudeProvider } from '../../egress/test/claude-provider.fixture.mjs';
 const repo = fileURLToPath(new URL('../../../', import.meta.url));
 const evidence = resolve(repo, process.env.NANOCODEX_CLAUDE_EVIDENCE_DIR ?? 'output/claude-managed');
 const grantHeaders = { 'x-nanocodex-connect-user':'11111111-1111-4111-8111-111111111133', 'x-nanocodex-connect-grant-id':'0x'+'a'.repeat(64), 'x-nanocodex-connect-capabilities':JSON.stringify(['agents:read','agents:write','tools:use']), 'x-nanocodex-connect-connectors':JSON.stringify(['chatgpt']), 'x-nanocodex-connect-mcp-ids':'[]', 'content-type':'application/json' };
 const identity = '11111111-1111-4111-8111-111111111133';
 const bootstrap = `
+import { DurableObject } from 'cloudflare:workers';
+// No container is allocated; session deletion still checks legacy resources.
+export class FixtureSandbox extends DurableObject {
+  async clearRemoteDesktop() {}
+  async destroy() {}
+}
 import managed, * as publicClasses from './src/index.ts';
 export * from './src/index.ts';
 import { ensureAccount, createApiKey } from './src/account-auth.ts';
@@ -40,7 +46,7 @@ async function bundle(source, cwd, name) {
     format:'esm', platform:'browser', target:'es2022', external:['cloudflare:*','node:*'],
     alias:{'node-rsa':resolve(repo,'js/nanocodex/tools/browser/unsupportedNodeRsa.mjs')},
     plugins:[{ name:'actual-wasm', setup(b) {
-      b.onResolve({filter:/^[a-z][a-z_]*$/}, args => builtinModules.includes(args.path) ? {path:'node:'+args.path,external:true} : undefined);
+      b.onResolve({filter:/^[a-z][a-z_]*(?:\/[a-z_]+)?$/}, args => builtinModules.includes(args.path) ? {path:'node:'+args.path,external:true} : undefined);
       b.onResolve({filter:/\.wasm$|^nanocodex\/wasm$/}, args => {
         const path = args.path === 'nanocodex/wasm' ? resolve(repo,'js/nanocodex/pkg-web/nanocodex_bg.wasm') : resolve(args.resolveDir,args.path);
         wasm.add(path); return {path,external:true};
@@ -69,16 +75,57 @@ function sse(block, stop, id) {
 }
 test('Managed native Claude and mixed-family public delegation, account gates, cancellation and recovery', {timeout:240_000}, async () => {
   await mkdir(evidence,{recursive:true});
-  const trace = [], upstream = [], providerErrors = []; let calls=0, summaries=0, writes=0, taskWrites=0, canonicalWrites=0, codexWrites=0, nestedWrites=0, allowResponses=false, sidebarCalls=0, holds=0, responsesAttempts=0, catalogOutage=false, catalogUnsupportedOnly=false, retainedTaskId, mf;
+  const trace = [], upstream = [], providerErrors = []; let calls=0, summaries=0, writes=0, taskWrites=0, canonicalWrites=0, codexWrites=0, nestedWrites=0, allowResponses=false, sidebarCalls=0, holds=0, responsesAttempts=0, catalogOutage=false, catalogUnsupportedOnly=false, catalogRequests=0, catalogHold, retainedTaskId, mf;
+  const mcpTrace = [], mcpOrigins = new Set(['https://developers.openai.com','https://mcp.tempo.xyz','https://mercator.sh','https://docs.mcp.cloudflare.com','https://viem.sh','https://vocs.dev']);
+  let holdMcp = false, releaseMcp;
+  let mcpHold = Promise.resolve();
+  const mcpStarts = () => mcpTrace.filter(row => row.method === 'initialize').length;
   const providerImpl = async request => {
     const url = new URL(request.url);
+    if (mcpOrigins.has(url.origin)) {
+      if (request.method === 'GET') return new Response(null,{status:405});
+      if (request.method === 'DELETE') return new Response(null,{status:204});
+      const body = await request.json();
+      mcpTrace.push({origin:url.origin,method:body.method,held:holdMcp});
+      if (body.method === 'initialize') {
+        if (holdMcp) await mcpHold;
+        return Response.json({jsonrpc:'2.0',id:body.id,result:{protocolVersion:body.params.protocolVersion,capabilities:{tools:{}},serverInfo:{name:'synthetic-public-mcp',version:'1'}}});
+      }
+      if (body.method === 'notifications/initialized') return new Response(null,{status:202});
+      if (body.method === 'tools/list') return Response.json({jsonrpc:'2.0',id:body.id,result:{tools:[{name:'fixture_echo',description:'Return the synthetic MCP proof',inputSchema:{type:'object',properties:{proof:{type:'string'}},required:['proof']}}]}});
+      if (body.method === 'tools/call') {
+        assert.equal(body.params.name,'fixture_echo');
+        return Response.json({jsonrpc:'2.0',id:body.id,result:{content:[{type:'text',text:body.params.arguments.proof}]}});
+      }
+      throw new Error('Unexpected MCP method '+body.method);
+    }
     if (url.origin === 'https://api.openai.com' || url.origin === 'https://chatgpt.com') {
       assert.equal(url.origin,'https://api.openai.com');
       assert.equal(request.headers.get('authorization'),'Bearer sk-synthetic-openai-runtime');
+      if (request.headers.get('upgrade')==='websocket') {
+        const [client,server]=Object.values(new WebSocketPair()); server.accept();
+        server.addEventListener('close',()=>server.close(1000));
+        server.addEventListener('message',event=>{
+          try {
+            const body=JSON.parse(event.data);
+            assert.equal(body.model,'gpt-6.1-sol');
+            assert.match(JSON.stringify(body.input),/GPT_MCP_DISCOVERY_PROBE/);
+            upstream.push({provider:'openai',model:body.model,scenario:'GPT_MCP_DISCOVERY_PROBE',transport:'websocket'});
+            server.send(JSON.stringify({type:'response.created',response:{id:'gpt-mcp-probe',status:'in_progress'}}));
+            server.send(JSON.stringify({type:'response.output_text.delta',output_index:0,delta:'CLAUDE_TOOL_DONE_GPT_MCP_PROBE'}));
+            server.send(JSON.stringify({type:'response.completed',response:{id:'gpt-mcp-probe',status:'completed',end_turn:true,output:[{type:'message',role:'assistant',content:[{type:'output_text',text:'CLAUDE_TOOL_DONE_GPT_MCP_PROBE'}]}],usage:{input_tokens:10,output_tokens:2,total_tokens:12}}}));
+          } catch(error) { providerErrors.push({scenario:'GPT_MCP_DISCOVERY_PROBE',error:String(error)});server.close(1011,'invalid fixture request'); }
+        });
+        return new FixtureResponse(null,{status:101,webSocket:client});
+      }
       const body=await request.json(), encoded=JSON.stringify(body.input);
+      if (encoded.includes('GPT_MCP_DISCOVERY_PROBE') && body.model==='gpt-6.1-sol') {
+        upstream.push({provider:'openai',model:body.model,scenario:'GPT_MCP_DISCOVERY_PROBE'});
+        return new Response(`data: ${JSON.stringify({type:'response.completed',response:{id:'gpt-mcp-probe',status:'completed',output:[{type:'message',role:'assistant',content:[{type:'output_text',text:'CLAUDE_TOOL_DONE_GPT_MCP_PROBE'}]}],usage:{input_tokens:10,output_tokens:2,total_tokens:12}}})}\n\n`,{headers:{'content-type':'text/event-stream'}});
+      }
       if (body.model==='gpt-6-luna') {
         assert.match(body.instructions,/Write a short session title/);
-        assert.match(encoded,/Delegate mixed Claude child|Try disconnected mixed child|Delegate nested gateway grandchild/,'only the Codex gateway root requests a sidebar title');
+        assert.match(encoded,/Delegate mixed Claude child|Try disconnected mixed child|Delegate nested gateway grandchild|GPT_MCP_DISCOVERY_PROBE|MCP_LAZY_/,'only the Codex gateway root requests a sidebar title');
         sidebarCalls++;
         return Response.json({id:'synthetic-title',output:[{type:'message',role:'assistant',content:[{type:'output_text',text:'Verify native Claude delegation'}]}],usage:{input_tokens:2,output_tokens:2,total_tokens:4}});
       }
@@ -144,6 +191,8 @@ test('Managed native Claude and mixed-family public delegation, account gates, c
       return reply({content:'CLAUDE_TOOL_DONE_MIXED_CHILD'},'stop');
     }
     if (url.origin === 'https://api.anthropic.com' && url.pathname === '/v1/models') {
+      catalogRequests++;
+      if (catalogHold) await catalogHold;
       if(catalogOutage)return new Response('synthetic catalog unavailable',{status:503});
       assert.match(request.headers.get('authorization')??'',/^Bearer synthetic-claude-(?:managed-runtime|profile-uncertain)/);
       if(catalogUnsupportedOnly)return Response.json({data:[{id:'claude-gated-unverified',display_name:'Not supported'}],has_more:false});
@@ -189,6 +238,22 @@ test('Managed native Claude and mixed-family public delegation, account gates, c
       const unavailableChild = encodedHistory.includes('Try unavailable canonical child');
       const disabledChild = encodedHistory.includes('Try disabled canonical child');
       const use = (name, input) => sse({type:'tool_use',id:`canonical-${name}-${calls}`,name,input},'tool_use',`message-${calls}`);
+      if (encodedHistory.includes('MCP_LAZY_')) {
+        const uses = body.messages.flatMap(message=>Array.isArray(message.content)?message.content.filter(block=>block.type==='tool_use').map(block=>block.name.replace(/^_/,'')):[]);
+        if (!uses.length) {
+          assert.ok(names.includes('MCPToolSearch') && names.includes('MCPExecute'),'fixed MCP schemas are available before discovery');
+          return encodedHistory.includes('MCP_LAZY_DIRECT')
+            ? use('MCPExecute',{name:'mcp__openaiDeveloperDocs__fixture_echo',arguments:{proof:'MCP_LAZY_PUBLIC_PROOF'}})
+            : use('MCPToolSearch',{query:'fixture_echo',limit:8});
+        }
+        assert.equal(result?.is_error??false,false,JSON.stringify(result));
+        if (uses.at(-1)==='MCPToolSearch') {
+          assert.match(JSON.stringify(result),/mcp__openaiDeveloperDocs__fixture_echo/);
+          return use('MCPExecute',{name:'mcp__openaiDeveloperDocs__fixture_echo',arguments:{proof:'MCP_LAZY_PUBLIC_PROOF'}});
+        }
+        assert.match(JSON.stringify(result),/MCP_LAZY_PUBLIC_PROOF/);
+        return sse({type:'text',text:'CLAUDE_TOOL_DONE_MCP_LAZY'},'end_turn',`message-${calls}`);
+      }
       if (encodedHistory.includes('NESTED_CLAUDE_PARENT')) {
         assert.equal(body.model,'claude-opus-4-6','middle generation uses the native Claude provider');
         const toolsUsed=body.messages.flatMap(message=>Array.isArray(message.content)?message.content.filter(block=>block.type==='tool_use').map(block=>block.name.replace(/^_/,'')):[]);
@@ -271,7 +336,7 @@ test('Managed native Claude and mixed-family public delegation, account gates, c
     {name:'managed',modulesRoot:'/',modules:managedModules,compatibilityDate:'2026-07-29',compatibilityFlags:['nodejs_compat','enable_request_signal'],
       bindings:{MANAGED_AGENT_DIRECT_CREDENTIALS:'true'},
       serviceBindings:{NANOCODEX:'egress',NANOCODEX_SESSION_MODEL_EGRESS:{name:'egress',entrypoint:'SessionModelEgress'}},
-      durableObjects:Object.fromEntries([['NANOCODEX_AUTH','NonceStorage'],['NANOCODEX_USERS','UserAccount'],['NANOCODEX_ORGANIZATIONS','Organization'],['NANOCODEX_API_KEYS','ApiKeyRecord'],['NANOCODEX_SESSIONS','DurableAgentSession'],['NANOCODEX_ACCOUNT_TOOLS','AccountHostedTools'],['NANOCODEX_VM_HOST_POOLS','VmHostPool'],['NANOCODEX_MEMORY','MemoryScope']].map(([binding,className])=>[binding,{className,useSQLite:true}])),
+      durableObjects:Object.fromEntries([['NANOCODEX_AUTH','NonceStorage'],['NANOCODEX_USERS','UserAccount'],['NANOCODEX_ORGANIZATIONS','Organization'],['NANOCODEX_API_KEYS','ApiKeyRecord'],['NANOCODEX_SESSIONS','DurableAgentSession'],['NANOCODEX_ACCOUNT_TOOLS','AccountHostedTools'],['NANOCODEX_VM_HOST_POOLS','VmHostPool'],['NANOCODEX_MEMORY','MemoryScope'],['NANOCODEX_SANDBOXES','FixtureSandbox']].map(([binding,className])=>[binding,{className,useSQLite:true}])),
       r2Buckets:['NANOCODEX_HISTORY','NANOCODEX_WORKSPACES'],outboundService:provider},
     {name:'egress',modulesRoot:'/',modules:egressModules,compatibilityDate:'2026-07-29',compatibilityFlags:['nodejs_compat','enable_request_signal'],
       bindings:{ENVIRONMENT:'test',CREDENTIAL_ENCRYPTION_KEY:'MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY'},
@@ -303,6 +368,7 @@ test('Managed native Claude and mixed-family public delegation, account gates, c
     mf=new Miniflare(options);
     token=(await call('/__fixture','POST',{user:identity})).token;
     assert.equal((await call('/v1/credentials')).claude.connected,false);
+    assert.equal((await call('/v1/agents','POST',{},409)).error,'no_available_models');
     for(const capabilities of [['agents:read'],['agents:write']]) {
       const scoped=(await call('/__fixture','POST',{user:identity,capabilities})).token;
       for(const [path,method,body] of [['/v1/credentials/claude/login','POST',undefined],['/v1/credentials/claude/login','GET',undefined],['/v1/credentials/claude/login/complete','POST',{code:'synthetic-denied'}],['/v1/credentials/claude','DELETE',undefined]])await call(path,method,body,401,{authorization:'Bearer '+scoped});
@@ -322,8 +388,14 @@ test('Managed native Claude and mixed-family public delegation, account gates, c
     await call('/v1/agents','POST',{},409);
     await call('/v1/agents','POST',{settings:{model:'claude-sonnet-4-6',thinking:'low',reasoning_mode:'standard',fast_mode:false}},409);
     catalogUnsupportedOnly=false;
+    catalogOutage=true;
+    assert.equal((await call('/v1/models','GET',undefined,503)).error,'model_availability_unavailable');
+    assert.equal((await call('/v1/agents','POST',{},503)).error,'model_availability_unavailable');
+    catalogOutage=false;
     const catalog=await call('/v1/models');assert.equal(catalog.availability.claude.available,true);assert.deepEqual(catalog.data.map(m=>m.id),['claude-sonnet-4-6','claude-opus-4-6']);assert.equal(catalog.default_model,'claude-sonnet-4-6');
+    const beforeClaudeDefault=catalogRequests;
     const created=await call('/v1/agents','POST',{},201), agent=created.agent_id;
+    assert.equal(catalogRequests-beforeClaudeDefault,2,'Claude-only default and admission share one paginated live catalog');
     assert.equal((await call(`/v1/agents/${agent}`)).settings.model,'claude-sonnet-4-6');
     // The mobile picker uses /routing, whose body excludes settings-only fields.
     await call(`/v1/agents/${agent}/routing`,'POST',{model:'claude-opus-4-6',thinking:'medium'});
@@ -333,6 +405,7 @@ test('Managed native Claude and mixed-family public delegation, account gates, c
     assert.equal((await call(`/v1/agents/${agent}`)).settings.model,'claude-opus-4-6','rejected mobile payload preserves selection');
     await call(`/v1/agents/${agent}/settings`,'PATCH',{model:'claude-sonnet-4-6',thinking:'low',reasoning_mode:'standard',fast_mode:false});
     await turn(agent,'Write durable proof','journey-write');
+    assert.equal(mcpStarts(),0,'native non-MCP tools never initialize the optional MCP adapter');
     await call(`/v1/agents/${agent}/settings`,'PATCH',{model:'claude-opus-4-6'},409);
     const done=await call(`/v1/agents/${agent}/done`,'PUT',{done:true});
     assert.equal(done.done,true);assert.ok(done.done_at>0);
@@ -358,10 +431,36 @@ test('Managed native Claude and mixed-family public delegation, account gates, c
     await turn(agent,'Check denied file','journey-denied-file');
     const onlyWrite=(await call('/v1/agents','POST',{configuration:{tools:['Write']}},201)).agent_id;
     assert.match(JSON.stringify(await turn(onlyWrite,'Try forbidden Read','journey-write-only','failed')),/outside the admitted catalog/);
+    assert.equal(mcpStarts(),0,'empty and non-MCP allowlists do not start MCP discovery');
+    const beforeMcp = mcpStarts();
+    const mcpAgent=(await call('/v1/agents','POST',{},201)).agent_id;
+    await turn(mcpAgent,'MCP_LAZY_SEARCH proof','journey-mcp-search');
+    assert.equal(mcpStarts()-beforeMcp,6,'search and execute share one set of public MCP clients');
+    const mcpHistory=await call(`/v1/agents/${mcpAgent}/events/history?after=0&limit=256`);
+    assert.match(JSON.stringify(mcpHistory),/MCP_LAZY_PUBLIC_PROOF/);
+    const directMcp=(await call('/v1/agents','POST',{},201)).agent_id;
+    await turn(directMcp,'MCP_LAZY_DIRECT proof','journey-mcp-direct');
+    assert.equal(mcpStarts()-beforeMcp,12,'execute as first MCP action discovers before exact resolution');
+    await call(`/v1/agents/${mcpAgent}`,'DELETE',undefined,204);
+    await call(`/v1/agents/${directMcp}`,'DELETE',undefined,204);
     const unavailable=(await call('/v1/agents','POST',{configuration:{tools:['TaskOutput']}},201)).agent_id;
     const beforeUnavailable=calls;
     assert.match(JSON.stringify(await turn(unavailable,'Unavailable native capability must fail','journey-unavailable','failed')),/unavailable Claude capability/);
     assert.equal(calls,beforeUnavailable,'requested but uninstalled capability fails before inference');
+    const closingMcp=(await call('/v1/agents','POST',{},201)).agent_id;
+    holdMcp=true; mcpHold=new Promise(resolve=>{releaseMcp=resolve;});
+    const heldMcpStart=mcpTrace.length;
+    await call(`/v1/agents/${closingMcp}/turns`,'POST',{input:'MCP_LAZY_SEARCH hold',id:'journey-mcp-close-during-init'},202);
+    for(let n=0;n<150 && mcpTrace.slice(heldMcpStart).filter(row=>row.method==='initialize').length<6;n++)await new Promise(resolve=>setTimeout(resolve,20));
+    assert.equal(mcpTrace.slice(heldMcpStart).filter(row=>row.method==='initialize').length,6);
+    let closeDeadline;
+    try {
+      await Promise.race([call(`/v1/agents/${closingMcp}`,'DELETE',undefined,204),new Promise((_,reject)=>{closeDeadline=setTimeout(()=>reject(new Error('MCP teardown waited for withheld discovery')),5000);})]);
+    } finally { clearTimeout(closeDeadline); holdMcp=false; releaseMcp(); }
+    // A completed unrelated HTTP request gives released callbacks an opportunity
+    // to run without imposing a timing-based correctness threshold.
+    await call('/v1/credentials');
+    assert.equal(mcpTrace.slice(heldMcpStart).filter(row=>row.method==='tools/list'||row.method==='tools/call').length,0,'closed discovery cannot proceed to listing or execution');
     const childAgent=(await call('/v1/agents','POST',{configuration:{tools:['Task','TaskOutput','TaskStop','Write','Read','Bash'],multi_agent:{enabled:true}}},201)).agent_id;
     await turn(childAgent,'Delegate native child','journey-child');
     assert.equal(taskWrites,1);
@@ -391,6 +490,11 @@ test('Managed native Claude and mixed-family public delegation, account gates, c
     await turn(childAgent,'Read retained task receipt','journey-task-receipt');assert.equal(taskWrites,1,'completed child not replayed after restart');
     await turn(agent,'Run Bash durable proof after cancellation','journey-after-cancel');assert.equal(holds,1,'cancelled request not replayed');
 
+    const beforeDeniedMcp=mcpStarts(), ownerMcpToken=token;
+    token=(await call('/__fixture','POST',{user:identity,capabilities:['agents:read','agents:write']})).token;
+    await call(`/v1/agents/${agent}/turns`,'POST',{input:'MCP_LAZY_SEARCH denied',id:'journey-mcp-denied'},403);
+    token=ownerMcpToken;
+    assert.equal(mcpStarts(),beforeDeniedMcp,'denied tool authority performs no MCP I/O');
     const beforeGrant=calls;
     for(const [path,body] of [['/v1/models',undefined],['/v1/agents',{settings:{model:'claude-sonnet-4-6',thinking:'low',reasoning_mode:'standard',fast_mode:false}}],[`/v1/agents/${agent}/turns`,{input:'Write durable proof',id:'connect-denied'}]]) {
       const response=await mf.dispatchFetch('https://nanocodex.internal'+path,{method:body?'POST':'GET',headers:grantHeaders,...(body?{body:JSON.stringify(body)}:{})});
@@ -409,6 +513,11 @@ test('Managed native Claude and mixed-family public delegation, account gates, c
     const mixed=await call('/v1/models');assert.equal(mixed.partial,true);assert.equal(mixed.availability.claude.error,'claude_models_unavailable');
     assert.deepEqual(mixed.data.map(model=>model.id),['gpt-6-astra','gpt-6.1-sol','gpt-6-luna']);
     await turn(agent,'Run Bash durable proof in mixed account','journey-mixed-provider-pin');assert.equal(responsesAttempts,0,'Claude inference/sidebar cannot borrow OAI credential');
+    const beforeGptMcp=mcpStarts();
+    const gptMcp=(await call('/v1/agents','POST',{settings:{model:'gpt-6.1-sol',thinking:'low',reasoning_mode:'standard',fast_mode:false}},201)).agent_id;
+    await turn(gptMcp,'GPT_MCP_DISCOVERY_PROBE','journey-gpt-mcp');
+    assert.equal(mcpStarts()-beforeGptMcp,6,'GPT-only turn starts primary discovery once, with no alternate-Claude duplicate');
+    await call(`/v1/agents/${gptMcp}`,'DELETE',undefined,204);
     allowResponses=true;
     const reverse=(await call('/v1/agents','POST',{settings:{model:'gpt-6-astra',thinking:'low',reasoning_mode:'standard',fast_mode:false}},201)).agent_id;
     catalogOutage=false;
@@ -421,7 +530,28 @@ test('Managed native Claude and mixed-family public delegation, account gates, c
     allowResponses=false;
     catalogOutage=true;
     assert.ok(!mixed.data.find(model=>model.id==='gpt-6-astra').thinking.includes('none'));assert.ok(mixed.data.find(model=>model.id==='gpt-6-luna').thinking.includes('none'));
+    const beforeMixedDefault=catalogRequests;
     const mixedDefault=await call('/v1/agents','POST',{},201);assert.equal((await call(`/v1/agents/${mixedDefault.agent_id}`)).settings.model,'gpt-6-astra');
+    assert.equal(catalogRequests,beforeMixedDefault,'default OpenAI admission skips the unavailable Claude catalog');
+    catalogOutage=false;
+    let releaseCatalog, deadline;
+    catalogHold=new Promise(resolve=>{releaseCatalog=resolve;});
+    try {
+      const heldDefault=await Promise.race([
+        call('/v1/agents','POST',{},201),
+        new Promise((_,reject)=>{deadline=setTimeout(()=>reject(new Error('default admission waited for the withheld Claude catalog')),5000);}),
+      ]);
+      assert.equal((await call(`/v1/agents/${heldDefault.agent_id}`)).settings.model,'gpt-6-astra');
+      assert.equal(catalogRequests,beforeMixedDefault,'default admission does not start an unrelated Claude lookup');
+      trace.push({scenario:'both providers, Claude catalog withheld',default_model:'gpt-6-astra',catalog_requests:catalogRequests-beforeMixedDefault,completed_before_catalog_release:true});
+    } finally { clearTimeout(deadline); releaseCatalog(); catalogHold=undefined; }
+    const fullMixed=await call('/v1/models');
+    assert.equal(fullMixed.partial,false);
+    assert.deepEqual(fullMixed.data.map(model=>model.id),['gpt-6-astra','gpt-6.1-sol','gpt-6-luna','claude-sonnet-4-6','claude-opus-4-6']);
+    assert.equal(fullMixed.default_model,'gpt-6-astra');
+    assert.equal(catalogRequests-beforeMixedDefault,2,'GET models still reads every Claude catalog page');
+    assert.equal((await call('/v1/agents','POST',{settings:{model:'claude-sonnet-5-5',thinking:'low',reasoning_mode:'standard',fast_mode:false}},409)).error,'claude_model_unavailable');
+    catalogOutage=true;
     await call('/v1/agents','POST',{settings:{model:'gpt-6-astra',thinking:'low',reasoning_mode:'standard',fast_mode:false}},201);
     await call('/v1/agents','POST',{settings:{model:'claude-sonnet-4-6',thinking:'low',reasoning_mode:'standard',fast_mode:false}},409);
     await mf.dispose();options.workers[0].bindings.NANOCODEX_THREAD_ROUTING='true';options.workers[0].bindings.OPENROUTER_API_KEY='synthetic-gateway-key';options.workers[0].ai={binding:'AI'};mf=new Miniflare(options);
@@ -476,6 +606,7 @@ test('Managed native Claude and mixed-family public delegation, account gates, c
     await writeFile(resolve(evidence,'public-api-trace.json'),JSON.stringify(trace,null,2));
     await writeFile(resolve(evidence,'provider-trace.json'),JSON.stringify(upstream,null,2));
     await writeFile(resolve(evidence,'provider-errors.json'),JSON.stringify(providerErrors,null,2));
+    await writeFile(resolve(evidence,'mcp-trace.json'),JSON.stringify(mcpTrace,null,2));
     await rm(persistence,{recursive:true,force:true});
   }
 });
