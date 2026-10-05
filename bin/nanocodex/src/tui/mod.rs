@@ -9,6 +9,7 @@ mod diff;
 ))]
 mod eval_attach;
 mod external_editor;
+pub(crate) mod interaction;
 mod markdown;
 mod notification;
 mod resume_picker;
@@ -36,7 +37,7 @@ use crossterm::event::{
     Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use eyre::{Result, WrapErr};
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use nanocodex::{
     AgentEvents, HarnessModel, Nanocodex, NanocodexError, OpenAi, Thinking, TurnControl,
     TurnResult,
@@ -816,6 +817,10 @@ pub(crate) async fn run_observed(
         ui.app
             .restore_transcript(session.transcript().iter().cloned());
     }
+    if let Some(session) = &config.claude_resume {
+        ui.app
+            .restore_transcript(session.transcript.iter().cloned());
+    }
     submit_initial_prompt(&mut ui.app, "", &worker_tx, initial_prompt)?;
     scheduler.request_immediate(Instant::now());
     // Synchronous pieces of backend construction run on a runtime worker, never
@@ -900,6 +905,10 @@ pub(crate) async fn run_observed(
     let mut agent_events = configured.events;
     let root_session_id = Arc::<str>::from(agent_events.request_id());
     ui.root_session_id = Arc::clone(&root_session_id);
+    let mut claude_interactions = configured.claude_interactions;
+    let mut claude_scheduler = configured.claude_scheduler;
+    let mut cron_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    cron_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut subagent_updates = configured.subagent_updates;
     let child_agents = configured.child_agents;
     let mpp_adapter = configured.mpp_adapter;
@@ -945,6 +954,50 @@ pub(crate) async fn run_observed(
 
             let render_deadline = scheduler.deadline();
             tokio::select! {
+            _ = cron_tick.tick(), if claude_scheduler.is_some() => {
+                // User input and queued turns have priority. This timer never
+                // interrupts a response, routes to BTW, or creates a new agent.
+                if ui.app.main_accepts_automatic_prompt() && !ui.app.has_input()
+                    && ui.app.claude_interaction.as_ref().is_none_or(crate::config::PendingInteraction::is_closed)
+                {
+                    let session = ui.app.main_branch_request_id().unwrap_or(&root_session_id);
+                    match claude_scheduler.as_ref().expect("enabled scheduler").take_due(session) {
+                        Ok(Some(due)) => {
+                            let source = if due.id.starts_with("monitor-") { "Monitor" } else { "Scheduled" };
+                            let display = format!("[{source} {}] {}", due.id, due.prompt);
+                            let mut prompt = SubmittedPrompt::text(display.clone());
+                            prompt.set_instruction(due.prompt);
+                            if let Some(prompt_id) = ui.app.queue_prompt(PaneId::Main, display) {
+                                send_command(&worker_tx, WorkerCommand::Prompt { target: PaneId::Main, prompt_id, prompt })?;
+                            }
+                            scheduler.request_immediate(Instant::now());
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            ui.app.main.push_output(TranscriptItem::Error(format!("Scheduler paused: {error}. Reopen the session after fixing its journal.")));
+                            claude_scheduler = None;
+                            scheduler.request_immediate(Instant::now());
+                        }
+                    }
+                }
+            }
+            interaction = async { match &mut claude_interactions { Some(receiver) => receiver.recv().await, None => std::future::pending().await } }, if ui.app.claude_interaction.as_ref().is_none_or(crate::config::PendingInteraction::is_closed) => {
+                if let Some(interaction) = interaction {
+                    if !interaction.is_closed() {
+                        // A draft or buffered key belongs to the previous UI
+                        // state, never to this newly published approval request.
+                        ui.app.clear_input();
+                        if let Some(events) = input_events.as_mut() {
+                            while matches!(events.next().now_or_never(), Some(Some(_))) {}
+                        }
+                        ui.app.focus = PaneId::Main;
+                        ui.app.main.push_output(TranscriptItem::Assistant(interaction.prompt().to_owned()));
+                        ui.app.claude_interaction = Some(interaction);
+                        ui.app.set_active_status("Awaiting your answer");
+                        scheduler.request_immediate(Instant::now());
+                    }
+                } else { claude_interactions = None; }
+            }
             command = async { match &mut control_server { Some(server) => server.commands.recv().await, None => std::future::pending().await } } => {
                 if let Some(command) = command { control::dispatch(&mut ui, command, &worker_tx)?; scheduler.request_immediate(Instant::now()); }
             }
@@ -957,6 +1010,14 @@ pub(crate) async fn run_observed(
                 let event = event.transpose()?.ok_or_else(|| {
                     std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "terminal input closed")
                 })?;
+                if matches!(&event, Event::Key(key) if key.code == KeyCode::Esc)
+                    && let Some(cron) = &claude_scheduler
+                {
+                    let session = ui.app.main_branch_request_id().unwrap_or(&root_session_id);
+                    if let Err(error) = cron.stop_wakeup(session) {
+                        ui.app.main.push_output(TranscriptItem::Error(format!("Cannot cancel wakeup: {error}")));
+                    }
+                }
                 let update = ui.update(UiAction::Terminal(event), &worker_tx)?;
                 if update == UiUpdate::RestoreTerminalGraphics {
                     if let Some(renderer) = &math_renderer { renderer.reupload_all(); }
@@ -2689,6 +2750,21 @@ async fn start_turn(
     finished: &mpsc::UnboundedSender<FinishedTurn>,
     updates: &mpsc::UnboundedSender<WorkerEvent>,
 ) -> Option<TrackedTurn> {
+    let mut prompt = prompt;
+    if !prompt.has_instruction() {
+        match crate::config::expand_session_user_skill(agent, prompt.display()) {
+            Ok(Some(instruction)) => prompt.set_instruction(instruction),
+            Ok(None) => {}
+            Err(error) => {
+                let _ = updates.send(WorkerEvent::TurnFinished {
+                    target: target.pane,
+                    main_branch_id: target.main_branch_id,
+                    error: Some(error),
+                });
+                return None;
+            }
+        }
+    }
     let started_at = Instant::now();
     let id = *next_turn_id;
     let span = info_span!(
@@ -2792,6 +2868,21 @@ async fn steer_turn(
     finished: &mpsc::UnboundedSender<FinishedTurn>,
     updates: &mpsc::UnboundedSender<WorkerEvent>,
 ) -> SteerOutcome {
+    let mut request = request;
+    if !request.prompt.has_instruction() {
+        match crate::config::expand_session_user_skill(agent, request.prompt.display()) {
+            Ok(Some(instruction)) => request.prompt.set_instruction(instruction),
+            Ok(None) => {}
+            Err(error) => {
+                let _ = updates.send(WorkerEvent::SteerFailed {
+                    target: target.pane,
+                    id: request.id,
+                    error,
+                });
+                return SteerOutcome::Failed;
+            }
+        }
+    }
     for turn in turns {
         let started_at = Instant::now();
         let span = info_span!(
@@ -3477,6 +3568,29 @@ fn submit(
     commands: &mpsc::UnboundedSender<WorkerCommand>,
     intent: SubmitIntent,
 ) -> Result<()> {
+    if let Some(mut request) = app.claude_interaction.take() {
+        if !request.is_closed() {
+            let answer = app.input.clone();
+            match request.respond(&answer) {
+                Ok(()) => {
+                    app.clear_input();
+                    app.main.push_output(TranscriptItem::User(answer));
+                    app.set_active_status("Running");
+                }
+                Err(error) => {
+                    app.main.push_output(TranscriptItem::Error(error));
+                    app.claude_interaction = Some(request);
+                }
+            }
+            return Ok(());
+        }
+        // An answer racing cancellation must not become a new model prompt.
+        app.clear_input();
+        app.main.push_output(TranscriptItem::Error(
+            "The request was cancelled; the answer was discarded".into(),
+        ));
+        return Ok(());
+    }
     if let PaneId::Btw(id) = app.focus
         && app.btw_splitting(id)
     {
@@ -3511,7 +3625,23 @@ fn execute_submission(
     submission: Submission,
 ) -> Result<()> {
     match submission {
-        Submission::Prompt(prompt) => {
+        Submission::Prompt(mut prompt) => {
+            if !prompt.has_instruction() && app.model().family() != nanocodex::HarnessFamily::Claude
+            {
+                match crate::config::expand_user_skill(
+                    app.model().family(),
+                    &app.cwd,
+                    prompt.display(),
+                ) {
+                    Ok(Some(instruction)) => prompt.set_instruction(instruction),
+                    Ok(None) => {}
+                    Err(error) => {
+                        app.push_active_error(error);
+                        app.set_active_status("Skill unavailable");
+                        return Ok(());
+                    }
+                }
+            }
             let target = app.focus;
             if matches!(intent, SubmitIntent::Immediate) && app.is_running(target) {
                 if let Some(id) = app.queue_steer(target, prompt.clone()) {

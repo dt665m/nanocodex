@@ -119,6 +119,10 @@ impl AgentArgs {
             .canonicalize()
             .wrap_err("failed to resolve the xAI workspace")?;
         let codex_home = default_codex_home()?;
+        let workspaces = Arc::new(super::claude::WorkspaceRegistry::new(
+            workspace.clone(),
+            codex_home.clone(),
+        ));
         let managed_mcp = if self.mcp.loads_managed() {
             load_managed_mcp_credential(&codex_home).await?
         } else {
@@ -153,6 +157,7 @@ impl AgentArgs {
             .build()?;
         let codex_home_for_recipe = codex_home.clone();
         let codex_workspace = workspace.clone();
+        let codex_workspaces = Arc::clone(&workspaces);
         let codex_registry = tool_registry.clone();
         let codex_instructions = instructions.clone();
         let websocket_url = self.websocket_url;
@@ -167,6 +172,7 @@ impl AgentArgs {
                 let auth = codex_auth.clone();
                 let tools = codex_tools.clone();
                 let workspace = codex_workspace.clone();
+                let workspaces = Arc::clone(&codex_workspaces);
                 let codex_home = codex_home_for_recipe.clone();
                 let registry = codex_registry.clone();
                 let instructions = codex_instructions.clone();
@@ -179,6 +185,28 @@ impl AgentArgs {
                             "Codex recipe received another family model".into(),
                         ));
                     };
+                    workspaces
+                        .authorize_cross_family(request.parent.as_ref())
+                        .map_err(nanocodex::NanocodexError::InvalidRequest)?;
+                    let session_id = match &request.snapshot {
+                        Some(nanocodex::agent::ChildSnapshot::Codex(snapshot)) => {
+                            snapshot.session_id.parse::<SessionId>().map_err(|error| {
+                                nanocodex::NanocodexError::InvalidRequest(error.to_string())
+                            })?
+                        }
+                        _ => SessionId::new(),
+                    };
+                    let session_key = session_id.to_string();
+                    if let Some(parent) = &request.parent {
+                        workspaces.initialize(parent.session_id(), &session_key)
+                    } else {
+                        workspaces.seed(&session_key, workspace)
+                    }
+                    .map_err(nanocodex::NanocodexError::InvalidRequest)?;
+                    let workspace = workspaces
+                        .current(&session_key)
+                        .map_err(nanocodex::NanocodexError::InvalidRequest)?;
+                    let tool_workspace = workspace.clone();
                     let auth = auth
                         .resolve()
                         .map_err(|error| {
@@ -206,6 +234,7 @@ impl AgentArgs {
                     })?;
                     let registry_enabled = registry.is_some();
                     let mut builder = Nanocodex::builder(client)
+                        .session_id(session_id)
                         .workspace(workspace)
                         .codex_home(codex_home)
                         .model(model)
@@ -215,6 +244,11 @@ impl AgentArgs {
                         .host_context(request.host_context)
                         .spawn_factory(request.spawn_factory)
                         .tools_factory(move |parent| {
+                            workspaces
+                                .seed(parent.session_id(), tool_workspace.clone())
+                                .map_err(
+                                    nanocodex::tools::runtime::ToolsBuildError::HostInitialization,
+                                )?;
                             if let Some(registry) = &registry {
                                 nanocodex_subagents::install_tools(
                                     tools.clone(),
@@ -245,12 +279,19 @@ impl AgentArgs {
                 self.claude_auth,
                 self.claude_api_key,
                 self.claude_messages_url,
-            ),
+            )
+            .with_hooks(self.claude_hooks)
+            .with_permission_config(
+                self.claude_permissions.as_deref(),
+                self.permission_mode.as_deref(),
+            )?,
             workspace.clone(),
             instructions.clone(),
             tools.clone(),
             web_search,
             tool_registry.clone(),
+            mcp_handle.clone(),
+            Arc::clone(&workspaces),
         );
         let harness = register_xai_recipe(
             harness_builder,
@@ -260,6 +301,7 @@ impl AgentArgs {
             tools.clone(),
             xai_search,
             tool_registry.clone(),
+            Arc::clone(&workspaces),
         )
         .build();
         let mut builder = configured_xai_builder(
@@ -271,6 +313,7 @@ impl AgentArgs {
             tools,
             xai_search,
             tool_registry,
+            workspaces,
         )?
         .spawn_factory(harness.spawn_factory());
         // Persist native Responses history in its own family journal by default.
@@ -308,6 +351,8 @@ impl AgentArgs {
                 )
             });
         Ok(ConfiguredAgent {
+            claude_interactions: None,
+            claude_scheduler: None,
             handle,
             events,
             realtime: None,
@@ -364,6 +409,7 @@ fn configured_xai_builder(
     tools: Tools,
     web_search: Option<bool>,
     registry: Option<Arc<nanocodex_subagents::Registry>>,
+    workspaces: Arc<super::claude::WorkspaceRegistry>,
 ) -> nanocodex::agent::Result<Xai> {
     let web_search = xai_web_search(model, web_search)?;
     let instructions = super::instructions::native(
@@ -378,6 +424,9 @@ fn configured_xai_builder(
         .workspace(workspace.to_string_lossy().into_owned())
         .system(instructions)
         .tools_factory(move |parent| {
+            workspaces
+                .seed(parent.session_id(), workspace.clone())
+                .map_err(nanocodex::NanocodexError::InvalidRequest)?;
             let tools = if let Some(registry) = &registry {
                 nanocodex_subagents::install_tools(tools.clone(), parent, Arc::clone(registry))?
             } else {
@@ -405,6 +454,7 @@ fn xai_web_search(model: HarnessModel, requested: Option<bool>) -> nanocodex::ag
     Ok(requested.unwrap_or_else(|| model.supports_backend_search()))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn register_xai_recipe(
     harness: nanocodex::HarnessBuilder,
     connection: XaiConnection,
@@ -413,6 +463,7 @@ pub(super) fn register_xai_recipe(
     tools: Tools,
     web_search: Option<bool>,
     registry: Option<Arc<nanocodex_subagents::Registry>>,
+    workspaces: Arc<super::claude::WorkspaceRegistry>,
 ) -> nanocodex::HarnessBuilder {
     harness.register(HarnessFamily::Xai, move |request| {
         let connection = connection.clone();
@@ -420,7 +471,26 @@ pub(super) fn register_xai_recipe(
         let instructions = instructions.clone();
         let tools = tools.clone();
         let registry = registry.clone();
+        let workspaces = Arc::clone(&workspaces);
         async move {
+            workspaces
+                .authorize_cross_family(request.parent.as_ref())
+                .map_err(nanocodex::NanocodexError::InvalidRequest)?;
+            let session_id = match &request.snapshot {
+                Some(nanocodex::agent::ChildSnapshot::Native { session_id, .. }) => {
+                    session_id.clone()
+                }
+                _ => SessionId::new().to_string(),
+            };
+            if let Some(parent) = &request.parent {
+                workspaces.initialize(parent.session_id(), &session_id)
+            } else {
+                workspaces.seed(&session_id, workspace)
+            }
+            .map_err(nanocodex::NanocodexError::InvalidRequest)?;
+            let workspace = workspaces
+                .current(&session_id)
+                .map_err(nanocodex::NanocodexError::InvalidRequest)?;
             let client = connection
                 .client()
                 .await
@@ -434,7 +504,9 @@ pub(super) fn register_xai_recipe(
                 tools,
                 web_search,
                 registry,
+                workspaces,
             )?
+            .session_id(session_id)
             .spawn_factory(request.spawn_factory)
             .host_context(request.host_context);
             if let Some(checkpoint) = request.snapshot {

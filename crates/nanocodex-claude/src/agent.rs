@@ -14,7 +14,7 @@ use nanocodex_agent::{
         BackendTurn, BackendTurnKey, BuilderBackend, LifecycleBackend,
     },
     events::{AgentEvent, AgentEventKind, AgentEventPublisher},
-    input::{Prompt, PromptInput, PromptMessageRole},
+    input::Prompt,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -92,11 +92,29 @@ impl ClaudeToolReply {
 #[derive(Clone, Default)]
 pub struct ClaudeTools {
     tools: Vec<(ToolDefinition, Handler)>,
+    dynamic: Vec<DynamicToolsFactory>,
+    custom_tool_search: bool,
 }
 impl ClaudeTools {
     /// Creates an empty native function collection.
     pub fn new() -> Self {
         Self::default()
+    }
+    /// Refresh host-owned tools for each new model request. Recovery retains its
+    /// admitted schemas; execution rechecks current availability. Nested dynamic
+    /// factories are ignored. Names must be unique and may not shadow static tools.
+    pub fn dynamic_tools<F>(mut self, factory: F) -> Self
+    where
+        F: Fn() -> Self + Send + Sync + 'static,
+    {
+        self.dynamic.push(Arc::new(factory));
+        self
+    }
+    /// Enable an embedding-supplied ToolSearch handler returning native
+    /// tool_reference blocks. The collection must register ToolSearch itself.
+    pub fn custom_tool_search(mut self) -> Self {
+        self.custom_tool_search = true;
+        self
     }
     /// Registers a callback retaining stable invocation identities and revision.
     pub fn tool_with_context<F, Fut>(mut self, definition: ToolDefinition, function: F) -> Self
@@ -111,7 +129,67 @@ impl ClaudeTools {
         self
     }
 }
+type DynamicToolsFactory = Arc<dyn Fn() -> ClaudeTools + Send + Sync>;
+
 type ClaudeToolsFactory = Arc<dyn Fn(AgentHandle) -> Result<ClaudeTools> + Send + Sync>;
+
+fn hooked_handler(
+    name: String,
+    handler: Handler,
+    hooks: Arc<dyn crate::ClaudeToolHooks>,
+) -> Handler {
+    Arc::new(move |input, invocation| {
+        let name = name.clone();
+        let handler = handler.clone();
+        let hooks = hooks.clone();
+        Box::pin(async move {
+            let input = match hooks.before(&name, &input, &invocation).await {
+                Ok(crate::ClaudeToolDecision::Allow) => input,
+                Ok(crate::ClaudeToolDecision::UpdateInput(updated)) if updated.is_object() => {
+                    updated
+                }
+                Ok(crate::ClaudeToolDecision::UpdateInput(_)) => {
+                    return Err("tool hook input must be an object; tool was not executed".into());
+                }
+                Ok(crate::ClaudeToolDecision::Deny(reason)) => {
+                    return Err(format!(
+                        "Tool blocked by host: {reason}; tool was not executed"
+                    ));
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "PreToolUse hook failed: {error}; tool was not executed"
+                    ));
+                }
+            };
+            let mut reply = match handler(input.clone(), invocation.clone()).await {
+                Ok(reply) => reply,
+                Err(error) => ClaudeToolReply {
+                    content: ToolResultContent::Text(error),
+                    is_error: true,
+                    metadata: None,
+                    structured_result: None,
+                },
+            };
+            if let Err(error) = hooks.after(&name, &input, &invocation, &reply).await {
+                let notice = format!(
+                    "PostToolUse hook failed: {error}. The tool already returned the preceding result; this does not undo its effects. Reconcile that result before retrying."
+                );
+                match &mut reply.content {
+                    ToolResultContent::Text(text) => {
+                        text.push_str("\n\n");
+                        text.push_str(&notice);
+                    }
+                    ToolResultContent::Blocks(blocks) => {
+                        blocks.push(json!({"type":"text","text":notice}))
+                    }
+                }
+                reply.is_error = true;
+            }
+            Ok(reply)
+        })
+    })
+}
 
 /// Explicit Claude Messages configuration with caller-owned authentication.
 /// Latest documented coding model as of September 2026; callers can pin any model via `new`.
@@ -142,6 +220,9 @@ impl BuilderBackend for Claude {
     }
 }
 
+type WorkspaceResolver = Arc<dyn Fn(&str) -> String + Send + Sync>;
+type ChildWorkspaceInit = Arc<dyn Fn(&str, &str) -> Result<()> + Send + Sync>;
+
 /// Provider-specific session builder. Custom functions are opt-in, not automatically discovered.
 #[derive(Clone)]
 pub struct ClaudeBuilder {
@@ -160,8 +241,13 @@ pub struct ClaudeBuilder {
     system: String,
     system_blocks: Option<Vec<Value>>,
     workspace: String,
+    workspace_resolver: Option<WorkspaceResolver>,
+    child_workspace_init: Option<ChildWorkspaceInit>,
+    system_resolver: Option<WorkspaceResolver>,
     tools: Vec<(ToolDefinition, Handler)>,
     tools_factory: Option<ClaudeToolsFactory>,
+    dynamic_tools: Vec<DynamicToolsFactory>,
+    tool_hooks: Vec<Arc<dyn crate::ClaudeToolHooks>>,
     spawn_factory: Option<Arc<dyn AgentFactory>>,
     host_context: Option<Arc<str>>,
     server_tools: Vec<ServerToolDefinition>,
@@ -196,8 +282,13 @@ impl ClaudeBuilder {
             system: String::new(),
             system_blocks: None,
             workspace: String::new(),
+            workspace_resolver: None,
+            child_workspace_init: None,
+            system_resolver: None,
             tools: Vec::new(),
             tools_factory: None,
+            dynamic_tools: Vec::new(),
+            tool_hooks: Vec::new(),
             spawn_factory: None,
             host_context: None,
             server_tools: Vec::new(),
@@ -382,6 +473,33 @@ impl ClaudeBuilder {
         self.system_blocks = Some(blocks);
         self
     }
+    /// Resolve an embedding-owned session workspace at each request/checkpoint.
+    /// The callback is host authority, never derived from model tool arguments.
+    pub fn workspace_resolver<F>(mut self, resolver: F) -> Self
+    where
+        F: Fn(&str) -> String + Send + Sync + 'static,
+    {
+        self.workspace_resolver = Some(Arc::new(resolver));
+        self
+    }
+    /// Seed an independent child workspace before its tools are constructed.
+    /// Arguments are the owning parent and newly allocated child session IDs.
+    pub fn child_workspace_init<F>(mut self, initialize: F) -> Self
+    where
+        F: Fn(&str, &str) -> Result<()> + Send + Sync + 'static,
+    {
+        self.child_workspace_init = Some(Arc::new(initialize));
+        self
+    }
+    /// Refresh host system context after completed tool batches. Persisted
+    /// requests retain their frozen context during effect replay.
+    pub fn system_resolver<F>(mut self, resolver: F) -> Self
+    where
+        F: Fn(&str) -> String + Send + Sync + 'static,
+    {
+        self.system_resolver = Some(Arc::new(resolver));
+        self
+    }
     /// Labels the session workspace for embeddings; this driver does not execute shell commands.
     pub fn workspace(mut self, workspace: impl Into<String>) -> Self {
         self.workspace = workspace.into();
@@ -391,6 +509,16 @@ impl ClaudeBuilder {
     /// safe to overlap. Results remain ordered in one user message.
     pub const fn parallel_tools(mut self, enabled: bool) -> Self {
         self.parallel_tools = enabled;
+        self
+    }
+    /// Install caller-owned pre/post client-tool hooks. A pre-hook error or
+    /// denial prevents execution; post-hook failures retain the actual result.
+    /// Repeated calls compose in registration order before dispatch and reverse
+    /// order afterward; an outer denial prevents all inner hooks and execution.
+    /// Hooks share the tool's durable effect identity and are not repeated for
+    /// committed replay. They do not intercept provider-side server tools.
+    pub fn tool_hooks(mut self, hooks: Arc<dyn crate::ClaudeToolHooks>) -> Self {
+        self.tool_hooks.push(hooks);
         self
     }
     /// Registers one named function. Its result becomes exactly one user tool_result.
@@ -473,7 +601,7 @@ impl ClaudeBuilder {
         }
         self
     }
-    /// Register only the five Claude-native text file tools (Read, Edit, Write,
+    /// Register the five Claude-native file tools (Read, Edit, Write,
     /// Glob, Grep) for a previously host-authorized, OS-isolated workspace.
     /// This is opt-in. In-process path checks are not a sandbox; a hostile
     /// concurrent process can race filesystem operations. No Codex tool name or
@@ -488,10 +616,10 @@ impl ClaudeBuilder {
                 .expect("built-in Claude file tool schema must remain valid");
             let name = definition.name.clone();
             let files = files.clone();
-            self = self.tool(definition, move |input| {
+            self = self.tool_with_context(definition, move |input, _invocation| {
                 let files = files.clone();
                 let name = name.clone();
-                async move { files.execute(&name, input).await }
+                async move { host_reply(files.execute_output(&name, input).await?) }
             });
         }
         self
@@ -677,8 +805,13 @@ impl ClaudeBuilder {
         if let Some(factory) = &self.spawn_factory {
             handle = handle.with_spawn_factory(factory.clone());
         }
+        let mut custom_tool_search = false;
         if let Some(factory) = &self.tools_factory {
-            self.tools.extend(factory(handle.clone())?.tools);
+            let native = factory(handle.clone())?;
+            custom_tool_search = native.custom_tool_search;
+            self.client_tool_search |= custom_tool_search;
+            self.tools.extend(native.tools);
+            self.dynamic_tools.extend(native.dynamic);
         }
 
         if self.claude.model.trim().is_empty()
@@ -719,19 +852,22 @@ impl ClaudeBuilder {
             definitions.push(definition);
         }
         let discovered = Arc::new(Mutex::new(HashSet::<String>::new()));
-        if self.client_tool_search {
+        if custom_tool_search && !handlers.contains_key("ToolSearch") {
+            return Err(unsupported(
+                "custom_tool_search requires a ToolSearch handler",
+            ));
+        }
+        if self.client_tool_search && !custom_tool_search {
             if handlers.contains_key("ToolSearch")
                 || handlers.contains_key("DeferredToolPlaceholder")
             {
                 return Err(unsupported("reserved Claude discovery tool name"));
             }
             let catalog = definitions.clone();
-            let active = discovered.clone();
             handlers.insert(
                 "ToolSearch".into(),
                 Arc::new(move |input, _context| {
                     let catalog = catalog.clone();
-                    let active = active.clone();
                     Box::pin(async move {
                         let fields = input
                             .as_object()
@@ -750,12 +886,14 @@ impl ClaudeBuilder {
                         if query.is_empty() || query.len() > 512 {
                             return Err("ToolSearch query must be 1–512 bytes".into());
                         }
-                        let limit = input
-                            .get("max_results")
-                            .and_then(Value::as_u64)
-                            .filter(|n| (1..=8).contains(n))
-                            .map(|n| n as usize)
-                            .ok_or("max_results must be 1–8")?;
+                        let limit = match input.get("max_results") {
+                            None => 5,
+                            Some(value) => value
+                                .as_u64()
+                                .filter(|n| (1..=8).contains(n))
+                                .ok_or("max_results must be 1–8")?
+                                as usize,
+                        };
                         let selected = query.strip_prefix("select:");
                         let matches = catalog
                             .iter()
@@ -779,17 +917,13 @@ impl ClaudeBuilder {
                                 "No matching tools".into(),
                             )));
                         }
-                        let mut discovered = active.lock().await;
                         let names = matches
                             .iter()
                             .map(|tool| tool.name.as_str())
                             .collect::<Vec<_>>();
                         let mut references = matches
                             .into_iter()
-                            .map(|tool| {
-                                discovered.insert(tool.name.clone());
-                                json!({"type":"tool_reference","tool_name":tool.name})
-                            })
+                            .map(|tool| json!({"type":"tool_reference","tool_name":tool.name}))
                             .collect::<Vec<_>>();
                         // Interactive Claude Code also includes a short text
                         // companion after its reference blocks. This is our
@@ -814,7 +948,7 @@ impl ClaudeBuilder {
             definitions.push(ToolDefinition {
                 name: "ToolSearch".into(),
                 description: "Find deferred tools by name or purpose; use select:ToolName for an exact match.".into(),
-                input_schema: json!({"type":"object","properties":{"query":{"type":"string"},"max_results":{"type":"integer","minimum":1,"maximum":8}},"required":["query","max_results"],"additionalProperties":false}),
+                input_schema: json!({"type":"object","properties":{"query":{"type":"string"},"max_results":{"type":"integer","minimum":1,"maximum":8}},"required":["query"],"additionalProperties":false}),
                 strict: None, defer_loading: false,
             });
             definitions.push(ToolDefinition {
@@ -824,6 +958,11 @@ impl ClaudeBuilder {
                 strict: None,
                 defer_loading: false,
             });
+        }
+        for hooks in self.tool_hooks.iter().rev() {
+            for (name, handler) in &mut handlers {
+                *handler = hooked_handler(name.clone(), handler.clone(), hooks.clone());
+            }
         }
         let mut names = handlers.keys().map(String::as_str).collect::<HashSet<_>>();
         for tool in &self.server_tools {
@@ -888,16 +1027,22 @@ impl ClaudeBuilder {
             auto_compact_window_tokens: self.auto_compact_window_tokens,
             session_id,
             workspace: self.workspace,
+            workspace_resolver: self.workspace_resolver,
+            child_workspace_init: self.child_workspace_init,
+            system_resolver: self.system_resolver,
             host_context: self.host_context,
             system: self.system,
             system_blocks: self.system_blocks,
             tools: definitions,
+            dynamic_tools: self.dynamic_tools,
+            tool_hooks: self.tool_hooks,
             server_tools: self.server_tools,
             handlers,
             discovered,
             client_tool_search: self.client_tool_search,
             parallel_tools: self.parallel_tools,
             conversation: Mutex::new(restored.conversation),
+            dispatch_fork: std::sync::RwLock::new(None),
             policy: self.policy,
             admission: Mutex::new(()),
             idle: Notify::new(),
@@ -1501,6 +1646,40 @@ impl ClaudeNativeFactory {
     }
 }
 impl AgentFactory for ClaudeNativeFactory {
+    fn fork(&self, _parent: AgentHandle) -> BackendFuture<Result<(Nanocodex, AgentEvents)>> {
+        let state = self.owner();
+        let mut recipe = self.recipe();
+        Box::pin(async move {
+            let state = state?;
+            let dispatch = state
+                .dispatch_fork
+                .read()
+                .map_err(|_| unsupported("Claude fork boundary lock poisoned"))?
+                .clone();
+            let mut snapshot = if let Some(snapshot) = dispatch {
+                snapshot
+            } else {
+                let conversation = state.conversation.lock().await;
+                if state.stopped.load(Ordering::SeqCst) {
+                    return Err(NanocodexError::AgentStopped);
+                }
+                state.snapshot(&conversation).await?
+            };
+            // Copy native transcript data, never an execution cursor, policy,
+            // task board or remote continuation identity from the parent.
+            snapshot.tasks = None;
+            snapshot.conversation.pending_continuation = false;
+            snapshot.conversation.previous_message_id = None;
+            snapshot.conversation.container = None;
+            recipe.claude.model = state.model();
+            recipe.effort = state.effort();
+            recipe.adaptive_thinking = state.adaptive_thinking.load(Ordering::SeqCst);
+            recipe.fast_mode = state.fast_mode.load(Ordering::SeqCst);
+            recipe.restored = Some(snapshot);
+            state.initialize_child_workspace(&mut recipe)?;
+            recipe.build()
+        })
+    }
     fn ensure_available(&self, _parent: AgentHandle) -> BackendFuture<Result<()>> {
         let available = self.owner().map(|_| ());
         Box::pin(async move { available })
@@ -1543,6 +1722,7 @@ impl AgentFactory for ClaudeNativeFactory {
                 if let Some(thinking) = options.selected_thinking() {
                     recipe = recipe.thinking(thinking)?;
                 }
+                state.initialize_child_workspace(&mut recipe)?;
                 return recipe.host_context(host_context).build();
             }
             let model: HarnessModel = state.model().parse().map_err(unsupported)?;
@@ -1561,6 +1741,7 @@ impl AgentFactory for ClaudeNativeFactory {
             let mut recipe = recipe;
             recipe.claude.model = selected.as_str().into();
             recipe.fast_mode = state.fast_mode.load(Ordering::SeqCst);
+            state.initialize_child_workspace(&mut recipe)?;
             recipe
                 .thinking(options.selected_thinking().expect("resolved thinking"))?
                 .host_context(host_context)
@@ -1576,12 +1757,21 @@ impl AgentFactory for ClaudeNativeFactory {
         let available = self.owner();
         let recipe = self.recipe();
         Box::pin(async move {
-            available?;
-            recipe
-                .restore_runtime(snapshot)?
-                .host_context(host_context)
-                .build()
+            let state = available?;
+            let mut recipe = recipe.restore_runtime(snapshot)?;
+            state.initialize_child_workspace(&mut recipe)?;
+            recipe.host_context(host_context).build()
         })
+    }
+}
+
+// The parent keeps its conversation lock throughout dispatch. Publishing a
+// separate immutable pre-batch boundary allows native callback forks without
+// admitting the still-running batch or inventing tool-result receipts.
+struct DispatchForkBoundary<'a>(&'a std::sync::RwLock<Option<Snapshot>>);
+impl Drop for DispatchForkBoundary<'_> {
+    fn drop(&mut self) {
+        *self.0.write().expect("fork boundary lock") = None;
     }
 }
 
@@ -1606,16 +1796,23 @@ struct State {
     context_window_tokens: u64,
     auto_compact_window_tokens: Option<u64>,
     workspace: String,
+    workspace_resolver: Option<WorkspaceResolver>,
+    child_workspace_init: Option<ChildWorkspaceInit>,
+    system_resolver: Option<WorkspaceResolver>,
     host_context: Option<Arc<str>>,
     system: String,
     system_blocks: Option<Vec<Value>>,
     tools: Vec<ToolDefinition>,
+    dynamic_tools: Vec<DynamicToolsFactory>,
+    tool_hooks: Vec<Arc<dyn crate::ClaudeToolHooks>>,
     server_tools: Vec<ServerToolDefinition>,
     handlers: HashMap<String, Handler>,
     discovered: Arc<Mutex<HashSet<String>>>,
     client_tool_search: bool,
     parallel_tools: bool,
     conversation: Mutex<Conversation>,
+    // Native context before the active tool batch; callbacks must not lock conversation.
+    dispatch_fork: std::sync::RwLock<Option<Snapshot>>,
     policy: Option<Arc<dyn ClaudeExecutionPolicy>>,
     admission: Mutex<()>,
     idle: Notify,
@@ -1730,6 +1927,31 @@ struct ResponseContext<'a> {
     effect: Option<Effect<'a>>,
 }
 impl State {
+    fn workspace(&self) -> String {
+        self.workspace_resolver.as_ref().map_or_else(
+            || self.workspace.clone(),
+            |resolve| resolve(&self.session_id),
+        )
+    }
+    fn initialize_child_workspace(&self, recipe: &mut ClaudeBuilder) -> Result<()> {
+        if let Some(initialize) = &self.child_workspace_init {
+            let child = recipe
+                .session_id
+                .get_or_insert_with(|| format!("claude-{}", uuid::Uuid::new_v4()));
+            initialize(&self.session_id, child)?;
+            if let Some(resolve) = &self.workspace_resolver {
+                recipe.workspace = resolve(child);
+            }
+        }
+        Ok(())
+    }
+    fn current_system(&self) -> Option<Value> {
+        self.system_resolver
+            .as_ref()
+            .map(|resolve| json!(resolve(&self.session_id)))
+            .or_else(|| self.system_blocks.as_ref().map(|blocks| json!(blocks)))
+            .or_else(|| (!self.system.is_empty()).then(|| json!(self.system)))
+    }
     fn emit(&self, events: &AgentEventPublisher, kind: AgentEventKind, payload: Value) {
         let Ok(payload) = serde_json::value::to_raw_value(&payload) else {
             return;
@@ -1773,7 +1995,7 @@ impl State {
             .effort()
             .map(|effort| format!("{effort:?}").to_lowercase())
             .unwrap_or_else(|| "model_default".into());
-        self.emit(&request.events,AgentEventKind::RunStarted,json!({"mode":"claude","model":self.model(),"reasoning_mode":reasoning_mode,"effort":effort,"transport":"messages_sse","orchestration":"claude","websocket_url":"","workspace":self.workspace,"instruction_bytes":request.prompt.text_bytes()}));
+        self.emit(&request.events,AgentEventKind::RunStarted,json!({"mode":"claude","model":self.model(),"reasoning_mode":reasoning_mode,"effort":effort,"transport":"messages_sse","orchestration":"claude","websocket_url":"","workspace":self.workspace(),"instruction_bytes":request.prompt.text_bytes()}));
         (reasoning_mode, effort)
     }
     fn emit_run_finished(
@@ -1829,11 +2051,7 @@ impl State {
             diagnostics: self
                 .message_diagnostics
                 .then(|| json!({"previous_message_id":null})),
-            system: self
-                .system_blocks
-                .as_ref()
-                .map(|blocks| json!(blocks))
-                .or_else(|| (!self.system.is_empty()).then(|| json!(self.system))),
+            system: self.current_system(),
             messages: Vec::new(),
             container: None,
             tools: self.available_tools(),
@@ -2072,6 +2290,11 @@ impl State {
         self.tools
             .iter()
             .cloned()
+            .chain(
+                self.dynamic_catalog()
+                    .into_iter()
+                    .map(|(definition, _)| definition),
+            )
             .map(ClaudeToolSpec::Client)
             .chain(
                 self.server_tools
@@ -2079,6 +2302,60 @@ impl State {
                     .cloned()
                     .map(ClaudeToolSpec::Server),
             )
+            .collect()
+    }
+    fn refresh_dynamic_tools(&self, cursor: &mut Cursor) {
+        cursor.template.tools.retain(|tool| match tool {
+            ClaudeToolSpec::Client(tool) => !cursor.dynamic_tool_names.contains(&tool.name),
+            ClaudeToolSpec::Server(_) => true,
+        });
+        let mut names = cursor
+            .template
+            .tools
+            .iter()
+            .map(|tool| match tool {
+                ClaudeToolSpec::Client(tool) => tool.name.clone(),
+                ClaudeToolSpec::Server(tool) => tool.name.clone(),
+            })
+            .collect::<HashSet<_>>();
+        cursor.dynamic_tool_names.clear();
+        let mut dynamic = Vec::new();
+        for (definition, _) in self.dynamic_catalog() {
+            if names.insert(definition.name.clone()) {
+                cursor.dynamic_tool_names.insert(definition.name.clone());
+                dynamic.push(ClaudeToolSpec::Client(definition));
+            }
+        }
+        let at = cursor
+            .template
+            .tools
+            .iter()
+            .position(|tool| matches!(tool, ClaudeToolSpec::Server(_)))
+            .unwrap_or(cursor.template.tools.len());
+        cursor.template.tools.splice(at..at, dynamic);
+    }
+    fn dynamic_catalog(&self) -> Vec<(ToolDefinition, Handler)> {
+        let mut names = self
+            .tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .chain(self.server_tools.iter().map(|tool| tool.name.clone()))
+            .collect::<HashSet<_>>();
+        self.dynamic_tools
+            .iter()
+            .flat_map(|factory| factory().tools)
+            .filter(|(definition, _)| {
+                !definition.name.is_empty()
+                    && definition.input_schema.is_object()
+                    && names.insert(definition.name.clone())
+            })
+            .map(|(definition, handler)| {
+                let mut handler = handler;
+                for hooks in self.tool_hooks.iter().rev() {
+                    handler = hooked_handler(definition.name.clone(), handler, hooks.clone());
+                }
+                (definition, handler)
+            })
             .collect()
     }
     fn compaction_threshold(&self) -> u64 {
@@ -2332,7 +2609,12 @@ impl State {
         }
         let prompt = prompt_messages(&request.prompt)?;
         let mut cursor = self
-            .cursor(conversation, request.request_id.as_deref(), speed)
+            .cursor(
+                conversation,
+                request.request_id.as_deref(),
+                speed,
+                Some(&request.prompt),
+            )
             .await?;
         let mut usage = cursor.usage.clone();
         let mut pending = cursor.pending.clone();
@@ -2421,7 +2703,14 @@ impl State {
                 cursor.usage = usage.clone();
                 self.advance_cursor(&mut cursor, conversation).await?;
             }
-            let discovered = self.discovered.lock().await.clone();
+            // Only successful references actually retained in the request can
+            // authorize deferred execution. A failed post-hook invalidates its
+            // ToolSearch receipt even if the handler already found the tool.
+            let discovered = client_discovered_tools(&pending)
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<HashSet<_>>();
+            *self.discovered.lock().await = discovered.clone();
             let response = self
                 .response(
                     pending.clone(),
@@ -2490,6 +2779,24 @@ impl State {
                     .as_ref()
                     .is_some_and(|profile| profile.enabled),
             );
+            let dynamic_handlers = self.dynamic_catalog().into_iter()
+                .map(|(definition, handler)| {
+                    let admitted = cursor.template.tools.iter().find_map(|tool| match tool {
+                        ClaudeToolSpec::Client(tool) if tool.name == definition.name => Some(tool),
+                        _ => None,
+                    });
+                    // Check at the effect boundary so durable receipts can still
+                    // replay after a host catalog change, without calling its
+                    // replacement handler or hooks.
+                    let handler = if !cursor.dynamic_tool_names.contains(&definition.name) || admitted != Some(&definition) {
+                        let name = definition.name.clone();
+                        Arc::new(move |_, _| {
+                            let error = format!("Claude dynamic tool {name} changed since admission; rediscover before executing");
+                            Box::pin(async move { Err(error) }) as ToolResultFuture
+                        }) as Handler
+                    } else { handler };
+                    (definition.name, handler)
+                }).collect::<HashMap<_, _>>();
             let validated = (|| -> Result<_> {
                 if let Some(container) = &response.container {
                     let id = container
@@ -2557,7 +2864,11 @@ impl State {
                                     "Claude used deferred tool before discovery",
                                 ));
                             }
-                            let handler = self.handlers.get(name);
+                            let handler = if cursor.dynamic_tool_names.contains(name) {
+                                dynamic_handlers.get(name)
+                            } else {
+                                self.handlers.get(name)
+                            };
                             if self.policy.is_none() && handler.is_none() {
                                 return Err(provider_error(format!(
                                     "unregistered Claude tool {name}"
@@ -2577,8 +2888,10 @@ impl State {
                         | ContentBlock::McpToolUse { .. }
                         | ContentBlock::McpToolResult { .. }
                         | ContentBlock::McpToolListing { .. } => {}
-                        ContentBlock::ToolResult { .. } => {
-                            return Err(provider_error("assistant emitted user tool_result"));
+                        ContentBlock::Image { .. }
+                        | ContentBlock::Document { .. }
+                        | ContentBlock::ToolResult { .. } => {
+                            return Err(provider_error("assistant emitted user-only content"));
                         }
                     }
                 }
@@ -2625,6 +2938,11 @@ impl State {
             if !text.is_empty() {
                 self.emit(&request.events,AgentEventKind::AssistantMessage,json!({"model_call_index":index,"item_id":response.id,"phase":null,"text":text,"citations":citations}));
             }
+            // Capture the fork boundary before reserving this unfinished batch's
+            // call identities. The child receives completed history and its guards.
+            let mut fork_snapshot = self.snapshot(conversation).await?;
+            fork_snapshot.conversation.messages = pending.clone();
+            fork_snapshot.conversation.summary.clear();
             // Reserve identities before invoking any handler. Compaction may
             // discard their transcript, but must not make an old effect callable
             // again. This protection is session-local, not crash-durable.
@@ -2635,6 +2953,8 @@ impl State {
             // cancelled. Keep *every* assistant tool_use paired with a result:
             // completed results are retained, while interrupted handlers get an
             // explicit unknown-outcome error. Never silently replay their calls.
+            *self.dispatch_fork.write().expect("fork boundary lock") = Some(fork_snapshot);
+            let fork_boundary = DispatchForkBoundary(&self.dispatch_fork);
             let mut results = vec![None; tool_calls.len()];
             let mut interrupted = false;
             if self.policy.is_some() {
@@ -2731,6 +3051,9 @@ impl State {
                     results[position] = Some(result?);
                 }
             }
+            if self.system_resolver.is_some() {
+                cursor.template.system = self.current_system();
+            }
             if interrupted {
                 for (position, (id, name, _, _)) in tool_calls.iter().enumerate() {
                     if results[position].is_none() {
@@ -2751,6 +3074,7 @@ impl State {
                     }
                 }
             }
+            drop(fork_boundary);
             let has_tool_calls = !tool_calls.is_empty();
             pending.push(Message {
                 role: Role::Assistant,
@@ -2787,6 +3111,9 @@ impl State {
                 cursor.index = index + 1;
                 cursor.pending = pending.clone();
                 cursor.usage = usage.clone();
+                // Admit discovery/removal for the next request before persisting it.
+                // Reopening a prepared cursor never expands its original catalog.
+                self.refresh_dynamic_tools(&mut cursor);
                 self.advance_cursor(&mut cursor, conversation).await?;
                 continue;
             }
@@ -2994,22 +3321,9 @@ fn server_discovered_tools<'a>(
 }
 
 fn prompt_messages(prompt: &Prompt) -> Result<Vec<Message>> {
-    let mut messages = Vec::new();
-    for item in prompt.transcript() {
-        let role = match item.role() {
-            PromptMessageRole::User => Role::User,
-            PromptMessageRole::Assistant => Role::Assistant,
-        };
-        messages.push(Message::text(role, item.content()));
-    }
-    let PromptInput::Text(text) = &prompt.instruction else {
-        return Err(unsupported(
-            "Claude driver currently supports text-only prompts",
-        ));
-    };
-    messages.push(Message::text(Role::User, text));
-    Ok(messages)
+    crate::prompt::messages(prompt)
 }
+
 impl LifecycleBackend for Driver {
     fn harness_family(&self) -> HarnessFamily {
         HarnessFamily::Claude
@@ -3095,7 +3409,6 @@ impl LifecycleBackend for Driver {
                     if state.stopped.load(Ordering::SeqCst) {
                         return Err(NanocodexError::AgentStopped);
                     }
-                    prompt_messages(&request.prompt)?;
                     if let Some(policy) = &state.policy {
                         let automatic = request.request_id.is_none();
                         let candidate = request
@@ -3150,10 +3463,19 @@ impl LifecycleBackend for Driver {
                             let _ = policy.release(id).await;
                             return Err(error);
                         }
+                        request.prompt = match crate::prompt::freeze_admitted(request.prompt, policy.as_ref(), &id).await {
+                            Ok(prompt) => prompt,
+                            Err(error) => {
+                                let _ = policy.release(id).await;
+                                return Err(error);
+                            }
+                        };
                     } else if request.request_id.is_some() {
                         return Err(unsupported(
                             "Claude request_id requires an attached durability policy",
                         ));
+                    } else {
+                        request.prompt = crate::prompt::freeze(request.prompt)?;
                     }
                     state.accepted_turns.fetch_add(1, Ordering::SeqCst);
                     let request_id = request.request_id.clone();
@@ -3210,7 +3532,7 @@ impl LifecycleBackend for Driver {
     fn steer(&self, key: BackendTurnKey, prompt: Prompt) -> BackendFuture<Result<()>> {
         let state = self.state.clone();
         Box::pin(async move {
-            prompt_messages(&prompt)?;
+            let prompt = crate::prompt::freeze(prompt)?;
             if state.stopped.load(Ordering::SeqCst) {
                 return Err(NanocodexError::AgentStopped);
             }
@@ -3339,7 +3661,7 @@ impl LifecycleBackend for Driver {
                         operation = Some(id);
                     }
                     let cursor = state
-                        .cursor(&mut context, operation.as_deref(), state.speed())
+                        .cursor(&mut context, operation.as_deref(), state.speed(), None)
                         .await?;
                     let result = state
                         .compact_locked(
@@ -3445,9 +3767,17 @@ impl LifecycleBackend for Driver {
     }
     fn fork(
         &self,
-        _completed: Option<TurnResult>,
+        completed: Option<TurnResult>,
     ) -> BackendFuture<Result<(Nanocodex, AgentEvents)>> {
-        Box::pin(async { Err(unsupported("Claude fork is unsupported")) })
+        if completed.is_some() {
+            return Box::pin(async {
+                Err(unsupported(
+                    "Claude fork_from cannot reconstruct a native transcript from TurnResult; use fork",
+                ))
+            });
+        }
+        let handle = self.handle.clone();
+        Box::pin(async move { handle.fork().await })
     }
     fn flush(&self) -> BackendFuture<Result<()>> {
         let state = self.state.clone();

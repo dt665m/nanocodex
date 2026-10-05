@@ -11,6 +11,9 @@ use serde_json::Value;
 use thiserror::Error;
 
 mod auth;
+mod hooks;
+mod prompt;
+pub use hooks::{ClaudeHookFuture, ClaudeToolDecision, ClaudeToolHooks};
 mod subscription_wire;
 pub use subscription_wire::SubscriptionIdentity;
 pub mod subscription;
@@ -52,6 +55,16 @@ pub enum Role {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
+    Image {
+        source: Value,
+        #[serde(flatten)]
+        extra: BTreeMap<String, Value>,
+    },
+    Document {
+        source: Value,
+        #[serde(flatten)]
+        extra: BTreeMap<String, Value>,
+    },
     Text {
         text: String,
         #[serde(flatten)]
@@ -519,7 +532,9 @@ impl MessagesRequest {
                     | ContentBlock::RedactedThinking { extra, .. } => {
                         (extra.get("cache_control"), false)
                     }
-                    ContentBlock::ToolResult { extra, .. } => (extra.get("cache_control"), true),
+                    ContentBlock::Image { extra, .. }
+                    | ContentBlock::Document { extra, .. }
+                    | ContentBlock::ToolResult { extra, .. } => (extra.get("cache_control"), true),
                     ContentBlock::ToolUse { extra, .. }
                     | ContentBlock::ServerToolUse { extra, .. }
                     | ContentBlock::WebSearchToolResult { extra, .. }

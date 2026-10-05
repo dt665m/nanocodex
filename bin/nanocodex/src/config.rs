@@ -35,10 +35,18 @@ use crate::subagents::{self, ChildAgents, DEFAULT_MAX_SUBAGENTS, SubagentToolSet
 use crate::vm::{ConfiguredVm, VmArgs};
 
 mod claude;
+pub(crate) use claude::interaction::{
+    InteractionReceiver, PendingInteraction, serve_terminal as serve_claude_terminal,
+};
+pub(crate) use claude::rewind_files;
+pub(crate) use claude::scheduler::SessionScheduler;
 mod instructions;
+pub(crate) use instructions::{expand_session_user_skill, expand_user_skill};
 mod xai;
 
 pub(crate) struct ConfiguredAgent {
+    pub(crate) claude_scheduler: Option<Arc<SessionScheduler>>,
+    pub(crate) claude_interactions: Option<InteractionReceiver>,
     pub(crate) handle: Nanocodex,
     pub(crate) events: AgentEvents,
     pub(crate) realtime: Option<OpenAi>,
@@ -142,6 +150,10 @@ pub(crate) struct EvalAgentArgs {
     reason = "independent CLI feature toggles are not one state machine"
 )]
 pub(crate) struct AgentArgs {
+    /// Internal native resume identity; never accepted from arbitrary CLI flags.
+    #[arg(skip)]
+    pub(crate) claude_resume: Option<crate::native_sessions::ResumeSession>,
+
     /// Voice microphone shortcut, or none to use /voice mute only.
     #[arg(long, env = "NANOCODEX_VOICE_MUTE_KEY", default_value = "ctrl+x", value_parser = crate::tui::voice::validate_key)]
     pub(crate) voice_mute_key: String,
@@ -182,6 +194,18 @@ pub(crate) struct AgentArgs {
     /// Native Anthropic Messages endpoint, including /v1/messages.
     #[arg(long, global = true, env = "ANTHROPIC_MESSAGES_URL", value_parser = NonEmptyStringValueParser::new())]
     claude_messages_url: Option<String>,
+
+    /// Explicit JSON file enabling native Claude command hooks (Unix only).
+    #[arg(long, global = true, value_name = "PATH")]
+    claude_hooks: Option<PathBuf>,
+
+    /// Explicit JSON file with Claude permissions allow/ask/deny rules.
+    #[arg(long, global = true, value_name = "PATH")]
+    claude_permissions: Option<PathBuf>,
+
+    /// Native Claude admission mode (auto classifier mode is not implemented).
+    #[arg(long, global = true, value_parser = ["full-access", "bypassPermissions", "default", "manual", "acceptEdits", "plan", "dontAsk"])]
+    permission_mode: Option<String>,
 
     /// Explicit xAI API key override.
     #[arg(long, global = true, env = "XAI_API_KEY", value_parser = NonEmptyStringValueParser::new(), hide_env_values = true)]
@@ -296,6 +320,41 @@ pub(crate) struct AgentArgs {
 }
 
 impl AgentArgs {
+    pub(crate) fn resume_claude(
+        mut self,
+        session: crate::native_sessions::ResumeSession,
+    ) -> Result<Self> {
+        if !self.rollouts {
+            return Err(eyre!(
+                "Claude resume requires native persistence; remove --rollouts false"
+            ));
+        }
+        let workspace = session.workspace.as_ref().or(self.cwd.as_ref())
+            .ok_or_else(|| eyre!("legacy Claude session has no saved workspace; pass --cwd explicitly to resume it"))?
+            .canonicalize().wrap_err("failed to resolve the resumed Claude workspace")?;
+        if let Some(requested) = &self.cwd
+            && requested
+                .canonicalize()
+                .wrap_err("failed to resolve --cwd")?
+                != workspace
+        {
+            return Err(eyre!(
+                "resumed Claude workspace is {}; --cwd requested {}",
+                workspace.display(),
+                requested.display()
+            ));
+        }
+        // An environment default must never silently switch a resumed model.
+        // An explicit --model remains a deliberate, family-validated override.
+        if self.model.is_none() {
+            self.model = Some(session.model.ok_or_else(|| eyre!("legacy Claude session has no saved model; pass --model explicitly to resume it"))?.to_string());
+        }
+        self.requested_model(HarnessFamily::Claude)?;
+        self.cwd = Some(workspace);
+        self.claude_resume = Some(session);
+        Ok(self)
+    }
+
     pub(crate) fn harness_model(&self) -> Result<HarnessModel> {
         let family = self.selected_harness()?;
         self.model_policy.requested_thinking(family)?;
@@ -598,6 +657,13 @@ impl AgentArgs {
             .web_search(false)
             .image_generation(false)
             .build()?;
+        let workspaces = Arc::new(claude::WorkspaceRegistry::new(
+            session.workspace.clone(),
+            codex_home.clone(),
+        ));
+        let root_workspace = session.workspace.clone();
+        let codex_workspaces = Arc::clone(&workspaces);
+        let codex_workspace = session.workspace.clone();
         let codex_registry = subagent_runtime
             .as_ref()
             .map(|(registry, _, _)| Arc::clone(registry));
@@ -606,19 +672,7 @@ impl AgentArgs {
             .reasoning_mode(self.reasoning_mode)
             .fast_mode(self.fast_mode.unwrap_or(true))
             .workspace(session.workspace.clone())
-            .codex_home(codex_home.clone())
-            .tools_factory(move |parent| {
-                if let Some(registry) = &codex_registry {
-                    subagents::install_tools(
-                        codex_tools.clone(),
-                        parent,
-                        Arc::clone(registry),
-                        subagent_tools.unwrap_or(SubagentToolSet::Generic),
-                    )
-                } else {
-                    Ok(codex_tools.clone())
-                }
-            });
+            .codex_home(codex_home.clone());
         if let Some(instructions) = self.instructions.clone() {
             codex_recipe = codex_recipe.instructions(instructions);
         }
@@ -632,13 +686,58 @@ impl AgentArgs {
         let harness_builder =
             nanocodex::Harness::builder().register(HarnessFamily::Codex, move |request| {
                 let mut builder = codex_recipe.clone();
+                let tools = codex_tools.clone();
+                let registry = codex_registry.clone();
+                let workspace = codex_workspace.clone();
+                let workspaces = Arc::clone(&codex_workspaces);
                 async move {
                     let HarnessModel::Codex(model) = request.model else {
                         return Err(nanocodex::NanocodexError::InvalidRequest(
                             "Codex recipe received a Claude model".into(),
                         ));
                     };
+                    workspaces
+                        .authorize_cross_family(request.parent.as_ref())
+                        .map_err(nanocodex::NanocodexError::InvalidRequest)?;
+                    let session_id = match &request.snapshot {
+                        Some(nanocodex::agent::ChildSnapshot::Codex(snapshot)) => {
+                            snapshot.session_id.parse::<SessionId>().map_err(|error| {
+                                nanocodex::NanocodexError::InvalidRequest(error.to_string())
+                            })?
+                        }
+                        _ => SessionId::new(),
+                    };
+                    let session_key = session_id.to_string();
+                    if let Some(parent) = &request.parent {
+                        workspaces.initialize(parent.session_id(), &session_key)
+                    } else {
+                        workspaces.seed(&session_key, workspace)
+                    }
+                    .map_err(nanocodex::NanocodexError::InvalidRequest)?;
+                    let workspace = workspaces
+                        .current(&session_key)
+                        .map_err(nanocodex::NanocodexError::InvalidRequest)?;
+                    let tool_workspace = workspace.clone();
                     builder = builder
+                        .session_id(session_id)
+                        .workspace(workspace)
+                        .tools_factory(move |parent| {
+                            workspaces
+                                .seed(parent.session_id(), tool_workspace.clone())
+                                .map_err(
+                                    nanocodex::tools::runtime::ToolsBuildError::HostInitialization,
+                                )?;
+                            if let Some(registry) = &registry {
+                                subagents::install_tools(
+                                    tools.clone(),
+                                    parent,
+                                    Arc::clone(registry),
+                                    subagent_tools.unwrap_or(SubagentToolSet::Generic),
+                                )
+                            } else {
+                                Ok(tools.clone())
+                            }
+                        })
                         .model(model)
                         .thinking(request.thinking)
                         .host_context(request.host_context)
@@ -659,6 +758,7 @@ impl AgentArgs {
             subagent_runtime
                 .as_ref()
                 .map(|(registry, _, _)| Arc::clone(registry)),
+            Arc::clone(&workspaces),
         );
         let harness = claude::register_claude_recipe(
             harness_builder,
@@ -666,7 +766,12 @@ impl AgentArgs {
                 self.claude_auth,
                 self.claude_api_key,
                 self.claude_messages_url,
-            ),
+            )
+            .with_hooks(self.claude_hooks)
+            .with_permission_config(
+                self.claude_permissions.as_deref(),
+                self.permission_mode.as_deref(),
+            )?,
             session.workspace.clone(),
             self.instructions.clone(),
             claude_tools,
@@ -674,6 +779,8 @@ impl AgentArgs {
             subagent_runtime
                 .as_ref()
                 .map(|(registry, _, _)| Arc::clone(registry)),
+            mcp_handle.clone(),
+            Arc::clone(&workspaces),
         )
         .build();
         let mut builder = Nanocodex::builder(openai)
@@ -693,22 +800,19 @@ impl AgentArgs {
         if let Some(rollout) = session.rollout {
             builder = builder.rollout(rollout);
         }
-        let builder = if let (Some((registry, _, _)), Some(subagent_tools)) =
-            (&subagent_runtime, subagent_tools)
-        {
-            let tools = tools;
-            let registry = Arc::clone(registry);
-            builder.tools_factory(move |agent| {
-                subagents::install_tools(
-                    tools.clone(),
-                    agent,
-                    Arc::clone(&registry),
-                    subagent_tools,
-                )
-            })
-        } else {
-            builder.tools(tools)
-        };
+        let root_registry = subagent_runtime
+            .as_ref()
+            .map(|(registry, _, _)| Arc::clone(registry));
+        let builder = builder.tools_factory(move |agent| {
+            workspaces
+                .seed(agent.session_id(), root_workspace.clone())
+                .map_err(nanocodex::tools::runtime::ToolsBuildError::HostInitialization)?;
+            if let (Some(registry), Some(subagent_tools)) = (&root_registry, subagent_tools) {
+                subagents::install_tools(tools.clone(), agent, Arc::clone(registry), subagent_tools)
+            } else {
+                Ok(tools.clone())
+            }
+        });
         let additional_instructions = session_instructions(
             self.instructions.as_deref(),
             generic_subagents,
@@ -762,6 +866,8 @@ impl AgentArgs {
                 )
             });
         Ok(ConfiguredAgent {
+            claude_interactions: None,
+            claude_scheduler: None,
             handle,
             events,
             realtime,

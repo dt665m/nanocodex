@@ -9,6 +9,10 @@ pub(super) struct Snapshot {
     pub(super) conversation: Conversation,
     pub(super) discovered: HashSet<String>,
     pub(super) tasks: Option<Value>,
+    #[serde(default)]
+    pub(super) model: Option<String>,
+    #[serde(default)]
+    pub(super) workspace: Option<String>,
 }
 impl Default for Snapshot {
     fn default() -> Self {
@@ -18,6 +22,8 @@ impl Default for Snapshot {
             conversation: Conversation::default(),
             discovered: HashSet::new(),
             tasks: None,
+            model: None,
+            workspace: None,
         }
     }
 }
@@ -39,6 +45,10 @@ pub(super) struct Cursor {
     pub(super) instruction_revision: Option<u64>,
     pub(super) snapshot: Snapshot,
     pub(super) template: MessagesRequest,
+    /// Only these host-owned definitions may change between requests. Static
+    /// definitions remain frozen throughout the admitted durable operation.
+    #[serde(default)]
+    pub(super) dynamic_tool_names: HashSet<String>,
     #[serde(default)]
     pub(super) wire_profile: Option<crate::FrozenWireProfile>,
     pub(super) threshold: u64,
@@ -46,6 +56,10 @@ pub(super) struct Cursor {
     pub(super) tool_search: bool,
     pub(super) operation: Option<String>,
     pub(super) prepared: bool,
+    // Advancing the cursor retires settled effect receipts. Retain admitted
+    // media here before retiring prompt-media so recovery never reopens a path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) frozen_prompt: Option<Prompt>,
     pub(super) pending: Vec<Message>,
     pub(super) usage: Usage,
     pub(super) index: u32,
@@ -127,6 +141,8 @@ impl State {
             conversation: conversation.clone(),
             discovered: self.discovered.lock().await.clone(),
             tasks: self.task_snapshot()?,
+            model: Some(self.model()),
+            workspace: Some(self.workspace()),
             ..Snapshot::default()
         })
     }
@@ -145,6 +161,7 @@ impl State {
         conversation: &mut Conversation,
         operation: Option<&str>,
         speed: Option<crate::Speed>,
+        prompt: Option<&Prompt>,
     ) -> Result<Cursor> {
         if let (Some(policy), Some(operation)) = (&self.policy, operation)
             && let Some(value) = policy.continuation(operation.to_owned()).await?
@@ -161,16 +178,41 @@ impl State {
                 .map_err(recovery_error)?;
             return Ok(cursor);
         }
+        let template = self.request_template(speed);
+        let static_names = self
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<HashSet<_>>();
+        let dynamic_tool_names = template
+            .tools
+            .iter()
+            .filter_map(|tool| match tool {
+                ClaudeToolSpec::Client(tool) if !static_names.contains(tool.name.as_str()) => {
+                    Some(tool.name.clone())
+                }
+                _ => None,
+            })
+            .collect();
         let mut cursor = Cursor {
             instruction_revision: None,
             snapshot: self.snapshot(conversation).await?,
-            template: self.request_template(speed),
+            template,
+            dynamic_tool_names,
             wire_profile: Some(self.client.freeze_wire_profile()),
             threshold: self.compaction_threshold(),
             parallel: self.parallel_tools,
             tool_search: self.client_tool_search,
             operation: operation.map(str::to_owned),
             prepared: false,
+            frozen_prompt: prompt
+                .filter(|prompt| {
+                    matches!(
+                        prompt.instruction,
+                        nanocodex_agent::input::PromptInput::Content(_)
+                    )
+                })
+                .cloned(),
             pending: Vec::new(),
             usage: Usage::default(),
             index: 0,

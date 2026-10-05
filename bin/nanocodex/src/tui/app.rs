@@ -1305,6 +1305,7 @@ fn append_branch_tree(
 }
 
 pub(super) struct App {
+    pub(super) claude_interaction: Option<super::interaction::PendingInteraction>,
     pub(super) voice: super::voice::VoiceUi,
     pub(super) cwd: PathBuf,
     pub(super) main: Conversation,
@@ -1397,6 +1398,7 @@ impl App {
             main_branches: Vec::new(),
             historical_editor: None,
             pending_historical_edit: None,
+            claude_interaction: None,
             pending_branch_switch: None,
             branch_navigator: None,
             btw: None,
