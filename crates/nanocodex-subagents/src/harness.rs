@@ -14,7 +14,10 @@ use nanocodex_agent::{
     ChildSnapshot, Nanocodex, NanocodexError, PromptRequest, Result as AgentResult, TurnControl,
     TurnResult,
 };
-use std::{collections::VecDeque, sync::Weak};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Weak},
+};
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::Instrument;
 
@@ -22,12 +25,15 @@ const COMMAND_CAPACITY: usize = 8;
 
 #[derive(Clone)]
 pub(super) struct HarnessHandle {
+    registry: Weak<Registry>,
     commands: mpsc::Sender<HarnessCommand>,
     deferred: mpsc::UnboundedSender<DeliveryCommand>,
     urgent: mpsc::UnboundedSender<DeliveryCommand>,
 }
 
 struct DeliveryCommand {
+    // Admission may outlive the sending caller before the actor accepts it.
+    registry: Arc<Registry>,
     message: AgentMessage,
     committed: Option<oneshot::Receiver<()>>,
     response: oneshot::Sender<std::io::Result<MessageDisposition>>,
@@ -85,6 +91,7 @@ struct Harness {
     urgent: mpsc::UnboundedReceiver<DeliveryCommand>,
     pending_deferred: VecDeque<AgentMessage>,
     pending_urgent: VecDeque<AgentMessage>,
+    pending_ownership: Option<Arc<Registry>>,
     output_schema: String,
     rehydrated_assignment: Option<String>,
     capacity: Capacity,
@@ -93,6 +100,7 @@ struct Harness {
 }
 
 struct ActiveTurn {
+    registry: Arc<Registry>,
     control: TurnControl,
     result: Task<AgentResult<TurnResult>>,
     _capacity: TurnCapacity,
@@ -156,6 +164,10 @@ impl HarnessHandle {
         let (response, result) = oneshot::channel();
         let (committed, wait_for_commit) = oneshot::channel();
         let command = DeliveryCommand {
+            registry: self
+                .registry
+                .upgrade()
+                .ok_or_else(|| std::io::Error::other("subagent registry stopped"))?,
             message,
             committed: Some(wait_for_commit),
             response,
@@ -201,6 +213,7 @@ pub(super) fn spawn(
     let (deferred, deferred_receiver) = mpsc::unbounded_channel();
     let (urgent, urgent_receiver) = mpsc::unbounded_channel();
     let handle = HarnessHandle {
+        registry: registry.clone(),
         commands,
         deferred,
         urgent,
@@ -217,6 +230,7 @@ pub(super) fn spawn(
             urgent: urgent_receiver,
             pending_deferred: VecDeque::new(),
             pending_urgent: VecDeque::new(),
+            pending_ownership: None,
             output_schema,
             rehydrated_assignment,
             capacity,
@@ -466,6 +480,7 @@ impl Harness {
     }
 
     async fn queue_delivery(&mut self, command: DeliveryCommand, priority: MessagePriority) {
+        self.pending_ownership = Some(command.registry.clone());
         let queue = match priority {
             MessagePriority::Deferred => &mut self.pending_deferred,
             MessagePriority::Urgent => &mut self.pending_urgent,
@@ -483,6 +498,7 @@ impl Harness {
                 .front()
                 .or_else(|| self.pending_deferred.front())
             else {
+                self.pending_ownership = None;
                 return;
             };
             let Ok(capacity) = self.capacity.reserve() else {
@@ -514,6 +530,9 @@ impl Harness {
                 }
             }
         }
+        if self.pending_urgent.is_empty() && self.pending_deferred.is_empty() {
+            self.pending_ownership = None;
+        }
     }
 
     async fn fail_pending(&mut self, reason: &str) {
@@ -526,6 +545,7 @@ impl Harness {
         for id in pending {
             self.publish_message_failure(id, reason.to_owned()).await;
         }
+        self.pending_ownership = None;
     }
 
     async fn reject_waiting_deliveries(&mut self, reason: &str) {
@@ -648,6 +668,7 @@ impl Harness {
         let control = turn.control();
         let result = platform::spawn(turn);
         self.active = Some(ActiveTurn {
+            registry,
             control,
             result,
             _capacity: capacity,
@@ -679,11 +700,15 @@ impl Harness {
     }
 
     async fn turn_finished(&mut self, result: Result<AgentResult<TurnResult>, TaskError>) {
+        // Release capacity before draining queued work, but keep the registry
+        // through snapshot persistence and transfer to the next execution.
+        let ownership = self.active.as_ref().map(|active| active.registry.clone());
         self.active = None;
         self.publish_turn_result(result).await;
         // Do not depend on the capacity watch to notice our own turn ending.
         // If another agent took the released slot, the watch still retries later.
         self.start_pending().await;
+        drop(ownership);
     }
 
     async fn publish_turn_result(&self, result: Result<AgentResult<TurnResult>, TaskError>) {
@@ -734,7 +759,9 @@ mod tests {
         let (commands, _commands) = mpsc::channel(COMMAND_CAPACITY);
         let (deferred, mut deferred_receiver) = mpsc::unbounded_channel();
         let (urgent, mut urgent_receiver) = mpsc::unbounded_channel();
+        let (registry, _, _updates) = crate::channel(128);
         let handle = HarnessHandle {
+            registry: Arc::downgrade(&registry),
             commands,
             deferred,
             urgent,

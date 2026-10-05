@@ -129,7 +129,7 @@ where
             .thinking(options.selected_thinking().expect("resolved"))
             .host_context(context)
             .spawn_factory(self.clone())
-            .turn_ownership(Arc::new(RegistryOwnership(registry.clone())));
+            .turn_ownership(Arc::new(RegistryOwnership::child(&registry)));
         let session = match snapshot {
             Some(snapshot) => {
                 let session = match &snapshot {
@@ -141,9 +141,17 @@ where
             }
             None => SessionId::new(),
         };
+        let tools_registry = Arc::downgrade(&registry);
         builder = builder
             .session_id(session)
-            .map_tools_factory(move |handle, tools| install_tools(tools, handle, registry.clone()));
+            .map_tools_factory(move |handle, tools| {
+                // Construction holds the registry through build; later native
+                // branches run only while their harness owns an execution lease.
+                let registry = tools_registry
+                    .upgrade()
+                    .expect("live child construction owns registry");
+                install_tools(tools, handle, registry)
+            });
         let state = DurableSession::open(
             self.state.child_store(),
             format!("{}/child/{session}", self.state.state_id()),
@@ -281,7 +289,7 @@ impl ClaudeChildren {
             .thinking(options.selected_thinking().expect("resolved"))?
             .host_context(context)
             .spawn_factory(self.clone())
-            .turn_ownership(Arc::new(RegistryOwnership(registry.clone())));
+            .turn_ownership(Arc::new(RegistryOwnership::child(&registry)));
         let session = match snapshot {
             Some(snapshot) => {
                 let session = match &snapshot {

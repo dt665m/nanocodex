@@ -3410,6 +3410,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn capacity_waiting_mailbox_owns_registry_until_delivery_settles() {
+        let (registry, control, _updates) = super::channel(0);
+        let called = Arc::new(Notify::new());
+        let (id, _) = insert_pending_runtime_session(&registry, "main", None, called.clone()).await;
+        mark_reusable(&registry, "main", id).await;
+        let receipt = registry.send_message("main", id, MessagePriority::Deferred,
+            MessagePurpose::Coordinate, None, "queued at zero capacity".to_owned()).await.unwrap();
+        assert_eq!(receipt.disposition, MessageDisposition::Queued);
+        let capacity = registry.capacity.clone();
+        let weak = Arc::downgrade(&registry);
+        drop((registry, control));
+        assert!(weak.upgrade().is_some(), "capacity wait owns committed delivery");
+        capacity.set_limit(1);
+        timeout(Duration::from_secs(5), called.notified()).await.unwrap();
+        let registry = weak.upgrade().expect("running delivery owns registry");
+        registry.close_all("main").await.unwrap();
+        drop(registry);
+        timeout(Duration::from_secs(5), async {
+            while weak.upgrade().is_some() { tokio::task::yield_now().await; }
+        }).await.expect("drained/cancelled delivery releases registry");
+    }
+
+    #[tokio::test]
     async fn pending_mailbox_work_protects_an_inactive_resident_from_eviction() {
         let (registry, _control, mut updates) = super::channel(0);
         registry.set_max_resident(1);

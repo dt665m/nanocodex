@@ -117,7 +117,7 @@ impl CliDurability {
             let registry = registry
                 .upgrade()
                 .ok_or(nanocodex::NanocodexError::AgentStopped)?;
-            builder = builder.turn_ownership(Arc::new(RegistryOwnership(registry)));
+            builder = builder.turn_ownership(Arc::new(RegistryOwnership::child(&registry)));
         }
         let state = PortableDurableSession::open(
             self.state.child_store(),
@@ -150,7 +150,7 @@ impl CliDurability {
             let registry = registry
                 .upgrade()
                 .ok_or(nanocodex::NanocodexError::AgentStopped)?;
-            builder = builder.turn_ownership(Arc::new(RegistryOwnership(registry)));
+            builder = builder.turn_ownership(Arc::new(RegistryOwnership::child(&registry)));
         }
         let state = PortableDurableSession::open(self.state.child_store(), session)
             .await

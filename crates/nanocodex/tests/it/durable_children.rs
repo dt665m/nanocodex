@@ -147,6 +147,11 @@ impl Fixture {
                             }),
                             ordinal,
                         )
+                    } else if prompt.contains("queue-followup") {
+                        function("send_agent_message", json!({
+                            "agent_id":1, "message":"gated-child-followup",
+                            "priority":"deferred", "purpose":"coordinate"
+                        }), ordinal)
                     } else if prompt.contains("directory") {
                         function(
                             "list_agents",
@@ -227,6 +232,10 @@ impl Fixture {
         )
         .await
         .unwrap();
+        self.parent_with_state(state).await
+    }
+
+    async fn parent_with_state(&self, state: DurableSession) -> (Nanocodex, nanocodex::AgentEvents) {
         #[cfg(feature = "claude")]
         if self.claude {
             let client = nanocodex::claude::ClaudeClient::new(
@@ -485,39 +494,106 @@ async fn claude_background_child_survives_parent_shutdown() {
 }
 
 async fn background_departure(claude: bool) {
-    let fixture = Fixture::start_family("background-departure", claude, None).await;
-    let (parent, events) = fixture.parent().await;
+    child_owner_departure(claude, true, true, false).await;
+}
+
+#[tokio::test]
+async fn native_completed_child_drop_releases_owner() {
+    child_owner_departure(false, false, false, false).await;
+}
+#[tokio::test]
+async fn native_completed_child_shutdown_releases_owner() {
+    child_owner_departure(false, true, false, false).await;
+}
+#[tokio::test]
+async fn native_background_child_drop_releases_owner_after_settlement() {
+    child_owner_departure(false, false, true, false).await;
+}
+#[cfg(feature = "claude")]
+#[tokio::test]
+async fn claude_completed_child_drop_releases_owner() {
+    child_owner_departure(true, false, false, false).await;
+}
+#[cfg(feature = "claude")]
+#[tokio::test]
+async fn claude_completed_child_shutdown_releases_owner() {
+    child_owner_departure(true, true, false, false).await;
+}
+#[cfg(feature = "claude")]
+#[tokio::test]
+async fn claude_background_child_drop_releases_owner_after_settlement() {
+    child_owner_departure(true, false, true, false).await;
+}
+
+#[tokio::test]
+async fn native_queued_child_work_retains_owner_until_drained() {
+    child_owner_departure(false, true, true, true).await;
+}
+#[cfg(feature = "claude")]
+#[tokio::test]
+async fn claude_queued_child_work_retains_owner_until_drained() {
+    child_owner_departure(true, true, true, true).await;
+}
+
+async fn child_owner_departure(claude: bool, shutdown: bool, background: bool, queued: bool) {
+    let fixture = Fixture::start_family("child-owner-departure", claude, None).await;
+    let owned = Arc::new(());
+    let weak = Arc::downgrade(&owned);
+    let state = DurableSession::open(
+        super::durable_owner_drop::WitnessStore {
+            inner: SqliteStore::open(fixture.workspace.join("children.sqlite")).unwrap(),
+            _witness: owned,
+        },
+        "configured-native-root",
+    ).await.unwrap();
+    let (parent, events) = fixture.parent_with_state(state).await;
+    let root_session = parent.session_id().to_owned();
     let turn = parent
-        .prompt(PromptRequest::new("spawn-background").request_id("background"))
-        .await
-        .unwrap();
-    tokio::time::timeout(DEADLINE, fixture.child_started.notified())
-        .await
-        .unwrap();
-    tokio::time::timeout(DEADLINE, turn.result())
-        .await
-        .unwrap()
-        .unwrap();
-    parent.shutdown().await.unwrap();
-    drop((parent, events));
-    // The original parent's driver is gone while the real child HTTP call is
-    // still gated. Its submit_result must remain callable after departure.
-    fixture.child_release.notify_one();
-    tokio::time::timeout(DEADLINE, fixture.child_finished.notified())
-        .await
-        .expect("background child must submit its result after parent shutdown");
+        .prompt(PromptRequest::new(if background { "spawn-background" } else { "spawn-foreground" }).request_id("child"))
+        .await.unwrap();
+    tokio::time::timeout(DEADLINE, fixture.child_started.notified()).await.unwrap();
+    if !background { fixture.child_release.notify_one(); }
+    tokio::time::timeout(DEADLINE, turn.result()).await.unwrap().unwrap();
+    if !background {
+        let directory: Value = serde_json::from_str(&answer(&parent, "directory", "before-departure").await).unwrap();
+        assert_eq!(directory["agents"][0]["status"]["state"], "completed");
+        assert_eq!(directory["agents"][0]["status"]["output"], "native-child-result");
+    }
+    if queued {
+        let receipt: Value = serde_json::from_str(&answer(&parent, "queue-followup", "queue-followup").await).unwrap();
+        assert_eq!(receipt["disposition"], "queued");
+    }
+    let retained = parent.clone();
+    drop(parent);
+    assert!(weak.upgrade().is_some(), "live root clone retains owner");
+    if shutdown { retained.shutdown().await.unwrap(); }
+    drop((retained, events));
+    if background {
+        // No root facade remains; accepted work still owns its registry.
+        assert!(weak.upgrade().is_some(), "pending background must retain owner");
+        fixture.child_release.notify_one();
+        tokio::time::timeout(DEADLINE, fixture.child_finished.notified()).await
+            .expect("background result submission must survive root departure");
+        if queued {
+            tokio::time::timeout(DEADLINE, fixture.child_started.notified()).await
+                .expect("queued follow-up starts after first child settles");
+            assert!(weak.upgrade().is_some(), "queued follow-up must retain registry");
+            fixture.child_release.notify_one();
+            tokio::time::timeout(DEADLINE, fixture.child_finished.notified()).await
+                .expect("queued follow-up result must settle after root departure");
+        }
+    }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while weak.upgrade().is_some() { tokio::task::yield_now().await; }
+    }).await.expect("completed child tree must release its store after final root departure");
     let (reopened, events) = fixture.parent().await;
     reopened.ready().await.unwrap();
-    let directory: Value =
-        serde_json::from_str(&answer(&reopened, "directory", "after-departure").await).unwrap();
+    assert_eq!(reopened.session_id(), root_session);
+    let directory: Value = serde_json::from_str(&answer(&reopened, "directory", "after-departure").await).unwrap();
+    assert_eq!(directory["agents"].as_array().unwrap().len(), 1);
     assert_eq!(directory["agents"][0]["status"]["state"], "completed");
-    assert_eq!(
-        directory["agents"][0]["status"]["output"],
-        "native-child-result"
-    );
-    println!(
-        "BACKGROUND_DEPARTURE claude={claude}: parent shutdown before child gate opened; result accepted and retained after reopen"
-    );
+    assert_eq!(directory["agents"][0]["status"]["output"], "native-child-result");
+    println!("CHILD_OWNER_RELEASE claude={claude} shutdown={shutdown} background={background} queued={queued}: live clone/pending work retained, final settlement released store, completed result survived reopen");
     reopened.shutdown().await.unwrap();
     drop((reopened, events));
 }

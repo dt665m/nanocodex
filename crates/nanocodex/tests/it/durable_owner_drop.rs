@@ -8,9 +8,9 @@ use nanocodex::{
 };
 use std::{sync::Arc, time::Duration};
 
-struct WitnessStore {
-    inner: SqliteStore,
-    _witness: Arc<()>,
+pub(super) struct WitnessStore {
+    pub(super) inner: SqliteStore,
+    pub(super) _witness: Arc<()>,
 }
 impl StateStore for WitnessStore {
     fn read_record<'a>(
