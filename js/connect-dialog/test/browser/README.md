@@ -41,3 +41,11 @@ directory. Run only these journeys with:
 ```sh
 pnpm --filter @nanocodex/connect-dialog run test:browser session.spec.ts
 ```
+
+The services-only journey (`services.spec.ts`) verifies exact Vault IDs/origins,
+phone IDs and action disclosures, absence of agent execution permission, mobile
+layout, and explicit approval with unchanged signed service resources. It records
+the rendered consent and HTTP request metadata. The account's separate
+`pnpm --filter nanocodex-web test:services` journey exercises production Vault and
+phone forms against real managed/egress services in workerd with synthetic sign-in
+and carrier fixtures.

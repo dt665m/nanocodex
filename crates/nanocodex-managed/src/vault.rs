@@ -174,6 +174,7 @@ pub struct VaultRequest {
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
     /// Public body template, never a resolved credential.
+    /// `{{NANOCODEX_VAULT_TOTP}}` is resolved only by the broker at the item’s saved origin.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
     /// Escaping applied to substituted body values by the broker.

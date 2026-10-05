@@ -1,3 +1,4 @@
+import { fillSavedBrowserVaultTotp, type BrowserVaultTotpResolver } from "./browser-vault-totp";
 import { createBrowserLoginRuntime } from "./browser-login-runtime";
 import { asSchema, type Tool as AiSdkTool, type ToolSet as AiSdkToolSet } from "ai";
 import {
@@ -385,6 +386,7 @@ export async function createManagedBrowserRuntime(
     /** Internal private companion; never exposes a model CDP runtime. */
     privateOnly?: boolean;
     resolveVaultLogin?: BrowserVaultResolver;
+    resolveVaultTotp?: BrowserVaultTotpResolver;
     authorizeVaultAccess?: (context: ToolContext) => void;
   }>,
 ): Promise<ManagedBrowserRuntime> {
@@ -846,7 +848,7 @@ export async function createManagedBrowserRuntime(
   });
   if (options.resolveVaultLogin) tools.push({
     name: "browser_vault_status",
-    description: "Inspect only the presence of supported login fields in a private Vault browser session. Use before filling and between username/password steps. Returns fixed selectors and status, never field values or page text. unknown is not proof of successful authentication. For otp_form use browser_vault_request_challenge; use browser_vault_snapshot for visible account-page evidence. CAPTCHA or unsupported custom controls require human takeover. Supported custom login controls are available through browser_vault_snapshot and browser_vault_action. The same selected Vault item, target and HTTPS origin are required throughout a private session.",
+    description: "Inspect only the presence of supported login fields in a private Vault browser session. Use before filling and between username/password steps. Returns fixed selectors and status, never field values or page text. unknown is not proof of successful authentication. For otp_form use browser_vault_fill_totp with an enrolled same-origin TOTP item or browser_vault_request_challenge; use browser_vault_snapshot for visible account-page evidence. CAPTCHA or unsupported custom controls require human takeover. Supported custom login controls are available through browser_vault_snapshot and browser_vault_action. The same selected Vault item, target and HTTPS origin are required throughout a private session.",
     supportsParallelToolCalls: false,
     parameters: { type: "object", additionalProperties: false,
       properties: Object.fromEntries(["vault_id", "expected_origin", "target_id"].map(key => [key, { type: "string" }])),
@@ -899,6 +901,38 @@ export async function createManagedBrowserRuntime(
     return privateContinuation.run(info.sessionId, identity, context.signal,
       cdp => operation(cdp, info.sessionId, login));
   };
+  if (options.resolveVaultLogin && options.resolveVaultTotp && options.authorizeVaultAccess) tools.push({
+    name: "browser_vault_fill_totp",
+    description: "Complete a supported OTP form in the retained saved-login private browser using an enrolled Vault TOTP item. Supply the selected login vault_id, target_id, exact expected_origin, totp_vault_id and a stable operation_id UUID. The TOTP item must belong to this account and be enrolled for this exact HTTPS origin. Codes are generated only inside the private broker and never enter tool arguments or results. The current document is bound before resolution and checked before filling. Reuse identical arguments and operation_id to retrieve a receipt; never retry an outcome_unknown operation under a new ID. Submission is not proof of sign-in: inspect browser_vault_snapshot for account access. Unsupported controls require private user input.",
+    supportsParallelToolCalls: false,
+    parameters: { type: "object", additionalProperties: false,
+      properties: { ...identityProperties, totp_vault_id: { type: "string" }, operation_id: { type: "string" } },
+      required: [...identityRequired, "totp_vault_id", "operation_id"] },
+    handler: (input, context) => exclusive(async () => {
+      options.authorizeVaultAccess!(context);
+      const identity = parseIdentity(input, ["totp_vault_id", "operation_id"]);
+      const value = input as Record<string, unknown>;
+      if (typeof value.totp_vault_id !== "string" || !/^[A-Za-z0-9_-]{22,64}$/.test(value.totp_vault_id)) throw new Error("Invalid TOTP Vault item");
+      const totpRequest = { totp_vault_id: value.totp_vault_id, expected_origin: identity.expected_origin };
+      await checkQuarantine({ ...identity, submit: false });
+      const selected = await options.ctx.storage.get<BrowserVaultQuarantine>(quarantineKey);
+      const info = await privateSessionInfo();
+      if (!selected || !info || selected.mode === "one_time" || selected.sessionId !== info.sessionId
+        || selected.vaultId !== identity.vault_id || selected.targetId !== identity.target_id
+        || selected.origin !== identity.expected_origin) throw new Error("The selected private login session is unavailable");
+      // Reauthorize the saved login on every call, including receipt replays.
+      const login = await options.resolveVaultLogin!({ ...identity, submit: false }, context);
+      return privateBrowserOperation({ storage: options.ctx.storage, scope: privateScope,
+        operationId: value.operation_id, input: { kind: "vault_fill_totp", identity, totp_vault_id: value.totp_vault_id },
+        run: () => withPrivate(identity, context, (cdp, sessionId) => fillSavedBrowserVaultTotp({
+          cdp, identity, signal: context.signal, resolve: () => options.resolveVaultTotp!(totpRequest, context),
+          remember: async code => {
+            secrets.push(code);
+            await options.ctx.storage.put(takeoverMemoryKey, { sessionId, owner: memoryOwner });
+          },
+        }), login) });
+    }),
+  });
   type PendingChallenge = { id: string; expiresAt: number; sessionId: string; identity: BrowserVaultIdentity;
     loaderId: string; selector: string };
   if (options.resolveVaultLogin) {
