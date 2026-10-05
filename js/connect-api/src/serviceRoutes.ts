@@ -91,7 +91,7 @@ export async function serviceVaultRequest(request: Request, broker: Fetcher, sco
       method: "POST", headers: { "content-type": "application/json" }, body, redirect: "manual", signal: request.signal,
     }));
     const result = await readJson(response, 4096);
-    // The destination body, headers, secrets and generated OTPs never cross Connect.
+    // The destination body, headers, secrets and generated codes never cross Connect.
     if (response.ok && Number.isInteger(result.status) && Number(result.status) >= 100 && Number(result.status) <= 599
       && result.ok === (Number(result.status) >= 200 && Number(result.status) < 300)) return reply({ status: result.status, ok: result.ok });
     if (!response.ok && typeof result.error === "string" && VAULT_ERRORS.has(result.error)) {
