@@ -164,7 +164,7 @@ impl AgentArgs {
             .build()?;
         let codex_home_for_recipe = codex_home.clone();
         let codex_workspace = workspace.clone();
-        let codex_registry = tool_registry.clone();
+        let codex_registry = tool_registry.as_ref().map(Arc::downgrade);
         let codex_instructions = instructions.clone();
         let websocket_url = self.websocket_url;
         let api_base_url = self.api_base_url;
@@ -229,7 +229,7 @@ impl AgentArgs {
                                 nanocodex_subagents::install_tools(
                                     tools.clone(),
                                     parent,
-                                    Arc::clone(registry),
+                                    registry.upgrade().expect("live CLI owns child registry"),
                                 )
                             } else {
                                 Ok(tools.clone())
@@ -317,14 +317,23 @@ fn configured_claude_builder(
         instructions.push_str("\n\n");
         instructions.push_str(SUBAGENT_INSTRUCTIONS);
     }
+    // The native Claude factory retains this tools recipe after construction.
+    // Installed tools retain the live registry, so the recipe must be weak.
+    let registry = registry.as_ref().map(Arc::downgrade);
     let mut builder = Nanocodex::builder(Claude::new(client, model.as_str()))
         .workspace(workspace.to_string_lossy().into_owned())
         .system(instructions)
         .max_tokens(16_384)
         .tools_factory(move |parent| {
             let tools = if let Some(registry) = &registry {
-                nanocodex_subagents::install_tools(tools.clone(), parent, Arc::clone(registry))
-                    .map_err(|error| nanocodex::NanocodexError::InvalidRequest(error.to_string()))?
+                nanocodex_subagents::install_tools(
+                    tools.clone(),
+                    parent,
+                    registry
+                        .upgrade()
+                        .ok_or(nanocodex::NanocodexError::AgentStopped)?,
+                )
+                .map_err(|error| nanocodex::NanocodexError::InvalidRequest(error.to_string()))?
             } else {
                 tools.clone()
             };
@@ -350,6 +359,7 @@ pub(super) fn register_claude_recipe(
     registry: Option<Arc<nanocodex_subagents::Registry>>,
     durability: Option<durability::CliDurability>,
 ) -> nanocodex::HarnessBuilder {
+    let registry = registry.as_ref().map(Arc::downgrade);
     harness.register(HarnessFamily::Claude, move |request| {
         let durability = durability.clone();
         let connection = connection.clone();
@@ -358,6 +368,14 @@ pub(super) fn register_claude_recipe(
         let tools = tools.clone();
         let registry = registry.clone();
         async move {
+            let registry = registry
+                .as_ref()
+                .map(|registry| {
+                    registry
+                        .upgrade()
+                        .ok_or(nanocodex::NanocodexError::AgentStopped)
+                })
+                .transpose()?;
             let client = connection
                 .client()
                 .await

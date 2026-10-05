@@ -596,9 +596,11 @@ impl AgentArgs {
             .web_search(false)
             .image_generation(false)
             .build()?;
+        // Recipes are retained by registered factory handles; only installed
+        // tools and the live CLI control own the registry strongly.
         let codex_registry = subagent_runtime
             .as_ref()
-            .map(|(registry, _, _)| Arc::clone(registry));
+            .map(|(registry, _, _)| Arc::downgrade(registry));
         let codex_tools = tools.clone();
         let mut codex_recipe = Nanocodex::builder(openai.clone())
             .reasoning_mode(self.reasoning_mode)
@@ -610,7 +612,7 @@ impl AgentArgs {
                     subagents::install_tools(
                         codex_tools.clone(),
                         parent,
-                        Arc::clone(registry),
+                        registry.upgrade().expect("live CLI owns child registry"),
                         subagent_tools.unwrap_or(SubagentToolSet::Generic),
                     )
                 } else {
@@ -683,12 +685,12 @@ impl AgentArgs {
             (&subagent_runtime, subagent_tools)
         {
             let tools = tools;
-            let registry = Arc::clone(registry);
+            let registry = Arc::downgrade(registry);
             builder.tools_factory(move |agent| {
                 subagents::install_tools(
                     tools.clone(),
                     agent,
-                    Arc::clone(&registry),
+                    registry.upgrade().expect("live CLI owns child registry"),
                     subagent_tools,
                 )
             })

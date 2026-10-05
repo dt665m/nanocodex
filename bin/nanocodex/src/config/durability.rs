@@ -8,7 +8,7 @@ use nanocodex_subagents::{Registry, RegistryOwnership};
 pub(super) struct CliDurability {
     state: PortableDurableSession,
     root_session: String,
-    registry: Option<Arc<Registry>>,
+    registry: Option<std::sync::Weak<Registry>>,
 }
 
 impl CliDurability {
@@ -59,7 +59,7 @@ impl CliDurability {
         Ok(Self {
             state,
             root_session,
-            registry,
+            registry: registry.as_ref().map(Arc::downgrade),
         })
     }
 
@@ -73,7 +73,10 @@ impl CliDurability {
     ) -> nanocodex::agent::Result<nanocodex::NanocodexBuilder<F>> {
         let mut builder = builder.session_id(self.root_session.parse().map_err(error)?);
         if let Some(registry) = &self.registry {
-            builder = builder.turn_ownership(Arc::new(RegistryOwnership(Arc::clone(registry))));
+            let registry = registry
+                .upgrade()
+                .ok_or(nanocodex::NanocodexError::AgentStopped)?;
+            builder = builder.turn_ownership(Arc::new(RegistryOwnership(registry)));
         }
         builder.durability(self.state.clone()).await
     }
@@ -84,7 +87,10 @@ impl CliDurability {
     ) -> nanocodex::agent::Result<nanocodex::claude::ClaudeBuilder> {
         let mut builder = builder.session_id(self.root_session.clone());
         if let Some(registry) = &self.registry {
-            builder = builder.turn_ownership(Arc::new(RegistryOwnership(Arc::clone(registry))));
+            let registry = registry
+                .upgrade()
+                .ok_or(nanocodex::NanocodexError::AgentStopped)?;
+            builder = builder.turn_ownership(Arc::new(RegistryOwnership(registry)));
         }
         builder.durability(self.state.clone()).await
     }
@@ -108,7 +114,10 @@ impl CliDurability {
         }
         builder = builder.session_id(session);
         if let Some(registry) = &self.registry {
-            builder = builder.turn_ownership(Arc::new(RegistryOwnership(Arc::clone(registry))));
+            let registry = registry
+                .upgrade()
+                .ok_or(nanocodex::NanocodexError::AgentStopped)?;
+            builder = builder.turn_ownership(Arc::new(RegistryOwnership(registry)));
         }
         let state = PortableDurableSession::open(
             self.state.child_store(),
@@ -138,7 +147,10 @@ impl CliDurability {
         }
         builder = builder.session_id(session.clone());
         if let Some(registry) = &self.registry {
-            builder = builder.turn_ownership(Arc::new(RegistryOwnership(Arc::clone(registry))));
+            let registry = registry
+                .upgrade()
+                .ok_or(nanocodex::NanocodexError::AgentStopped)?;
+            builder = builder.turn_ownership(Arc::new(RegistryOwnership(registry)));
         }
         let state = PortableDurableSession::open(self.state.child_store(), session)
             .await
