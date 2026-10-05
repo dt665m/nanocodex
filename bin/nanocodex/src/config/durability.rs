@@ -127,7 +127,7 @@ impl CliDurability {
                     "expected Claude child checkpoint".into(),
                 ));
             }
-            None => SessionId::new().to_string(),
+            None => format!("{}/child/{}", self.state.state_id(), SessionId::new()),
         };
         if let Some(snapshot) = snapshot {
             builder = builder.restore_runtime(snapshot)?;
@@ -136,12 +136,9 @@ impl CliDurability {
         if let Some(registry) = &self.registry {
             builder = builder.turn_ownership(Arc::new(RegistryOwnership(Arc::clone(registry))));
         }
-        let state = PortableDurableSession::open(
-            self.state.child_store(),
-            format!("{}/child/{session}", self.state.state_id()),
-        )
-        .await
-        .map_err(error)?;
+        let state = PortableDurableSession::open(self.state.child_store(), session)
+            .await
+            .map_err(error)?;
         builder.durability(state).await
     }
 }
