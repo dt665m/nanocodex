@@ -511,43 +511,44 @@ async fn cold_child(family: &str) -> Result<()> {
         "x",
         "cold child repeated its committed append"
     );
-    let requests = fixture.requests.lock().unwrap();
-    let child_recovery: Vec<_> = requests
-        .iter()
-        .filter(|record| record["child"] == true && record["recovery"] == true)
-        .collect();
-    assert!(
-        !child_recovery.is_empty(),
-        "new process did not reconstruct the unfinished child"
-    );
-    assert!(
-        child_recovery
-            .iter()
-            .all(|record| !record["tool_result"].is_null()),
-        "cold child lost its committed tool history"
-    );
     let other = if family == "claude" {
         "codex"
     } else {
         "claude"
     };
-    assert!(
-        child_recovery
+    let recovered_request_count = {
+        let requests = fixture.requests.lock().unwrap();
+        let child_recovery: Vec<_> = requests
             .iter()
-            .all(|record| record["family"] == other),
-        "cold reconstruction changed harness family"
-    );
-    assert!(
-        child_recovery
-            .iter()
-            .flat_map(|record| record["tool_result"].as_array().into_iter().flatten())
-            .filter_map(|block| block["text"].as_str())
-            .filter_map(|text| serde_json::from_str::<Value>(text).ok())
-            .any(|receipt| receipt["accepted"] == true && receipt["status"] == "accepted"),
-        "recovered child never received an accepted structured result receipt"
-    );
-    let recovered_request_count = requests.len();
-    drop(requests);
+            .filter(|record| record["child"] == true && record["recovery"] == true)
+            .collect();
+        assert!(
+            !child_recovery.is_empty(),
+            "new process did not reconstruct the unfinished child"
+        );
+        assert!(
+            child_recovery
+                .iter()
+                .all(|record| !record["tool_result"].is_null()),
+            "cold child lost its committed tool history"
+        );
+        assert!(
+            child_recovery
+                .iter()
+                .all(|record| record["family"] == other),
+            "cold reconstruction changed harness family"
+        );
+        assert!(
+            child_recovery
+                .iter()
+                .flat_map(|record| record["tool_result"].as_array().into_iter().flatten())
+                .filter_map(|block| block["text"].as_str())
+                .filter_map(|text| serde_json::from_str::<Value>(text).ok())
+                .any(|receipt| receipt["accepted"] == true && receipt["status"] == "accepted"),
+            "recovered child never received an accepted structured result receipt"
+        );
+        requests.len()
+    };
     let replay = fixture
         .run(
             fixture.command(family, "cold-turn", "SPAWN_OWNED_CHILD", false),
