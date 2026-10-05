@@ -276,3 +276,26 @@ test('public WASM refuses terminal observations after an uncommitted child settl
   assert.equal(f.requests.filter(row => row.phase === 'resume').length, 0, 'native terminal receipt is handed off without more inference');
   t.diagnostic(JSON.stringify({ child: child.agent_id, refusedObservations: ['list', 'wait', 'recover'], effectDispatches: 1, resumedModelRequests: 0 }));
 });
+
+
+test('public WASM reports the child recovery store error and preserves lost-steer work for the next owner', { timeout: 60_000 }, async t => {
+  const f = await fixture(t, 'steer-recovery-capacity');
+  const first = await f.start({ loseSteerDelivery: true });
+  const child = await first.call('spawn', task('RUNNING'));
+  await f.until(() => f.requests.some(row => row.marker === 'RUNNING' && JSON.stringify(row.body).includes('DURABLE_CHILD_EFFECT_RECEIPT')), 'child checkpoints its external effect');
+  const sending = first.call('send', { agentId: child.agent_id, message: 'MAILBOX_AFTER_RESTART', purpose: 'coordinate', priority: 'urgent' });
+  await f.until(() => f.trace.some(row => row.type === 'lost-steer-delivery'), 'native admission committed before losing the tree acknowledgement');
+  const lost = assert.rejects(sending, /owner terminated/);
+  await first.kill(); await lost; f.phase('resume');
+  const sessionId = f.effects[0].sessionId;
+  await assert.rejects(f.start({ exhaustChildStorage: sessionId }), /database or disk is full/);
+  assert.equal(f.trace.find(row => row.type === 'child-acquisition-error').error.code, 'ERR_SQLITE_ERROR');
+  const successor = await f.start();
+  await completed(successor, child.agent_id, 'mailbox');
+  const resumed = f.requests.filter(row => row.phase === 'resume');
+  assert.ok(resumed.length > 0);
+  assert.ok(resumed.every(row => row.auth === 'Bearer synthetic-owner-3'));
+  assert.ok(resumed.every(row => row.body.input.filter(item => item.type === 'message' && JSON.stringify(item.content).includes('MAILBOX_AFTER_RESTART')).length <= 1), 'failed construction must not admit the mailbox twice');
+  assert.equal(f.effects.length, 1, 'the committed effect survives failed recovery without redispatch');
+  t.diagnostic(JSON.stringify({ child: child.agent_id, failedOwner: 2, successfulOwner: 3, effectDispatches: 1, underlyingError: 'database or disk is full' }));
+});

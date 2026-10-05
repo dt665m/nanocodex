@@ -9,15 +9,40 @@ const database = new DatabaseSync(workerData.databasePath);
 database.exec('PRAGMA busy_timeout = 5000');
 for (const sql of sqliteDurabilitySchema) database.exec(sql);
 const store = createSqliteDurabilityStore({ transaction(callback) {
-  database.exec('BEGIN IMMEDIATE');
   try {
+    database.exec('BEGIN IMMEDIATE');
     const result = callback((sql, args) => database.prepare(sql).all(...args));
     database.exec('COMMIT');
     return result;
-  } catch (error) { database.exec('ROLLBACK'); throw error; }
+  } catch (error) {
+    parentPort.postMessage({ type: 'store-error', error: { message: error.message, code: error.code, stack: error.stack } });
+    if (database.isTransaction) database.exec('ROLLBACK');
+    throw error;
+  }
 } });
 let lostAcknowledgement = false, nativeSteerCommitted = false, settlementFailed = false;
-const durability = { ...store, replace(id, request) {
+const durability = { ...store, acquire(id, request) {
+  if (id === workerData.exhaustChildStorage) {
+    // A real SQLite capacity error at child recovery, without filling the disk
+    // or changing the committed journals. SQLITE_FULL rolls back this probe.
+    const limit = database.prepare('PRAGMA max_page_count').get().max_page_count;
+    const pages = database.prepare('PRAGMA page_count').get().page_count;
+    database.exec(`PRAGMA max_page_count = ${pages}`);
+    try {
+      database.exec('BEGIN IMMEDIATE');
+      database.exec('CREATE TABLE synthetic_capacity_probe (value BLOB)');
+      database.exec('INSERT INTO synthetic_capacity_probe VALUES (zeroblob(1048576))');
+      throw new Error('SQLite capacity probe unexpectedly succeeded');
+    } catch (error) {
+      if (database.isTransaction) database.exec('ROLLBACK');
+      parentPort.postMessage({ type: 'child-acquisition-error', stateId: id, error: { message: error.message, code: error.code } });
+      throw error;
+    } finally {
+      database.exec(`PRAGMA max_page_count = ${limit}`);
+    }
+  }
+  return store.acquire(id, request);
+}, replace(id, request) {
   const encoded = request.payload + request.records.map(record => record.value).join('');
   if (workerData.failSettlement && !settlementFailed && id.endsWith('/children') && encoded.includes('"state":"completed"')) {
     settlementFailed = true;

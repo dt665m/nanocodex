@@ -1516,7 +1516,12 @@ impl WasmHarnessFactory {
             .await
             .map(|(inner, events, _)| (inner, events)),
         }
-        .map_err(|_| NanocodexError::InvalidRequest("target harness construction failed".into()))?;
+        .map_err(|error| {
+            NanocodexError::InvalidRequest(format!(
+                "target harness construction failed: {}",
+                host_error_message(&error)
+            ))
+        })?;
         factory
             .hosts
             .lock()
