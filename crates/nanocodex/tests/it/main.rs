@@ -22,3 +22,6 @@ mod harness;
 mod durable_children;
 
 const fn main() {}
+
+#[cfg(all(feature = "durability", not(target_family = "wasm")))]
+mod durable_owner_drop;
