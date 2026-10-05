@@ -116,14 +116,22 @@ Hosted agents with durability configure a separate native `DurableSession` for
 each child and reconstruct the registry before returning replayed capabilities.
 A completed spawn receipt therefore refers to the original child. Root and child
 owners remain separate, and reconstruction uses the current host's authorization.
-Saved tool context does not grant new authority. The native `nanocodex::DurableAgentExt` facade installs the registry, same-family
-child factory, per-child execution journals, and foreground ownership barrier for
-both OpenAI and Claude builders. Caller tools and callback recipes are retained.
+Saved tool context does not grant new authority.
+
+On native targets, `nanocodex::DurableAgentExt` (the facade's `durability`
+feature) installs the registry, same-family child factory, per-child execution
+journals, and foreground ownership barrier. OpenAI builders are supported;
+Claude builders also require the facade's `claude` feature. Caller tools and
+tool-factory recipes are retained. Automatic recipes do not switch between
+OpenAI and Claude; an embedding must supply explicit authorized recipes for that
+routing. Successful root completion waits for foreground children; failure or
+cancellation stops foreground children before settlement.
 An already configured spawn factory is rejected before identity or child-tree
 mutation; embeddings with custom routing can attach the core
 `nanocodex_durability::DurableAgentExt` adapter and supply their own durable child
 factory and registry. Copying the parent's execution policy into a child is not
-supported.
+supported. On WASM, the facade reexports the core adapter; JavaScript hosts
+compose their own durable child registry and factory.
 
 Native facade builds begin owner-bound reconstruction immediately, including
 pending background work when the root operation already completed. Await
@@ -150,6 +158,16 @@ survive terminal receipt pruning, and destination initialization rejects an
 already occupied state. Historical forks use the original boundary rather than
 reinterpreting the current transcript. Reusing a retained historical operation ID
 is rejected even after its ordinary terminal receipt has expired.
+
+A document fork seeds a new session's checkpoint and selected documents, not its
+source's operation receipts, pending effects, or child tree. For OpenAI's paged
+context, use `DurableSession::agent_document_fork` and
+`initialize_agent_document_fork`; these materialize and reindex the checkpoint
+in the destination store. Claude's native checkpoint uses `document_fork` and
+`initialize_document_fork`. Construct the destination with its own durable owner
+and current tools and credentials. These APIs are distinct from native
+`Nanocodex::fork`/`fork_from`: OpenAI rejects those history operations when an
+execution policy is installed, and Claude does not implement them.
 
 ## Store contract
 
@@ -182,8 +200,11 @@ continue to own public exact-ID replay beyond that tail.
 
 State format 5 uses the `nanocodex_durable_state` head envelope and SHA-256
 addressed payload records. Bodies over 256,000 UTF-8 bytes are split into records.
-Persistent 64-message context pages share prior records. Each boundary publishes
-only new messages and changed pages, with its head in one atomic transaction.
+OpenAI checkpoints use persistent 64-message context pages that share prior
+records. Each boundary publishes only new messages and changed pages, with its
+head in one atomic transaction. Claude checkpoints retain native Messages
+content, including signed thinking and tool results, in chunked payloads;
+serialization and restoration still process the full retained Claude context.
 Format 4 heads remain readable; missing tool replay permission is unsafe.
 The old inline/compressed storage formats are rejected.
 
@@ -268,7 +289,12 @@ The Cloudflare adapter exposes this protocol directly as
 inactive Agent. Import requires a pristine Durable Object and is exactly
 idempotent for a byte-identical archive, so a lost success response can be
 retried. A fresh runtime session ID is created at the destination while the
-archive's stable state ID remains unchanged.
+archive's stable state ID remains unchanged. This archive represents one execution
+state, not a task tree. Cloudflare rejects export (including head-only export)
+when descendant execution journals are retained, even for closed children;
+the rejection occurs before acquiring or fencing any owner. An empty registry
+alone does not block export. `CloudflareAgent.destroy(owner)` requires an inactive
+lifecycle and fences and deletes the root, registry, and descendant journals.
 
 Archives can contain conversation and tool state and are not encrypted by this
 API. Applications own transport encryption, access control, retention, and
@@ -419,8 +445,8 @@ the durable cursor is authoritative.
 |---|---|---|
 | Before acceptance commit | No operation | Caller may submit normally |
 | After acceptance, before effect start | Pending operation | New owner claims and executes |
-| After effect start | `effect_pending` step | Execute again with the same identity and input |
-| After effect returns, before settlement | `effect_pending` | Execute again; duplicate billing or effects are allowed |
+| After effect start | `effect_pending` step | Replay only with retained and current safe permissions; otherwise settle an unknown outcome |
+| After effect returns, before settlement | `effect_pending` | Same replay-safety check; a repeatable request may incur duplicate billing |
 | After settlement | `completed(output)` | Replay exact output; never redispatch |
 | During terminal replacement with `NotCommitted` | Pending operation | Same valid owner may retry |
 | During an unconfirmed terminal replacement | Store result is not authoritative | Reacquire, reload, then decide |
@@ -441,7 +467,7 @@ archival and cold recovery.
 1. Persist before dispatch.
 2. Never infer a commit from a transport error.
 3. Never retry on a stale owner.
-4. Execute every unfinished step again after recovery.
+4. Execute an unfinished step again only when both retained and current replay permissions are safe.
 5. Replay every completed step without dispatching it again.
 6. Never split a checkpoint from its terminal receipt.
 7. Never let managed projection override Rust effect recovery.

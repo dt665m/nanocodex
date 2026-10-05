@@ -25,7 +25,9 @@ nanocodex-oai-api <- nanocodex-tools <- nanocodex-agent
 ```
 
 Construct only the layer an application needs, or attach durable state after the
-OpenAI client and tool registry have been composed into an agent:
+OpenAI client and tool registry have been composed into an agent. The examples
+below import this crate's core `DurableAgentExt`, which configures execution
+recovery for that agent; it does not install a child registry or durable factory:
 
 ```rust,ignore
 use nanocodex_agent::{Nanocodex, OpenAi, PromptRequest};
@@ -83,10 +85,27 @@ Claude snapshots use the store's chunked immutable payloads; they do not yet
 use the OpenAI adapter's per-message context pages. Snapshot serialization and
 restoration therefore process the full retained Claude context.
 
-Durability belongs to each explicitly configured agent. The core spawn/fork
-lifecycle does not inherit a durable owner or journal. An embedding that hosts
-Claude's Agent tool can construct each child with its own `DurableSession` and
-stable identity; attaching the parent's session alone does not persist children.
+Durability belongs to each explicitly configured agent. Core spawning does not
+inherit a durable owner or journal. A lower-level embedding must configure
+`Registry::enable_durability`, a factory that opens each child's own
+`DurableSession`, registry tools, and reconstruction before replaying child
+capabilities. `RegistryOwnership` supplies startup recovery and the foreground
+settlement barrier when attached to the native builder's `turn_ownership` hook.
+
+For automatic native composition, import `nanocodex::DurableAgentExt` instead
+(with the facade's `durability` feature, plus `claude` for Claude builders).
+It installs the registry, tools, same-family factory, and independent child
+journals while retaining caller tools and tool-factory recipes. It rejects a
+preconfigured spawn factory before mutating child identity or topology. Mixed
+OpenAI/Claude routing requires explicit factories with the core adapter. On
+WASM, the facade reexports the core adapter; JavaScript hosts compose the tree.
+
+Native facade construction starts owner-bound child recovery without submitting
+a root turn, including background work whose root turn already completed.
+Await `agent.ready()` to observe completion or the retained startup error. New
+prompts also await readiness; shutdown or dropping the last handle cancels
+unfinished startup recovery. A successful foreground turn waits for its
+foreground children, while failed or cancelled turns stop them before settlement.
 
 Without `.durability(...)`, the same builder is an ordinary non-durable agent.
 An OpenAI-only consumer can stop at `OpenAi::instructions(...).build()`, and a
@@ -271,6 +290,15 @@ Immutable historical snapshots use operation-derived lookup records in the
 `StateStore`; the execution head has no growing boundary index. Legacy format-5
 heads with a boundary index are migrated into these records on their next commit.
 `document_fork(operation_id)` returns a loaded `EncodedPayload` checkpoint and a
-policy-selected seed. Pass that checkpoint directly to
-`initialize_document_fork(seed, &checkpoint)` in an empty destination; the
-checkpoint contents are copied into the destination store with its documents.
+policy-selected seed. For a self-contained checkpoint (including Claude), pass
+it to `initialize_document_fork(seed, &checkpoint)` in an empty destination.
+For OpenAI agent checkpoints, use `agent_document_fork(operation_id)` followed
+by `initialize_agent_document_fork(seed, &snapshot)` instead: these load the
+referenced context pages and publish them under the destination's own records.
+Then attach the destination session to a freshly authorized builder.
+
+These document forks copy the selected checkpoint and documents, not pending
+effects, operation receipts, or a child tree. They differ from native
+`Nanocodex::fork`/`fork_from`: OpenAI rejects those history operations when an
+execution policy is installed, and Claude does not implement them. Historical
+Claude document forks are supported independently of that native API limit.
