@@ -1699,7 +1699,23 @@ impl WasmSubagents {
     }
 
     async fn release_parent(&self, session_id: &str) -> std::io::Result<()> {
-        self.registry.release_parent(session_id).await?;
+        if let Err(error) = self.registry.release_parent(session_id).await {
+            let retired = self.registry.retire_failed_parent(session_id).await;
+            if let Some(root) = retired.first() {
+                release_subagent_scope(
+                    self.host_definition_id,
+                    &self.sessions,
+                    &self.parents,
+                    &self.hosts,
+                    root,
+                );
+                for session in retired {
+                    self.remove_parent(&session);
+                    self.hosts.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&session);
+                }
+            }
+            return Err(error);
+        }
         // Background drivers remain owned by their registry until a cold host
         // scheduler acquires a new fenced parent generation.
         if !self.registry.has_background(session_id).await {

@@ -98,6 +98,14 @@ struct ActiveTurn {
     _capacity: TurnCapacity,
 }
 
+impl Drop for ActiveTurn {
+    fn drop(&mut self) {
+        // Retiring a poisoned harness must also drop its detached result waiter.
+        // This releases local handles without issuing a durable cancellation.
+        self.result.abort();
+    }
+}
+
 enum HarnessEvent {
     Command(Option<HarnessCommand>),
     Deferred(Option<DeliveryCommand>),

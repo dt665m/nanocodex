@@ -199,6 +199,28 @@ test('public WASM requires durability for background children and releases foreg
 });
 
 
+test('public WASM immediate disposal preserves foreground and background checkpoints for a new owner', { timeout: 60_000 }, async t => {
+  const f = await fixture(t, 'dispose-recovery');
+  const oldOwner = await f.start();
+  const foreground = await oldOwner.call('spawn', task('FOREGROUND'));
+  const background = await oldOwner.call('spawn', task('BACKGROUND', 'background'));
+  await f.until(() => ['FOREGROUND', 'BACKGROUND'].every(marker => f.requests.some(row =>
+    row.marker === marker && JSON.stringify(row.body).includes('DURABLE_CHILD_EFFECT_RECEIPT'))), 'both lifetimes checkpoint effects');
+  await oldOwner.call('dispose');
+  // Keep the old JS/WASM isolate alive: disposal must retire its local ownership
+  // without depending on process termination or cancelling the durable work.
+  f.phase('resume');
+  const owner = await f.start();
+  await owner.call('recover');
+  await completed(owner, foreground.agent_id, 'foreground');
+  await completed(owner, background.agent_id, 'background');
+  const directory = await owner.call('list', { includeCompleted: true });
+  assert.equal(directory.agents.find(row => row.agent_id === background.agent_id).lifetime, 'background');
+  assert.equal(f.effects.length, 2, 'committed effects are not repeated after immediate disposal');
+  assert.ok(f.requests.filter(row => row.phase === 'resume').every(row => row.auth === 'Bearer synthetic-owner-2'));
+  t.diagnostic(JSON.stringify({ foregroundRecovered: foreground.agent_id, backgroundRecovered: background.agent_id, effectDispatches: 2, oldIsolateStillAlive: true }));
+});
+
 test('public WASM cold recovery retains the consumed urgent steering revision', { timeout: 60_000 }, async t => {
   const f = await fixture(t, 'steer-revision');
   let owner = await f.start();

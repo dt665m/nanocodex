@@ -324,6 +324,41 @@ impl Registry {
         Ok(())
     }
 
+    /// Drops a poisoned generation's local capabilities without changing its
+    /// durable checkpoint. A successor must recover the committed work; this
+    /// is retirement after failed persistence, not a durable cancellation.
+    /// Returns the root followed by its child session identities for host cleanup.
+    pub async fn retire_failed_parent(&self, session: &str) -> Vec<String> {
+        let _residency = self.residency_lock.lock().await;
+        let _messages = self.message_lock.lock().await;
+        let (sessions, tasks) = {
+            let mut state = self.state.lock().await;
+            let root = state.root_session_id(session).to_owned();
+            let Some(scope) = state.scopes.get_mut(&root) else { return Vec::new(); };
+            // A healthy background tree still owns its live work after its
+            // foreground parent leaves. Only an unusable journal retires it.
+            if scope.observation_error.is_none() { return Vec::new(); }
+            let mut sessions = vec![root];
+            let mut tasks = Vec::new();
+            for child in scope.sessions.values_mut() {
+                sessions.push(child.descriptor.session_id.clone());
+                for task in child.harness_task.take().into_iter().chain(child.event_task.take()) {
+                    task.abort();
+                    tasks.push(task);
+                }
+                child.harness = None;
+            }
+            let mut handles = self.session_handles.write().expect("session handles poisoned");
+            for session in &sessions { handles.remove(session); }
+            (sessions, tasks)
+        };
+        // Do not run normal close callbacks: they would try to publish terminal
+        // outcomes from an owner whose journal has already failed or been fenced.
+        for task in tasks { let _ = task.await; }
+        self.changed();
+        sessions
+    }
+
     pub(super) async fn admit_child_turn(
         &self, root: &str, id: AgentId, prompt: String, message_id: Option<MessageId>,
     ) -> std::io::Result<(u64, String, Option<String>, bool)> {

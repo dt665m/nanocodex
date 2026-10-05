@@ -76,6 +76,7 @@ parentPort.on('message', async ({ id, action, args }) => {
   try {
     let result;
     if (action === 'prompt') result = { finalMessage: (await agent.turn.prompt(args).result()).finalMessage };
+    else if (action === 'dispose') { agent.dispose(); result = { disposed: true }; }
     else if (action === 'shutdown') { await agent.session.shutdown(); result = { stopped: true }; }
     else if (['interrupt', 'close'].includes(action)) result = await Subagents[action](agent, args.agentId);
     else result = await Subagents[action](agent, args);
