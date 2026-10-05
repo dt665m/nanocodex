@@ -4,7 +4,7 @@
 //! device protocol differs from ChatGPT's PKCE/device-code exchange. Parameters
 //! are verified against Muse CLI and the OpenCode Muse plugins (see README).
 //! Credentials and recovery state remain in memory; callers own persistence.
-use std::{fmt, io, path::PathBuf, sync::Arc, time::Duration};
+use std::{fmt, sync::Arc, time::Duration};
 
 use nanocodex_oai_api::auth::{
     OpenAiAuth, OpenAiAuthError, OpenAiAuthFuture, OpenAiAuthMode, OpenAiAuthSnapshot,
@@ -30,19 +30,10 @@ const MAX_RESPONSE_BYTES: usize = 16 * 1024;
 /// Failure resolving or exchanging Muse credentials. Never contains tokens or HTTP bodies.
 #[derive(Debug, thiserror::Error)]
 pub enum MuseAuthError {
-    /// A credential file could not be accessed.
-    #[error("failed to access Muse authorization file {path}: {source}")]
-    Storage {
-        /// Credential file involved.
-        path: PathBuf,
-        /// Filesystem failure.
-        #[source]
-        source: io::Error,
-    },
     /// A credential document or server response is invalid.
     #[error("Muse authorization data is invalid")]
     Invalid,
-    /// A bounded network or OS credential-store operation failed.
+    /// A bounded network operation failed.
     #[error("Muse authorization service is unavailable")]
     Unavailable,
     /// An endpoint rejected the exchange.
@@ -448,73 +439,6 @@ async fn mint_key(
     let key = nonempty(&value, "api_key")?;
     bearer(key)?;
     Ok(key.to_owned())
-}
-
-/// Reads Muse Code's credentials into memory, retaining both tokens when available.
-/// Reads macOS Keychain first, then the CLI's plaintext fallback files. An existing
-/// inference key needs no exchange. Never writes either CLI or Alfredo credentials.
-///
-/// # Errors
-/// Returns a redacted error if discovery or exchange fails.
-pub async fn import_muse_code_auth() -> Result<MuseCredential, MuseAuthError> {
-    let home = std::env::var_os("HOME").ok_or(MuseAuthError::LoginRequired)?;
-    let root = PathBuf::from(home).join(".config/muse");
-    #[cfg(target_os = "macos")]
-    {
-        let output = timeout(
-            REQUEST_TIMEOUT,
-            tokio::process::Command::new("security")
-                .args([
-                    "find-generic-password",
-                    "-s",
-                    "ai.meta.dev.credentials",
-                    "-a",
-                    "meta",
-                    "-w",
-                ])
-                .kill_on_drop(true)
-                .output(),
-        )
-        .await
-        .map_err(|_| MuseAuthError::Unavailable)?
-        .map_err(|_| MuseAuthError::Unavailable)?;
-        if output.status.success() {
-            let value =
-                serde_json::from_slice(&output.stdout).map_err(|_| MuseAuthError::Invalid)?;
-            return import_value(value).await;
-        }
-    }
-    for name in ["auth.json", "secrets.json"] {
-        let path = root.join(name);
-        match tokio::fs::read(&path).await {
-            Ok(bytes) => {
-                let value: Value =
-                    serde_json::from_slice(&bytes).map_err(|_| MuseAuthError::Invalid)?;
-                let candidate = value
-                    .get("providers")
-                    .and_then(|providers| providers.get("meta"))
-                    .unwrap_or(&value);
-                if candidate.get("api_key").is_some() || candidate.get("access_token").is_some() {
-                    return import_value(candidate.clone()).await;
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(source) => return Err(MuseAuthError::Storage { path, source }),
-        }
-    }
-    Err(MuseAuthError::LoginRequired)
-}
-
-async fn import_value(value: Value) -> Result<MuseCredential, MuseAuthError> {
-    if let Ok(key) = nonempty(&value, "api_key") {
-        let credentials = MuseCredential {
-            api_key: key.to_owned(),
-            access_token: nonempty(&value, "access_token").ok().map(str::to_owned),
-        };
-        credentials.validate()?;
-        return Ok(credentials);
-    }
-    exchange_muse_key(nonempty(&value, "access_token")?).await
 }
 
 fn auth_client() -> Result<Client, MuseAuthError> {

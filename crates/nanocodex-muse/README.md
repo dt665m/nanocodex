@@ -34,8 +34,8 @@ agent.shutdown().await?;
 Native `auth::MuseLogin::start()` exposes `verification_url()` and `user_code()`;
 `complete()` performs device OAuth and `/muse-code/key` exchange. It returns a
 `MuseCredential` with public `access_token: Option<String>` and `api_key: String`.
-`exchange_muse_key()` returns the same pair. `import_muse_code_auth()` reads an
-existing Muse Code login from macOS Keychain or fallback files without writing.
+`exchange_muse_key()` returns the same pair. Hosts supply credentials explicitly;
+the library does not query Keychain or discover another application's login files.
 
 `MuseAuth::new(credentials)` keeps both credentials in memory and exposes the
 shared `OpenAiAuth` through `authorization()`. Responses and image requests use
@@ -63,9 +63,7 @@ let credentials = manager.credentials().await; // Persistence is the host's choi
 ```
 
 OAuth parameters follow the Muse CLI and the
-[OpenCode device-auth plugin](https://github.com/TheStreamCode/opencode-muse-auth/blob/8ff829b4e18a5600f25e82ee186af40ff4ea2d47/src/auth.ts);
-credential lookup follows
-[opencode-muse-code](https://github.com/swalker326/opencode-muse-code/blob/4690c3f4540343c0138224d2c5a9caa7c8b6b0a0/index.ts).
+[OpenCode device-auth plugin](https://github.com/TheStreamCode/opencode-muse-auth/blob/8ff829b4e18a5600f25e82ee186af40ff4ea2d47/src/auth.ts).
 
 ## Context and images
 

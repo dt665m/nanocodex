@@ -162,24 +162,6 @@ async fn device_login_returns_both_credentials_without_a_store() {
 }
 
 #[tokio::test]
-async fn importing_an_existing_key_retains_oauth_without_exchange() {
-    let credentials = import_value(
-        serde_json::json!({"api_key":"synthetic-key","access_token":"synthetic-oauth"}),
-    )
-    .await
-    .unwrap();
-    assert_eq!(credentials.api_key, "synthetic-key");
-    assert_eq!(credentials.access_token.as_deref(), Some("synthetic-oauth"));
-    assert!(
-        import_value(serde_json::json!({"api_key":"synthetic-key"}))
-            .await
-            .unwrap()
-            .access_token
-            .is_none()
-    );
-}
-
-#[tokio::test]
 async fn denied_expired_and_cancelled_login_return_no_credentials() {
     let (origin, server) = serve(vec![
         json(200, device()),
