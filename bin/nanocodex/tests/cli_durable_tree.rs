@@ -340,6 +340,34 @@ fn events(output: &Output) -> Result<Vec<Value>> {
         .collect()
 }
 
+fn completed_receipt(output: &Output) -> Result<Value> {
+    success(output, "run.completed");
+    let terminals: Vec<_> = events(output)?
+        .into_iter()
+        .filter(|event| event["type"] == "run.completed")
+        .collect();
+    assert_eq!(terminals.len(), 1, "expected exactly one terminal receipt");
+    assert_eq!(terminals[0]["payload"]["status"], "completed");
+    assert!(
+        terminals[0]["request_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty())
+    );
+    Ok(terminals.into_iter().next().unwrap())
+}
+
+fn replay_receipt(output: &Output) -> Result<Value> {
+    let terminal = completed_receipt(output)?;
+    // Native Claude also acknowledges prompt admission before its replay receipt.
+    assert!(
+        events(output)?
+            .iter()
+            .all(|event| { event["type"] == "input.accepted" || event["type"] == "run.completed" })
+    );
+    assert_eq!(terminal["payload"]["model_calls"], 0);
+    Ok(terminal)
+}
+
 #[tokio::test]
 async fn shipped_cli_http_roots_replay_and_restore_history_for_both_families() -> Result<()> {
     for family in ["codex", "claude"] {
@@ -358,21 +386,12 @@ async fn shipped_cli_http_roots_replay_and_restore_history_for_both_families() -
                 "replay",
             )
             .await?;
-        // The JSONL replay contract emits only its terminal receipt; the
-        // next turn below proves the retained answer and conversation.
-        success(&replay, "run.completed");
-        let replay_events = events(&replay)?;
-        // Native Claude acknowledges prompt admission before its replay receipt.
-        // Neither family's replay may publish generation or tool events.
-        assert!(replay_events.iter().all(|event| {
-            event["type"] == "input.accepted" || event["type"] == "run.completed"
-        }));
-        let terminals: Vec<_> = replay_events
-            .iter()
-            .filter(|event| event["type"] == "run.completed")
-            .collect();
-        assert_eq!(terminals.len(), 1);
-        assert_eq!(terminals[0]["payload"]["model_calls"], 0);
+        // Replay retains the native root identity without dispatching inference.
+        let initial_receipt = completed_receipt(&first)?;
+        assert_eq!(
+            replay_receipt(&replay)?["request_id"],
+            initial_receipt["request_id"]
+        );
         assert_eq!(
             fixture.requests.lock().unwrap().len(),
             count,
@@ -385,6 +404,10 @@ async fn shipped_cli_http_roots_replay_and_restore_history_for_both_families() -
             )
             .await?;
         success(&next, "durable-http-answer");
+        assert_eq!(
+            completed_receipt(&next)?["request_id"],
+            initial_receipt["request_id"]
+        );
         let requests = fixture.requests.lock().unwrap();
         assert_eq!(requests.len(), count + 1);
         let restored = requests.last().unwrap()["request"].to_string();
@@ -408,6 +431,7 @@ async fn shipped_cli_default_claude_rollouts_start_with_owned_durability() -> Re
         )
         .await?;
     success(&first, "durable-http-answer");
+    completed_receipt(&first)?;
     assert!(
         fixture
             .artifact
@@ -460,8 +484,9 @@ async fn cold_child(family: &str) -> Result<()> {
         stderr: stderr.await??,
     };
     evidence(&fixture.artifact, "killed", &killed)?;
+    let killed_events = events(&killed)?;
     assert!(
-        !events(&killed)?
+        !killed_events
             .iter()
             .any(|event| event["type"] == "run.completed"),
         "root exposed completion before its foreground child settled"
@@ -474,9 +499,13 @@ async fn cold_child(family: &str) -> Result<()> {
             "cold-recovery",
         )
         .await?;
-    // Codex already journaled its answer before the process was killed at
-    // the ownership barrier. Recovery publishes the retained terminal receipt.
-    success(&resumed, "run.completed");
+    // Recovery can publish a retained terminal receipt without re-emitting
+    // an answer journaled before the process was killed at the ownership barrier.
+    let recovered_receipt = completed_receipt(&resumed)?;
+    assert_eq!(
+        recovered_receipt["request_id"],
+        killed_events[0]["request_id"]
+    );
     assert_eq!(
         std::fs::read_to_string(&effect)?,
         "x",
@@ -508,7 +537,33 @@ async fn cold_child(family: &str) -> Result<()> {
             .all(|record| record["family"] == other),
         "cold reconstruction changed harness family"
     );
+    assert!(
+        child_recovery
+            .iter()
+            .flat_map(|record| record["tool_result"].as_array().into_iter().flatten())
+            .filter_map(|block| block["text"].as_str())
+            .filter_map(|text| serde_json::from_str::<Value>(text).ok())
+            .any(|receipt| receipt["accepted"] == true && receipt["status"] == "accepted"),
+        "recovered child never received an accepted structured result receipt"
+    );
+    let recovered_request_count = requests.len();
     drop(requests);
+    let replay = fixture
+        .run(
+            fixture.command(family, "cold-turn", "SPAWN_OWNED_CHILD", false),
+            "completed-cold-replay",
+        )
+        .await?;
+    assert_eq!(
+        replay_receipt(&replay)?["request_id"],
+        recovered_receipt["request_id"]
+    );
+    assert_eq!(
+        fixture.requests.lock().unwrap().len(),
+        recovered_request_count,
+        "completed cold tree replay dispatched root or child inference"
+    );
+    assert_eq!(std::fs::read_to_string(&effect)?, "x");
     let database = fixture.artifact.join("workspace/durability.sqlite");
     let connection = rusqlite::Connection::open(database)?;
     let states: Vec<String> = connection
@@ -524,7 +579,7 @@ async fn cold_child(family: &str) -> Result<()> {
         fixture.artifact.join("recovery-contract.json"),
         serde_json::to_vec_pretty(&json!({
             "expected":"root terminal withheld until foreground child completes; process kill, mixed-family cold reconstruction, committed append exactly once, independent child execution state",
-            "observed":{"root_family":family,"child_family":other,"effect":"x","child_state_ids":states,"terminal_after_recovery":true},
+            "observed":{"root_family":family,"child_family":other,"effect":"x","child_state_ids":states,"terminal_after_recovery":true,"native_root_session_id":recovered_receipt["request_id"],"accepted_child_result":true,"completed_replay_inference_calls":0},
             "reproduce":"cargo +1.97 test -p nanocodex-bin --test cli_durable_tree -- --nocapture"
         }))?,
     )?;
