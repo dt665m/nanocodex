@@ -6,6 +6,7 @@ import { inputChunks } from "./managed-turn-input";
 // Ordinary transient retries aren't owner loss. Abrupt loss and caught host
 // interruptions retain this lease until durable progress; projected IDs do not.
 const MAX_MANAGED_ABRUPT_ATTEMPTS = 3;
+export const MAX_MANAGED_CODE_STORE_BYTES = 8 * 1024 * 1024;
 export const MANAGED_RECOVERY_UNKNOWN = "MANAGED_RECOVERY_EXHAUSTED: repeated runtime loss while recovering the same unfinished operation; execution outcome unknown. Automatic replay was stopped; original operation identity and receipts were retained. Inspect retained tool receipts or external state before retrying any effect with its original operation identity.";
 
 export class ManagedRecoverySafety {
@@ -197,7 +198,7 @@ export function createManagedCodeEffectJournal(storage: DurableObjectStorage, op
   type Entries = readonly (readonly [string, unknown])[];
   const encodeEntries = (entries: Entries): string => {
     let nodes = 0;
-    let budget = 8 * 1024 * 1024;
+    let budget = MAX_MANAGED_CODE_STORE_BYTES;
     let encoded: string;
     try {
       encoded = JSON.stringify(entries, (key, value: unknown) => {
@@ -214,7 +215,7 @@ export function createManagedCodeEffectJournal(storage: DurableObjectStorage, op
       });
       if (!Array.isArray(entries) || entries.some(entry => !Array.isArray(entry) || entry.length !== 2 || typeof entry[0] !== "string")
         || new Set(entries.map(entry => entry[0])).size !== entries.length
-        || new TextEncoder().encode(encoded).byteLength > 8 * 1024 * 1024) throw new Error("invalid store entries");
+        || new TextEncoder().encode(encoded).byteLength > MAX_MANAGED_CODE_STORE_BYTES) throw new Error("invalid store entries");
     } catch { throw codeEffectUnknown("Code Mode store snapshot is invalid or exceeds 8 MiB/32768 entries"); }
     return encoded;
   };
@@ -240,7 +241,7 @@ export function createManagedCodeEffectJournal(storage: DurableObjectStorage, op
       "SELECT COUNT(*) AS count, COALESCE(SUM(length(CAST(value_json AS BLOB))), 0) AS bytes FROM managed_code_store_chunks WHERE blob_key = ?", key,
     ).one();
     if (!Number.isSafeInteger(metadata.chunks) || metadata.chunks < 1 || metadata.chunks > 256
-      || bounds.count !== metadata.chunks || bounds.bytes !== metadata.bytes || bounds.bytes > 8 * 1024 * 1024) {
+      || bounds.count !== metadata.chunks || bounds.bytes !== metadata.bytes || bounds.bytes > MAX_MANAGED_CODE_STORE_BYTES) {
       throw codeEffectUnknown("Code Mode store snapshot is incomplete or exceeds bounds");
     }
     const chunks = storage.sql.exec<{ chunk_index: number; value_json: string }>(

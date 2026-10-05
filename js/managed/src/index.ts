@@ -7,7 +7,7 @@ import { createManagedClaudeTools } from './claude-tools';
 import { managedClaudeTasks } from './claude-tasks';
 import type { Options as ClaudeOptions } from '../../nanocodex/runtime/claude.mjs';
 import { availableManagedModels } from "./model-catalog";
-import { ManagedRecoverySafety, MANAGED_RECOVERY_UNKNOWN, createManagedCodeEffectJournal } from "./managed-recovery-safety";
+import { ManagedRecoverySafety, MANAGED_RECOVERY_UNKNOWN, MAX_MANAGED_CODE_STORE_BYTES, createManagedCodeEffectJournal } from "./managed-recovery-safety";
 import { nativeAppValidator } from "./prompt-apps-native";
 import { gmailDecisionReceipts } from "./gmail-firehose-receipts";
 import { parsePrivateSecureInput } from "./browser-vault";
@@ -2237,6 +2237,19 @@ async function managedFetchRoute(
             creationSettings = validateAgentAdmissionSettings(importedSettings);
           } else {
             durabilityStateId = portableDurabilityStateId(durabilityArchive);
+          }
+          // Older archives may already contain account-bound store pointers.
+          // Reject them before creating a destination rather than importing
+          // a native document whose colocated journal would start empty.
+          const portable = managedArchive?.durability ?? durabilityArchive;
+          if (isRecord(portable) && typeof portable.payload === "string") {
+            const state: unknown = JSON.parse(portable.payload);
+            const checkpoint = isRecord(state) ? state.nanocodex_durable_state : undefined;
+            if (isRecord(checkpoint) && isRecord(checkpoint.documents)
+              && isRecord(checkpoint.documents.current)
+              && Object.hasOwn(checkpoint.documents.current, CODE_STORE_DOCUMENT)) {
+              return json({ error: "code_mode_store_not_portable", message: "The durability archive contains account-bound Code Mode state without its journal and R2 data." }, { status: 409 });
+            }
           }
           durabilityRequestHash = await hashText(canonicalJson(durabilityArchive));
         } catch (error) {
@@ -4742,6 +4755,14 @@ export class DurableAgentSession extends DurableComputerObject {
           "SELECT COUNT(*) AS count FROM managed_realtime_operations WHERE state = 'pending' AND blocked = 0",
         ).one().count > 0) {
         return json({ error: "agent_busy" }, { status: 409 });
+      }
+      // The root-only archive carries native document references, not their
+      // account-owned R2 blobs or the colocated Code Mode journal. Refuse
+      // before fencing admission so the caller can continue using its data.
+      if (this.ctx.storage.sql.exec(
+        "SELECT 1 FROM managed_code_store_versions UNION ALL SELECT 1 FROM managed_code_store_blobs WHERE blob_key LIKE 'session:%' LIMIT 1",
+      ).toArray().length) {
+        return json({ error: "code_mode_store_not_portable", message: "Stored Code Mode state requires its journal and R2 data; the current durability archive cannot export it." }, { status: 409 });
       }
       this.#durabilityExported = true;
       // Fence socket-owned mutation synchronously with the admission flag.
@@ -8745,7 +8766,7 @@ export class DurableAgentSession extends DurableComputerObject {
     this.#assertDeletionGeneration(generation);
     CloudflareAgent.destroy(this);
     this.ctx.storage.transactionSync(() => {
-      for (const table of ["managed_recovery_safety", "managed_recovery_progress", "managed_recovery_call_indices", "managed_child_recovery", "managed_child_route_recipes", "managed_code_effect_legacy_parents", "managed_code_effect_legacy_sessions", "managed_code_effect_migration", "managed_code_effect_runtime", "managed_code_effects", "managed_code_effect_receipt_chunks", "managed_configuration", "managed_environment_setup", "managed_webhook", "managed_webhook_deliveries", "managed_turn_usage", "managed_model_usage", "managed_artifacts", "managed_artifact_publications", "managed_output_checkpoints", "managed_output_checkpoint_chunks", "managed_turn_file_owners", "managed_connect_inputs"]) this.ctx.storage.sql.exec(`DELETE FROM ${table}`);
+      for (const table of ["managed_recovery_safety", "managed_recovery_progress", "managed_recovery_call_indices", "managed_child_recovery", "managed_child_route_recipes", "managed_code_effect_legacy_parents", "managed_code_effect_legacy_sessions", "managed_code_effect_migration", "managed_code_effect_runtime", "managed_code_effects", "managed_code_effect_receipt_chunks", "managed_code_cells", "managed_code_store_versions", "managed_code_store_blobs", "managed_code_store_chunks", "managed_configuration", "managed_environment_setup", "managed_webhook", "managed_webhook_deliveries", "managed_turn_usage", "managed_model_usage", "managed_artifacts", "managed_artifact_publications", "managed_output_checkpoints", "managed_output_checkpoint_chunks", "managed_turn_file_owners", "managed_connect_inputs"]) this.ctx.storage.sql.exec(`DELETE FROM ${table}`);
       this.ctx.storage.sql.exec("DROP TABLE IF EXISTS managed_fork_seed");
       this.ctx.storage.sql.exec("DELETE FROM managed_turn_dispatch_chunks");
       this.ctx.storage.sql.exec("DELETE FROM managed_turn_input_chunks");
@@ -8958,7 +8979,7 @@ export class DurableAgentSession extends DurableComputerObject {
     if (!agent || !owner || this.#deleting || this.#deleted) throw new Error("Code Mode document owner is unavailable");
     const encoded = JSON.stringify(entries);
     const bytes = new TextEncoder().encode(encoded).byteLength;
-    if (bytes > 4 * 1024 * 1024) throw new Error("Code Mode document exceeds its journal bound");
+    if (bytes > MAX_MANAGED_CODE_STORE_BYTES) throw new Error("Code Mode document exceeds its journal bound");
     const hash = createHash("sha256").update(encoded).digest("hex");
     // The account-derived namespace is never read from guest data or a seed.
     await this.env.NANOCODEX_HISTORY.put(`code-store/${owner}/${hash}`, encoded);
@@ -8980,7 +9001,7 @@ export class DurableAgentSession extends DurableComputerObject {
     const value = document.value;
     if (value.format !== 1 || typeof value.hash !== "string" || !/^[a-f0-9]{64}$/.test(value.hash)
       || typeof value.bytes !== "number" || !Number.isSafeInteger(value.bytes)
-      || value.bytes < 2 || value.bytes > 4 * 1024 * 1024) throw new Error("Invalid Code Mode fork reference");
+      || value.bytes < 2 || value.bytes > MAX_MANAGED_CODE_STORE_BYTES) throw new Error("Invalid Code Mode fork reference");
     const owner = this.#session()?.owner_id;
     if (!owner) throw new Error("Code Mode fork owner is unavailable");
     const object = await this.env.NANOCODEX_HISTORY.get(`code-store/${owner}/${value.hash}`);
