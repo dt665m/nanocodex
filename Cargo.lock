@@ -5784,6 +5784,7 @@ dependencies = [
  "nanocodex-claude-tools",
  "nanocodex-durability",
  "nanocodex-managed",
+ "nanocodex-muse",
  "nanocodex-oai-api",
  "nanocodex-oai-tools",
  "nanocodex-observability",
@@ -6233,6 +6234,24 @@ dependencies = [
  "url",
  "uuid",
  "zeroize",
+]
+
+[[package]]
+name = "nanocodex-muse"
+version = "0.6.6"
+dependencies = [
+ "base64 0.22.1",
+ "eyre",
+ "image",
+ "nanocodex-agent",
+ "nanocodex-oai-api",
+ "nanocodex-oai-tools",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

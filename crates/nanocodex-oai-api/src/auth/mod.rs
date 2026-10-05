@@ -150,6 +150,9 @@ pub enum OpenAiAuthError {
     /// The user must complete an interactive login before retrying.
     #[error("ChatGPT authorization must be refreshed by logging in again: {0}")]
     LoginRequired(Arc<str>),
+    /// Provider-specific authorization failure; the source must omit secrets.
+    #[error("{0}")]
+    Provider(Arc<str>),
     /// Managed `ChatGPT` credential refresh failed.
     #[error("failed to refresh ChatGPT authorization: {0}")]
     Refresh(Arc<str>),
@@ -203,6 +206,15 @@ impl OpenAiAuth {
     pub fn managed_chatgpt(source: Arc<dyn OpenAiAuthSource>) -> Self {
         Self {
             mode: OpenAiAuthMode::ChatGpt,
+            source,
+        }
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn managed_api_key(source: Arc<dyn OpenAiAuthSource>) -> Self {
+        Self {
+            mode: OpenAiAuthMode::ApiKey,
             source,
         }
     }
@@ -296,7 +308,7 @@ impl OpenAiAuthSource for ApiKeyAuth {
         &self,
         _rejected: &OpenAiAuthSnapshot,
     ) -> OpenAiAuthFuture<'_, Result<(), OpenAiAuthError>> {
-        Box::pin(ready(Err(OpenAiAuthError::LoginRequired(Arc::from(
+        Box::pin(ready(Err(OpenAiAuthError::Provider(Arc::from(
             "the API key was rejected",
         )))))
     }

@@ -99,6 +99,20 @@ const MIMO_STANDARD: TokenRates = TokenRates {
     cache_write_input: 435,
     output: 870,
 };
+// https://dev.meta.ai/docs/pricing-rate-limits (standard, 2026-10-05).
+const MUSE_STANDARD: TokenRates = TokenRates {
+    input: 1_250,
+    cached_input: 150,
+    cache_write_input: 1_250,
+    output: 4_250,
+};
+// https://dev.meta.ai/docs/pricing-rate-limits (contributor, 2026-10-05).
+const MUSE_CONTRIBUTOR: TokenRates = TokenRates {
+    input: 100,
+    cached_input: 2,
+    cache_write_input: 100,
+    output: 200,
+};
 const LONG_CONTEXT_THRESHOLD: u64 = 272_000;
 
 #[derive(Clone, Copy)]
@@ -117,6 +131,8 @@ impl TokenRates {
             (Model::Glm53, _, _) => GLM53_STANDARD,
             (Model::Kimi, _, _) => KIMI_STANDARD,
             (Model::Mimo, _, _) => MIMO_STANDARD,
+            (Model::Muse, _, _) => MUSE_STANDARD,
+            (Model::MuseContributor, _, _) => MUSE_CONTRIBUTOR,
             (Model::Sol, false, false) => SOL_STANDARD,
             (Model::Sol, true, false) => SOL_PRIORITY,
             (Model::Sol, false, true) => SOL_LONG_CONTEXT_STANDARD,
@@ -161,7 +177,11 @@ impl ServiceTier {
     #[must_use]
     pub const fn for_model(model: Model, fast_mode: bool) -> Self {
         match (model, fast_mode) {
-            (Model::Glm53 | Model::Kimi | Model::Mimo, _) | (_, false) => Self::Standard,
+            (
+                Model::Glm53 | Model::Kimi | Model::Mimo | Model::Muse | Model::MuseContributor,
+                _,
+            )
+            | (_, false) => Self::Standard,
             (Model::Sol | Model::Luna | Model::Astra, true) => Self::Fast,
         }
     }
@@ -371,6 +391,38 @@ mod tests {
             ServiceTier::for_model(Model::Glm53, true),
             ServiceTier::Standard
         );
+    }
+
+    #[test]
+    fn muse_tiers_use_distinct_rates_without_a_long_context_or_fast_surcharge() {
+        let usage = Usage {
+            input_tokens: 1_000_000,
+            input_tokens_details: Some(InputTokenDetails {
+                cached_tokens: 250_000,
+                cache_write_tokens: 0,
+            }),
+            output_tokens: 1_000_000,
+            total_tokens: 2_000_000,
+            ..Usage::default()
+        };
+        for tier in [
+            ServiceTier::Standard,
+            ServiceTier::Priority,
+            ServiceTier::Fast,
+        ] {
+            assert_eq!(
+                estimate_for_model(&usage, Model::Muse, tier)
+                    .amount()
+                    .decimal(),
+                "5.225"
+            );
+            assert_eq!(
+                estimate_for_model(&usage, Model::MuseContributor, tier)
+                    .amount()
+                    .decimal(),
+                "0.2755"
+            );
+        }
     }
 
     #[test]

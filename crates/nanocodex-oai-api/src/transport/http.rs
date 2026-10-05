@@ -14,6 +14,8 @@ const TURN_STATE_HEADER: &str = "x-codex-turn-state";
 pub(crate) struct ResponsesHttp {
     #[cfg(not(target_family = "wasm"))]
     client: reqwest::Client,
+    #[cfg(not(target_family = "wasm"))]
+    muse: bool,
     #[cfg(target_family = "wasm")]
     host: Option<std::sync::Arc<dyn crate::transport::host::HostTransport>>,
 }
@@ -34,8 +36,8 @@ pub(crate) struct HttpMetadata {
 
 #[cfg(not(target_family = "wasm"))]
 impl ResponsesHttp {
-    pub(crate) const fn new(client: reqwest::Client) -> Self {
-        Self { client }
+    pub(crate) const fn new(client: reqwest::Client, muse: bool) -> Self {
+        Self { client, muse }
     }
 
     pub(crate) async fn send(
@@ -54,7 +56,6 @@ impl ResponsesHttp {
             .bearer_auth(auth.bearer())
             .header(header::CONTENT_TYPE, "application/json")
             .header(header::ACCEPT, "text/event-stream")
-            .header(RESPONSES_LITE_HEADER, "true")
             .header("session-id", session_id)
             .header("thread-id", thread_id)
             .header("x-client-request-id", thread_id)
@@ -63,6 +64,11 @@ impl ResponsesHttp {
                 concat!("nanocodex/", env!("CARGO_PKG_VERSION")),
             )
             .body(request.raw().get().to_owned());
+        builder = if self.muse {
+            builder.header("x-api-version", "1.0.0")
+        } else {
+            builder.header(RESPONSES_LITE_HEADER, "true")
+        };
         if let Some(account_id) = auth.account_id() {
             builder = builder.header("ChatGPT-Account-ID", account_id);
         }

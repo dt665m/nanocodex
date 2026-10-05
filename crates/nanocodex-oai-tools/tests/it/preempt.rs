@@ -3,7 +3,7 @@ use serde_json::json;
 use std::time::Duration;
 use tokio::time::timeout;
 
-fn context() -> ToolContext<'static> {
+const fn context() -> ToolContext<'static> {
     ToolContext::new("gpt-6-astra", "preempt-session", "origin-exec", &[], 10000)
 }
 

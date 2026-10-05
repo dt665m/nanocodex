@@ -63,6 +63,13 @@ static ORIGINAL_IMAGE_ESTIMATE_CACHE: LazyLock<Mutex<OriginalImageEstimateCache>
 
 #[must_use]
 pub fn auto_compact_token_limit(model: &str, context_window_tokens: u64) -> Option<u64> {
+    if model.parse().is_ok_and(crate::Model::is_muse) {
+        return Some(if context_window_tokens <= 33_000 {
+            context_window_tokens.saturating_mul(95) / 100
+        } else {
+            context_window_tokens - 33_000
+        });
+    }
     matches!(model, "gpt-6-astra" | "gpt-6.1-sol" | "gpt-6-luna")
         .then_some(context_window_tokens.saturating_mul(9) / 10)
 }
@@ -205,6 +212,9 @@ pub fn install_history_with_provenance(
     compaction: ResponseItem,
     client_authored: &BTreeSet<String>,
 ) -> Vec<ResponseItem> {
+    if crate::muse::is_summary(&compaction) {
+        return crate::muse::install_summary(history, initial_context, compaction);
+    }
     let retained = retained_item_groups(history.iter(), client_authored)
         .filter(|(item, _)| {
             (item.is_user_message() && !is_contextual_user_message(item))

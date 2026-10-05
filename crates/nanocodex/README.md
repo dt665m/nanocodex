@@ -96,6 +96,16 @@ OpenAI dependency. On native targets, add `workspace-tools` to expose Claude's o
 file tools as well as the standard workspace runtime. The `claude` feature
 alone does not enable durability or workspace tools.
 
+## Muse
+
+Enable `muse` on the facade for Muse Spark HTTP/SSE Responses using the shared
+agent loop, tools, events and session types. `nanocodex::Muse::builder(auth)`
+selects Standard; `.model(Model::MuseContributor)` selects Contributor.
+Native OAuth and inference-key credentials are exposed through
+`nanocodex::muse::auth`, with persistence left to the caller. See
+[`nanocodex-muse`](../nanocodex-muse/README.md) for login, compaction and image
+workflow details.
+
 ## Reusable native harnesses
 
 `Harness` composes explicitly registered construction recipes. Each recipe

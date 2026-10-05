@@ -1,0 +1,45 @@
+[package]
+name = "nanocodex-muse"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
+description = "Muse Spark Responses provider and caller-owned OAuth for Nanocodex"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["-D", "warnings"]
+
+[features]
+default = ["openai"]
+openai = ["nanocodex-agent/openai", "nanocodex-oai-api/client", "dep:reqwest", "dep:serde_json"]
+
+[dependencies]
+nanocodex-agent = { version = "0.6.6", path = "../nanocodex-agent", default-features = false }
+nanocodex-oai-api = { version = "0.6.6", path = "../nanocodex-oai-api", default-features = false, features = ["events"] }
+serde.workspace = true
+serde_json = { workspace = true, optional = true }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+reqwest = { workspace = true, features = ["form"], optional = true }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+
+[dev-dependencies]
+base64.workspace = true
+eyre.workspace = true
+image.workspace = true
+nanocodex-oai-tools = { workspace = true, features = ["mcp"] }
+serde_json.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

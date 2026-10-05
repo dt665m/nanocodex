@@ -176,17 +176,35 @@ pub enum Model {
     /// Xiaomi MiMo V2.6 Pro through a host-managed gateway.
     #[serde(rename = "mimo-v2.6-pro", alias = "mimo")]
     Mimo,
+    /// Meta Muse Spark 1.3, using stateless HTTP Responses.
+    #[serde(rename = "muse-spark-1.3")]
+    Muse,
+    /// Discounted Muse Spark 1.3; prompts and completions may train Meta models.
+    #[serde(rename = "muse-spark-1.3-contributor")]
+    MuseContributor,
 }
 
 impl Model {
     /// Supported model catalog in picker order.
     pub const ALL: [Self; 3] = [Self::Astra, Self::Sol, Self::Luna];
 
+    /// Whether this model uses Muse HTTP Responses and client-side compaction.
+    #[must_use]
+    pub const fn is_muse(self) -> bool {
+        matches!(self, Self::Muse | Self::MuseContributor)
+    }
+
     /// Default reasoning effort from the pinned Codex model catalog.
     #[must_use]
     pub const fn default_thinking(self) -> Thinking {
         match self {
-            Self::Astra | Self::Sol | Self::Glm53 | Self::Kimi | Self::Mimo => Thinking::Low,
+            Self::Astra
+            | Self::Sol
+            | Self::Glm53
+            | Self::Kimi
+            | Self::Mimo
+            | Self::Muse
+            | Self::MuseContributor => Thinking::Low,
             Self::Luna => Thinking::Medium,
         }
     }
@@ -200,6 +218,8 @@ impl Model {
             Self::Glm53 => "@cf/zai-org/glm-5.3",
             Self::Kimi => "kimi-k3",
             Self::Mimo => "mimo-v2.6-pro",
+            Self::Muse => "muse-spark-1.3",
+            Self::MuseContributor => "muse-spark-1.3-contributor",
         }
     }
 
@@ -211,7 +231,8 @@ impl Model {
             Self::Glm53 | Self::Mimo => {
                 matches!(thinking, Thinking::Low | Thinking::Medium | Thinking::High)
             }
-            Self::Luna => true,
+            Self::Luna | Self::Muse => true,
+            Self::MuseContributor => !matches!(thinking, Thinking::Max),
             Self::Astra | Self::Sol => !matches!(thinking, Thinking::None),
         }
     }
@@ -222,7 +243,12 @@ impl Model {
         !matches!(
             (self, mode),
             (
-                Self::Astra | Self::Glm53 | Self::Kimi | Self::Mimo,
+                Self::Astra
+                    | Self::Glm53
+                    | Self::Kimi
+                    | Self::Mimo
+                    | Self::Muse
+                    | Self::MuseContributor,
                 ReasoningMode::Pro
             )
         )
@@ -234,7 +260,7 @@ impl Model {
         match self {
             Self::Glm53 => 1_310_720,
             Self::Kimi => 1_000_000,
-            Self::Mimo => 1_048_576,
+            Self::Mimo | Self::Muse | Self::MuseContributor => 1_048_576,
             _ => MAX_CONTEXT_WINDOW_TOKENS,
         }
     }
@@ -257,8 +283,10 @@ impl FromStr for Model {
             "@cf/zai-org/glm-5.3" | "glm-5.3" | "glm53" => Ok(Self::Glm53),
             "kimi-k3" | "kimi" => Ok(Self::Kimi),
             "mimo-v2.6-pro" | "mimo" => Ok(Self::Mimo),
+            "muse-spark-1.3" | "muse" => Ok(Self::Muse),
+            "muse-spark-1.3-contributor" => Ok(Self::MuseContributor),
             _ => Err(format!(
-                "invalid model {value:?}; expected gpt-6-astra, gpt-6.1-sol, gpt-6-luna, @cf/zai-org/glm-5.3, kimi-k3, or mimo-v2.6-pro"
+                "invalid model {value:?}; expected gpt-6-astra, gpt-6.1-sol, gpt-6-luna, @cf/zai-org/glm-5.3, kimi-k3, mimo-v2.6-pro, muse-spark-1.3, or muse-spark-1.3-contributor"
             )),
         }
     }
@@ -958,3 +986,6 @@ mod image_file_prompt_tests {
         }
     }
 }
+
+#[cfg(feature = "client")]
+mod muse;

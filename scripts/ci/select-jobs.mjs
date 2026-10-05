@@ -217,6 +217,7 @@ const gate = {
   "voice-native": o => o.voice,
   "windows-hand": o => o.windows,
   clippy: o => o.rust,
+  "muse-journeys": o => o.rust,
   "rust-extra": o => o.rust_extra,
   "vm-guest": o => o.vm,
   policy: o => o.policy,

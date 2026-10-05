@@ -22,6 +22,27 @@ const TINY_PNG: &[u8] = &[
     5, 0, 1, 255, 137, 153, 61, 29, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
 ];
 
+#[test]
+fn muse_responses_images_require_a_completed_image_and_preserve_format() {
+    let encoded = BASE64_STANDARD.encode(TINY_PNG);
+    let response = json!({"status":"completed","output":[
+        {"type":"message","role":"assistant","content":[]},
+        {"type":"image_generation_call","id":"ig-test","status":"completed","result":encoded,"output_format":"png"}
+    ]});
+    let parsed = super::muse_image_response(&serde_json::to_vec(&response).unwrap()).unwrap();
+    assert_eq!(parsed.data[0].b64_json.as_deref(), Some(encoded.as_str()));
+    assert_eq!(parsed.generation_id.as_deref(), Some("ig-test"));
+    assert_eq!(parsed.output_format.as_deref(), Some("png"));
+    for invalid in [
+        json!({"status":"incomplete","output":response["output"]}),
+        json!({"status":"completed","output":[]}),
+        json!({"status":"completed","output":[{"type":"image_generation_call","status":"in_progress","result":encoded}]}),
+        json!({"status":"completed","output":[{"type":"image_generation_call","status":"completed","result":null}]}),
+    ] {
+        assert!(super::muse_image_response(&serde_json::to_vec(&invalid).unwrap()).is_err());
+    }
+}
+
 #[tokio::test]
 async fn generation_uses_codex_images_request_and_persists_result() -> Result<()> {
     let workspace = temporary_workspace("image-generation")?;

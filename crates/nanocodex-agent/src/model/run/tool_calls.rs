@@ -246,9 +246,14 @@ where
                     let (result, persist_result) = if let Some(mut completed) = recovered {
                         // Legacy effect receipts bypass fresh tool execution. Prepare
                         // their media before those response items enter history too.
-                        prepare_output_images(&mut completed.output).await;
-                        nanocodex_oai_tools::image::prepare_history_images(
+                        prepare_output_images_with_policy(
+                            &mut completed.output,
+                            ImagePolicy::for_model(model),
+                        )
+                        .await;
+                        nanocodex_oai_tools::image::prepare_history_images_with_policy(
                             &mut completed.response_items,
+                            ImagePolicy::for_model(model),
                         );
                         (Ok(completed), false)
                     } else {
@@ -570,11 +575,12 @@ where
         if !code_mode_entrypoint
             && matches!(call.kind, CodeCallKind::Function | CodeCallKind::Custom)
         {
+            let tool_history = history.as_deref().map_or(&[][..], Vec::as_slice);
             let context = ToolContext::new(
                 model.as_str(),
                 session_id,
                 &call.call_id,
-                &[],
+                tool_history,
                 DEFAULT_TOOL_OUTPUT_TOKENS,
             )
             .with_instruction_revision(instruction_revision)
@@ -607,7 +613,8 @@ where
             // The explicit result is retained by CompletedToolCall. Move it before
             // image preparation instead of keeping another large copy alive.
             let structured_result = execution.take_structured_result();
-            prepare_output_images(&mut execution.output).await;
+            prepare_output_images_with_policy(&mut execution.output, ImagePolicy::for_model(model))
+                .await;
             if let Some(content) = serialize_trace_content(&execution.output) {
                 record_span_content(tool_span, "tool.output", &content);
             }
@@ -731,7 +738,8 @@ where
             return Err(error);
         }
         let structured_result = execution.output.structured_result();
-        prepare_output_images(&mut execution.output).await;
+        prepare_output_images_with_policy(&mut execution.output, ImagePolicy::for_model(model))
+            .await;
         if let Some(content) = serialize_trace_content(&execution.output) {
             record_span_content(tool_span, "tool.output", &content);
         }
