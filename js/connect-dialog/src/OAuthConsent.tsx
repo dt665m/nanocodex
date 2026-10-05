@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import "./OAuthConsent.css";
 import { AccountChooser } from "nanocodex-connect-ui/AccountChooser";
 import {
   BrowserAccountReauthenticationRequiredError,
@@ -147,7 +148,7 @@ export function OAuthConsent() {
     }
   }
 
-  return <section className="connect-onboarding dialog-shell" data-request="oauth-consent">
+  return <section className="connect-onboarding dialog-shell oauth-consent" data-request="oauth-consent">
     <header className="dialog-header">
       <span className="wordmark">Nanocodex Connect</span>
       <span className="secure-label">MCP authorization</span>
@@ -158,23 +159,25 @@ export function OAuthConsent() {
           <h1 id="oauth-heading">Connect {request.client_name}</h1>
           <p className="request-copy">This client name is provided by its developer and is not verified by Nanocodex.</p>
         </section>
-        <section aria-label="Requested access">
+        <section className="oauth-permissions" aria-label="Requested access">
           <h2>Requested access</h2>
           <p>Choose the permissions to share with this client.</p>
-          <ul>{request.scope.split(" ").map(scope => <li key={scope}>
+          <ul className="oauth-scope-list">{request.scope.split(" ").map(scope => <li key={scope}>
             <label><input type="checkbox" checked={selectedScopes.includes(scope)} disabled={busy || finished}
               onChange={event => setSelectedScopes(current => event.target.checked
                 ? [...current, scope] : current.filter(value => value !== scope))} />
-              {scopeLabel(scope)} <code>{scope}</code>
+              <span>{scopeLabel(scope)}<code>{scope}</code></span>
             </label>
           </li>)}</ul>
           <p>Only the selected permissions are granted.</p>
-          <p>MCP server: <code>{request.resource}</code></p>
-          <p>Return address: <code>{request.redirect_uri}</code></p>
+          <dl className="oauth-destinations">
+            <div><dt>MCP server</dt><dd><code>{request.resource}</code></dd></div>
+            <div><dt>Return address</dt><dd><code>{request.redirect_uri}</code></dd></div>
+          </dl>
         </section>
         {account === undefined && !failure ? <p role="status">Checking your account session…</p> : null}
-        {account && !finished ? <section aria-label="Selected account">
-          <p>Account: <code>{account.address}</code></p>
+        {account && !finished ? <section className="oauth-account" aria-label="Selected account">
+          <h2>Selected account</h2><code>{account.address}</code>
           <button type="button" disabled={busy} onClick={() => void changeAccount()}>Use another account</button>
         </section> : null}
         {account === null && !finished ? <AccountChooser
