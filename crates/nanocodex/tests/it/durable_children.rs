@@ -473,6 +473,55 @@ async fn lifetime_journey(claude: bool) {
     drop((reopened, reopened_events));
 }
 
+#[tokio::test]
+async fn native_background_child_survives_parent_shutdown() {
+    background_departure(false).await;
+}
+
+#[cfg(feature = "claude")]
+#[tokio::test]
+async fn claude_background_child_survives_parent_shutdown() {
+    background_departure(true).await;
+}
+
+async fn background_departure(claude: bool) {
+    let fixture = Fixture::start_family("background-departure", claude, None).await;
+    let (parent, events) = fixture.parent().await;
+    let turn = parent
+        .prompt(PromptRequest::new("spawn-background").request_id("background"))
+        .await
+        .unwrap();
+    tokio::time::timeout(DEADLINE, fixture.child_started.notified())
+        .await
+        .unwrap();
+    tokio::time::timeout(DEADLINE, turn.result())
+        .await
+        .unwrap()
+        .unwrap();
+    parent.shutdown().await.unwrap();
+    drop((parent, events));
+    // The original parent's driver is gone while the real child HTTP call is
+    // still gated. Its submit_result must remain callable after departure.
+    fixture.child_release.notify_one();
+    tokio::time::timeout(DEADLINE, fixture.child_finished.notified())
+        .await
+        .expect("background child must submit its result after parent shutdown");
+    let (reopened, events) = fixture.parent().await;
+    reopened.ready().await.unwrap();
+    let directory: Value =
+        serde_json::from_str(&answer(&reopened, "directory", "after-departure").await).unwrap();
+    assert_eq!(directory["agents"][0]["status"]["state"], "completed");
+    assert_eq!(
+        directory["agents"][0]["status"]["output"],
+        "native-child-result"
+    );
+    println!(
+        "BACKGROUND_DEPARTURE claude={claude}: parent shutdown before child gate opened; result accepted and retained after reopen"
+    );
+    reopened.shutdown().await.unwrap();
+    drop((reopened, events));
+}
+
 fn directory_completed(directory: &Value) -> Value {
     let mut directory = directory.clone();
     for agent in directory["agents"].as_array_mut().unwrap() {

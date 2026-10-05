@@ -12,7 +12,10 @@ use nanocodex_oai_api::{
     tower::{ResponsesAttempt, ResponsesServiceResponse},
 };
 use nanocodex_subagents::{Registry, RegistryOwnership, channel, install_tools};
-use std::{future::Future, sync::Arc};
+use std::{
+    future::Future,
+    sync::{Arc, Weak},
+};
 use tower::Service;
 
 type Result<T> = nanocodex_agent::Result<T>;
@@ -72,7 +75,7 @@ where
         let factory = Arc::new(NativeChildren {
             recipe: self.clone().fresh_child(),
             state: state.clone(),
-            registry: registry.clone(),
+            registry: Arc::downgrade(&registry),
         });
         let builder = self
             .session_id(session)
@@ -86,7 +89,9 @@ where
 struct NativeChildren<F> {
     recipe: NanocodexBuilder<F>,
     state: DurableSession,
-    registry: Arc<Registry>,
+    // Installed tools and ownership barriers retain the live registry. Its
+    // registered factory capabilities must not retain it in return.
+    registry: Weak<Registry>,
 }
 
 impl<F> NativeChildren<F>
@@ -104,6 +109,10 @@ where
         snapshot: Option<ChildSnapshot>,
     ) -> Result<(Nanocodex, AgentEvents)> {
         parent.ensure_available().await?;
+        let registry = self
+            .registry
+            .upgrade()
+            .ok_or(NanocodexError::AgentStopped)?;
         let (model, thinking) = parent.settings().await?;
         let options = options.resolve(model, thinking)?;
         let HarnessModel::Codex(model) = options.selected_harness_model().expect("resolved") else {
@@ -120,7 +129,7 @@ where
             .thinking(options.selected_thinking().expect("resolved"))
             .host_context(context)
             .spawn_factory(self.clone())
-            .turn_ownership(Arc::new(RegistryOwnership(self.registry.clone())));
+            .turn_ownership(Arc::new(RegistryOwnership(registry.clone())));
         let session = match snapshot {
             Some(snapshot) => {
                 let session = match &snapshot {
@@ -132,7 +141,6 @@ where
             }
             None => SessionId::new(),
         };
-        let registry = self.registry.clone();
         builder = builder
             .session_id(session)
             .map_tools_factory(move |handle, tools| install_tools(tools, handle, registry.clone()));
@@ -216,14 +224,18 @@ impl DurableAgentExt for nanocodex_claude::ClaudeBuilder {
         let factory = Arc::new(ClaudeChildren {
             recipe: self.clone().fresh_child(),
             state: state.clone(),
-            registry: registry.clone(),
+            registry: Arc::downgrade(&registry),
         });
+        let tools_registry = Arc::downgrade(&registry);
         let builder = self
             .session_id(session)
             .spawn_factory(factory)
             .turn_ownership(Arc::new(RegistryOwnership(registry.clone())))
             .map_tools_factory(move |handle, tools| {
-                nanocodex_subagents::install_claude_tools(tools, handle, registry.clone())
+                let registry = tools_registry
+                    .upgrade()
+                    .ok_or(NanocodexError::AgentStopped)?;
+                nanocodex_subagents::install_claude_tools(tools, handle, registry)
             });
         nanocodex_durability::DurableAgentExt::durability(builder, state).await
     }
@@ -234,7 +246,9 @@ impl DurableAgentExt for nanocodex_claude::ClaudeBuilder {
 struct ClaudeChildren {
     recipe: nanocodex_claude::ClaudeBuilder,
     state: DurableSession,
-    registry: Arc<Registry>,
+    // Installed tools and ownership barriers retain the live registry. Its
+    // registered factory capabilities must not retain it in return.
+    registry: Weak<Registry>,
 }
 
 #[cfg(feature = "claude")]
@@ -247,6 +261,10 @@ impl ClaudeChildren {
         snapshot: Option<ChildSnapshot>,
     ) -> Result<(Nanocodex, AgentEvents)> {
         parent.ensure_available().await?;
+        let registry = self
+            .registry
+            .upgrade()
+            .ok_or(NanocodexError::AgentStopped)?;
         let (model, thinking) = parent.settings().await?;
         let options = options.resolve(model, thinking)?;
         let model = options.selected_harness_model().expect("resolved");
@@ -263,7 +281,7 @@ impl ClaudeChildren {
             .thinking(options.selected_thinking().expect("resolved"))?
             .host_context(context)
             .spawn_factory(self.clone())
-            .turn_ownership(Arc::new(RegistryOwnership(self.registry.clone())));
+            .turn_ownership(Arc::new(RegistryOwnership(registry.clone())));
         let session = match snapshot {
             Some(snapshot) => {
                 let session = match &snapshot {
@@ -279,11 +297,14 @@ impl ClaudeChildren {
             }
             None => format!("{}/child/{}", self.state.state_id(), SessionId::new()),
         };
-        let registry = self.registry.clone();
+        let tools_registry = Arc::downgrade(&registry);
         builder = builder
             .session_id(session.clone())
             .map_tools_factory(move |handle, tools| {
-                nanocodex_subagents::install_claude_tools(tools, handle, registry.clone())
+                let registry = tools_registry
+                    .upgrade()
+                    .ok_or(NanocodexError::AgentStopped)?;
+                nanocodex_subagents::install_claude_tools(tools, handle, registry)
             });
         let state = DurableSession::open(self.state.child_store(), session)
             .await
