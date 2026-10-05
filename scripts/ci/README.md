@@ -27,20 +27,12 @@ unavailable diff or Cargo graph, and non-PR/push events select everything
 `crossPackageInputs`.
 
 Draft PRs get only the fast lane (fmt/Clippy on affected crates, WASM Clippy,
-policy, JS typecheck/build and the standalone service journeys); marking ready
-reruns CI with the heavy lane. Only
+policy, JS typecheck/build); marking ready reruns CI with the heavy lane. Only
 superseded PR runs are cancelled. `pnpm check:fast` runs the fast-lane
 fmt + Clippy command locally for crates changed since `origin/master`.
 
-Broad test suites are paused: they run only when `NANOCODEX_CI_TESTS` in `ci.yml`
-is `on`. Focused standalone service SDK, HTTP, durable recovery, and browser
-journeys run in the selected `bindings` and `apps` jobs even for draft PRs, like
-the existing private browser input journeys. They reuse the jobs' WASM artifact,
-evaluator, and Chromium setup; `standalone-service-journeys` and
-`standalone-service-browser-journeys` retain receipts, traces, screenshots, and
-logs on failure as well as success. Account Worker entrypoint changes select
-bindings too, and managed browser runtime changes select apps too, because those
-journeys consume code across package boundaries. Rust tests use `cargo nextest run --profile ci` (`.config/nextest.toml`).
+Automatic tests are paused: they run only when `NANOCODEX_CI_TESTS` in `ci.yml`
+is `on`. Rust tests use `cargo nextest run --profile ci` (`.config/nextest.toml`).
 When re-enabling, add `hands` to `vm-guest`'s condition (its Docker tests run
 `nanocodex2`).
 
