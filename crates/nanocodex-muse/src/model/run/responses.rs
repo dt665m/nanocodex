@@ -110,7 +110,8 @@ where
             if let Some(steps) = &execution_steps {
                 steps.complete(&step_id, &output).await?;
             }
-            (output, true)
+            // Muse never stores responses; every continuation replays full history.
+            (output, false)
         };
         let RecordedModelResult {
             response,

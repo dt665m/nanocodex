@@ -140,6 +140,21 @@ fn images(body: &Value) -> Vec<&Value> {
         .collect()
 }
 fn receipt<'a>(body: &'a Value, call_id: &str) -> &'a Value {
+    let input = body["input"].as_array().unwrap();
+    let call = input
+        .iter()
+        .position(|item| item["type"] == "function_call" && item["call_id"] == call_id)
+        .expect("stateless continuation must replay the matching tool call");
+    let output = input
+        .iter()
+        .position(|item| item["type"] == "function_call_output" && item["call_id"] == call_id)
+        .expect("tool receipt must be present");
+    assert!(call < output, "the tool call must precede its receipt");
+    assert!(
+        body["tools"]
+            .as_array()
+            .is_some_and(|tools| !tools.is_empty())
+    );
     &body["input"]
         .as_array()
         .unwrap()
