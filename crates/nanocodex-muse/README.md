@@ -6,6 +6,11 @@ The reference crate is unchanged. This copy differs for Muse image preparation,
 image generation, summary compaction, and the provider recipe; shared Responses,
 events, tool contracts, ToolRuntime, auth-source and transport types remain imports.
 
+The system prompt is adapted from [OpenCode's Meta prompt](https://github.com/anomalyco/opencode/blob/b9f3b382fcfd82b57103b29b77572f112ce9e1e5/packages/opencode/src/session/prompt/meta.txt).
+General guidance is retained; OpenCode tool workflows, modes and product links
+are omitted. Available tools are described by the harness's tool definitions.
+The source's MIT notice is retained in `THIRD-PARTY-LICENSES`.
+
 The optional `nanocodex` facade feature exports `Muse`, `MuseBuilder`, `MuseModel`,
 and `nanocodex::muse`. `Nanocodex::builder(Muse::builder(auth).build()?)` selects
 the Muse-owned lifecycle builder, whose agent and snapshots belong to this crate.
