@@ -12,10 +12,9 @@ const TURN_STATE_HEADER: &str = "x-codex-turn-state";
 
 #[derive(Clone)]
 pub(crate) struct ResponsesHttp {
+    dialect: Option<std::sync::Arc<dyn crate::tower::ResponsesDialect>>,
     #[cfg(not(target_family = "wasm"))]
     client: reqwest::Client,
-    #[cfg(not(target_family = "wasm"))]
-    muse: bool,
     #[cfg(target_family = "wasm")]
     host: Option<std::sync::Arc<dyn crate::transport::host::HostTransport>>,
 }
@@ -36,8 +35,11 @@ pub(crate) struct HttpMetadata {
 
 #[cfg(not(target_family = "wasm"))]
 impl ResponsesHttp {
-    pub(crate) const fn new(client: reqwest::Client, muse: bool) -> Self {
-        Self { client, muse }
+    pub(crate) const fn new(
+        client: reqwest::Client,
+        dialect: Option<std::sync::Arc<dyn crate::tower::ResponsesDialect>>,
+    ) -> Self {
+        Self { client, dialect }
     }
 
     pub(crate) async fn send(
@@ -64,11 +66,18 @@ impl ResponsesHttp {
                 concat!("nanocodex/", env!("CARGO_PKG_VERSION")),
             )
             .body(request.raw().get().to_owned());
-        builder = if self.muse {
-            builder.header("x-api-version", "1.0.0")
-        } else {
-            builder.header(RESPONSES_LITE_HEADER, "true")
-        };
+        if self
+            .dialect
+            .as_ref()
+            .is_none_or(|dialect| dialect.responses_lite_headers())
+        {
+            builder = builder.header(RESPONSES_LITE_HEADER, "true");
+        }
+        if let Some(dialect) = &self.dialect {
+            for (name, value) in dialect.http_headers() {
+                builder = builder.header(*name, *value);
+            }
+        }
         if let Some(account_id) = auth.account_id() {
             builder = builder.header("ChatGPT-Account-ID", account_id);
         }
@@ -324,8 +333,9 @@ mod tests {
 impl ResponsesHttp {
     pub(crate) fn new(
         host: Option<std::sync::Arc<dyn crate::transport::host::HostTransport>>,
+        dialect: Option<std::sync::Arc<dyn crate::tower::ResponsesDialect>>,
     ) -> Self {
-        Self { host }
+        Self { host, dialect }
     }
 
     pub(crate) async fn send(
@@ -355,7 +365,8 @@ impl ResponsesHttp {
                     session_id,
                     thread_id,
                     turn_state,
-                ),
+                )
+                .with_dialect(self.dialect.as_deref()),
                 request.raw().get(),
             )
             .await

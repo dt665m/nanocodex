@@ -66,7 +66,7 @@ use nanocodex_oai_tools::{
     ToolContext, Tools,
     code_mode::{CodeModeExecution, CodeModeObserver, CodeModeUpdate},
     contract::{DEFAULT_TOOL_OUTPUT_TOKENS, ToolInput, ToolOutput, ToolOutputBody},
-    image::{ImagePolicy, prepare_output_images_with_policy, prepare_user_input_with_policy},
+    image::{prepare_output_images, prepare_user_input},
     runtime::{
         ImageGenerationConfig, OwnedToolContext, ToolRuntime, ToolRuntimeControl, WebSearchConfig,
     },
@@ -528,10 +528,7 @@ pub(crate) fn prepare_resumed_checkpoint(
     session_id: &str,
     context_source: ContextSource,
 ) -> Result<PreparedCheckpoint> {
-    if checkpoint
-        .conversation
-        .prepare_replay_images(ImagePolicy::for_model(config.model))
-    {
+    if checkpoint.conversation.prepare_replay_images() {
         checkpoint.preserve_inherited_delta = false;
     }
     // Unstored response IDs are scoped to the live transport connection. A fork

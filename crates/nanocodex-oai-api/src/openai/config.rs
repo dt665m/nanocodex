@@ -19,6 +19,8 @@ const ASTRA_SYSTEM_PROMPT: &str = include_str!("../../prompts/astra.md");
 /// [`ResponsesServiceFactory`]: super::ResponsesServiceFactory
 #[derive(Clone)]
 pub struct ModelConfig {
+    /// Optional wire translation owned by an external provider.
+    pub dialect: Option<Arc<dyn crate::tower::ResponsesDialect>>,
     /// Selected OpenAI coding model.
     pub model: Model,
     /// Optional namespace prepended to the model identifier on the wire.
@@ -84,26 +86,22 @@ impl ModelConfig {
     #[must_use]
     pub fn system_prompt(&self) -> Cow<'_, str> {
         let base = self.system_prompt.as_deref().unwrap_or(match self.model {
+            Model::External(model) => model.system_prompt,
             Model::Astra => ASTRA_SYSTEM_PROMPT,
-            Model::Glm53 | Model::Kimi | Model::Mimo | Model::Muse | Model::MuseContributor => {
-                GLM_SYSTEM_PROMPT
-            }
+            Model::Glm53 | Model::Kimi | Model::Mimo => GLM_SYSTEM_PROMPT,
             Model::Sol => SOL_SYSTEM_PROMPT,
             Model::Luna => LUNA_SYSTEM_PROMPT,
         });
-        let base = if self.system_prompt.is_none()
-            && matches!(
-                self.model,
-                Model::Kimi | Model::Mimo | Model::Muse | Model::MuseContributor
-            ) {
-            Cow::Owned(base.replacen(
-                "powered by Z.ai GLM-5.3",
-                &format!("powered by {}", self.model.as_str()),
-                1,
-            ))
-        } else {
-            Cow::Borrowed(base)
-        };
+        let base =
+            if self.system_prompt.is_none() && matches!(self.model, Model::Kimi | Model::Mimo) {
+                Cow::Owned(base.replacen(
+                    "powered by Z.ai GLM-5.3",
+                    &format!("powered by {}", self.model.as_str()),
+                    1,
+                ))
+            } else {
+                Cow::Borrowed(base)
+            };
         match self.additional_instructions.as_deref() {
             Some(additional) if !additional.is_empty() => {
                 Cow::Owned(format!("{base}\n\n{additional}"))
@@ -122,6 +120,7 @@ impl ModelConfig {
 impl Default for ModelConfig {
     fn default() -> Self {
         Self {
+            dialect: None,
             model: Model::default(),
             model_id_prefix: None,
             auth: OpenAiAuth::api_key(String::new()),

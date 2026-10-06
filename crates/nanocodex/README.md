@@ -98,13 +98,12 @@ alone does not enable durability or workspace tools.
 
 ## Muse
 
-Enable `muse` on the facade for Muse Spark HTTP/SSE Responses using the shared
-agent loop, tools, events and session types. `nanocodex::Muse::builder(auth)`
-selects Standard; `.model(Model::MuseContributor)` selects Contributor.
-Native OAuth and inference-key credentials are exposed through
-`nanocodex::muse::auth`, with persistence left to the caller. See
-[`nanocodex-muse`](../nanocodex-muse/README.md) for login, compaction and image
-workflow details.
+Enable `muse` for the Muse-owned adaptation of the reference agent loop, sharing
+Responses transports and tool types. `Muse::builder(auth)` selects Standard;
+`.model(MuseModel::Contributor)` selects Contributor. `Nanocodex::builder(muse)`
+returns the Muse lifecycle builder. Its agent and snapshots are available through
+`nanocodex::muse`; `nanocodex-agent` remains the unchanged reference implementation.
+See [nanocodex-muse](../nanocodex-muse/README.md) for OAuth, images, and compaction.
 
 ## Reusable native harnesses
 

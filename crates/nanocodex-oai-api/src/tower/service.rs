@@ -482,15 +482,9 @@ impl ResponsesService {
                 ))
             }
         };
-        let encoded = if request.model().is_muse() {
-            encoded.and_then(|encoded| {
-                crate::muse::encode(
-                    encoded,
-                    matches!(request.kind, ResponsesAttemptKind::Compaction),
-                )
-            })
-        } else {
-            encoded
+        let encoded = match &self.config.dialect {
+            Some(dialect) => encoded.and_then(|encoded| dialect.encode(encoded, request.kind)),
+            None => encoded,
         };
         encoded.map_err(|error| {
             ResponsesServiceError::responses(error, FailurePhase::Encode, connection.generation)

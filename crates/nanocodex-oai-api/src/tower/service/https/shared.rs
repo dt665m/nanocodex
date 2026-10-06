@@ -67,12 +67,11 @@ pub(crate) async fn run(
     connection.observe_turn_state(metadata.turn_state.as_deref());
     let send_duration_ns = elapsed_ns(send_started_at);
     span.record("request.send.duration_ns", send_duration_ns);
-    // Muse has no compact endpoint; it streams a generation that becomes the summary.
-    let receive_kind = if request.model().is_muse() {
-        ResponsesAttemptKind::Generation
-    } else {
-        request.kind
-    };
+    let receive_kind = service
+        .config
+        .dialect
+        .as_ref()
+        .map_or(request.kind, |dialect| dialect.receive_kind(request.kind));
     let output = match receive_kind {
         ResponsesAttemptKind::Generation => ResponsesOutput::Generation(
             stream::receive(
@@ -96,10 +95,9 @@ pub(crate) async fn run(
         ),
         ResponsesAttemptKind::Warmup => unreachable!("warmup rejected above"),
     };
-    let output = if request.model().is_muse() {
-        crate::muse::decode(output, request)?
-    } else {
-        output
+    let output = match &service.config.dialect {
+        Some(dialect) => dialect.decode(output, request)?,
+        None => output,
     };
     let pipeline_stats = match &output {
         ResponsesOutput::Generation(result) => result.pipeline_stats,
@@ -150,7 +148,12 @@ async fn send_with_auth_recovery(
         .await
     {
         Err(ResponsesError::HttpRejected { status: 401, .. })
-            if auth.mode() == OpenAiAuthMode::ChatGpt || service.config.model.is_muse() =>
+            if auth.mode() == OpenAiAuthMode::ChatGpt
+                || service
+                    .config
+                    .dialect
+                    .as_ref()
+                    .is_some_and(|dialect| dialect.recover_api_key()) =>
         {
             service
                 .config

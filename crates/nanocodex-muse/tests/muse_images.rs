@@ -5,7 +5,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use eyre::{Result, eyre};
 use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
 use nanocodex_muse::{
-    Model, Muse, Nanocodex, Tools,
+    Muse, Nanocodex, Tools,
     input::{ImageDetail, Prompt, UserInput},
     tools::ToolExposure,
 };
@@ -581,7 +581,7 @@ async fn generation_journey(exposure: ToolExposure) -> Result<()> {
         Result::<()>::Ok(())
     });
     let provider = Muse::builder("synthetic-key")
-        .model(Model::MuseContributor)
+        .model(nanocodex_muse::MuseModel::Contributor)
         .api_base_url(endpoint)
         .context_window_tokens(40_000)
         .build()?;

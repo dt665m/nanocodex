@@ -24,7 +24,10 @@ impl ServicePlatform {
     pub(crate) fn new(config: &ModelConfig) -> Self {
         Self {
             host: config.host_transport.clone(),
-            http: crate::http::ResponsesHttp::new(config.host_transport.clone()),
+            http: crate::http::ResponsesHttp::new(
+                config.host_transport.clone(),
+                config.dialect.clone(),
+            ),
         }
     }
 }

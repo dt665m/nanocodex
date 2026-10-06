@@ -122,12 +122,6 @@ where
         ) else {
             return Ok(false);
         };
-        if self.model.is_muse()
-            && !self.force_compaction
-            && !conversation.muse_compaction.allows_auto_compaction()
-        {
-            return Ok(false);
-        }
         let active_context_tokens = conversation.active_context_tokens();
         if !self.force_compaction && active_context_tokens < auto_compact_token_limit {
             return Ok(false);
@@ -158,9 +152,6 @@ where
                     factory.profile().prefix(),
                 );
             }
-        }
-        if self.model.is_muse() {
-            conversation.muse_compaction.compacted(true);
         }
         self.force_compaction = false;
         Ok(true)
@@ -403,12 +394,10 @@ where
                 }
             }
         }
-        if !self.model.is_muse() {
-            history.fit_context_window(
-                factory.profile().prefix(),
-                self.config.context_window_tokens,
-            );
-        }
+        history.fit_context_window(
+            factory.profile().prefix(),
+            self.config.context_window_tokens,
+        );
         let started_at = Instant::now();
         self.stats.compactions += 1;
         self.events.emit(

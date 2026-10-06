@@ -135,19 +135,19 @@ async fn malformed_custom_tool_wrappers_fail_without_panicking_the_agent() -> Re
 
 #[tokio::test]
 async fn muse_edits_a_file_compacts_and_continues_with_authentic_tool_receipts() -> Result<()> {
-    file_edit_compaction_journey(Model::Muse).await
+    file_edit_compaction_journey(nanocodex_muse::MuseModel::Spark.into()).await
 }
 
 #[tokio::test]
 async fn contributor_uses_its_model_id_for_tools_compaction_and_continuation() -> Result<()> {
     assert!(
         Muse::builder("synthetic-test-key")
-            .model(Model::MuseContributor)
+            .model(nanocodex_muse::MuseModel::Contributor)
             .thinking(Thinking::Max)
             .build()
             .is_err()
     );
-    file_edit_compaction_journey(Model::MuseContributor).await
+    file_edit_compaction_journey(nanocodex_muse::MuseModel::Contributor.into()).await
 }
 
 async fn file_edit_compaction_journey(model: Model) -> Result<()> {

@@ -139,6 +139,13 @@ pub struct OpenAiBuilder<F = StandardServiceFactory> {
 }
 
 impl<F> OpenAiBuilder<F> {
+    /// Installs a provider-owned wire adapter on the shared transport.
+    #[must_use]
+    pub fn dialect(mut self, dialect: impl crate::tower::ResponsesDialect + 'static) -> Self {
+        self.config.dialect = Some(Arc::new(dialect));
+        self
+    }
+
     /// Selects the default coding model for new sessions and agents.
     ///
     /// A higher-level session or agent builder may override this reusable
@@ -148,10 +155,7 @@ impl<F> OpenAiBuilder<F> {
         self.config.model = model;
         // Workers AI is a stateless chat binding behind the host Responses adapter.
         // Preserve the agent loop while selecting its existing full-replay HTTP path.
-        if matches!(
-            model,
-            Model::Glm53 | Model::Kimi | Model::Mimo | Model::Muse | Model::MuseContributor
-        ) {
+        if matches!(model, Model::Glm53 | Model::Kimi | Model::Mimo) {
             self.config.responses_transport = ResponsesTransport::Https;
             self.config.responses_history = ResponsesHistory::FullReplay;
             self.config.store_responses = false;

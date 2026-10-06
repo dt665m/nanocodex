@@ -18,7 +18,7 @@ pub use harness::{Harness, HarnessBuilder, HarnessRequest};
 pub use nanocodex_claude::Claude;
 #[cfg(feature = "muse")]
 #[cfg_attr(docsrs, doc(cfg(feature = "muse")))]
-pub use nanocodex_muse::{Muse, MuseBuilder};
+pub use nanocodex_muse::{Muse, MuseBuilder, MuseModel};
 
 #[cfg(feature = "durability")]
 #[cfg_attr(docsrs, doc(cfg(feature = "durability")))]

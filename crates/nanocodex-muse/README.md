@@ -1,17 +1,19 @@
 # Nanocodex Muse
 
-Muse Spark 1.3 over HTTP/SSE Responses, using Nanocodex's existing agent lifecycle,
-Responses client, tools, sessions, snapshots, cancellation, and public types.
-This crate adds the Muse provider recipe and native account authentication; it
-re-exports `nanocodex-agent` rather than copying its implementation.
+Muse Spark 1.3 over HTTP/SSE Responses. The lifecycle and loop are lifted from
+`nanocodex-agent` at upstream commit `8bfb67ad2dbb7d3b5d031cc44d563fd2471355e3`.
+The reference crate is unchanged. This copy differs for Muse image preparation,
+image generation, summary compaction, and the provider recipe; shared Responses,
+events, tool contracts, ToolRuntime, auth-source and transport types remain imports.
 
-The `nanocodex` facade's optional `muse` feature also exports `Muse`,
-`MuseBuilder`, and `nanocodex::muse::auth` (native targets), so applications can
-use one dependency and the canonical Nanocodex types.
+The optional `nanocodex` facade feature exports `Muse`, `MuseBuilder`, `MuseModel`,
+and `nanocodex::muse`. `Nanocodex::builder(Muse::builder(auth).build()?)` selects
+the Muse-owned lifecycle builder, whose agent and snapshots belong to this crate.
+Use `nanocodex::muse` for lifecycle-specific types. See [reference provenance](REFERENCE.md).
 
 `Muse::builder(auth)` selects Standard (`muse-spark-1.3`),
 `https://api.meta.ai/v1`, low reasoning, and client-owned full history (`store:
-false`, encrypted reasoning replay). `.model(Model::MuseContributor)` selects
+false`, encrypted reasoning replay). `.model(MuseModel::Contributor)` selects
 `muse-spark-1.3-contributor`, which permits Meta training. Contributor does not
 support `Thinking::Max`. No WebSocket connection is attempted.
 
@@ -67,7 +69,7 @@ OAuth parameters follow the Muse CLI and the
 
 ## Context and images
 
-The shared agent uses Claude-style client-side summary compaction for Muse:
+The Muse loop uses Claude-style client-side summary compaction for Muse:
 reserve 20,000 output plus 13,000 thinking tokens, summarize through Responses
 with tools disabled, validate a completed nonempty summary, then retain the
 latest complete reasoning/tool round and receipts. Manual compaction, automatic
@@ -76,13 +78,13 @@ at one boundary is suppressed and rapid compactions are throttled. Other model
 providers retain their existing compaction behavior.
 
 `input::Prompt::content` accepts upstream `UserInput::LocalImage`, `Image` (data
-or public HTTP(S) URL), and `ImageFile`. The shared image machinery preserves
+or public HTTP(S) URL), and `ImageFile`. The adapted upstream image machinery preserves
 `auto`, `low`, `high`, and `original` detail. User images serialize as typed
 `input_image` parts with a string `image_url` or `file_id`. MCP screenshots and
 image tool results remain typed `function_call_output.output` arrays, matching
 [OpenCode's Responses serializer](https://github.com/vercel/ai/blob/@ai-sdk/openai@3.0.88/packages/openai/src/responses/convert-to-openai-responses-input.ts).
 
-`Tools::builder().image_generation(true)` enables the shared
+`Tools::builder().image_generation(true)` enables the imported
 `image_gen__imagegen` tool. For Muse sessions it makes a separate `/responses`
 request with `model: "muse-image-1.0"`, `store: false`, user `input_text` plus
 optional `input_image` references, and only

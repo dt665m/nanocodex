@@ -17,5 +17,3 @@ Guidelines:
 - Always use this tool for image editing unless the user explicitly requests otherwise. Do not use the `python` tool for image editing unless specifically instructed.
 
 For transparent cutouts or edits that preserve transparency, set transparent_background=true. Omitted or false explicitly produces an opaque background. Recent images may be inline data or provider file-ID references; the exact newest selected window is used.
-
-When running under Muse Spark, this tool calls Muse Image (`muse-image-1.0`). Muse Image produces opaque images only; do not request `transparent_background=true`.

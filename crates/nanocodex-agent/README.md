@@ -7,10 +7,6 @@ The owned lifecycle for one headless `OpenAI` coding agent.
 builds one agent, receives a cheap cloneable [`Nanocodex`] handle and an
 independent [`AgentEvents`] stream, then submits ordered prompts.
 
-The [`nanocodex-muse`](../nanocodex-muse/README.md) provider uses this same driver,
-public types and tool runtime for Muse Spark Responses sessions, with
-client-side summary compaction. It adds the provider recipe and account auth.
-
 ## Quick start
 
 ```rust,no_run

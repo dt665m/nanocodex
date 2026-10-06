@@ -352,7 +352,7 @@ jobs:
         with:
           toolchain: "1.97"
       - uses: ./.github/actions/rust-compiler-cache
-      - name: Exercise shared runtime over HTTP/SSE with synthetic credentials
+      - name: Exercise Muse runtime over HTTP/SSE with synthetic credentials
         run: |
           mkdir -p output/muse
           set -o pipefail

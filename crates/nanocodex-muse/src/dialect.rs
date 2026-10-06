@@ -4,14 +4,13 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::tower::{
-    ResponsesAttempt, ResponsesAttemptKind, ResponsesOutput, ResponsesServiceError,
-    service_error::FailurePhase,
-    stream::{CodeCallKind, CompactionOutput, GenerationOutput},
+use nanocodex_oai_api::tower::{
+    CodeCallKind, CompactionOutput, GenerationOutput, ResponsesAttempt, ResponsesAttemptKind,
+    ResponsesOutput, ResponsesServiceError,
 };
-use crate::{
-    ContentItem, EncodedRequest, MessageRole, ResponseItem, ResponsesError,
-    responses::ToolDefinition,
+use nanocodex_oai_api::{
+    responses::{ContentItem, MessageRole, ResponseItem, ToolDefinition},
+    transport::{EncodedRequest, ResponsesError},
 };
 
 const SUMMARY_OPEN: &str = "<muse_context_summary>\n";
@@ -205,7 +204,7 @@ pub(crate) fn decode(
     };
     normalize(&mut generated, request)?;
     Ok(
-        if matches!(request.kind, ResponsesAttemptKind::Compaction) {
+        if matches!(request.kind(), ResponsesAttemptKind::Compaction) {
             ResponsesOutput::Compaction(summary(generated)?)
         } else {
             ResponsesOutput::Generation(generated)
@@ -242,7 +241,7 @@ fn normalize(
                 ..
             } = item
             {
-                *phase = Some(crate::MessagePhase::Commentary);
+                *phase = Some(nanocodex_oai_api::responses::MessagePhase::Commentary);
             }
         }
     }
@@ -336,7 +335,7 @@ fn wrapped_input(arguments: &str) -> Result<Value, ResponsesServiceError> {
 }
 
 const fn invalid(detail: &'static str) -> ResponsesServiceError {
-    ResponsesServiceError::invalid_attempt_state(detail, FailurePhase::Protocol, 0)
+    ResponsesServiceError::protocol(detail)
 }
 
 pub(crate) fn is_summary(item: &ResponseItem) -> bool {
@@ -369,7 +368,7 @@ fn continuation_start(history: &[ResponseItem]) -> usize {
     // Lift Claude's latest-assistant boundary policy, retaining the entire Responses
     // reasoning/call batch and all matching tool receipts. Do not summarize that suffix.
     if matches!(history.last(), Some(ResponseItem::Message {role:MessageRole::Assistant, phase, ..})
-        if !matches!(phase, Some(crate::MessagePhase::Commentary)))
+        if !matches!(phase, Some(nanocodex_oai_api::responses::MessagePhase::Commentary)))
     {
         return history.len();
     }
@@ -395,4 +394,43 @@ fn continuation_start(history: &[ResponseItem]) -> usize {
         start -= 1;
     }
     start
+}
+
+#[derive(Clone)]
+pub(crate) struct MuseDialect;
+impl nanocodex_oai_api::tower::ResponsesDialect for MuseDialect {
+    fn encode(
+        &self,
+        encoded: EncodedRequest,
+        kind: ResponsesAttemptKind,
+    ) -> Result<EncodedRequest, ResponsesError> {
+        encode(encoded, matches!(kind, ResponsesAttemptKind::Compaction))
+    }
+    fn receive_kind(&self, _: ResponsesAttemptKind) -> ResponsesAttemptKind {
+        ResponsesAttemptKind::Generation
+    }
+    fn decode(
+        &self,
+        output: ResponsesOutput,
+        request: &ResponsesAttempt,
+    ) -> Result<ResponsesOutput, ResponsesServiceError> {
+        decode(output, request)
+    }
+    fn responses_lite_headers(&self) -> bool {
+        false
+    }
+    fn http_headers(&self) -> &'static [(&'static str, &'static str)] {
+        &[("x-api-version", "1.0.0")]
+    }
+    fn recover_api_key(&self) -> bool {
+        true
+    }
+}
+
+pub(crate) const fn auto_compact_token_limit(_: &str, tokens: u64) -> Option<u64> {
+    Some(if tokens <= 33_000 {
+        tokens.saturating_mul(95) / 100
+    } else {
+        tokens - 33_000
+    })
 }

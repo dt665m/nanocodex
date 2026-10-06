@@ -200,7 +200,10 @@ async fn denied_expired_and_cancelled_login_return_no_credentials() {
 
 #[tokio::test]
 async fn responses_401_exchanges_once_retries_and_reuses_the_key_for_both_models() {
-    for model in [Model::Muse, Model::MuseContributor] {
+    for model in [
+        crate::MuseModel::Spark.into(),
+        crate::MuseModel::Contributor.into(),
+    ] {
         let (origin, server) = serve(vec![
             json(401, serde_json::json!({"error":"expired"})),
             json(200, serde_json::json!({"api_key":"synthetic-new-key"})),
@@ -339,7 +342,7 @@ async fn api_key_only_auth_works_but_cannot_exchange_a_rejected_key() {
             .contains("Muse login required")
     );
     let (origin, server) = serve(vec![answer()]).await;
-    let agent = agent(&manager, &origin, Model::Muse).await;
+    let agent = agent(&manager, &origin, crate::MuseModel::Spark.into()).await;
     assert_eq!(turn(&agent).await.unwrap(), "hello");
     agent.shutdown().await.unwrap();
     assert_eq!(server.await.unwrap().len(), 1);
@@ -358,7 +361,7 @@ async fn responses_retry_is_bounded_and_other_rejections_do_not_exchange() {
         }
         let (origin, server) = serve(replies).await;
         let auth = manager(&origin);
-        let agent = agent(&auth, &origin, Model::Muse).await;
+        let agent = agent(&auth, &origin, crate::MuseModel::Spark.into()).await;
         assert!(turn(&agent).await.is_err());
         agent.shutdown().await.unwrap();
         let requests = server.await.unwrap();

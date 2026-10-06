@@ -133,9 +133,6 @@ where
         session
             .conversation
             .install_pre_turn_compaction(item, session.factory.profile().prefix());
-        if self.model.is_muse() {
-            session.conversation.muse_compaction.compacted(false);
-        }
         session.conversation.commit_tail();
         session.context.require_full_reinjection();
         session.preserve_inherited_delta = false;
@@ -423,11 +420,7 @@ where
             }
         };
         let Some(compacted) = compacted else {
-            let user_content = prepare_user_input_with_policy(
-                &task.instruction,
-                ImagePolicy::for_model(self.model),
-            )
-            .await;
+            let user_content = prepare_user_input(&task.instruction).await;
             session
                 .conversation
                 .append(prompt_messages(task, user_content));
@@ -463,9 +456,7 @@ where
                 .conversation
                 .set_canonical_context(canonical_context);
         }
-        let user_content =
-            prepare_user_input_with_policy(&task.instruction, ImagePolicy::for_model(self.model))
-                .await;
+        let user_content = prepare_user_input(&task.instruction).await;
         session
             .conversation
             .append(prompt_messages(task, user_content));
@@ -518,11 +509,7 @@ where
             tool_control.begin_turn();
             self.active_tools = Some(tool_control);
             let factory = self.attempt_factory(&tools)?.for_logical_turn(logical_turn);
-            let user_content = prepare_user_input_with_policy(
-                &task.instruction,
-                ImagePolicy::for_model(self.model),
-            )
-            .await;
+            let user_content = prepare_user_input(&task.instruction).await;
             let mut context = ContextState::new(selected_agents_md, ContextBaseline::Missing);
             let context_snapshot = context.capture(
                 tools.working_directory(),
@@ -863,7 +850,6 @@ where
                 .map_err(|_| NanocodexError::MalformedResponse {
                     detail: "completed turn did not have a response ID",
                 })?;
-            session.conversation.muse_compaction.advance_boundary();
             can_drain_steers = true;
 
             if code_calls.is_empty() {
@@ -926,9 +912,7 @@ where
             session.conversation.clear_delta();
             let history = code_calls
                 .iter()
-                .any(|call| {
-                    call.name == "exec" || qualified_tool_name(call) == "image_gen__imagegen"
-                })
+                .any(|call| call.name == "exec")
                 .then(|| Arc::new(session.conversation.flattened_history()));
             {
                 let tool_control = session.tools.control();
@@ -1027,11 +1011,7 @@ where
                 self.instruction_revision = Some(revision);
             }
             let instruction_bytes = steer.prompt.text_bytes();
-            let user_content = prepare_user_input_with_policy(
-                &steer.prompt.instruction,
-                ImagePolicy::for_model(self.model),
-            )
-            .await;
+            let user_content = prepare_user_input(&steer.prompt.instruction).await;
             conversation.append(prompt_messages(&steer.prompt, user_content));
             self.stats.steers += 1;
             self.events.emit(

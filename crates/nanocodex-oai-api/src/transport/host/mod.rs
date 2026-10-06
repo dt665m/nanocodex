@@ -81,6 +81,8 @@ pub struct HostConnectRequest<'a> {
     session_id: &'a str,
     thread_id: &'a str,
     turn_state: Option<&'a str>,
+    responses_lite: bool,
+    additional_headers: &'static [(&'static str, &'static str)],
 }
 
 impl<'a> HostConnectRequest<'a> {
@@ -126,7 +128,33 @@ impl<'a> HostConnectRequest<'a> {
             session_id,
             thread_id,
             turn_state,
+            responses_lite: true,
+            additional_headers: &[],
         }
+    }
+
+    #[cfg(target_family = "wasm")]
+    pub(crate) fn with_dialect(
+        mut self,
+        dialect: Option<&dyn crate::tower::ResponsesDialect>,
+    ) -> Self {
+        if let Some(dialect) = dialect {
+            self.responses_lite = dialect.responses_lite_headers();
+            self.additional_headers = dialect.http_headers();
+        }
+        self
+    }
+
+    /// Whether the embedding should include Responses Lite HTTP headers.
+    #[must_use]
+    pub const fn responses_lite_headers(&self) -> bool {
+        self.responses_lite
+    }
+
+    /// Additional provider-owned HTTP headers without authorization material.
+    #[must_use]
+    pub const fn additional_headers(&self) -> &'static [(&'static str, &'static str)] {
+        self.additional_headers
     }
 
     /// Returns the complete Responses WebSocket endpoint.

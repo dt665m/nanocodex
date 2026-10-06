@@ -37,11 +37,13 @@
 
 pub(crate) mod attempt;
 pub(crate) mod client;
+mod dialect;
 pub(crate) mod middleware;
 pub(crate) mod service;
 pub(crate) mod service_error;
 pub(crate) mod stream;
 mod transport_policy;
+pub use dialect::ResponsesDialect;
 
 #[doc(inline)]
 pub use crate::openai::{

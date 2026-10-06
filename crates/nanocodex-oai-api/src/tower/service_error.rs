@@ -16,6 +16,12 @@ pub struct ResponsesServiceError {
 }
 
 impl ResponsesServiceError {
+    /// Constructs a provider protocol failure.
+    #[must_use]
+    pub const fn protocol(detail: &'static str) -> Self {
+        Self::invalid_attempt_state(detail, FailurePhase::Protocol, 0)
+    }
+
     const fn new(
         source: ResponsesServiceErrorSource,
         phase: FailurePhase,

@@ -27,7 +27,6 @@ pub(super) struct ImageGenerationHandler {
     client: reqwest::Client,
     generation_endpoint: String,
     edit_endpoint: String,
-    responses_endpoint: String,
     auth: OpenAiAuth,
     save_root: PathBuf,
 }
@@ -45,7 +44,6 @@ impl ImageGenerationHandler {
             client,
             generation_endpoint: format!("{api_base_url}/images/generations"),
             edit_endpoint: format!("{api_base_url}/images/edits"),
-            responses_endpoint: format!("{api_base_url}/responses"),
             auth: config.auth,
             save_root: config.save_root,
         }
@@ -60,32 +58,17 @@ impl ImageGenerationHandler {
                 ));
             }
         };
-        let muse = context
-            .model()
-            .parse::<nanocodex_oai_api::Model>()
-            .is_ok_and(nanocodex_oai_api::Model::is_muse);
-        if muse && args.transparent_background {
-            return ToolOutput::error(
-                "Muse Image only produces opaque images; transparent_background is unsupported",
-            );
-        }
-        let request =
-            match request_for_args_with_remote_images(&args, context.history(), muse).await {
-                Ok(request) => request,
-                Err(error) => return ToolOutput::error(error),
-            };
+        let request = match request_for_args(&args, context.history()).await {
+            Ok(request) => request,
+            Err(error) => return ToolOutput::error(error),
+        };
         let response = match request {
             ImageRequest::Generate(request) => {
-                self.post_image_request(
-                    &self.generation_endpoint,
-                    &request,
-                    "image generation",
-                    muse,
-                )
-                .await
+                self.post_image_request(&self.generation_endpoint, &request, "image generation")
+                    .await
             }
             ImageRequest::Edit(request) => {
-                self.post_image_request(&self.edit_endpoint, &request, "image edit", muse)
+                self.post_image_request(&self.edit_endpoint, &request, "image edit")
                     .await
             }
         };
@@ -113,15 +96,6 @@ impl ImageGenerationHandler {
             }
             .output();
         };
-        let format = response.output_format.as_deref().unwrap_or("png");
-        let mime = match format {
-            "png" => "image/png",
-            "jpeg" => "image/jpeg",
-            "webp" => "image/webp",
-            _ => {
-                return ToolOutput::error("image generation returned an unsupported output format");
-            }
-        };
         let mut structured_result = metadata.clone();
         let mut output_items = Vec::new();
         match (data.b64_json, data.file_id) {
@@ -131,11 +105,10 @@ impl ImageGenerationHandler {
                     context.session_id(),
                     context.call_id(),
                     &result,
-                    format,
                 )
                 .await
                 .ok();
-                let image_url = format!("data:{mime};base64,{result}");
+                let image_url = format!("data:image/png;base64,{result}");
                 output_items.push(ToolOutputContent::InputImage {
                     image_url: image_url.clone(),
                     detail: ImageDetail::High,
@@ -176,41 +149,15 @@ impl ImageGenerationHandler {
         endpoint: &str,
         request: &R,
         operation: &str,
-        muse: bool,
     ) -> Result<(ImageResponse, Option<String>), ImageRequestFailure> {
-        let mut body = serde_json::to_value(request)
-            .map_err(|_| "failed to encode image request".to_owned())?;
-        if muse {
-            let mut content = vec![json!({"type":"input_text","text":body["prompt"]})];
-            if let Some(images) = body["images"].as_array() {
-                for image in images {
-                    let mut image = image.clone();
-                    image["type"] = json!("input_image");
-                    content.push(image);
-                }
-            }
-            // Subscription credentials support Responses, but reject the Images API.
-            // Muse Image accepts only its image_generation tool, never Spark's tools.
-            body = json!({
-                "model":"muse-image-1.0",
-                "store":false,
-                "input":[{"role":"user","content":content}],
-                "tools":[{"type":"image_generation","output_format":"png","size":"auto"}]
-            });
-        }
-        let endpoint = if muse {
-            &self.responses_endpoint
-        } else {
-            endpoint
-        };
         let auth = self
             .auth
             .snapshot()
             .await
             .map_err(|error| error.to_string())?;
-        let response = self.send_authorized(endpoint, &body, &auth, muse).await?;
+        let response = self.send_authorized(endpoint, request, &auth).await?;
         let response = if response.status() == reqwest::StatusCode::UNAUTHORIZED
-            && (auth.mode() == OpenAiAuthMode::ChatGpt || muse)
+            && auth.mode() == OpenAiAuthMode::ChatGpt
         {
             self.auth
                 .recover_unauthorized(&auth)
@@ -221,8 +168,7 @@ impl ImageGenerationHandler {
                 .snapshot()
                 .await
                 .map_err(|error| error.to_string())?;
-            self.send_authorized(endpoint, &body, &refreshed, muse)
-                .await?
+            self.send_authorized(endpoint, request, &refreshed).await?
         } else {
             response
         };
@@ -252,14 +198,8 @@ impl ImageGenerationHandler {
                 generation_id,
             });
         }
-        let parsed = if muse {
-            muse_image_response(&body)
-        } else {
-            serde_json::from_slice(&body)
-                .map_err(|_| format!("failed to decode {operation} response"))
-        }
-        .map_err(|message| ImageRequestFailure {
-            message,
+        let parsed = serde_json::from_slice(&body).map_err(|_| ImageRequestFailure {
+            message: format!("failed to decode {operation} response"),
             imagegen_request_id: imagegen_request_id.clone(),
             generation_id,
         })?;
@@ -271,16 +211,12 @@ impl ImageGenerationHandler {
         endpoint: &str,
         body: &R,
         auth: &OpenAiAuthSnapshot,
-        muse: bool,
     ) -> Result<reqwest::Response, String> {
         let mut request = self
             .client
             .post(endpoint)
             .header(USER_AGENT, concat!("nanocodex/", env!("CARGO_PKG_VERSION")))
             .header(AUTHORIZATION, format!("Bearer {}", auth.bearer()));
-        if muse {
-            request = request.header("x-api-version", "1.0.0");
-        }
         if let Some(account_id) = auth.account_id() {
             request = request.header("ChatGPT-Account-ID", account_id);
         }
@@ -365,8 +301,6 @@ struct ImageResponse {
     #[serde(default)]
     generation_id: Option<String>,
     data: Vec<ImageData>,
-    #[serde(default)]
-    output_format: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -377,35 +311,6 @@ struct ImageData {
     file_id: Option<String>,
     #[serde(default)]
     generation_id: Option<String>,
-}
-
-fn muse_image_response(body: &[u8]) -> Result<ImageResponse, String> {
-    let response: Value = serde_json::from_slice(body)
-        .map_err(|_| "failed to decode Muse Image response".to_owned())?;
-    if response["status"] != "completed" {
-        return Err("Muse Image response did not complete".to_owned());
-    }
-    let image = response["output"]
-        .as_array()
-        .and_then(|items| {
-            items.iter().find(|item| {
-                item["type"] == "image_generation_call" && item["status"] == "completed"
-            })
-        })
-        .ok_or_else(|| "Muse Image response contained no completed image".to_owned())?;
-    let result = image["result"]
-        .as_str()
-        .filter(|result| !result.is_empty())
-        .ok_or_else(|| "Muse Image response contained no image bytes".to_owned())?;
-    Ok(ImageResponse {
-        generation_id: image["id"].as_str().and_then(safe_image_id),
-        data: vec![ImageData {
-            b64_json: Some(result.to_owned()),
-            file_id: None,
-            generation_id: None,
-        }],
-        output_format: Some(image["output_format"].as_str().unwrap_or("png").to_owned()),
-    })
 }
 
 struct ImageRequestFailure {
@@ -457,18 +362,9 @@ enum ImageRequest {
     Edit(ImageEditRequest),
 }
 
-#[cfg(test)]
 async fn request_for_args(
     args: &ImagegenArgs,
     history: &[ResponseItem],
-) -> Result<ImageRequest, String> {
-    request_for_args_with_remote_images(args, history, false).await
-}
-
-async fn request_for_args_with_remote_images(
-    args: &ImagegenArgs,
-    history: &[ResponseItem],
-    allow_remote_images: bool,
 ) -> Result<ImageRequest, String> {
     let background = if args.transparent_background {
         "transparent"
@@ -532,11 +428,7 @@ async fn request_for_args_with_remote_images(
     for image in &images {
         match image {
             ImageReference::File { file_id } if valid_image_file_id(file_id) => {}
-            ImageReference::Inline { image_url }
-                if image_url.starts_with("data:image/")
-                    || (allow_remote_images
-                        && (image_url.starts_with("https://")
-                            || image_url.starts_with("http://"))) => {}
+            ImageReference::Inline { image_url } if image_url.starts_with("data:image/") => {}
             _ => {
                 return Err(
                     "selected conversation image has an invalid or unsupported reference"
@@ -643,12 +535,11 @@ async fn save_result(
     session_id: &str,
     call_id: &str,
     result: &str,
-    format: &str,
 ) -> Result<PathBuf, String> {
     let bytes = BASE64_STANDARD
         .decode(result.trim().as_bytes())
         .map_err(|error| format!("generated image was not valid base64: {error}"))?;
-    let path = artifact_path(save_root, session_id, call_id, format);
+    let path = artifact_path(save_root, session_id, call_id);
     let parent = path
         .parent()
         .ok_or_else(|| format!("generated image path `{}` has no parent", path.display()))?;
@@ -661,11 +552,11 @@ async fn save_result(
     Ok(path)
 }
 
-fn artifact_path(save_root: &Path, session_id: &str, call_id: &str, format: &str) -> PathBuf {
+fn artifact_path(save_root: &Path, session_id: &str, call_id: &str) -> PathBuf {
     save_root
         .join("generated_images")
         .join(sanitize_path_component(session_id))
-        .join(format!("{}.{format}", sanitize_path_component(call_id)))
+        .join(format!("{}.png", sanitize_path_component(call_id)))
 }
 
 fn sanitize_path_component(value: &str) -> String {

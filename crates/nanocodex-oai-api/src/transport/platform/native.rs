@@ -21,9 +21,9 @@ impl ServicePlatform {
         Self::with_http_client(config, reqwest::Client::new())
     }
 
-    pub(crate) const fn with_http_client(config: &ModelConfig, client: reqwest::Client) -> Self {
+    pub(crate) fn with_http_client(config: &ModelConfig, client: reqwest::Client) -> Self {
         Self {
-            http: ResponsesHttp::new(client, config.model.is_muse()),
+            http: ResponsesHttp::new(client, config.dialect.clone()),
         }
     }
 

@@ -161,28 +161,6 @@ impl ImagePreparationError {
     }
 }
 
-/// Provider image preparation policy. Existing Codex behavior remains the default.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum ImagePolicy {
-    /// Codex's data-only input and high/original detail conventions.
-    #[default]
-    Codex,
-    /// Standard Responses supports remote URLs and low image detail.
-    StandardResponses,
-}
-
-impl ImagePolicy {
-    /// Selects the image contract for the request model.
-    #[must_use]
-    pub const fn for_model(model: nanocodex_oai_api::Model) -> Self {
-        if model.is_muse() {
-            Self::StandardResponses
-        } else {
-            Self::Codex
-        }
-    }
-}
-
 /// Validates, normalizes, and bounds images returned by a tool.
 ///
 /// Unsupported or failed images become model-visible text placeholders. CPU
@@ -192,12 +170,6 @@ impl ImagePolicy {
     reason = "WASM prepares images inline without a blocking pool"
 )]
 pub async fn prepare_output_images(output: &mut ToolOutputBody) {
-    prepare_output_images_with_policy(output, ImagePolicy::Codex).await;
-}
-
-/// Prepares tool images using the selected provider contract and the shared decoder.
-#[allow(clippy::unused_async, reason = "WASM prepares images inline")]
-pub async fn prepare_output_images_with_policy(output: &mut ToolOutputBody, policy: ImagePolicy) {
     let ToolOutputBody::Content(content) = output else {
         return;
     };
@@ -219,11 +191,11 @@ pub async fn prepare_output_images_with_policy(output: &mut ToolOutputBody, poli
     let content = std::mem::take(content);
     #[cfg(target_family = "wasm")]
     {
-        *output = ToolOutputBody::Content(prepare_content_with_policy(content, policy));
+        *output = ToolOutputBody::Content(prepare_content(content));
         output.replace_invalid_image_envelopes();
     }
     #[cfg(not(target_family = "wasm"))]
-    match tokio::task::spawn_blocking(move || prepare_content_with_policy(content, policy)).await {
+    match tokio::task::spawn_blocking(move || prepare_content(content)).await {
         Ok(prepared) => {
             let ToolOutputBody::Content(output) = output else {
                 return;
@@ -242,14 +214,6 @@ pub async fn prepare_output_images_with_policy(output: &mut ToolOutputBody, poli
 /// Prepares reconstructed history with the same decoder and limits as fresh images.
 /// Returns whether any image was replaced or normalized; item order is preserved.
 pub fn prepare_history_images(items: &mut [nanocodex_oai_api::responses::ResponseItem]) -> bool {
-    prepare_history_images_with_policy(items, ImagePolicy::Codex)
-}
-
-/// Prepares restored images using the same provider contract as fresh input.
-pub fn prepare_history_images_with_policy(
-    items: &mut [nanocodex_oai_api::responses::ResponseItem],
-    policy: ImagePolicy,
-) -> bool {
     use nanocodex_oai_api::responses::{FunctionOutputBody, FunctionOutputContent, ResponseItem};
     let mut changed = false;
     for item in items {
@@ -258,11 +222,7 @@ pub fn prepare_history_images_with_policy(
                 for part in content {
                     if let ContentItem::InputImage { image_url, detail } = part {
                         let mut url = image_url.to_string();
-                        match prepare_image_with_policy(
-                            &mut url,
-                            detail.unwrap_or(ImageDetail::Auto),
-                            policy,
-                        ) {
+                        match prepare_image(&mut url, detail.unwrap_or(ImageDetail::Auto)) {
                             Ok(()) => {
                                 changed |= url != image_url.as_ref();
                                 *image_url = url.into_boxed_str();
@@ -283,11 +243,7 @@ pub fn prepare_history_images_with_policy(
                 for part in content {
                     if let FunctionOutputContent::InputImage { image_url, detail } = part {
                         let mut url = image_url.to_string();
-                        match prepare_image_with_policy(
-                            &mut url,
-                            detail.unwrap_or(ImageDetail::Auto),
-                            policy,
-                        ) {
+                        match prepare_image(&mut url, detail.unwrap_or(ImageDetail::Auto)) {
                             Ok(()) => {
                                 changed |= url != image_url.as_ref();
                                 *image_url = url.into_boxed_str();
@@ -317,26 +273,16 @@ pub fn prepare_history_images_with_policy(
     reason = "WASM prepares images inline without a blocking pool"
 )]
 pub async fn prepare_user_input(input: &PromptInput) -> Vec<ContentItem> {
-    prepare_user_input_with_policy(input, ImagePolicy::Codex).await
-}
-
-/// Prepares typed prompt content under the selected provider's image contract.
-#[allow(clippy::unused_async, reason = "WASM prepares images inline")]
-pub async fn prepare_user_input_with_policy(
-    input: &PromptInput,
-    policy: ImagePolicy,
-) -> Vec<ContentItem> {
     let input = match input {
         PromptInput::Text(text) => vec![UserInput::Text { text: text.clone() }],
         PromptInput::Content(items) => items.clone(),
     };
     #[cfg(target_family = "wasm")]
     {
-        prepare_user_content_with_policy(input, policy)
+        prepare_user_content(input)
     }
     #[cfg(not(target_family = "wasm"))]
-    match tokio::task::spawn_blocking(move || prepare_user_content_with_policy(input, policy)).await
-    {
+    match tokio::task::spawn_blocking(move || prepare_user_content(input)).await {
         Ok(content) => content,
         Err(error) => {
             tracing::warn!(%error, "failed to join user image preparation task");
@@ -360,27 +306,11 @@ pub(crate) fn prepare_embedded_user_input(input: &PromptInput) -> Vec<ContentIte
     prepare_user_content_for_host(input, true)
 }
 
-#[cfg(test)]
 fn prepare_user_content(input: Vec<UserInput>) -> Vec<ContentItem> {
-    prepare_user_content_with_policy(input, ImagePolicy::Codex)
-}
-
-fn prepare_user_content_with_policy(
-    input: Vec<UserInput>,
-    policy: ImagePolicy,
-) -> Vec<ContentItem> {
-    prepare_user_content_for_host_with_policy(input, cfg!(target_family = "wasm"), policy)
+    prepare_user_content_for_host(input, cfg!(target_family = "wasm"))
 }
 
 fn prepare_user_content_for_host(input: Vec<UserInput>, embedded: bool) -> Vec<ContentItem> {
-    prepare_user_content_for_host_with_policy(input, embedded, ImagePolicy::Codex)
-}
-
-fn prepare_user_content_for_host_with_policy(
-    input: Vec<UserInput>,
-    embedded: bool,
-    policy: ImagePolicy,
-) -> Vec<ContentItem> {
     let mut content = Vec::with_capacity(input.len());
     #[cfg(not(target_family = "wasm"))]
     let mut image_index = 0;
@@ -405,7 +335,6 @@ fn prepare_user_content_for_host_with_policy(
                 content.push(prepare_user_image(
                     image_url,
                     detail.unwrap_or(ImageDetail::High),
-                    policy,
                 ));
             }
             #[cfg(target_family = "wasm")]
@@ -438,7 +367,6 @@ fn prepare_user_content_for_host_with_policy(
                                 BASE64_STANDARD.encode(bytes)
                             ),
                             detail,
-                            policy,
                         ));
                         content.push(input_text("</image>"));
                     }
@@ -472,12 +400,8 @@ fn prepare_user_content_for_host_with_policy(
     content
 }
 
-fn prepare_user_image(
-    mut image_url: String,
-    detail: ImageDetail,
-    policy: ImagePolicy,
-) -> ContentItem {
-    match prepare_image_with_policy(&mut image_url, detail, policy) {
+fn prepare_user_image(mut image_url: String, detail: ImageDetail) -> ContentItem {
+    match prepare_image(&mut image_url, detail) {
         Ok(()) => ContentItem::InputImage {
             image_url: image_url.into_boxed_str(),
             detail: Some(detail),
@@ -495,19 +419,12 @@ fn input_text(text: impl Into<String>) -> ContentItem {
     }
 }
 
-fn prepare_content(content: Vec<ToolOutputContent>) -> Vec<ToolOutputContent> {
-    prepare_content_with_policy(content, ImagePolicy::Codex)
-}
-
-fn prepare_content_with_policy(
-    mut content: Vec<ToolOutputContent>,
-    policy: ImagePolicy,
-) -> Vec<ToolOutputContent> {
+fn prepare_content(mut content: Vec<ToolOutputContent>) -> Vec<ToolOutputContent> {
     for item in &mut content {
         let ToolOutputContent::InputImage { image_url, detail } = item else {
             continue;
         };
-        if let Err(error) = prepare_image_with_policy(image_url, *detail, policy) {
+        if let Err(error) = prepare_image(image_url, *detail) {
             tracing::warn!(%error, "failed to prepare tool output image");
             *item = ToolOutputContent::InputText {
                 text: error.placeholder().to_owned(),
@@ -517,22 +434,9 @@ fn prepare_content_with_policy(
     content
 }
 
-#[cfg(test)]
 fn prepare_image(image_url: &mut String, detail: ImageDetail) -> Result<(), ImagePreparationError> {
-    prepare_image_with_policy(image_url, detail, ImagePolicy::Codex)
-}
-
-fn prepare_image_with_policy(
-    image_url: &mut String,
-    detail: ImageDetail,
-    policy: ImagePolicy,
-) -> Result<(), ImagePreparationError> {
     if is_remote_image_url(image_url) {
-        return if policy == ImagePolicy::StandardResponses {
-            Ok(())
-        } else {
-            Err(ImagePreparationError::RemoteUrlUnsupported)
-        };
+        return Err(ImagePreparationError::RemoteUrlUnsupported);
     }
     if !is_data_url(image_url) {
         return Ok(());
@@ -540,7 +444,6 @@ fn prepare_image_with_policy(
     let limits = match detail {
         ImageDetail::Auto | ImageDetail::High => HIGH_DETAIL_LIMITS,
         ImageDetail::Original => ORIGINAL_DETAIL_LIMITS,
-        ImageDetail::Low if policy == ImagePolicy::StandardResponses => HIGH_DETAIL_LIMITS,
         ImageDetail::Low => return Err(ImagePreparationError::UnsupportedLowDetail),
     };
     let bytes = decode_data_url(image_url, MAX_PROMPT_IMAGE_INPUT_BYTES)?;

@@ -36,7 +36,6 @@ pub(super) struct ConversationState {
     pub(super) canonical_context: Arc<ResponseItem>,
     pub(super) managed: ManagedSessionState,
     pub(super) continuation_policy: Option<ContinuationPolicy>,
-    pub(super) muse_compaction: MuseCompactionPolicy,
 }
 
 impl ConversationState {
@@ -45,7 +44,6 @@ impl ConversationState {
             canonical_context: Arc::new(canonical_context),
             managed: ManagedSessionState::new(Vec::new()),
             continuation_policy: None,
-            muse_compaction: MuseCompactionPolicy::default(),
         }
     }
 
@@ -61,7 +59,6 @@ impl ConversationState {
             canonical_context: Arc::new(canonical_context),
             managed: ManagedSessionState::new(history),
             continuation_policy: None,
-            muse_compaction: MuseCompactionPolicy::default(),
         })
     }
 
@@ -81,19 +78,16 @@ impl ConversationState {
             canonical_context: Arc::new(canonical_context),
             managed,
             continuation_policy: None,
-            muse_compaction: MuseCompactionPolicy::default(),
         };
-        state.prepare_replay_images(ImagePolicy::StandardResponses);
+        state.prepare_replay_images();
         Ok(state)
     }
 
-    pub(super) fn prepare_replay_images(&mut self, policy: ImagePolicy) -> bool {
+    pub(super) fn prepare_replay_images(&mut self) -> bool {
         let mut history = self.managed.flattened_history();
-        let history_changed =
-            nanocodex_oai_tools::image::prepare_history_images_with_policy(&mut history, policy);
-        let context_changed = nanocodex_oai_tools::image::prepare_history_images_with_policy(
+        let history_changed = nanocodex_oai_tools::image::prepare_history_images(&mut history);
+        let context_changed = nanocodex_oai_tools::image::prepare_history_images(
             std::slice::from_mut(Arc::make_mut(&mut self.canonical_context)),
-            policy,
         );
         let changed = history_changed || context_changed;
         if changed {
@@ -220,7 +214,7 @@ mod image_replay_tests {
         // Exact in-memory checkpoints can bypass the serialized resume constructor.
         let mut state = ConversationState::new(history).unwrap();
         let revision = state.managed.history_revision();
-        assert!(state.prepare_replay_images(ImagePolicy::Codex));
+        assert!(state.prepare_replay_images());
         assert_eq!(state.managed.history_revision(), revision + 1);
         assert!(
             !serde_json::to_string(&state.flattened_history())
@@ -232,36 +226,7 @@ mod image_replay_tests {
                 .unwrap()
                 .contains("input_image")
         );
-        assert!(!state.prepare_replay_images(ImagePolicy::Codex));
+        assert!(!state.prepare_replay_images());
         assert_eq!(state.managed.history_revision(), revision + 1);
-    }
-}
-
-// Compaction throttling lifted from nanocodex-claude::Conversation.
-#[derive(Clone, Default)]
-pub(super) struct MuseCompactionPolicy {
-    auto_compaction_suppressed: bool,
-    rapid_compactions: u8,
-    rounds_since_compaction: u8,
-}
-impl MuseCompactionPolicy {
-    pub(super) const fn allows_auto_compaction(&self) -> bool {
-        !self.auto_compaction_suppressed
-            && (self.rapid_compactions < 2 || self.rounds_since_compaction >= 3)
-    }
-    pub(super) const fn advance_boundary(&mut self) {
-        self.auto_compaction_suppressed = false;
-        self.rounds_since_compaction = self.rounds_since_compaction.saturating_add(1);
-    }
-    pub(super) const fn compacted(&mut self, automatic: bool) {
-        self.auto_compaction_suppressed = true;
-        self.rapid_compactions = if !automatic {
-            0
-        } else if self.rounds_since_compaction < 3 {
-            self.rapid_compactions.saturating_add(1)
-        } else {
-            1
-        };
-        self.rounds_since_compaction = 0;
     }
 }

@@ -736,8 +736,7 @@ impl<'a> ResponseCreate<'a> {
                     crate::Model::Glm53
                     | crate::Model::Kimi
                     | crate::Model::Mimo
-                    | crate::Model::Muse
-                    | crate::Model::MuseContributor,
+                    | crate::Model::External(_),
                     _,
                 ) => None,
                 (_, true) => Some("priority"),
