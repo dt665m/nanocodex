@@ -11,9 +11,7 @@ pub mod host;
 mod retry_after;
 #[cfg(target_family = "wasm")]
 pub(crate) use host::socket;
-/// HTTP/SSE transport primitives for custom Responses services.
-#[doc(hidden)]
-pub mod http;
+pub(crate) mod http;
 pub(crate) mod platform;
 #[cfg(not(target_family = "wasm"))]
 pub(crate) mod socket;

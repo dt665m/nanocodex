@@ -7,13 +7,14 @@ use std::{
 };
 
 use nanocodex_oai_api::{
+    __private::ResponsesHttp,
     OpenAiError,
     tower::{
         ResponsesAttempt, ResponsesAttemptKind, ResponsesOutput, ResponsesRetryPolicy,
         ResponsesServiceConfig, ResponsesServiceError, ResponsesServiceFactory,
         ResponsesServiceResponse,
     },
-    transport::{ResponsesError, ResponsesTransport, http::ResponsesHttp},
+    transport::{ResponsesError, ResponsesTransport},
 };
 use tower::{Service, retry::Retry};
 use web_time::Instant;
