@@ -297,31 +297,34 @@ async fn run_flushes_each_assistant_delta_before_completion() {
     let gate = Arc::clone(&next);
     let app = Router::new()
         .route("/v1/models", fixture_catalog(format!("Bearer ncx_live_{}_{}", "a".repeat(12), "b".repeat(43))))
-        .route("/v1/agents/live", get(move |Query(query): Query<HashMap<String, String>>, upgrade: WebSocketUpgrade| {
-        assert_catalog_creation_query(&query);
-        let gate = Arc::clone(&gate);
-        async move {
-            upgrade.on_upgrade(move |mut socket| async move {
-                send_ready(&mut socket, "0", false).await;
-                let Some(Ok(Message::Text(prompt))) = socket.recv().await else { return; };
-                let prompt: serde_json::Value = serde_json::from_str(&prompt).unwrap();
-                let turn = prompt["id"].as_str().unwrap();
-                send_accepted(&mut socket, turn, "stream answer", 1).await;
-                for (seq, text) in [(1, "first"), (2, " second")] {
-                    socket.send(Message::Text(serde_json::json!({
-                        "cursor": (seq + 1).to_string(), "turn_id": turn, "type": "event",
-                        "event": {"protocol_version": 1, "request_id": turn, "seq": seq,
-                            "type": "assistant.delta", "payload": {
-                                "model_call_index": 1, "item_id": "answer", "phase": "final_answer", "text": text
-                            }}
-                    }).to_string().into())).await.unwrap();
-                    // The next event cannot arrive until stdout exposes this one.
-                    gate.notified().await;
-                }
-                send_turn_messages(&mut socket, turn, "first second", 4, 3).await;
-            })
-        }
-    }));
+        .route("/v1/agent-runs", post(move |headers: HeaderMap, axum::Json(body): axum::Json<serde_json::Value>| {
+            let gate = gate.clone();
+            async move {
+                assert_eq!(headers["idempotency-key"], "stream-request");
+                assert_eq!(body["input"], "stream answer");
+                let stream = futures_util::stream::unfold(0, move |step| {
+                    let gate = gate.clone();
+                    async move {
+                        let chunk = match step {
+                            0 => combined_receipt("stream answer"),
+                            1 | 2 => {
+                                if step == 2 { gate.notified().await; }
+                                let event = serde_json::json!({"cursor": (step+1).to_string(), "created_at": step+1, "turn_id": TURN_ID,
+                                    "type": "event", "event": {"protocol_version": 1, "request_id": "server-request", "seq": step,
+                                    "type": "assistant.delta", "payload": {"model_call_index": 1, "item_id": "answer", "phase": "final_answer",
+                                    "text": if step == 1 { "first" } else { " second" }}}});
+                                format!("id: {}\nevent: event\ndata: {event}\n\n", step+1)
+                            }
+                            3 => { gate.notified().await; durable_turn_events(TURN_ID, "first second", 4, 3) }
+                            _ => return None,
+                        };
+                        Some((Ok::<_, Infallible>(chunk), step+1))
+                    }
+                });
+                Response::builder().status(StatusCode::CREATED).header("content-type", "text/event-stream")
+                    .body(Body::from_stream(stream)).unwrap()
+            }
+        }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -430,7 +433,7 @@ async fn run_workspace_lifecycle(pinned: bool) {
                 },
             ),
         )
-        .route("/v1/agents/live", get(create_live_socket))
+        .route("/v1/agent-runs", post(combined_cli_run))
         .route("/v1/agents/{agent}", get(agent_state))
         .route("/v1/agents/{agent}/tool-host", get(tool_host))
         .route("/v1/agents/{agent}/ws", get(managed_socket))
@@ -537,7 +540,7 @@ async fn run_workspace_lifecycle(pinned: bool) {
 }
 
 #[tokio::test]
-async fn run_rejects_a_malformed_create_live_ready_frame() {
+async fn run_rejects_a_malformed_combined_receipt() {
     let api_key = format!("ncx_live_{}_{}", "1".repeat(12), "2".repeat(43));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -557,7 +560,17 @@ async fn run_rejects_a_malformed_create_live_ready_frame() {
     };
     let app = Router::new()
         .route("/v1/models", fixture_catalog(state.authorization.clone()))
-        .route("/v1/agents/live", get(failed_create_live_socket))
+        .route(
+            "/v1/agent-runs",
+            post(
+                |State(state): State<TestState>, headers: HeaderMap| async move {
+                    assert!(authorized(&state, &headers));
+                    sse_response(async {
+                        "event: run\ndata: {\"agent_id\":\"wrong-agent\"}\n\n".to_owned()
+                    })
+                },
+            ),
+        )
         .with_state(state.clone());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let workspace = tempfile::tempdir().unwrap();
@@ -611,7 +624,7 @@ async fn run_keeps_the_durable_agent_when_local_tools_are_initially_unavailable(
     };
     let app = Router::new()
         .route("/v1/models", fixture_catalog(state.authorization.clone()))
-        .route("/v1/agents/live", get(create_live_socket))
+        .route("/v1/agent-runs", post(combined_cli_run))
         .route("/v1/agents/{agent}", get(agent_state))
         .route("/v1/agents/{agent}/tool-host", get(tool_host))
         .route("/v1/agents/{agent}/ws", get(managed_socket))
@@ -684,7 +697,7 @@ async fn run_reconnects_the_same_local_host_after_a_ready_socket_disconnect() {
     };
     let app = Router::new()
         .route("/v1/models", fixture_catalog(state.authorization.clone()))
-        .route("/v1/agents/live", get(create_live_socket))
+        .route("/v1/agent-runs", post(combined_cli_run))
         .route("/v1/agents/{agent}", get(agent_state))
         .route("/v1/agents/{agent}/tool-host", get(tool_host))
         .route("/v1/agents/{agent}/ws", get(managed_socket))
@@ -727,7 +740,12 @@ async fn run_reconnects_the_same_local_host_after_a_ready_socket_disconnect() {
     assert_eq!(state.tool_host_attempts.load(Ordering::SeqCst), 2);
     let catalogs = state.catalogs.lock().unwrap();
     assert_eq!(catalogs.len(), 2);
-    assert_eq!(catalogs[0], catalogs[1]);
+    assert_ne!(catalogs[0]["connection_id"], catalogs[1]["connection_id"]);
+    let mut first = catalogs[0].clone();
+    let mut second = catalogs[1].clone();
+    first.as_object_mut().unwrap().remove("connection_id");
+    second.as_object_mut().unwrap().remove("connection_id");
+    assert_eq!(first, second);
     assert_eq!(
         catalogs[0]["attachment_id"],
         catalogs[0]["machines"][0]["id"]
@@ -759,7 +777,32 @@ async fn run_reopens_one_durable_agent_and_falls_back_when_local_tools_are_absen
     };
     let app = Router::new()
         .route("/v1/models", fixture_catalog(state.authorization.clone()))
-        .route("/v1/agents/live", get(durable_create_live_socket))
+        .route(
+            "/v1/agent-runs",
+            post(
+                |State(state): State<DurableState>,
+                 headers: HeaderMap,
+                 axum::Json(body): axum::Json<serde_json::Value>| async move {
+                    assert!(durable_authorized(&state, &headers));
+                    assert_eq!(headers["idempotency-key"], "durable-turn-one");
+                    assert_eq!(body["input"], "first durable turn");
+                    state.creates.fetch_add(1, Ordering::SeqCst);
+                    state
+                        .submissions
+                        .lock()
+                        .unwrap()
+                        .push(("durable-turn-one".into(), "first durable turn".into()));
+                    state.first_submitted.notify_one();
+                    combined_stream("first durable turn", async move {
+                        wait_for_durable_state(&state, || {
+                            state.local_calls.load(Ordering::SeqCst) == 1
+                        })
+                        .await;
+                        durable_turn_events(TURN_ID, "local turn answer", 2, 1)
+                    })
+                },
+            ),
+        )
         .route("/v1/agents/{agent}", get(durable_agent_state))
         .route("/v1/agents/{agent}/tool-host", get(durable_tool_host))
         .route("/v1/agents/{agent}/ws", get(durable_socket))
@@ -867,7 +910,7 @@ async fn run_reopens_one_durable_agent_and_falls_back_when_local_tools_are_absen
     assert_eq!(state.creates.load(Ordering::SeqCst), 1);
     assert_eq!(state.state_reads.lock().unwrap().as_slice(), [AGENT_ID]);
     let cursors = state.event_cursors.lock().unwrap();
-    assert_eq!(cursors.first().map(String::as_str), Some("0"));
+    assert_eq!(cursors.first().map(String::as_str), Some("3"));
     assert!(cursors.iter().any(|cursor| cursor == "3"), "{cursors:?}");
     assert!(cursors.iter().all(|cursor| cursor == "0" || cursor == "3"));
     drop(cursors);
@@ -923,23 +966,6 @@ struct DurableState {
     changed: Arc<tokio::sync::Notify>,
     first_submitted: Arc<tokio::sync::Notify>,
     tool_completed: Arc<tokio::sync::Notify>,
-}
-
-async fn durable_create_live_socket(
-    State(state): State<DurableState>,
-    Query(query): Query<HashMap<String, String>>,
-    headers: HeaderMap,
-    upgrade: WebSocketUpgrade,
-) -> impl IntoResponse {
-    if !durable_authorized(&state, &headers) {
-        return unauthorized();
-    }
-    state.creates.fetch_add(1, Ordering::SeqCst);
-    state.event_cursors.lock().unwrap().push("0".to_owned());
-    assert_catalog_creation_query(&query);
-    upgrade
-        .on_upgrade(move |socket| serve_durable_socket(socket, state, "0".to_owned()))
-        .into_response()
 }
 
 async fn durable_agent_state(
@@ -1333,56 +1359,60 @@ async fn managed_socket(
         .into_response()
 }
 
-async fn create_live_socket(
-    State(state): State<TestState>,
-    Query(query): Query<HashMap<String, String>>,
-    headers: HeaderMap,
-    upgrade: WebSocketUpgrade,
-) -> impl IntoResponse {
-    if !authorized(&state, &headers) {
-        return unauthorized();
-    }
-    assert_catalog_creation_query(&query);
-    upgrade
-        .on_upgrade(move |mut socket| async move {
-            if state.disconnect_after_ready {
-                send_ready(&mut socket, "0", false).await;
-                drop(socket.send(Message::Close(None)).await);
-            } else {
-                serve_managed_socket(socket, state).await;
-            }
-        })
-        .into_response()
+fn combined_receipt(input: &str) -> String {
+    let receipt = serde_json::json!({
+        "agent_id": AGENT_ID, "session_id": AGENT_ID,
+        "turn_id": TURN_ID, "turn_idempotency_key": "server-derived-key",
+        "state": "accepted", "input": input, "accepted_cursor": "1",
+        "terminal_cursor": null, "created_at": 1, "accepted_at": 1,
+        "updated_at": 1, "attempt_count": 1, "retry_at": null,
+        "error": null, "terminal": null
+    });
+    format!("event: run\ndata: {receipt}\n\n")
 }
 
-async fn failed_create_live_socket(
+fn combined_stream<F>(input: &str, remaining: F) -> Response<Body>
+where
+    F: Future<Output = String> + Send + 'static,
+{
+    use futures_util::StreamExt;
+    let receipt = combined_receipt(input);
+    let stream = futures_util::stream::once(async move { Ok::<_, Infallible>(receipt) }).chain(
+        futures_util::stream::once(async move { Ok::<_, Infallible>(remaining.await) }),
+    );
+    Response::builder()
+        .status(StatusCode::CREATED)
+        .header("content-type", "text/event-stream")
+        .body(Body::from_stream(stream))
+        .unwrap()
+}
+
+async fn combined_cli_run(
     State(state): State<TestState>,
     headers: HeaderMap,
-    upgrade: WebSocketUpgrade,
-) -> impl IntoResponse {
-    if !authorized(&state, &headers) {
-        return unauthorized();
-    }
-    upgrade
-        .on_upgrade(|mut socket| async move {
-            socket
-                .send(Message::Text(
-                    serde_json::json!({
-                        "type": "ready",
-                        "session_id": "wrong-agent",
-                        "restored": false,
-                        "active_turns": [],
-                        "capabilities": agent_capabilities(),
-                        "settings": agent_settings(),
-                        "latest_event_cursor": "not-a-cursor"
-                    })
-                    .to_string()
-                    .into(),
-                ))
-                .await
-                .unwrap();
-        })
-        .into_response()
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> Response<Body> {
+    assert!(authorized(&state, &headers));
+    assert_eq!(headers["idempotency-key"], state.idempotency_key);
+    assert_eq!(headers["accept"], "text/event-stream");
+    assert_eq!(body["input"], "answer from managed");
+    assert_eq!(body["settings"], agent_settings());
+    state.completed.notify_one();
+    combined_stream("answer from managed", async move {
+        if state.disconnect_after_ready {
+            state.tool_completed.notified().await;
+            while state.catalogs.lock().unwrap().len() < 2 {
+                tokio::task::yield_now().await;
+            }
+        } else if state.expect_local_tool {
+            state.tool_completed.notified().await;
+        } else {
+            while state.tool_host_attempts.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        }
+        durable_turn_events(TURN_ID, "managed answer", 2, 1)
+    })
 }
 
 async fn serve_managed_socket(mut socket: WebSocket, state: TestState) {
@@ -1539,7 +1569,11 @@ async fn serve_tool_host(mut socket: WebSocket, state: TestState, disconnect_aft
             "machines",
             "attachment_id",
             "capabilities",
-            "runtime_id"
+            "runtime_id",
+            "command_recovery",
+            "turn_lifecycle",
+            "diagnostics",
+            "connection_id"
         ]
         .into_iter()
         .collect(),
@@ -1622,11 +1656,18 @@ async fn serve_tool_host(mut socket: WebSocket, state: TestState, disconnect_aft
         ))
         .await
         .unwrap();
-    let Some(Ok(Message::Text(result))) = socket.recv().await else {
-        return;
+    let result = loop {
+        let Some(Ok(Message::Text(frame))) = socket.recv().await else {
+            return;
+        };
+        let frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        if frame["type"] == "diagnostic" {
+            assert_eq!(frame["call_id"], "call-managed");
+            continue;
+        }
+        assert_eq!(frame["type"], "result");
+        break frame;
     };
-    let result: serde_json::Value = serde_json::from_str(&result).unwrap();
-    assert_eq!(result["type"], "result");
     assert_eq!(result["call_id"], "call-managed");
     assert_eq!(result["outcome"]["status"], "completed");
     assert_eq!(result["outcome"]["output"]["success"], true, "{result}");
@@ -1787,16 +1828,6 @@ fn fixture_command(home: &std::path::Path) -> tokio::process::Command {
         .env("NANOCODEX_DISABLE_HAND", "1")
         .env("NANOCODEX_COMPUTER", "off");
     command
-}
-
-fn assert_catalog_creation_query(query: &HashMap<String, String>) {
-    assert_eq!(query.get("model").map(String::as_str), Some("gpt-6-astra"));
-    assert_eq!(query.get("thinking").map(String::as_str), Some("low"));
-    assert_eq!(
-        query.get("reasoning_mode").map(String::as_str),
-        Some("standard")
-    );
-    assert_eq!(query.get("fast_mode").map(String::as_str), Some("false"));
 }
 
 fn fixture_model_catalog() -> serde_json::Value {
@@ -2351,3 +2382,167 @@ async fn docker_preflight_errors_are_actionable_before_account_login() {
 #[cfg(unix)]
 #[path = "native_screen_lifecycle.rs"]
 mod native_screen_lifecycle;
+
+// Real executable over HTTP/WS: optional catalog failure must not gate an
+// explicit model, while default selection and live authentication remain live.
+#[tokio::test]
+async fn explicit_model_startup_does_not_read_catalog() {
+    for catalog_mode in ["held", "unavailable", "available"] {
+        for explicit in [true, false] {
+            startup_catalog_journey(catalog_mode, explicit, false).await;
+        }
+    }
+    startup_catalog_journey("held", true, true).await;
+}
+
+async fn startup_catalog_journey(catalog_mode: &'static str, explicit: bool, revoked: bool) {
+    let reads = Arc::new(AtomicUsize::new(0));
+    let prompts = Arc::new(AtomicUsize::new(0));
+    let admissions = Arc::new(AtomicUsize::new(0));
+    let key = format!("ncx_live_{}_{}", "a".repeat(12), "b".repeat(43));
+    let authorization = format!("Bearer {key}");
+    let catalog_reads = reads.clone();
+    let prompt_count = prompts.clone();
+    let admission_count = admissions.clone();
+    let app = Router::new()
+        .route(
+            "/v1/models",
+            get(move || async move {
+                catalog_reads.fetch_add(1, Ordering::SeqCst);
+                match catalog_mode {
+                    "held" => std::future::pending().await,
+                    "unavailable" => json_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        serde_json::json!({"error": "model_availability_unavailable"}),
+                    ),
+                    _ => json_response(StatusCode::OK, fixture_model_catalog()),
+                }
+            }),
+        )
+        .route(
+            "/v1/agent-runs",
+            post(move |headers: HeaderMap, axum::Json(body): axum::Json<serde_json::Value>| async move {
+                admission_count.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(headers["authorization"], authorization);
+                assert_eq!(headers["accept"], "text/event-stream");
+                if revoked { return unauthorized(); }
+                if explicit {
+                    assert_eq!(body["settings"]["model"], "gpt-6.1-sol");
+                    assert_eq!(body["settings"]["thinking"], "xhigh");
+                    assert_eq!(body["settings"]["fast_mode"], true);
+                } else { assert_eq!(body["settings"], agent_settings()); }
+                assert_eq!(body["input"], "startup answer");
+                prompt_count.fetch_add(1, Ordering::SeqCst);
+                combined_stream("startup answer", async { durable_turn_events(TURN_ID, "catalog-independent answer", 2, 1) })
+            }),
+        )
+        .route(
+            "/v1/agents/{agent}/tool-host",
+            get(|upgrade: WebSocketUpgrade| async move {
+                upgrade.on_upgrade(|mut socket| async move {
+                    let Some(Ok(Message::Text(catalog))) = socket.recv().await else {
+                        return;
+                    };
+                    let catalog: serde_json::Value = serde_json::from_str(&catalog).unwrap();
+                    assert_eq!(catalog["type"], "catalog");
+                    socket
+                        .send(Message::Text(
+                            serde_json::json!({"type":"ready"}).to_string().into(),
+                        ))
+                        .await
+                        .unwrap();
+                    serve_until_drain(&mut socket).await;
+                })
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let home = tempfile::tempdir().unwrap();
+    let mut command = fixture_command(home.path());
+    command
+        .env("NANOCODEX_MANAGED_URL", format!("http://{address}"))
+        .env("NC_API_KEY", key)
+        .args(["run", "startup answer"])
+        .kill_on_drop(true);
+    if explicit {
+        command.args(["--model", "sol"]);
+    }
+    let result = tokio::time::timeout(std::time::Duration::from_secs(8), command.output()).await;
+    if !explicit && catalog_mode == "held" {
+        assert!(result.is_err(), "default must wait for the catalog");
+    } else {
+        let output = result.expect("CLI journey timed out").unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eprintln!(
+            "catalog={catalog_mode} explicit={explicit} revoked={revoked}: status={} stdout={stdout} stderr={stderr}",
+            output.status
+        );
+        if revoked || (!explicit && catalog_mode == "unavailable") {
+            assert!(!output.status.success());
+            if revoked {
+                assert!(
+                    stderr.contains("401") || stderr.contains("Unauthorized"),
+                    "{stderr}"
+                );
+            } else {
+                assert!(
+                    stderr.contains("model_availability_unavailable"),
+                    "{stderr}"
+                );
+            }
+        } else {
+            assert!(output.status.success(), "{stderr}");
+            assert!(stdout.contains("catalog-independent answer"), "{stdout}");
+        }
+    }
+    assert_eq!(reads.load(Ordering::SeqCst) == 0, explicit);
+    assert_eq!(
+        prompts.load(Ordering::SeqCst),
+        usize::from(!revoked && (explicit || catalog_mode == "available"))
+    );
+    assert_eq!(
+        admissions.load(Ordering::SeqCst) > 0,
+        explicit || catalog_mode == "available"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn explicit_model_rejects_invalid_options_before_network() {
+    let home = tempfile::tempdir().unwrap();
+    for flags in [
+        vec![
+            "--model",
+            "claude-sonnet-4-6",
+            "--chatgpt-account",
+            "synthetic-pin",
+        ],
+        vec!["--model", "claude-sonnet-4-6", "--thinking", "xhigh"],
+        vec!["--model", "claude-sonnet-4-6", "--reasoning-mode", "pro"],
+        vec!["--model", "claude-sonnet-4-6", "--fast-mode"],
+        vec!["--model", "unknown-model"],
+    ] {
+        let output = fixture_command(home.path())
+            .env("NANOCODEX_MANAGED_URL", "http://127.0.0.1:1")
+            .env(
+                "NC_API_KEY",
+                format!("ncx_live_{}_{}", "a".repeat(12), "b".repeat(43)),
+            )
+            .args(["run", "startup answer"])
+            .args(&flags)
+            .output()
+            .await
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success());
+        assert!(
+            stderr.contains("cannot be pinned")
+                || stderr.contains("not offered")
+                || stderr.contains("supported managed model"),
+            "{flags:?}: {stderr}"
+        );
+        eprintln!("invalid flags={flags:?}: {stderr}");
+    }
+}
