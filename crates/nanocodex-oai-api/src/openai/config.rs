@@ -8,7 +8,6 @@ use crate::{
 const SOL_SYSTEM_PROMPT: &str = include_str!("../../prompts/sol.md");
 const LUNA_SYSTEM_PROMPT: &str = include_str!("../../prompts/luna.md");
 const GLM_SYSTEM_PROMPT: &str = include_str!("../../prompts/glm.md");
-const MUSE_SYSTEM_PROMPT: &str = include_str!("../../prompts/muse.md");
 const ASTRA_SYSTEM_PROMPT: &str = include_str!("../../prompts/astra.md");
 
 /// Validated, read-only settings passed to a [`ResponsesServiceFactory`].
@@ -89,7 +88,7 @@ impl ModelConfig {
             Model::Glm53 | Model::Kimi | Model::Mimo => GLM_SYSTEM_PROMPT,
             Model::Sol => SOL_SYSTEM_PROMPT,
             Model::Luna => LUNA_SYSTEM_PROMPT,
-            Model::MuseSpark13 | Model::MuseSpark13Contributor => MUSE_SYSTEM_PROMPT,
+            Model::MuseSpark13 | Model::MuseSpark13Contributor => "",
         });
         let base =
             if self.system_prompt.is_none() && matches!(self.model, Model::Kimi | Model::Mimo) {

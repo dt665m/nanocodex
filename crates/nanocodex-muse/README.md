@@ -9,8 +9,9 @@ events, tool contracts, ToolRuntime, auth-source and transport types remain impo
 The system prompt is adapted from [OpenCode's Meta prompt](https://github.com/anomalyco/opencode/blob/b9f3b382fcfd82b57103b29b77572f112ce9e1e5/packages/opencode/src/session/prompt/meta.txt).
 General guidance is retained; OpenCode tool workflows, modes and product links
 are omitted. Available tools are described by the harness's tool definitions.
-The prompt lives beside the other model prompts in `nanocodex-oai-api/prompts`;
-its MIT notice is retained in that crate's `THIRD-PARTY-LICENSES`.
+The prompt lives in this crate's `prompts/muse.md`, with its MIT notice in
+`THIRD-PARTY-LICENSES`. The Muse recipe supplies it through the existing agent
+instructions setting; callers can replace it with `.instructions(...)`.
 
 The optional `nanocodex` facade feature exports `Muse`, `MuseBuilder`, `MuseModel`,
 and `nanocodex::muse`. `Nanocodex::builder(Muse::builder(auth).build()?)` selects

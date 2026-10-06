@@ -3,6 +3,8 @@ use nanocodex_oai_api::{Model, OpenAi, OpenAiBuilder, OpenAiError, Thinking, aut
 
 use crate::{BuilderBackend, NanocodexBuilder};
 
+const MUSE_SYSTEM_PROMPT: &str = include_str!("../prompts/muse.md");
+
 /// Muse Spark 1.3 using HTTP/SSE Responses and client-owned conversation history.
 #[derive(Clone)]
 pub struct Muse {
@@ -85,7 +87,7 @@ impl BuilderBackend for Muse {
     type Builder = NanocodexBuilder<crate::service::MuseServiceFactory>;
 
     fn into_builder(self) -> Self::Builder {
-        self.inner.into_builder()
+        self.inner.into_builder().instructions(MUSE_SYSTEM_PROMPT)
     }
 }
 
