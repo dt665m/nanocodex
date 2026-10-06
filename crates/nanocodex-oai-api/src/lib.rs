@@ -125,7 +125,7 @@ pub mod __private {
             },
         },
         tower::attempt::ResponsesAttemptFactory,
-        transport::http::{HttpMetadata, ResponsesHttp, ResponsesHttpStream},
+        transport::http::ResponsesHttp,
     };
 
     /// Agent-owned context accounting and compaction policy primitives.

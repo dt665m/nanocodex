@@ -33,6 +33,12 @@ impl ResponsesServiceFactory for MuseServiceFactory {
                 detail: "Muse requires HTTP Responses",
             });
         }
+        #[cfg(target_family = "wasm")]
+        if config.host_transport.is_none() {
+            return Err(OpenAiError::InvalidConfiguration {
+                detail: "Muse on WebAssembly requires an embedding-owned HTTP host transport",
+            });
+        }
         Ok(())
     }
 
@@ -43,6 +49,7 @@ impl ResponsesServiceFactory for MuseServiceFactory {
             ResponsesHttp::new(reqwest::Client::new())
         };
         #[cfg(target_family = "wasm")]
+        // Protocol headers are part of the embedding-owned HTTP host contract.
         let http = ResponsesHttp::new(config.host_transport.clone());
         Retry::new(
             ResponsesRetryPolicy::for_config(ResponsesRetryPolicy::DEFAULT_MAX_ATTEMPTS, &config),

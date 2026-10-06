@@ -31,6 +31,12 @@ recovery belong to this crate. The shared API exposes its existing generation
 encoder, HTTP sender, SSE receiver, and retry policy for reuse; its standard
 HTTP and WebSocket services have no provider adaptation hooks.
 
+WebAssembly embeddings supply their own `HostTransport` through
+`MuseBuilder::host_transport(...)`. The host must honor
+`HostConnectRequest::responses_lite_headers()` and `additional_headers()` when
+sending HTTP requests. The existing JavaScript bindings do not enable or expose
+the Muse harness.
+
 ```rust,no_run
 use nanocodex_muse::{Muse, Nanocodex};
 # async fn run() -> Result<(), Box<dyn std::error::Error>> {

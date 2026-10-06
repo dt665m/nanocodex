@@ -54,6 +54,19 @@ impl MuseBuilder {
         self
     }
 
+    /// Installs the embedding-owned HTTP and timer implementation on WebAssembly.
+    /// The host must honor the request's Responses Lite and additional HTTP headers.
+    #[cfg(any(target_family = "wasm", docsrs))]
+    #[cfg_attr(docsrs, doc(cfg(target_family = "wasm")))]
+    #[must_use]
+    pub fn host_transport(
+        mut self,
+        transport: impl nanocodex_oai_api::transport::host::HostTransport,
+    ) -> Self {
+        self.inner = self.inner.host_transport(transport);
+        self
+    }
+
     /// Selects the reasoning effort (defaults to low).
     #[must_use]
     pub fn thinking(mut self, thinking: Thinking) -> Self {
