@@ -11,15 +11,18 @@ const RESPONSES_LITE_HEADER: &str = "x-openai-internal-codex-responses-lite";
 const TURN_STATE_HEADER: &str = "x-codex-turn-state";
 
 #[derive(Clone)]
-pub(crate) struct ResponsesHttp {
-    dialect: Option<std::sync::Arc<dyn crate::tower::ResponsesDialect>>,
+#[doc(hidden)]
+pub struct ResponsesHttp {
+    responses_lite: bool,
+    additional_headers: &'static [(&'static str, &'static str)],
     #[cfg(not(target_family = "wasm"))]
     client: reqwest::Client,
     #[cfg(target_family = "wasm")]
     host: Option<std::sync::Arc<dyn crate::transport::host::HostTransport>>,
 }
 
-pub(crate) struct ResponsesHttpStream {
+#[doc(hidden)]
+pub struct ResponsesHttpStream {
     #[cfg(not(target_family = "wasm"))]
     response: reqwest::Response,
     #[cfg(target_family = "wasm")]
@@ -28,21 +31,24 @@ pub(crate) struct ResponsesHttpStream {
     ended: bool,
 }
 
-pub(crate) struct HttpMetadata {
-    pub(crate) reasoning_included: bool,
-    pub(crate) turn_state: Option<String>,
+#[doc(hidden)]
+pub struct HttpMetadata {
+    pub reasoning_included: bool,
+    pub turn_state: Option<String>,
 }
 
 #[cfg(not(target_family = "wasm"))]
 impl ResponsesHttp {
-    pub(crate) const fn new(
-        client: reqwest::Client,
-        dialect: Option<std::sync::Arc<dyn crate::tower::ResponsesDialect>>,
-    ) -> Self {
-        Self { client, dialect }
+    #[must_use]
+    pub const fn new(client: reqwest::Client) -> Self {
+        Self {
+            client,
+            responses_lite: true,
+            additional_headers: &[],
+        }
     }
 
-    pub(crate) async fn send(
+    pub async fn send(
         &self,
         api_base_url: &str,
         auth: &OpenAiAuthSnapshot,
@@ -66,17 +72,11 @@ impl ResponsesHttp {
                 concat!("nanocodex/", env!("CARGO_PKG_VERSION")),
             )
             .body(request.raw().get().to_owned());
-        if self
-            .dialect
-            .as_ref()
-            .is_none_or(|dialect| dialect.responses_lite_headers())
-        {
+        if self.responses_lite {
             builder = builder.header(RESPONSES_LITE_HEADER, "true");
         }
-        if let Some(dialect) = &self.dialect {
-            for (name, value) in dialect.http_headers() {
-                builder = builder.header(*name, *value);
-            }
+        for (name, value) in self.additional_headers {
+            builder = builder.header(*name, *value);
         }
         if let Some(account_id) = auth.account_id() {
             builder = builder.header("ChatGPT-Account-ID", account_id);
@@ -127,7 +127,41 @@ impl ResponsesHttp {
     }
 }
 
+impl ResponsesHttp {
+    /// Sets protocol headers on this HTTP sender; standard clients retain their defaults.
+    #[must_use]
+    pub const fn with_headers(
+        mut self,
+        responses_lite: bool,
+        additional_headers: &'static [(&'static str, &'static str)],
+    ) -> Self {
+        self.responses_lite = responses_lite;
+        self.additional_headers = additional_headers;
+        self
+    }
+}
+
 impl ResponsesHttpStream {
+    /// Receives one generation using the shared Responses parser and event pipeline.
+    /// The caller owns the transport and any provider-specific normalization.
+    pub async fn receive_generation(
+        &mut self,
+        request: &crate::tower::ResponsesAttempt,
+        started_at: web_time::Instant,
+    ) -> Result<crate::tower::GenerationOutput, crate::tower::ResponsesServiceError> {
+        let call_index = request.model_call_index().ok_or_else(|| {
+            crate::tower::ResponsesServiceError::protocol("generation requires a model call index")
+        })?;
+        crate::tower::stream::receive(
+            self,
+            crate::ResponsesTransport::Https.as_str(),
+            &request.observer,
+            call_index,
+            started_at,
+        )
+        .await
+    }
+
     pub(crate) async fn next_text(&mut self) -> Result<ReceivedText, ResponsesError> {
         loop {
             if let Some(text) = self.decoder.next()? {
@@ -331,14 +365,16 @@ mod tests {
 
 #[cfg(target_family = "wasm")]
 impl ResponsesHttp {
-    pub(crate) fn new(
-        host: Option<std::sync::Arc<dyn crate::transport::host::HostTransport>>,
-        dialect: Option<std::sync::Arc<dyn crate::tower::ResponsesDialect>>,
-    ) -> Self {
-        Self { host, dialect }
+    #[must_use]
+    pub fn new(host: Option<std::sync::Arc<dyn crate::transport::host::HostTransport>>) -> Self {
+        Self {
+            host,
+            responses_lite: true,
+            additional_headers: &[],
+        }
     }
 
-    pub(crate) async fn send(
+    pub async fn send(
         &self,
         api_base_url: &str,
         auth: &OpenAiAuthSnapshot,
@@ -366,7 +402,7 @@ impl ResponsesHttp {
                     thread_id,
                     turn_state,
                 )
-                .with_dialect(self.dialect.as_deref()),
+                .with_http_headers(self.responses_lite, self.additional_headers),
                 request.raw().get(),
             )
             .await

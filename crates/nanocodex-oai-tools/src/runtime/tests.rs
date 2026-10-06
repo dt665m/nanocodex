@@ -1105,7 +1105,7 @@ async fn direct_model_calls_reach_activated_dynamic_tools() {
 }
 
 #[tokio::test]
-async fn code_mode_can_search_then_call_a_deferred_tool_in_the_next_cell() {
+async fn code_mode_can_search_and_call_a_deferred_tool_in_one_cell() {
     let tools = Tools::builder()
         .without_defaults()
         .provider(DeferredProvider {
@@ -1124,11 +1124,12 @@ async fn code_mode_can_search_then_call_a_deferred_tool_in_the_next_cell() {
             .is_some_and(|description| !description.contains("Shared MCP Types:")),
         "ordinary deferred providers must not opt into MCP-specific guidance"
     );
-    let search = runtime
+    let execution = runtime
         .execute_code(
             r#"
 const found = await tools.tool_search({ query: "echo" });
-text(found.name);
+const result = await tools[found.name]({ value: 21 });
+text(result.value);
 "#,
             ToolContext::new(
                 "test-model",
@@ -1140,31 +1141,16 @@ text(found.name);
         )
         .await
         .unwrap();
-    assert!(search.success);
-    assert_eq!(search.nested_calls.len(), 1);
-    assert_eq!(search.nested_calls[0].name, "tool_search");
-    // Deferred definitions are snapshotted at the start of each Code Mode cell.
-    let execution = runtime
-        .execute_code(
-            "const result = await tools.deferred_echo({value: 21}); text(result.value);",
-            ToolContext::new(
-                "test-model",
-                "test-session",
-                "next-call",
-                &[],
-                DEFAULT_TOOL_OUTPUT_TOKENS,
-            ),
-        )
-        .await
-        .unwrap();
-    assert!(execution.success, "{:?}", execution.output);
+
+    assert!(execution.success);
     assert_eq!(
         serde_json::to_vec(&runtime.model_specs("test-session")).unwrap(),
         model_specs_before,
         "activating deferred tools must not change the model request prefix"
     );
-    assert_eq!(execution.nested_calls.len(), 1);
-    assert_eq!(execution.nested_calls[0].name, "deferred_echo");
+    assert_eq!(execution.nested_calls.len(), 2);
+    assert_eq!(execution.nested_calls[0].name, "tool_search");
+    assert_eq!(execution.nested_calls[1].name, "deferred_echo");
     let ToolOutputBody::Content(content) = execution.output else {
         panic!("expected content output");
     };

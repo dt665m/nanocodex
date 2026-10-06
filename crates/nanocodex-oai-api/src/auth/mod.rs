@@ -308,7 +308,7 @@ impl OpenAiAuthSource for ApiKeyAuth {
         &self,
         _rejected: &OpenAiAuthSnapshot,
     ) -> OpenAiAuthFuture<'_, Result<(), OpenAiAuthError>> {
-        Box::pin(ready(Err(OpenAiAuthError::Provider(Arc::from(
+        Box::pin(ready(Err(OpenAiAuthError::LoginRequired(Arc::from(
             "the API key was rejected",
         )))))
     }

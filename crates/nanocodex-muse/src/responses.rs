@@ -1,4 +1,4 @@
-//! Meta Responses compatibility; the shared agent and HTTP/SSE client stay unchanged.
+//! Meta Responses request encoding, normalization, and summary compaction.
 use std::collections::BTreeMap;
 
 use serde::Deserialize;
@@ -67,7 +67,9 @@ pub(crate) fn encode(
             }
             Some("reasoning") => {
                 // Muse requires this even when reasoning summaries are unavailable.
-                item["summary"] = json!([]);
+                if item.get("summary").is_none() {
+                    item["summary"] = json!([]);
+                }
                 item.as_object_mut().unwrap().remove("content");
             }
             _ => {}
@@ -100,7 +102,7 @@ pub(crate) fn encode(
     body["store"] = json!(false);
     body["stream"] = json!(true);
     body["truncation"] = json!("disabled");
-    body["reasoning"] = json!({"effort": if compact { "none" } else { body["reasoning"]["effort"].as_str().unwrap_or("low") }});
+    body["reasoning"] = json!({"effort": if compact { "minimal" } else { body["reasoning"]["effort"].as_str().unwrap_or("low") }, "summary":"auto"});
     if compact {
         body["max_output_tokens"] = json!(4096);
     }
@@ -394,37 +396,6 @@ fn continuation_start(history: &[ResponseItem]) -> usize {
         start -= 1;
     }
     start
-}
-
-#[derive(Clone)]
-pub(crate) struct MuseDialect;
-impl nanocodex_oai_api::tower::ResponsesDialect for MuseDialect {
-    fn encode(
-        &self,
-        encoded: EncodedRequest,
-        kind: ResponsesAttemptKind,
-    ) -> Result<EncodedRequest, ResponsesError> {
-        encode(encoded, matches!(kind, ResponsesAttemptKind::Compaction))
-    }
-    fn receive_kind(&self, _: ResponsesAttemptKind) -> ResponsesAttemptKind {
-        ResponsesAttemptKind::Generation
-    }
-    fn decode(
-        &self,
-        output: ResponsesOutput,
-        request: &ResponsesAttempt,
-    ) -> Result<ResponsesOutput, ResponsesServiceError> {
-        decode(output, request)
-    }
-    fn responses_lite_headers(&self) -> bool {
-        false
-    }
-    fn http_headers(&self) -> &'static [(&'static str, &'static str)] {
-        &[("x-api-version", "1.0.0")]
-    }
-    fn recover_api_key(&self) -> bool {
-        true
-    }
 }
 
 pub(crate) const fn auto_compact_token_limit(_: &str, tokens: u64) -> Option<u64> {

@@ -97,7 +97,9 @@ impl ResponsesServiceError {
         self
     }
 
-    pub(crate) fn with_request_input(self, request: &crate::ResponsesAttempt) -> Self {
+    /// Resolves provider input indices against this attempt before retry changes its replay mode.
+    #[doc(hidden)]
+    pub fn with_request_input(self, request: &crate::ResponsesAttempt) -> Self {
         match self.source {
             ResponsesServiceErrorSource::Responses(source) => {
                 let source = source.with_request_input(request.input_items());

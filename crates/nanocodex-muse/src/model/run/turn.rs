@@ -83,7 +83,7 @@ where
                 .await?;
         }
         let active_context_tokens = session.conversation.active_context_tokens();
-        let auto_compact_token_limit = crate::dialect::auto_compact_token_limit(
+        let auto_compact_token_limit = crate::responses::auto_compact_token_limit(
             self.model.as_str(),
             self.config.context_window_tokens,
         )

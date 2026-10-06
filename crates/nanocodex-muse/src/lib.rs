@@ -126,7 +126,12 @@ mod muse;
 #[cfg(feature = "openai")]
 pub use muse::{Muse, MuseBuilder};
 #[cfg(feature = "openai")]
-mod dialect;
+mod responses;
+#[cfg(feature = "openai")]
+mod service;
+#[cfg(feature = "openai")]
+#[doc(hidden)]
+pub use service::{MuseService, MuseServiceFactory};
 #[cfg(feature = "openai")]
 mod image;
 #[cfg(all(feature = "openai", not(target_family = "wasm")))]

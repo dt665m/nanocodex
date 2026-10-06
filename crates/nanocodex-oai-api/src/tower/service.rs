@@ -482,10 +482,6 @@ impl ResponsesService {
                 ))
             }
         };
-        let encoded = match &self.config.dialect {
-            Some(dialect) => encoded.and_then(|encoded| dialect.encode(encoded, request.kind)),
-            None => encoded,
-        };
         encoded.map_err(|error| {
             ResponsesServiceError::responses(error, FailurePhase::Encode, connection.generation)
         })

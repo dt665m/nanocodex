@@ -57,6 +57,7 @@ async fn request(listener: &TcpListener) -> Result<(TcpStream, Value)> {
     assert_eq!(body["stream"], true);
     assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
     assert_eq!(body["truncation"], "disabled");
+    assert_eq!(body["reasoning"]["summary"], "auto");
     for key in [
         "previous_response_id",
         "client_metadata",
@@ -147,6 +148,18 @@ async fn contributor_uses_its_model_id_for_tools_compaction_and_continuation() -
             .build()
             .is_err()
     );
+    for model in [
+        nanocodex_muse::MuseModel::Spark,
+        nanocodex_muse::MuseModel::Contributor,
+    ] {
+        assert!(
+            Muse::builder("synthetic-test-key")
+                .model(model)
+                .thinking(Thinking::None)
+                .build()
+                .is_err()
+        );
+    }
     file_edit_compaction_journey(nanocodex_muse::MuseModel::Contributor.into()).await
 }
 
@@ -173,12 +186,12 @@ async fn file_edit_compaction_journey(model: Model) -> Result<()> {
         let arguments =
             json!({"input":"*** Begin Patch\n*** Add File: hello.txt\n+hello Muse\n*** End Patch"})
                 .to_string();
-        respond(stream, "resp-tool", vec![json!({"type":"reasoning", "id":"rs_original", "summary":[], "encrypted_content":"opaque-original"}),
+        respond(stream, "resp-tool", vec![json!({"type":"reasoning", "id":"rs_original", "summary":[{"type":"summary_text","text":"Retained reasoning summary"}], "encrypted_content":"opaque-original"}),
             json!({"type":"function_call", "call_id":"patch1", "name":name, "arguments":arguments})], 9_000).await?;
         let (stream, compact) = request(&listener).await?;
         assert_eq!(compact["model"], model.as_str());
         assert_eq!(compact["tool_choice"], "none");
-        assert_eq!(compact["reasoning"]["effort"], "none");
+        assert_eq!(compact["reasoning"]["effort"], "minimal");
         assert!(compact.to_string().contains("Summarize the conversation"));
         assert!(
             !compact.to_string().contains("opaque-original"),
@@ -199,7 +212,10 @@ async fn file_edit_compaction_journey(model: Model) -> Result<()> {
         assert!(continuation.to_string().contains("muse_context_summary"));
         let reasoning = items.iter().find(|i| i["type"] == "reasoning").unwrap();
         assert_eq!(reasoning["encrypted_content"], "opaque-original");
-        assert_eq!(reasoning["summary"], json!([]));
+        assert_eq!(
+            reasoning["summary"],
+            json!([{ "type":"summary_text", "text":"Retained reasoning summary" }])
+        );
         assert_eq!(
             items
                 .iter()

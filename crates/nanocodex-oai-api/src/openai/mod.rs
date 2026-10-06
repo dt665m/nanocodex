@@ -139,11 +139,14 @@ pub struct OpenAiBuilder<F = StandardServiceFactory> {
 }
 
 impl<F> OpenAiBuilder<F> {
-    /// Installs a provider-owned wire adapter on the shared transport.
+    /// Replaces the service factory while retaining the configured client policy.
+    /// Each service receives the final configuration for its managed session.
     #[must_use]
-    pub fn dialect(mut self, dialect: impl crate::tower::ResponsesDialect + 'static) -> Self {
-        self.config.dialect = Some(Arc::new(dialect));
-        self
+    pub fn service_factory<M: ResponsesServiceFactory>(self, factory: M) -> OpenAiBuilder<M> {
+        OpenAiBuilder {
+            config: self.config,
+            factory,
+        }
     }
 
     /// Selects the default coding model for new sessions and agents.

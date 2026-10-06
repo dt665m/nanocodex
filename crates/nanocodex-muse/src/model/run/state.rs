@@ -142,7 +142,8 @@ impl ConversationState {
         item: ResponseItem,
         request_prefix: &[ResponseItem],
     ) {
-        let history = crate::dialect::install_summary(&self.managed.flattened_history(), &[], item);
+        let history =
+            crate::responses::install_summary(&self.managed.flattened_history(), &[], item);
         self.managed.replace_prepared_history(history);
         let _ = request_prefix;
     }
@@ -156,7 +157,7 @@ impl ConversationState {
     ) {
         self.canonical_context = Arc::new(canonical_context.clone());
         let initial_context = [canonical_developer_context, canonical_context];
-        let history = crate::dialect::install_summary(
+        let history = crate::responses::install_summary(
             &self.managed.flattened_history(),
             &initial_context,
             item,

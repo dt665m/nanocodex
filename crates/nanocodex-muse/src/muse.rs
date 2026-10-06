@@ -1,4 +1,4 @@
-//! Provider recipe for the shared Nanocodex harness.
+//! Provider recipe for the Muse harness.
 use nanocodex_oai_api::{Model, OpenAi, OpenAiBuilder, OpenAiError, Thinking, auth::OpenAiAuth};
 
 use crate::{BuilderBackend, NanocodexBuilder};
@@ -6,12 +6,12 @@ use crate::{BuilderBackend, NanocodexBuilder};
 /// Muse Spark 1.3 using HTTP/SSE Responses and client-owned conversation history.
 #[derive(Clone)]
 pub struct Muse {
-    inner: OpenAi,
+    inner: OpenAi<crate::service::MuseServiceFactory>,
 }
 
 /// Validates a Muse provider recipe before starting the agent driver.
 pub struct MuseBuilder {
-    inner: OpenAiBuilder,
+    inner: OpenAiBuilder<crate::service::MuseServiceFactory>,
     model: Model,
 }
 
@@ -29,7 +29,7 @@ impl Muse {
                 .transport(nanocodex_oai_api::transport::ResponsesTransport::Https)
                 .store(false)
                 .history(nanocodex_oai_api::transport::ResponsesHistory::FullReplay)
-                .dialect(crate::dialect::MuseDialect)
+                .service_factory(crate::service::MuseServiceFactory)
                 .raw_api_events(false),
         }
     }
@@ -83,7 +83,7 @@ impl MuseBuilder {
 }
 
 impl BuilderBackend for Muse {
-    type Builder = NanocodexBuilder;
+    type Builder = NanocodexBuilder<crate::service::MuseServiceFactory>;
 
     fn into_builder(self) -> Self::Builder {
         self.inner.into_builder()
@@ -91,7 +91,7 @@ impl BuilderBackend for Muse {
 }
 
 impl nanocodex_agent_reference::BuilderBackend for Muse {
-    type Builder = NanocodexBuilder;
+    type Builder = NanocodexBuilder<crate::service::MuseServiceFactory>;
     fn into_builder(self) -> Self::Builder {
         BuilderBackend::into_builder(self)
     }

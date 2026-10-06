@@ -134,14 +134,13 @@ impl<'a> HostConnectRequest<'a> {
     }
 
     #[cfg(target_family = "wasm")]
-    pub(crate) fn with_dialect(
+    pub(crate) const fn with_http_headers(
         mut self,
-        dialect: Option<&dyn crate::tower::ResponsesDialect>,
+        responses_lite: bool,
+        additional_headers: &'static [(&'static str, &'static str)],
     ) -> Self {
-        if let Some(dialect) = dialect {
-            self.responses_lite = dialect.responses_lite_headers();
-            self.additional_headers = dialect.http_headers();
-        }
+        self.responses_lite = responses_lite;
+        self.additional_headers = additional_headers;
         self
     }
 

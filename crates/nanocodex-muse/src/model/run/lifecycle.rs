@@ -116,7 +116,7 @@ where
         context: CompactionContext<'_>,
     ) -> Result<bool> {
         let CompactionContext { snapshot, phase } = context;
-        let Some(auto_compact_token_limit) = crate::dialect::auto_compact_token_limit(
+        let Some(auto_compact_token_limit) = crate::responses::auto_compact_token_limit(
             self.model.as_str(),
             self.config.context_window_tokens,
         ) else {

@@ -203,7 +203,7 @@ async fn catalog_call_result_and_drain_use_exact_frames() {
     std::fs::create_dir_all(&evidence_dir).unwrap();
     let evidence_path = evidence_dir.join("rust-native-lifecycle.log");
     let subscriber = tracing_subscriber::fmt()
-        .with_env_filter("nanocodex_oai_tools::attachment=info")
+        .with_env_filter("nanocodex_tools::attachment=info")
         .with_ansi(false)
         .with_span_events(
             tracing_subscriber::fmt::format::FmtSpan::NEW

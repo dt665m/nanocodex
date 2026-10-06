@@ -20,7 +20,14 @@ Use `nanocodex::muse` for lifecycle-specific types.
 `https://api.meta.ai/v1`, low reasoning, and client-owned full history (`store:
 false`, encrypted reasoning replay). `.model(MuseModel::Contributor)` selects
 `muse-spark-1.3-contributor`, which permits Meta training. Contributor does not
-support `Thinking::Max`. No WebSocket connection is attempted.
+support `Thinking::Max`. Neither model supports `Thinking::None`. No WebSocket
+connection is attempted.
+
+Muse installs its own service through the existing Tower factory interface.
+Request adaptation, response normalization, protocol headers, and bounded key
+recovery belong to this crate. The shared API exposes its existing generation
+encoder, HTTP sender, SSE receiver, and retry policy for reuse; its standard
+HTTP and WebSocket services have no provider adaptation hooks.
 
 ```rust,no_run
 use nanocodex_muse::{Muse, Nanocodex};
@@ -76,7 +83,7 @@ OAuth parameters follow the Muse CLI and the
 
 The Muse loop uses Claude-style client-side summary compaction for Muse:
 reserve 20,000 output plus 13,000 thinking tokens, summarize through Responses
-with tools disabled, validate a completed nonempty summary, then retain the
+with tools disabled and minimal reasoning, validate a completed nonempty summary, then retain the
 latest complete reasoning/tool round and receipts. Manual compaction, automatic
 compaction, and context-window recovery use the same path. Repeated compaction
 at one boundary is suppressed and rapid compactions are throttled. Other model
