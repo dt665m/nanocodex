@@ -9,7 +9,7 @@ events, tool contracts, ToolRuntime, auth-source and transport types remain impo
 The optional `nanocodex` facade feature exports `Muse`, `MuseBuilder`, `MuseModel`,
 and `nanocodex::muse`. `Nanocodex::builder(Muse::builder(auth).build()?)` selects
 the Muse-owned lifecycle builder, whose agent and snapshots belong to this crate.
-Use `nanocodex::muse` for lifecycle-specific types. See [reference provenance](REFERENCE.md).
+Use `nanocodex::muse` for lifecycle-specific types.
 
 `Muse::builder(auth)` selects Standard (`muse-spark-1.3`),
 `https://api.meta.ai/v1`, low reasoning, and client-owned full history (`store:
