@@ -449,6 +449,10 @@ fn auth_client() -> Result<Client, MuseAuthError> {
         .default_headers(
             [
                 (
+                    reqwest::header::USER_AGENT,
+                    HeaderValue::from_static(concat!("nanocodex/", env!("CARGO_PKG_VERSION"))),
+                ),
+                (
                     reqwest::header::ACCEPT,
                     HeaderValue::from_static("application/json"),
                 ),

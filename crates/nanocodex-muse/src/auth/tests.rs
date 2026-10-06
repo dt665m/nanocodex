@@ -156,6 +156,9 @@ async fn device_login_returns_both_credentials_without_a_store() {
     assert!(!format!("{credentials:?}{auth:?}{snapshot:?}").contains("synthetic-"));
     let requests = server.await.unwrap();
     assert!(requests[0].contains("client_id=1031625952748946"));
+    assert!(requests.iter().all(|request| {
+        request.contains(concat!("user-agent: nanocodex/", env!("CARGO_PKG_VERSION")))
+    }));
     assert!(requests[1].contains("device_code=synthetic-device"));
     assert!(requests[4].contains("Bearer synthetic-oauth"));
     assert!(requests[4].contains(r#"{"onboard":true}"#));
