@@ -153,14 +153,12 @@ pub mod __private {
     }
 }
 
-mod provider_model;
-pub use provider_model::{ProviderModel, register_provider_model};
-
 /// The default Responses model used by this SDK.
 pub const MODEL: &str = Model::Astra.as_str();
 
 /// Supported coding models.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum Model {
     /// GPT-6.1 Sol.
@@ -171,13 +169,20 @@ pub enum Model {
     #[default]
     Astra,
     /// Z.ai GLM-5.3 served by Cloudflare Workers AI.
+    #[serde(rename = "glm-5.3")]
     Glm53,
     /// Moonshot Kimi K3 through a host-managed gateway.
+    #[serde(rename = "kimi-k3", alias = "kimi")]
     Kimi,
     /// Xiaomi MiMo V2.6 Pro through a host-managed gateway.
+    #[serde(rename = "mimo-v2.6-pro", alias = "mimo")]
     Mimo,
-    /// Model metadata supplied and registered by a provider crate.
-    External(&'static ProviderModel),
+    /// Meta Muse Spark 1.3.
+    #[serde(rename = "muse-spark-1.3")]
+    MuseSpark13,
+    /// Subsidized Muse Spark 1.3; Meta may train on prompts and completions.
+    #[serde(rename = "muse-spark-1.3-contributor")]
+    MuseSpark13Contributor,
 }
 
 impl Model {
@@ -190,7 +195,7 @@ impl Model {
         match self {
             Self::Astra | Self::Sol | Self::Glm53 | Self::Kimi | Self::Mimo => Thinking::Low,
             Self::Luna => Thinking::Medium,
-            Self::External(model) => model.default_thinking,
+            Self::MuseSpark13 | Self::MuseSpark13Contributor => Thinking::Low,
         }
     }
     /// Returns the Responses API model identifier.
@@ -203,7 +208,8 @@ impl Model {
             Self::Glm53 => "@cf/zai-org/glm-5.3",
             Self::Kimi => "kimi-k3",
             Self::Mimo => "mimo-v2.6-pro",
-            Self::External(model) => model.id,
+            Self::MuseSpark13 => "muse-spark-1.3",
+            Self::MuseSpark13Contributor => "muse-spark-1.3-contributor",
         }
     }
 
@@ -211,26 +217,27 @@ impl Model {
     #[must_use]
     pub const fn supports_thinking(self, thinking: Thinking) -> bool {
         match self {
-            Self::External(model) => model.thinking_mask & (1 << thinking as u8) != 0,
             Self::Kimi => matches!(thinking, Thinking::Low | Thinking::High),
             Self::Glm53 | Self::Mimo => {
                 matches!(thinking, Thinking::Low | Thinking::Medium | Thinking::High)
             }
             Self::Luna => true,
             Self::Astra | Self::Sol => !matches!(thinking, Thinking::None),
+            Self::MuseSpark13 => !matches!(thinking, Thinking::None),
+            Self::MuseSpark13Contributor => !matches!(thinking, Thinking::None | Thinking::Max),
         }
     }
 
     /// Returns whether the model accepts the requested reasoning execution mode.
     #[must_use]
     pub const fn supports_reasoning_mode(self, mode: ReasoningMode) -> bool {
-        if let Self::External(model) = self {
-            return model.supports_pro || !matches!(mode, ReasoningMode::Pro);
-        }
         !matches!(
             (self, mode),
             (
                 Self::Astra | Self::Glm53 | Self::Kimi | Self::Mimo,
+                ReasoningMode::Pro
+            ) | (
+                Self::MuseSpark13 | Self::MuseSpark13Contributor,
                 ReasoningMode::Pro
             )
         )
@@ -240,10 +247,10 @@ impl Model {
     #[must_use]
     pub const fn max_context_window_tokens(self) -> u64 {
         match self {
-            Self::External(model) => model.context_window_tokens,
             Self::Glm53 => 1_310_720,
             Self::Kimi => 1_000_000,
             Self::Mimo => 1_048_576,
+            Self::MuseSpark13 | Self::MuseSpark13Contributor => 1_048_576,
             _ => MAX_CONTEXT_WINDOW_TOKENS,
         }
     }
@@ -266,8 +273,10 @@ impl FromStr for Model {
             "@cf/zai-org/glm-5.3" | "glm-5.3" | "glm53" => Ok(Self::Glm53),
             "kimi-k3" | "kimi" => Ok(Self::Kimi),
             "mimo-v2.6-pro" | "mimo" => Ok(Self::Mimo),
-            _ => provider_model::lookup(value).map(Self::External).ok_or_else(|| format!(
-                "invalid model {value:?}; expected gpt-6-astra, gpt-6.1-sol, gpt-6-luna, @cf/zai-org/glm-5.3, kimi-k3, mimo-v2.6-pro, or a registered provider model"
+            "muse-spark-1.3" | "muse" => Ok(Self::MuseSpark13),
+            "muse-spark-1.3-contributor" => Ok(Self::MuseSpark13Contributor),
+            _ => Err(format!(
+                "invalid model {value:?}; expected gpt-6-astra, gpt-6.1-sol, gpt-6-luna, @cf/zai-org/glm-5.3, kimi-k3, mimo-v2.6-pro, muse-spark-1.3, or muse-spark-1.3-contributor"
             )),
         }
     }

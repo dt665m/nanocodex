@@ -1,5 +1,5 @@
-//! Muse-owned selectors and static provider metadata.
-use nanocodex_oai_api::{Model, ProviderModel, Thinking};
+//! Convenience selectors for the shared Muse model identifiers.
+use nanocodex_oai_api::Model;
 use serde::{Deserialize, Serialize};
 /// Muse Spark subscription variant.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -12,52 +12,27 @@ pub enum MuseModel {
     #[serde(rename = "muse-spark-1.3-contributor")]
     Contributor,
 }
-const PROMPT: &str = include_str!("../prompts/muse.md");
-static SPARK: ProviderModel = ProviderModel {
-    id: "muse-spark-1.3",
-    context_window_tokens: 1_048_576,
-    default_thinking: Thinking::Low,
-    thinking_mask: 0b111110,
-    supports_pro: false,
-    system_prompt: PROMPT,
-    token_rates: [1250, 150, 1250, 4250],
-};
-static CONTRIBUTOR: ProviderModel = ProviderModel {
-    id: "muse-spark-1.3-contributor",
-    context_window_tokens: 1_048_576,
-    default_thinking: Thinking::Low,
-    thinking_mask: 0b011110,
-    supports_pro: false,
-    system_prompt: PROMPT,
-    token_rates: [100, 2, 100, 200],
-};
 impl MuseModel {
     /// Provider-native model ID.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Spark => SPARK.id,
-            Self::Contributor => CONTRIBUTOR.id,
+            Self::Spark => Model::MuseSpark13.as_str(),
+            Self::Contributor => Model::MuseSpark13Contributor.as_str(),
         }
     }
 }
 impl From<MuseModel> for Model {
     fn from(model: MuseModel) -> Self {
-        register();
         match model {
-            MuseModel::Spark => Self::External(&SPARK),
-            MuseModel::Contributor => Self::External(&CONTRIBUTOR),
+            MuseModel::Spark => Self::MuseSpark13,
+            MuseModel::Contributor => Self::MuseSpark13Contributor,
         }
     }
 }
-pub(crate) fn register() {
-    nanocodex_oai_api::register_provider_model(&SPARK).expect("static Muse model definition");
-    nanocodex_oai_api::register_provider_model(&CONTRIBUTOR)
-        .expect("static Muse contributor definition");
-}
 #[cfg(feature = "openai")]
 pub(crate) fn is_muse(model: Model) -> bool {
-    model == Model::External(&SPARK) || model == Model::External(&CONTRIBUTOR)
+    matches!(model, Model::MuseSpark13 | Model::MuseSpark13Contributor)
 }
 
 impl std::fmt::Display for MuseModel {

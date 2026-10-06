@@ -19,7 +19,6 @@ impl Muse {
     /// Creates a recipe with Meta API-key authentication. The key is never logged.
     #[must_use]
     pub fn builder(auth: impl Into<OpenAiAuth>) -> MuseBuilder {
-        crate::muse_model::register();
         MuseBuilder {
             model: crate::MuseModel::Spark.into(),
             inner: OpenAi::builder(auth.into())

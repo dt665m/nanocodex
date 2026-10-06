@@ -95,7 +95,7 @@ async fn respond_with_turn_state(
     turn_state: Option<&str>,
 ) -> Result<()> {
     let event = json!({"type":"response.completed", "response":{"id":id, "status":"completed", "output":output,
-        "usage":{"input_tokens":tokens, "output_tokens":2, "total_tokens":tokens + 2}}});
+        "usage":{"input_tokens":tokens, "input_tokens_details":{"cached_tokens":tokens / 2}, "output_tokens":2, "output_tokens_details":{"reasoning_tokens":1}, "total_tokens":tokens + 2}}});
     let body = format!("data: {event}\n\ndata: [DONE]\n\n");
     let turn_state = turn_state
         .map(|value| format!("x-codex-turn-state: {value}\r\n"))
@@ -154,7 +154,7 @@ async fn malformed_custom_tool_wrappers_fail_without_panicking_the_agent() -> Re
 
 #[tokio::test]
 async fn muse_edits_a_file_compacts_and_continues_with_authentic_tool_receipts() -> Result<()> {
-    file_edit_compaction_journey(nanocodex_muse::MuseModel::Spark.into()).await
+    file_edit_compaction_journey(serde_json::from_value(json!("muse-spark-1.3"))?).await
 }
 
 #[tokio::test]
@@ -178,7 +178,7 @@ async fn contributor_uses_its_model_id_for_tools_compaction_and_continuation() -
                 .is_err()
         );
     }
-    file_edit_compaction_journey(nanocodex_muse::MuseModel::Contributor.into()).await
+    file_edit_compaction_journey(serde_json::from_value(json!("muse-spark-1.3-contributor"))?).await
 }
 
 async fn file_edit_compaction_journey(model: Model) -> Result<()> {
@@ -291,9 +291,33 @@ async fn file_edit_compaction_journey(model: Model) -> Result<()> {
         .instructions("Complete the user's file task.")
         .tools(tools)
         .build()?;
+    let result = timeout(Duration::from_secs(10), async {
+        agent
+            .prompt("Create hello.txt containing hello Muse.")
+            .await?
+            .result()
+            .await
+    })
+    .await??;
+    assert_eq!(result.final_message(), "Created hello.txt");
+    let usage = result.usage().expect("provider-reported usage");
+    assert_eq!(usage.input_tokens(), 9_032);
+    assert_eq!(usage.cached_input_tokens(), 4_516);
+    assert_eq!(usage.output_tokens(), 6);
+    assert_eq!(usage.reasoning_output_tokens(), 3);
+    assert_eq!(usage.total_tokens(), 9_038);
+    let expected = match model {
+        Model::MuseSpark13 => "0.0063479",
+        Model::MuseSpark13Contributor => "0.000461832",
+        _ => unreachable!("Muse journey"),
+    };
     assert_eq!(
-        turn(&agent, "Create hello.txt containing hello Muse.").await?,
-        "Created hello.txt"
+        usage
+            .estimated_cost()
+            .expect("cost from usage")
+            .amount()
+            .decimal(),
+        expected
     );
     assert_eq!(
         std::fs::read_to_string(workspace.path().join("hello.txt"))?,

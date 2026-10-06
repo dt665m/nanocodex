@@ -9,7 +9,8 @@ events, tool contracts, ToolRuntime, auth-source and transport types remain impo
 The system prompt is adapted from [OpenCode's Meta prompt](https://github.com/anomalyco/opencode/blob/b9f3b382fcfd82b57103b29b77572f112ce9e1e5/packages/opencode/src/session/prompt/meta.txt).
 General guidance is retained; OpenCode tool workflows, modes and product links
 are omitted. Available tools are described by the harness's tool definitions.
-The source's MIT notice is retained in `THIRD-PARTY-LICENSES`.
+The prompt lives beside the other model prompts in `nanocodex-oai-api/prompts`;
+its MIT notice is retained in that crate's `THIRD-PARTY-LICENSES`.
 
 The optional `nanocodex` facade feature exports `Muse`, `MuseBuilder`, `MuseModel`,
 and `nanocodex::muse`. `Nanocodex::builder(Muse::builder(auth).build()?)` selects
@@ -42,6 +43,23 @@ agent.shutdown().await?;
 # Ok(())
 # }
 ```
+
+Model identifiers and defaults use the shared `Model::MuseSpark13` and
+`Model::MuseSpark13Contributor` variants. `MuseModel` is a convenience selector
+that converts directly to these variants.
+
+Token usage comes from the final Responses `usage` object. Cached input is a
+subset of input, and reasoning is a subset of output; neither is counted twice.
+The existing USD estimator applies Meta's published input/cache/output rates:
+Standard $1.25/$0.15/$4.25 and Contributor $0.10/$0.002/$0.20 per million tokens,
+with no long-context premium. These estimates cover Spark calls, including
+compaction; Muse Image's per-image fee is separate.
+
+Before reported usage is available, context accounting uses the reference loop's
+approximate token estimate, as OpenCode also does. Meta's
+[`/v1/responses/input_tokens`](https://dev.meta.ai/docs/token-counting) endpoint
+can measure model-specific rendered context exactly; it is distinct from billed
+usage and is not called automatically by this harness.
 
 ## Authentication
 
