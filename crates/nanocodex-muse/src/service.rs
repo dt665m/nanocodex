@@ -49,7 +49,7 @@ impl ResponsesServiceFactory for MuseServiceFactory {
             MuseService {
                 config,
                 http: http.with_headers(false, &[("x-api-version", "1.0.0")]),
-                turn_state: Arc::new(tokio::sync::Mutex::new(None)),
+                state: Arc::new(tokio::sync::Mutex::new(HttpState::default())),
             },
         )
     }
@@ -61,7 +61,30 @@ impl ResponsesServiceFactory for MuseServiceFactory {
 pub struct MuseService {
     config: Arc<ResponsesServiceConfig>,
     http: ResponsesHttp,
-    turn_state: Arc<tokio::sync::Mutex<Option<String>>>,
+    state: Arc<tokio::sync::Mutex<HttpState>>,
+}
+
+// Lifted from the reference service's ConnectionState; HTTP needs no socket state.
+#[derive(Default)]
+struct HttpState {
+    logical_turn: Option<String>,
+    turn_state: Option<String>,
+}
+
+impl HttpState {
+    fn enter_logical_turn(&mut self, logical_turn: String) {
+        if self.logical_turn.as_ref() == Some(&logical_turn) {
+            return;
+        }
+        self.logical_turn = Some(logical_turn);
+        self.turn_state = None;
+    }
+
+    fn observe_turn_state(&mut self, turn_state: Option<&str>) {
+        if self.turn_state.is_none() {
+            self.turn_state = turn_state.map(str::to_owned);
+        }
+    }
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -81,6 +104,7 @@ impl Service<ResponsesAttempt> for MuseService {
     }
 
     fn call(&mut self, request: ResponsesAttempt) -> Self::Future {
+        let request = request.with_raw_api_events(self.config.raw_api_events);
         let mut service = self.clone();
         Box::pin(async move {
             service
@@ -101,10 +125,11 @@ impl MuseService {
                 "Muse HTTP does not perform a warmup request",
             ));
         }
-        let mut turn_state = self.turn_state.lock().await;
+        let mut state = self.state.lock().await;
+        state.enter_logical_turn(request.profile().turn_id());
         let started_at = Instant::now();
         let encoded = crate::responses::encode(
-            request.encode_generation(&self.config, turn_state.as_deref())?,
+            request.encode_generation(&self.config, state.turn_state.as_deref())?,
             matches!(request.kind(), ResponsesAttemptKind::Compaction),
         )?;
         request.record_http_request(&encoded)?;
@@ -124,7 +149,7 @@ impl MuseService {
                 &auth,
                 profile.session_id(),
                 profile.thread_id(),
-                turn_state.as_deref(),
+                state.turn_state.as_deref(),
                 &encoded,
             )
             .await;
@@ -148,14 +173,14 @@ impl MuseService {
                         &refreshed,
                         profile.session_id(),
                         profile.thread_id(),
-                        turn_state.as_deref(),
+                        state.turn_state.as_deref(),
                         &encoded,
                     )
                     .await?
             }
             result => result?,
         };
-        *turn_state = metadata.turn_state;
+        state.observe_turn_state(metadata.turn_state.as_deref());
         let generated = response.receive_generation(request, started_at).await?;
         let output = crate::responses::decode(ResponsesOutput::Generation(generated), request)?;
         Ok(ResponsesServiceResponse::new(output)

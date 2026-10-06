@@ -12,6 +12,11 @@ use tokio::{
 };
 
 async fn request(listener: &TcpListener) -> Result<(TcpStream, Value)> {
+    let (stream, body, _) = request_with_headers(listener).await?;
+    Ok((stream, body))
+}
+
+async fn request_with_headers(listener: &TcpListener) -> Result<(TcpStream, Value, String)> {
     let (mut stream, _) = timeout(Duration::from_secs(10), listener.accept()).await??;
     let mut bytes = Vec::new();
     let end = loop {
@@ -70,7 +75,7 @@ async fn request(listener: &TcpListener) -> Result<(TcpStream, Value)> {
         assert_ne!(item["type"], "additional_tools");
         assert_ne!(item["type"], "compaction_trigger");
     }
-    Ok((stream, body))
+    Ok((stream, body, headers.to_lowercase()))
 }
 
 fn answer(text: &str) -> Value {
@@ -78,11 +83,24 @@ fn answer(text: &str) -> Value {
     json!({"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":text}]})
 }
 
-async fn respond(mut stream: TcpStream, id: &str, output: Vec<Value>, tokens: u64) -> Result<()> {
+async fn respond(stream: TcpStream, id: &str, output: Vec<Value>, tokens: u64) -> Result<()> {
+    respond_with_turn_state(stream, id, output, tokens, None).await
+}
+
+async fn respond_with_turn_state(
+    mut stream: TcpStream,
+    id: &str,
+    output: Vec<Value>,
+    tokens: u64,
+    turn_state: Option<&str>,
+) -> Result<()> {
     let event = json!({"type":"response.completed", "response":{"id":id, "status":"completed", "output":output,
         "usage":{"input_tokens":tokens, "output_tokens":2, "total_tokens":tokens + 2}}});
     let body = format!("data: {event}\n\ndata: [DONE]\n\n");
-    stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await?;
+    let turn_state = turn_state
+        .map(|value| format!("x-codex-turn-state: {value}\r\n"))
+        .unwrap_or_default();
+    stream.write_all(format!("HTTP/1.1 200 OK\r\n{turn_state}Content-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await?;
     stream.shutdown().await?;
     Ok(())
 }
@@ -168,7 +186,8 @@ async fn file_edit_compaction_journey(model: Model) -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = format!("http://{}/v1", listener.local_addr()?);
     let server = tokio::spawn(async move {
-        let (stream, first) = request(&listener).await?;
+        let (stream, first, headers) = request_with_headers(&listener).await?;
+        assert!(!headers.contains("x-codex-turn-state:"));
         assert_eq!(first["model"], model.as_str());
         assert_eq!(first["reasoning"]["effort"], "low");
         let patch_tool = first["tools"]
@@ -186,9 +205,10 @@ async fn file_edit_compaction_journey(model: Model) -> Result<()> {
         let arguments =
             json!({"input":"*** Begin Patch\n*** Add File: hello.txt\n+hello Muse\n*** End Patch"})
                 .to_string();
-        respond(stream, "resp-tool", vec![json!({"type":"reasoning", "id":"rs_original", "summary":[{"type":"summary_text","text":"Retained reasoning summary"}], "encrypted_content":"opaque-original"}),
-            json!({"type":"function_call", "call_id":"patch1", "name":name, "arguments":arguments})], 9_000).await?;
-        let (stream, compact) = request(&listener).await?;
+        respond_with_turn_state(stream, "resp-tool", vec![json!({"type":"reasoning", "id":"rs_original", "summary":[{"type":"summary_text","text":"Retained reasoning summary"}], "encrypted_content":"opaque-original"}),
+            json!({"type":"function_call", "call_id":"patch1", "name":name, "arguments":arguments})], 9_000, Some("turn-a")).await?;
+        let (stream, compact, headers) = request_with_headers(&listener).await?;
+        assert!(headers.contains("x-codex-turn-state: turn-a"));
         assert_eq!(compact["model"], model.as_str());
         assert_eq!(compact["tool_choice"], "none");
         assert_eq!(compact["reasoning"]["effort"], "minimal");
@@ -197,16 +217,21 @@ async fn file_edit_compaction_journey(model: Model) -> Result<()> {
             !compact.to_string().contains("opaque-original"),
             "active suffix was summarized"
         );
-        respond(
+        respond_with_turn_state(
             stream,
             "resp-summary",
             vec![answer(
                 "The user requested hello.txt. Continue the active edit.",
             )],
             20,
+            Some("turn-b"),
         )
         .await?;
-        let (stream, continuation) = request(&listener).await?;
+        let (stream, continuation, headers) = request_with_headers(&listener).await?;
+        assert!(
+            headers.contains("x-codex-turn-state: turn-a"),
+            "the first turn state must remain sticky"
+        );
         assert_eq!(continuation["model"], model.as_str());
         let items = continuation["input"].as_array().unwrap();
         assert!(continuation.to_string().contains("muse_context_summary"));
@@ -241,7 +266,11 @@ async fn file_edit_compaction_journey(model: Model) -> Result<()> {
             12,
         )
         .await?;
-        let (stream, followup) = request(&listener).await?;
+        let (stream, followup, headers) = request_with_headers(&listener).await?;
+        assert!(
+            !headers.contains("x-codex-turn-state:"),
+            "a new user turn must reset turn state"
+        );
         assert_eq!(followup["model"], model.as_str());
         assert!(followup.to_string().contains("task is complete"));
         assert!(!followup.to_string().contains("opaque-original"));
@@ -257,7 +286,7 @@ async fn file_edit_compaction_journey(model: Model) -> Result<()> {
     let tools = Tools::builder()
         .exposure(ToolExposure::DirectOnly)
         .build()?;
-    let (agent, _events) = Nanocodex::builder(provider)
+    let (agent, mut events) = Nanocodex::builder(provider)
         .workspace(workspace.path())
         .instructions("Complete the user's file task.")
         .tools(tools)
@@ -274,6 +303,19 @@ async fn file_edit_compaction_journey(model: Model) -> Result<()> {
     assert_eq!(turn(&agent, "What did you create?").await?, "hello Muse");
     agent.shutdown().await?;
     server.await??;
+    let mut count = 0;
+    while let Some(event) = events.try_recv_timed() {
+        count += 1;
+        assert_ne!(
+            event.event.kind,
+            nanocodex_muse::events::AgentEventKind::ApiEvent,
+            "raw request/response bodies must remain suppressed"
+        );
+    }
+    assert!(
+        count > 0,
+        "normalized lifecycle events must still be delivered"
+    );
     Ok(())
 }
 

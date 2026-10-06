@@ -292,6 +292,14 @@ impl ResponsesAttempt {
         }
     }
 
+    /// Applies the configured raw-event policy to a custom transport's event pipeline.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_raw_api_events(mut self, enabled: bool) -> Self {
+        self.observer.events = self.observer.events.with_raw_api_events(enabled);
+        self
+    }
+
     /// Records an HTTP attempt and its outbound payload on the existing event pipeline.
     #[doc(hidden)]
     pub fn record_http_request(&self, encoded: &crate::EncodedRequest) -> Result<(), EventError> {
