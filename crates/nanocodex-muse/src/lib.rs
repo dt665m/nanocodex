@@ -12,8 +12,7 @@ extern crate self as nanocodex_agent;
 
 mod agent;
 mod error;
-mod harness;
-pub use harness::{ClaudeModel, HarnessFamily, HarnessModel};
+pub use nanocodex_agent_reference::{ClaudeModel, HarnessFamily, HarnessModel};
 #[cfg(feature = "openai")]
 mod model;
 #[cfg(feature = "openai")]
@@ -31,7 +30,7 @@ pub mod rollout;
 /// Serializable local session snapshots returned when a backend supports them.
 pub mod session;
 /// Per-turn token accounting and USD estimates.
-pub mod usage;
+pub use nanocodex_agent_reference::usage;
 
 /// Backend implementor surface used by first-party lifecycle crates.
 #[doc(hidden)]
@@ -136,5 +135,8 @@ pub use service::{MuseService, MuseServiceFactory};
 mod image;
 #[cfg(all(feature = "openai", not(target_family = "wasm")))]
 mod image_generation;
+#[cfg(feature = "openai")]
+/// Protocol version header required by every Meta API request.
+const API_VERSION_HEADER: (&str, &str) = ("x-api-version", "1.0.0");
 mod muse_model;
 pub use muse_model::MuseModel;

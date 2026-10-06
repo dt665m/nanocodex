@@ -453,8 +453,8 @@ fn auth_client() -> Result<Client, MuseAuthError> {
                     HeaderValue::from_static("application/json"),
                 ),
                 (
-                    reqwest::header::HeaderName::from_static("x-api-version"),
-                    HeaderValue::from_static("1.0.0"),
+                    reqwest::header::HeaderName::from_static(crate::API_VERSION_HEADER.0),
+                    HeaderValue::from_static(crate::API_VERSION_HEADER.1),
                 ),
             ]
             .into_iter()

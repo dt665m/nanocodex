@@ -55,7 +55,7 @@ impl ResponsesServiceFactory for MuseServiceFactory {
             ResponsesRetryPolicy::for_config(ResponsesRetryPolicy::DEFAULT_MAX_ATTEMPTS, &config),
             MuseService {
                 config,
-                http: http.with_headers(false, &[("x-api-version", "1.0.0")]),
+                http: http.with_headers(false, &[crate::API_VERSION_HEADER]),
                 state: Arc::new(tokio::sync::Mutex::new(HttpState::default())),
             },
         )
@@ -140,52 +140,33 @@ impl MuseService {
             matches!(request.kind(), ResponsesAttemptKind::Compaction),
         )?;
         request.record_http_request(&encoded)?;
-        let auth =
-            self.config
-                .auth
-                .snapshot()
-                .await
-                .map_err(|error| ResponsesError::Authorization {
-                    detail: error.to_string(),
-                })?;
         let profile = request.profile();
-        let send = self
-            .http
-            .send(
-                &self.config.api_base_url,
-                &auth,
-                profile.session_id(),
-                profile.thread_id(),
-                state.turn_state.as_deref(),
-                &encoded,
-            )
-            .await;
-        let (mut response, metadata) = match send {
-            Err(ResponsesError::HttpRejected { status: 401, .. }) => {
-                self.config
-                    .auth
-                    .recover_unauthorized(&auth)
-                    .await
-                    .map_err(|error| ResponsesError::Authorization {
-                        detail: error.to_string(),
-                    })?;
-                let refreshed = self.config.auth.snapshot().await.map_err(|error| {
-                    ResponsesError::Authorization {
-                        detail: error.to_string(),
-                    }
-                })?;
-                self.http
-                    .send(
-                        &self.config.api_base_url,
-                        &refreshed,
-                        profile.session_id(),
-                        profile.thread_id(),
-                        state.turn_state.as_deref(),
-                        &encoded,
-                    )
-                    .await?
+        let mut auth = self.config.auth.snapshot().await.map_err(auth_error)?;
+        let mut recovered = false;
+        let (mut response, metadata) = loop {
+            let send = self
+                .http
+                .send(
+                    &self.config.api_base_url,
+                    &auth,
+                    profile.session_id(),
+                    profile.thread_id(),
+                    state.turn_state.as_deref(),
+                    &encoded,
+                )
+                .await;
+            match send {
+                Err(ResponsesError::HttpRejected { status: 401, .. }) if !recovered => {
+                    self.config
+                        .auth
+                        .recover_unauthorized(&auth)
+                        .await
+                        .map_err(auth_error)?;
+                    auth = self.config.auth.snapshot().await.map_err(auth_error)?;
+                    recovered = true;
+                }
+                result => break result?,
             }
-            result => result?,
         };
         state.observe_turn_state(metadata.turn_state.as_deref());
         let generated = response.receive_generation(request, started_at).await?;
@@ -193,5 +174,11 @@ impl MuseService {
         Ok(ResponsesServiceResponse::new(output)
             .with_attempt(request.attempt())
             .with_server_reasoning_included(metadata.reasoning_included))
+    }
+}
+
+fn auth_error(error: nanocodex_oai_api::auth::OpenAiAuthError) -> ResponsesError {
+    ResponsesError::Authorization {
+        detail: error.to_string(),
     }
 }

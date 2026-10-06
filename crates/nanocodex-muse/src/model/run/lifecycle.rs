@@ -116,12 +116,8 @@ where
         context: CompactionContext<'_>,
     ) -> Result<bool> {
         let CompactionContext { snapshot, phase } = context;
-        let Some(auto_compact_token_limit) = crate::responses::auto_compact_token_limit(
-            self.model.as_str(),
-            self.config.context_window_tokens,
-        ) else {
-            return Ok(false);
-        };
+        let auto_compact_token_limit =
+            crate::responses::auto_compact_token_limit(self.config.context_window_tokens);
         if !self.force_compaction && !conversation.muse_compaction.allows_auto_compaction() {
             return Ok(false);
         }
@@ -141,7 +137,7 @@ where
         conversation.observe_server_reasoning(server_reasoning_included);
         match phase {
             CompactionPhase::PreTurn => {
-                conversation.install_pre_turn_compaction(item, factory.profile().prefix());
+                conversation.install_pre_turn_compaction(item);
             }
             CompactionPhase::MidTurn => {
                 let snapshot = snapshot.ok_or(NanocodexError::InvalidAttemptState {
@@ -152,7 +148,6 @@ where
                     item,
                     developer_context(),
                     canonical_context,
-                    factory.profile().prefix(),
                 );
             }
         }

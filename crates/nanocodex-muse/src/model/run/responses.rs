@@ -567,29 +567,34 @@ pub(super) fn attempt_factory(
 }
 
 pub(super) fn tool_runtime(workspace: &str, config: &ModelConfig, tools: &Tools) -> ToolRuntime {
+    let image_generation = tools
+        .image_generation_enabled()
+        .then(|| ImageGenerationConfig {
+            api_base_url: config.api_base_url.clone(),
+            auth: config.auth.clone(),
+            save_root: Path::new(workspace).to_path_buf(),
+        });
+    // Native Muse replaces the shared Images API tool with its Responses-backed handler.
     #[cfg(not(target_family = "wasm"))]
     let adapted_tools;
     #[cfg(not(target_family = "wasm"))]
-    let tools = if tools.image_generation_enabled() {
-        adapted_tools = tools
-            .clone()
-            .into_builder()
-            .image_generation(false)
-            .tool(
-                crate::image_generation::ImageGenerationHandler::with_client(
-                    ImageGenerationConfig {
-                        api_base_url: config.api_base_url.clone(),
-                        auth: config.auth.clone(),
-                        save_root: Path::new(workspace).to_path_buf(),
-                    },
-                    reqwest::Client::new(),
-                ),
-            )
-            .build()
-            .expect("validated Muse image-generation tool selection");
-        &adapted_tools
-    } else {
-        tools
+    let (tools, image_generation) = match image_generation {
+        Some(image_generation) => {
+            adapted_tools = tools
+                .clone()
+                .into_builder()
+                .image_generation(false)
+                .tool(
+                    crate::image_generation::ImageGenerationHandler::with_client(
+                        image_generation,
+                        reqwest::Client::new(),
+                    ),
+                )
+                .build()
+                .expect("validated Muse image-generation tool selection");
+            (&adapted_tools, None)
+        }
+        None => (tools, None),
     };
     ToolRuntime::new_with_tools(
         workspace,
@@ -597,13 +602,7 @@ pub(super) fn tool_runtime(workspace: &str, config: &ModelConfig, tools: &Tools)
             endpoint: config.search_endpoint(),
             auth: config.auth.clone(),
         }),
-        tools
-            .image_generation_enabled()
-            .then(|| ImageGenerationConfig {
-                api_base_url: config.api_base_url.clone(),
-                auth: config.auth.clone(),
-                save_root: Path::new(workspace).to_path_buf(),
-            }),
+        image_generation,
         tools,
     )
 }

@@ -340,29 +340,23 @@ const fn invalid(detail: &'static str) -> ResponsesServiceError {
     ResponsesServiceError::protocol(detail)
 }
 
-pub(crate) fn is_summary(item: &ResponseItem) -> bool {
+fn is_summary(item: &ResponseItem) -> bool {
     matches!(item, ResponseItem::Message {role:MessageRole::User, content, ..}
         if matches!(content.as_slice(), [ContentItem::InputText {text}] if text.starts_with(SUMMARY_OPEN) && text.ends_with(SUMMARY_CLOSE)))
 }
 
 pub(crate) fn install_summary(
-    history: &[ResponseItem],
-    initial: &[ResponseItem],
+    mut history: Vec<ResponseItem>,
+    initial: impl IntoIterator<Item = ResponseItem>,
     summary: ResponseItem,
 ) -> Vec<ResponseItem> {
-    let start = continuation_start(history);
+    let kept = history.split_off(continuation_start(&history));
     let mut result = initial
-        .iter()
+        .into_iter()
         .filter(|item| !item.is_user_message())
-        .cloned()
         .collect::<Vec<_>>();
     result.push(summary);
-    result.extend(
-        history[start..]
-            .iter()
-            .filter(|item| !is_summary(item))
-            .cloned(),
-    );
+    result.extend(kept.into_iter().filter(|item| !is_summary(item)));
     result
 }
 
@@ -398,10 +392,10 @@ fn continuation_start(history: &[ResponseItem]) -> usize {
     start
 }
 
-pub(crate) const fn auto_compact_token_limit(_: &str, tokens: u64) -> Option<u64> {
-    Some(if tokens <= 33_000 {
+pub(crate) const fn auto_compact_token_limit(tokens: u64) -> u64 {
+    if tokens <= 33_000 {
         tokens.saturating_mul(95) / 100
     } else {
         tokens - 33_000
-    })
+    }
 }

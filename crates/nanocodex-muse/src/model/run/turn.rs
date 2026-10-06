@@ -83,11 +83,8 @@ where
                 .await?;
         }
         let active_context_tokens = session.conversation.active_context_tokens();
-        let auto_compact_token_limit = crate::responses::auto_compact_token_limit(
-            self.model.as_str(),
-            self.config.context_window_tokens,
-        )
-        .unwrap_or(self.config.context_window_tokens);
+        let auto_compact_token_limit =
+            crate::responses::auto_compact_token_limit(self.config.context_window_tokens);
         let compacted = {
             let compaction = self.perform_compaction(
                 self.stats.model_calls,
@@ -130,9 +127,7 @@ where
         session
             .conversation
             .observe_server_reasoning(server_reasoning_included);
-        session
-            .conversation
-            .install_pre_turn_compaction(item, session.factory.profile().prefix());
+        session.conversation.install_pre_turn_compaction(item);
         session.conversation.muse_compaction.compacted(false);
         session.conversation.commit_tail();
         session.context.require_full_reinjection();

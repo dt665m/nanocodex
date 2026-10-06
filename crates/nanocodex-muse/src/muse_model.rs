@@ -3,13 +3,12 @@ use nanocodex_oai_api::Model;
 use serde::{Deserialize, Serialize};
 /// Muse Spark subscription variant.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(into = "Model", try_from = "Model")]
 pub enum MuseModel {
     /// Standard Spark 1.3.
     #[default]
-    #[serde(rename = "muse-spark-1.3")]
     Spark,
     /// Subsidized Spark: Meta may train on prompts and completions.
-    #[serde(rename = "muse-spark-1.3-contributor")]
     Contributor,
 }
 impl MuseModel {
@@ -30,9 +29,19 @@ impl From<MuseModel> for Model {
         }
     }
 }
-#[cfg(feature = "openai")]
-pub(crate) fn is_muse(model: Model) -> bool {
-    matches!(model, Model::MuseSpark13 | Model::MuseSpark13Contributor)
+impl TryFrom<Model> for MuseModel {
+    type Error = String;
+    fn try_from(model: Model) -> Result<Self, Self::Error> {
+        match model {
+            Model::MuseSpark13 => Ok(Self::Spark),
+            Model::MuseSpark13Contributor => Ok(Self::Contributor),
+            other => Err(invalid_model(other.as_str())),
+        }
+    }
+}
+
+fn invalid_model(value: &str) -> String {
+    format!("invalid Muse model {value:?}; expected muse-spark-1.3 or muse-spark-1.3-contributor")
 }
 
 impl std::fmt::Display for MuseModel {
@@ -43,12 +52,9 @@ impl std::fmt::Display for MuseModel {
 impl std::str::FromStr for MuseModel {
     type Err = String;
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "muse-spark-1.3" | "muse" => Ok(Self::Spark),
-            "muse-spark-1.3-contributor" => Ok(Self::Contributor),
-            _ => Err(format!(
-                "invalid Muse model {value:?}; expected muse-spark-1.3 or muse-spark-1.3-contributor"
-            )),
-        }
+        value
+            .parse::<Model>()
+            .map_err(|_| invalid_model(value))
+            .and_then(Self::try_from)
     }
 }

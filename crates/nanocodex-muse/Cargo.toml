@@ -37,7 +37,6 @@ openai = [
     "dep:image",
     "dep:sha1",
     "dep:async-trait",
-    "dep:nanocodex-agent-reference",
 ]
 
 [dependencies]
@@ -46,7 +45,7 @@ base64 = { workspace = true, optional = true }
 image = { workspace = true, optional = true }
 sha1 = { workspace = true, optional = true }
 reqwest = { workspace = true, features = ["form"], optional = true }
-nanocodex-agent-reference = { package = "nanocodex-agent", version = "0.6.6", path = "../nanocodex-agent", default-features = false, optional = true }
+nanocodex-agent-reference = { package = "nanocodex-agent", version = "0.6.6", path = "../nanocodex-agent", default-features = false }
 chrono = { workspace = true, optional = true }
 futures-util.workspace = true
 iana-time-zone = { workspace = true, optional = true }
@@ -70,8 +69,6 @@ wasm-bindgen-futures = { workspace = true, optional = true }
 
 [dev-dependencies]
 async-trait.workspace = true
-tokio-tungstenite.workspace = true
-tracing-subscriber.workspace = true
 base64.workspace = true
 eyre.workspace = true
 image.workspace = true

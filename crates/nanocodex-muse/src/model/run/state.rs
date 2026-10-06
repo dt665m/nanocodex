@@ -137,15 +137,9 @@ impl ConversationState {
         self.managed.history_revision()
     }
 
-    pub(super) fn install_pre_turn_compaction(
-        &mut self,
-        item: ResponseItem,
-        request_prefix: &[ResponseItem],
-    ) {
-        let history =
-            crate::responses::install_summary(&self.managed.flattened_history(), &[], item);
+    pub(super) fn install_pre_turn_compaction(&mut self, item: ResponseItem) {
+        let history = crate::responses::install_summary(self.managed.flattened_history(), [], item);
         self.managed.replace_prepared_history(history);
-        let _ = request_prefix;
     }
 
     pub(super) fn install_mid_turn_compaction(
@@ -153,17 +147,14 @@ impl ConversationState {
         item: ResponseItem,
         canonical_developer_context: ResponseItem,
         canonical_context: ResponseItem,
-        request_prefix: &[ResponseItem],
     ) {
         self.canonical_context = Arc::new(canonical_context.clone());
-        let initial_context = [canonical_developer_context, canonical_context];
         let history = crate::responses::install_summary(
-            &self.managed.flattened_history(),
-            &initial_context,
+            self.managed.flattened_history(),
+            [canonical_developer_context, canonical_context],
             item,
         );
         self.managed.replace_prepared_history(history);
-        let _ = request_prefix;
     }
 
     pub(super) fn append_canonical_context(

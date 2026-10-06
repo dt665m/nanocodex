@@ -26,7 +26,7 @@ impl Muse {
             inner: OpenAi::builder(auth.into())
                 .model(crate::MuseModel::Spark.into())
                 .api_base_url("https://api.meta.ai/v1")
-                .context_window_tokens(1_048_576)
+                .context_window_tokens(Model::MuseSpark13.max_context_window_tokens())
                 .transport(nanocodex_oai_api::transport::ResponsesTransport::Https)
                 .store(false)
                 .history(nanocodex_oai_api::transport::ResponsesHistory::FullReplay)
@@ -86,7 +86,7 @@ impl MuseBuilder {
     /// # Errors
     /// Returns an error for an empty key, endpoint, or context budget.
     pub fn build(self) -> Result<Muse, OpenAiError> {
-        if !crate::muse_model::is_muse(self.model) {
+        if crate::MuseModel::try_from(self.model).is_err() {
             return Err(OpenAiError::InvalidConfiguration {
                 detail: "Muse requires muse-spark-1.3 or muse-spark-1.3-contributor",
             });

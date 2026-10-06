@@ -4,7 +4,8 @@ Muse Spark 1.3 over HTTP/SSE Responses. The lifecycle and loop are lifted from
 `nanocodex-agent` at upstream commit `8bfb67ad2dbb7d3b5d031cc44d563fd2471355e3`.
 The reference crate is unchanged. This copy differs for Muse image preparation,
 image generation, summary compaction, and the provider recipe; shared Responses,
-events, tool contracts, ToolRuntime, auth-source and transport types remain imports.
+events, tool contracts, ToolRuntime, auth-source and transport types, plus the
+reference crate's harness model and usage types, remain imports.
 
 The system prompt is adapted from [OpenCode's Meta prompt](https://github.com/anomalyco/opencode/blob/b9f3b382fcfd82b57103b29b77572f112ce9e1e5/packages/opencode/src/session/prompt/meta.txt).
 General guidance is retained; OpenCode tool workflows, modes and product links

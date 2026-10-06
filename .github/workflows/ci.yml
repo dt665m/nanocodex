@@ -39,6 +39,7 @@ jobs:
       windows: ${{ steps.select.outputs.windows }}
       vm: ${{ steps.select.outputs.vm }}
       voice: ${{ steps.select.outputs.voice }}
+      muse: ${{ steps.select.outputs.muse }}
       python: ${{ steps.select.outputs.python }}
       rust: ${{ steps.select.outputs.rust }}
       rust_extra: ${{ steps.select.outputs.rust_extra }}
@@ -338,7 +339,7 @@ jobs:
 
   muse-journeys:
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: needs.changes.outputs.muse == 'true'
     name: Muse auth and HTTP image/tool journeys
     runs-on: ubuntu-latest
     timeout-minutes: 15

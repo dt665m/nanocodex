@@ -10,7 +10,7 @@ use nanocodex_oai_api::{
     tools::ToolDefinition,
 };
 use reqwest::header::{AUTHORIZATION, USER_AGENT};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::image::load_for_prompt_data_url;
@@ -57,43 +57,17 @@ impl ImageGenerationHandler {
                 "Muse Image only produces opaque images; transparent_background is unsupported",
             );
         }
-        let request =
-            match request_for_args_with_remote_images(&args, context.history(), true).await {
-                Ok(request) => request,
-                Err(error) => return ToolOutput::error(error),
+        let images = match selected_images(&args, context.history()).await {
+            Ok(images) => images,
+            Err(error) => return ToolOutput::error(error),
+        };
+        let (image, imagegen_request_id) =
+            match self.post_image_request(&args.prompt, &images).await {
+                Ok(response) => response,
+                Err(error) => return error.output(),
             };
-        let response = match request {
-            ImageRequest::Generate(request) => {
-                self.post_image_request(&request, "image generation").await
-            }
-            ImageRequest::Edit(request) => self.post_image_request(&request, "image edit").await,
-        };
-        let (response, imagegen_request_id) = match response {
-            Ok(response) => response,
-            Err(error) => return error.output(),
-        };
-        let generation_id = response
-            .generation_id
-            .as_deref()
-            .and_then(safe_image_id)
-            .or_else(|| {
-                response
-                    .data
-                    .first()
-                    .and_then(|data| data.generation_id.as_deref())
-                    .and_then(safe_image_id)
-            });
-        let metadata = image_ids(imagegen_request_id.clone(), generation_id.clone());
-        let Some(data) = response.data.into_iter().next() else {
-            return ImageRequestFailure {
-                message: "image generation returned no image data".to_owned(),
-                imagegen_request_id,
-                generation_id,
-            }
-            .output();
-        };
-        let format = response.output_format.as_deref().unwrap_or("png");
-        let mime = match format {
+        let metadata = image_ids(imagegen_request_id, image.id);
+        let mime = match image.format.as_str() {
             "png" => "image/png",
             "jpeg" => "image/jpeg",
             "webp" => "image/webp",
@@ -101,74 +75,54 @@ impl ImageGenerationHandler {
                 return ToolOutput::error("image generation returned an unsupported output format");
             }
         };
+        let saved_path = save_result(
+            &self.save_root,
+            context.session_id(),
+            context.call_id(),
+            &image.b64,
+            &image.format,
+        )
+        .await
+        .ok();
+        let image_url = format!("data:{mime};base64,{}", image.b64);
         let mut structured_result = metadata.clone();
-        let mut output_items = Vec::new();
-        match (data.b64_json, data.file_id) {
-            (Some(result), None) if !result.is_empty() => {
-                let saved_path = save_result(
-                    &self.save_root,
-                    context.session_id(),
-                    context.call_id(),
-                    &result,
-                    format,
-                )
-                .await
-                .ok();
-                let image_url = format!("data:{mime};base64,{result}");
-                output_items.push(ToolOutputContent::InputImage {
-                    image_url: image_url.clone(),
-                    detail: ImageDetail::High,
-                });
-                structured_result["image_url"] = Value::String(image_url);
-                if let Some(output_hint) =
-                    saved_path.as_ref().and_then(|path| image_output_hint(path))
-                {
-                    output_items.push(ToolOutputContent::InputText {
-                        text: output_hint.clone(),
-                    });
-                    structured_result["output_hint"] = Value::String(output_hint);
-                }
-            }
-            (None, Some(file_id)) if valid_image_file_id(&file_id) => {
-                output_items.push(ToolOutputContent::InputImageFile {
-                    file_id: file_id.clone(),
-                    detail: ImageDetail::High,
-                });
-                structured_result["file_id"] = Value::String(file_id);
-            }
-            _ => {
-                return ImageRequestFailure {
-                    message: "image generation returned an invalid image reference".to_owned(),
-                    imagegen_request_id,
-                    generation_id,
-                }
-                .output();
-            }
+        structured_result["image_url"] = Value::String(image_url.clone());
+        let mut output_items = vec![ToolOutputContent::InputImage {
+            image_url,
+            detail: ImageDetail::High,
+        }];
+        if let Some(output_hint) = saved_path.as_ref().and_then(|path| image_output_hint(path)) {
+            output_items.push(ToolOutputContent::InputText {
+                text: output_hint.clone(),
+            });
+            structured_result["output_hint"] = Value::String(output_hint);
         }
         ToolOutput::content(output_items)
             .with_structured_result(structured_result)
             .with_metadata(metadata)
     }
 
-    async fn post_image_request<R: Serialize + ?Sized>(
+    async fn post_image_request(
         &self,
-        request: &R,
-        operation: &str,
-    ) -> Result<(ImageResponse, Option<String>), ImageRequestFailure> {
-        let mut body = serde_json::to_value(request)
-            .map_err(|_| "failed to encode image request".to_owned())?;
-        let mut content = vec![json!({"type":"input_text","text":body["prompt"]})];
-        if let Some(images) = body["images"].as_array() {
-            for image in images {
-                let mut image = image.clone();
-                image["type"] = json!("input_image");
-                content.push(image);
-            }
+        prompt: &str,
+        images: &[ImageReference],
+    ) -> Result<(MuseImage, Option<String>), ImageRequestFailure> {
+        let operation = if images.is_empty() {
+            "image generation"
+        } else {
+            "image edit"
+        };
+        let mut content = vec![json!({"type":"input_text","text":prompt})];
+        for image in images {
+            let mut image = serde_json::to_value(image)
+                .map_err(|_| "failed to encode image request".to_owned())?;
+            image["type"] = json!("input_image");
+            content.push(image);
         }
         // Subscription credentials support Responses, but reject the Images API.
         // Muse Image accepts only its image_generation tool, never Spark's tools.
-        body = json!({
-            "model":"muse-image-1.0",
+        let body = json!({
+            "model":IMAGE_MODEL,
             "store":false,
             "input":[{"role":"user","content":content}],
             "tools":[{"type":"image_generation","output_format":"png","size":"auto"}]
@@ -205,14 +159,12 @@ impl ImageGenerationHandler {
             imagegen_request_id: imagegen_request_id.clone(),
             generation_id: None,
         })?;
-        let generation_id = serde_json::from_slice::<Value>(&body)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("generation_id")
-                    .and_then(Value::as_str)
-                    .and_then(safe_image_id)
-            });
+        let body = serde_json::from_slice::<Value>(&body).ok();
+        let generation_id = body
+            .as_ref()
+            .and_then(|value| value.get("generation_id"))
+            .and_then(Value::as_str)
+            .and_then(safe_image_id);
         if !status.is_success() {
             return Err(ImageRequestFailure {
                 message: format!("{operation} returned HTTP {status}"),
@@ -220,18 +172,18 @@ impl ImageGenerationHandler {
                 generation_id,
             });
         }
-        let parsed = muse_image_response(&body).map_err(|message| ImageRequestFailure {
+        let image = muse_image_response(body).map_err(|message| ImageRequestFailure {
             message,
             imagegen_request_id: imagegen_request_id.clone(),
             generation_id,
         })?;
-        Ok((parsed, imagegen_request_id))
+        Ok((image, imagegen_request_id))
     }
 
-    async fn send_authorized<R: Serialize + ?Sized>(
+    async fn send_authorized(
         &self,
         endpoint: &str,
-        body: &R,
+        body: &Value,
         auth: &OpenAiAuthSnapshot,
     ) -> Result<reqwest::Response, String> {
         let request = self
@@ -239,7 +191,7 @@ impl ImageGenerationHandler {
             .post(endpoint)
             .header(USER_AGENT, concat!("nanocodex/", env!("CARGO_PKG_VERSION")))
             .header(AUTHORIZATION, format!("Bearer {}", auth.bearer()))
-            .header("x-api-version", "1.0.0");
+            .header(crate::API_VERSION_HEADER.0, crate::API_VERSION_HEADER.1);
         request
             .json(body)
             .send()
@@ -294,70 +246,35 @@ struct ImagegenArgs {
     num_last_images_to_include: Option<usize>,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
-struct ImageGenerationRequest {
-    prompt: String,
-    background: &'static str,
-    model: &'static str,
-    quality: &'static str,
-    size: &'static str,
+struct MuseImage {
+    id: Option<String>,
+    b64: String,
+    format: String,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
-struct ImageEditRequest {
-    images: Vec<ImageReference>,
-    prompt: String,
-    background: &'static str,
-    model: &'static str,
-    quality: &'static str,
-    size: &'static str,
-}
-
-#[derive(Deserialize)]
-struct ImageResponse {
-    #[serde(default)]
-    generation_id: Option<String>,
-    data: Vec<ImageData>,
-    #[serde(default)]
-    output_format: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ImageData {
-    #[serde(default)]
-    b64_json: Option<String>,
-    #[serde(default)]
-    file_id: Option<String>,
-    #[serde(default)]
-    generation_id: Option<String>,
-}
-
-fn muse_image_response(body: &[u8]) -> Result<ImageResponse, String> {
-    let response: Value = serde_json::from_slice(body)
-        .map_err(|_| "failed to decode Muse Image response".to_owned())?;
+fn muse_image_response(response: Option<Value>) -> Result<MuseImage, String> {
+    let mut response = response.ok_or_else(|| "failed to decode Muse Image response".to_owned())?;
     if response["status"] != "completed" {
         return Err("Muse Image response did not complete".to_owned());
     }
     let image = response["output"]
-        .as_array()
+        .as_array_mut()
         .and_then(|items| {
-            items.iter().find(|item| {
+            items.iter_mut().find(|item| {
                 item["type"] == "image_generation_call" && item["status"] == "completed"
             })
         })
         .ok_or_else(|| "Muse Image response contained no completed image".to_owned())?;
-    let result = image["result"]
-        .as_str()
-        .filter(|result| !result.is_empty())
-        .ok_or_else(|| "Muse Image response contained no image bytes".to_owned())?;
-    Ok(ImageResponse {
-        generation_id: image["id"].as_str().and_then(safe_image_id),
-        data: vec![ImageData {
-            b64_json: Some(result.to_owned()),
-            file_id: None,
-            generation_id: None,
-        }],
-        output_format: Some(image["output_format"].as_str().unwrap_or("png").to_owned()),
+    let Value::String(b64) = image["result"].take() else {
+        return Err("Muse Image response contained no image bytes".to_owned());
+    };
+    if b64.is_empty() {
+        return Err("Muse Image response contained no image bytes".to_owned());
+    }
+    Ok(MuseImage {
+        id: image["id"].as_str().and_then(safe_image_id),
+        b64,
+        format: image["output_format"].as_str().unwrap_or("png").to_owned(),
     })
 }
 
@@ -404,22 +321,10 @@ fn image_ids(request_id: Option<String>, generation_id: Option<String>) -> Value
     result
 }
 
-#[derive(Debug, PartialEq)]
-enum ImageRequest {
-    Generate(ImageGenerationRequest),
-    Edit(ImageEditRequest),
-}
-
-async fn request_for_args_with_remote_images(
+async fn selected_images(
     args: &ImagegenArgs,
     history: &[ResponseItem],
-    allow_remote_images: bool,
-) -> Result<ImageRequest, String> {
-    let background = if args.transparent_background {
-        "transparent"
-    } else {
-        "opaque"
-    };
+) -> Result<Vec<ImageReference>, String> {
     let paths = args.referenced_image_paths.as_deref().unwrap_or_default();
     if paths.len() > MAX_EDIT_IMAGES {
         return Err(format!(
@@ -427,15 +332,7 @@ async fn request_for_args_with_remote_images(
         ));
     }
     let images = match (paths.is_empty(), args.num_last_images_to_include) {
-        (true, None) => {
-            return Ok(ImageRequest::Generate(ImageGenerationRequest {
-                prompt: args.prompt.clone(),
-                background,
-                model: IMAGE_MODEL,
-                quality: "auto",
-                size: "auto",
-            }));
-        }
+        (true, None) => return Ok(Vec::new()),
         (false, None) => {
             let mut images = Vec::with_capacity(paths.len());
             for path in paths {
@@ -479,9 +376,8 @@ async fn request_for_args_with_remote_images(
             ImageReference::File { file_id } if valid_image_file_id(file_id) => {}
             ImageReference::Inline { image_url }
                 if image_url.starts_with("data:image/")
-                    || (allow_remote_images
-                        && (image_url.starts_with("https://")
-                            || image_url.starts_with("http://"))) => {}
+                    || image_url.starts_with("https://")
+                    || image_url.starts_with("http://") => {}
             _ => {
                 return Err(
                     "selected conversation image has an invalid or unsupported reference"
@@ -490,14 +386,7 @@ async fn request_for_args_with_remote_images(
             }
         }
     }
-    Ok(ImageRequest::Edit(ImageEditRequest {
-        images,
-        prompt: args.prompt.clone(),
-        background,
-        model: IMAGE_MODEL,
-        quality: "auto",
-        size: "auto",
-    }))
+    Ok(images)
 }
 
 async fn local_image_url(path: PathBuf) -> Result<String, String> {

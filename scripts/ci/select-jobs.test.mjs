@@ -10,7 +10,7 @@ import { test } from "node:test";
 import { families } from "./select-jobs.mjs";
 
 const script = fileURLToPath(new URL("./select-jobs.mjs", import.meta.url));
-const heavy = ["hands", "windows", "vm", "voice", "python", "rust_extra", "preview", "codeql"];
+const heavy = ["hands", "windows", "vm", "voice", "muse", "python", "rust_extra", "preview", "codeql"];
 const only = (...on) => Object.fromEntries(families.map(name => [name, on.includes(name)]));
 const everything = only(...families);
 
@@ -142,7 +142,7 @@ test("ci success accepts reduced matrices and rejects failures, cancellations, a
   const w = workspace(t);
   const outputs = selected => ({ ...Object.fromEntries(families.map(name => [name, String(selected.includes(name))])), tests: "false" });
   const jobs = {
-    test: [], "shared-hands": ["hands"], "voice-native": ["voice"], "windows-hand": ["windows"], clippy: ["rust"], "muse-journeys": ["rust"],
+    test: [], "shared-hands": ["hands"], "voice-native": ["voice"], "windows-hand": ["windows"], clippy: ["rust"], "muse-journeys": ["muse"],
     "rust-extra": ["rust_extra"], "vm-guest": ["vm"], policy: ["policy"], "wasm-build": ["wasm"], "js-preview": ["preview"],
     "wasm-quality": ["wasm_rust"], bindings: ["bindings"], python: ["python"], apps: ["apps"], codeql: ["codeql"],
   };

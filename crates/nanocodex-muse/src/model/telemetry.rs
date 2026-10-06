@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, value::RawValue};
 use web_time::Instant;
 
-use crate::usage::TurnUsage;
+use crate::usage::{CostStatus, ReportedTurnUsage, TurnUsage};
 
 use nanocodex_oai_tools::contract::ToolOutputBody;
 
@@ -242,7 +242,8 @@ impl RunStats {
             (None, Some(warmup)) => Some(warmup),
             (None, None) => None,
         };
-        TurnUsage::from_counts(crate::usage::TurnUsageCounts {
+        let reported = self.usage.reported || self.warmup_usage.reported;
+        TurnUsage::from_reported(ReportedTurnUsage {
             input_tokens: self.usage.input_tokens + self.warmup_usage.input_tokens,
             cached_input_tokens: self.usage.cached_input_tokens
                 + self.warmup_usage.cached_input_tokens,
@@ -252,8 +253,12 @@ impl RunStats {
             reasoning_output_tokens: self.usage.reasoning_output_tokens
                 + self.warmup_usage.reasoning_output_tokens,
             total_tokens: self.usage.total_tokens + self.warmup_usage.total_tokens,
-            reported: self.usage.reported || self.warmup_usage.reported,
-            estimated_cost,
+            estimated_cost: estimated_cost.filter(|_| reported),
+            cost_status: if reported {
+                CostStatus::EstimatedFromUsage
+            } else {
+                CostStatus::UsageNotReported
+            },
         })
     }
 }
