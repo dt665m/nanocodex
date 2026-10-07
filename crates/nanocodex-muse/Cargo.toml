@@ -45,11 +45,11 @@ base64 = { workspace = true, optional = true }
 image = { workspace = true, optional = true }
 sha1 = { workspace = true, optional = true }
 reqwest = { workspace = true, features = ["form"], optional = true }
-nanocodex-agent-reference = { package = "nanocodex-agent", version = "0.6.6", path = "../nanocodex-agent", default-features = false }
+nanocodex-agent-reference = { package = "nanocodex-agent", version = "0.6.7", path = "../nanocodex-agent", default-features = false }
 chrono = { workspace = true, optional = true }
 futures-util.workspace = true
 iana-time-zone = { workspace = true, optional = true }
-nanocodex-oai-api = { version = "0.6.6", path = "../nanocodex-oai-api", default-features = false, features = ["events"] }
+nanocodex-oai-api = { version = "0.6.7", path = "../nanocodex-oai-api", default-features = false, features = ["events"] }
 nanocodex-oai-tools = { workspace = true, optional = true }
 serde.workspace = true
 serde_json = { workspace = true, optional = true }

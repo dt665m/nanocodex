@@ -1143,20 +1143,13 @@ fn supported_agent_page_origin(url: &Url) -> bool {
 async fn run_turn(client: &ManagedClient, command: Run) -> Result<(), ManagedError> {
     let created = command.agent.is_none();
     let account = command.settings.chatgpt_account.clone();
-    let settings = if command.agent.is_none() || account.is_some() {
+    let selection = command.settings.server_selection();
+    let settings = if created && selection.is_none() {
         command.settings.resolve_for_account(client).await?
     } else {
         command.settings.resolve()
     };
-    let requested_agent = match account {
-        Some(account) => Some(
-            client
-                .create_with_chatgpt_account(settings, &account)
-                .await?
-                .agent_id,
-        ),
-        None => command.agent,
-    };
+    let requested_agent = command.agent;
     let request_id = command
         .idempotency_key
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -1168,11 +1161,20 @@ async fn run_turn(client: &ManagedClient, command: Run) -> Result<(), ManagedErr
             settings,
             None,
             Some((command.prompt.clone(), request_id.clone())),
+            Some((selection, account)),
         )
         .await?
     } else {
-        build_workspace_agent_with_settings(client, requested_agent, None, settings, None, None)
-            .await?
+        build_workspace_agent_with_settings(
+            client,
+            requested_agent,
+            None,
+            settings,
+            None,
+            None,
+            None,
+        )
+        .await?
     };
     if created {
         eprintln!("Managed agent: {agent_id}");
@@ -1238,6 +1240,7 @@ async fn open_workspace_agent_with_settings(
         settings,
         event_observer,
         None,
+        None,
     )
     .await?;
     Ok((agent, events, id, workspace))
@@ -1250,6 +1253,10 @@ async fn build_workspace_agent_with_settings(
     settings: AgentSettings,
     event_observer: Option<tokio::sync::mpsc::UnboundedSender<ManagedEvent>>,
     initial_prompt: Option<(String, String)>,
+    startup: Option<(
+        Option<nanocodex_managed::InitialSettingsSelection>,
+        Option<String>,
+    )>,
 ) -> Result<
     (
         Nanocodex,
@@ -1273,27 +1280,32 @@ async fn build_workspace_agent_with_settings(
         client
             .clone()
             .with_request_origin("nanocodex2", Some(&hand_key), Some(&hand_cwd))?;
-    let mut tools = Tools::builder()
+    // Required workspace configuration is validated before cloud admission.
+    let tools = Tools::builder()
         .without_defaults()
-        .add(WorkspaceTools::new(&workspace));
-    let computer = {
-        let _timing = startup_timing::Stage::new("computer_discovery");
-        native_hand::computer_tools().await?
-    };
-    if let Some(computer) = computer {
-        for tool in computer.tools() {
-            tools = tools.add(tool);
-        }
-    }
-    // The terminal owns its local tool runtime. Cloudflare managed-agent MCP
-    // defaults are not inherited by nanocodex2's workspace-backed driver.
-    let tools = tools
+        .add(WorkspaceTools::new(&workspace))
         .add(default_mercator_mcp()?)
         .build()
         .map_err(|error| ManagedError::Configuration(error.to_string()))?;
+    // Explicit providers preserve their fail-before-admission contract.
+    let explicit_computer =
+        std::env::var_os("NANOCODEX_COMPUTER").is_some_and(|value| !value.is_empty());
+    let tools = if explicit_computer {
+        prepare_workspace_computer(tools).await?
+    } else {
+        tools
+    };
     let backend = match (agent_id, state) {
         (None, None) if initial_prompt.is_some() => {
-            Managed::create(client.clone()).with_settings(settings)
+            let backend = Managed::create(client.clone());
+            if startup
+                .as_ref()
+                .is_some_and(|(selection, _)| selection.is_some())
+            {
+                backend
+            } else {
+                backend.with_settings(settings)
+            }
         }
         (None, None) => Managed::create_live(client.clone()).with_settings(settings),
         (Some(agent_id), Some(state)) => {
@@ -1306,9 +1318,29 @@ async fn build_workspace_agent_with_settings(
             ));
         }
     };
-    let builder = Nanocodex::builder(backend)
-        .tools(tools)
-        .attachment_metadata(attachment_metadata);
+    let mut builder = Nanocodex::builder(backend).attachment_metadata(attachment_metadata);
+    if let Some((selection, account)) = startup {
+        if let Some(selection) = selection {
+            builder = builder.settings_selection(selection);
+        }
+        if let Some(account) = account {
+            builder = builder.chatgpt_account(account);
+        }
+    }
+    let builder = if explicit_computer {
+        builder.tools(tools)
+    } else {
+        builder.tools_async(async move {
+            let fallback = tools.clone();
+            match prepare_workspace_computer(tools).await {
+                Ok(tools) => tools,
+                Err(error) => {
+                    tracing::warn!(%error, "optional computer tools unavailable; retaining workspace tools");
+                    fallback
+                }
+            }
+        })
+    };
     let builder = match event_observer {
         Some(observer) => builder.event_observer(observer),
         None => builder,
@@ -1331,6 +1363,20 @@ async fn build_workspace_agent_with_settings(
     };
     let agent_id = agent.agent_id().to_owned();
     Ok((agent, events, agent_id, workspace, turn))
+}
+
+async fn prepare_workspace_computer(tools: Tools) -> Result<Tools, ManagedError> {
+    let _timing = startup_timing::Stage::new("computer_discovery");
+    let Some(computer) = native_hand::computer_tools().await? else {
+        return Ok(tools);
+    };
+    let mut builder = tools.into_builder();
+    for tool in computer.tools() {
+        builder = builder.add(tool);
+    }
+    builder
+        .build()
+        .map_err(|error| ManagedError::Configuration(error.to_string()))
 }
 
 fn default_mercator_mcp() -> Result<Mcp, ManagedError> {

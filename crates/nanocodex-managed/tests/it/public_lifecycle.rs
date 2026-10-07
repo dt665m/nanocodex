@@ -233,6 +233,150 @@ async fn combined_first_prompt_with_local_tools_does_not_wait_for_attachment() {
     }).await.expect("combined prompt must not wait for attachment readiness");
 }
 
+// The actual HTTP/SSE and reverse-tool WebSocket remain usable while discovery
+// is held. Closing or failed admission must drop preparation without publishing.
+#[cfg(feature = "tools")]
+#[tokio::test]
+async fn combined_first_prompt_with_deferred_tools_preserves_lifecycle() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        for scenario in ["late", "disconnect", "rejected", "cancelled"] {
+            let api_key = format!("ncx_live_{}_{}", "a".repeat(12), "b".repeat(43));
+            let fixture = Fixture::new(&api_key);
+            let started = Arc::new(Notify::new());
+            let dropped = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            let post_entered = Arc::new(Notify::new());
+            let http_entered = post_entered.clone();
+            let gate = started.clone();
+            let app = Router::new()
+                .route("/v1/agent-runs", post(move |state: State<Fixture>, headers: HeaderMap, body: Bytes| {
+                    let gate = gate.clone();
+                    let entered = http_entered.clone();
+                    async move {
+                        gate.notified().await;
+                        entered.notify_one();
+                        if scenario == "cancelled" { return std::future::pending().await; }
+                        if scenario == "rejected" {
+                            return json_response(StatusCode::UNAUTHORIZED, json!({"error":"unauthorized"}));
+                        }
+                        combined_run(state, headers, body).await
+                    }
+                }))
+                .route("/v1/agents/{agent_id}/tool-host", get(tool_host))
+                .with_state(fixture.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let client = ManagedClient::new(format!("http://{address}"), ManagedApiKey::parse(api_key).unwrap()).unwrap()
+                .with_request_origin("nanocodex2", Some("user:synthetic-host"), Some("/synthetic-host")).unwrap();
+            struct DropNotice(Arc<Notify>);
+            impl Drop for DropNotice { fn drop(&mut self) { self.0.notify_one(); } }
+            let notice = DropNotice(dropped.clone());
+            let tools_gate = release.clone();
+            let builder = Nanocodex::builder(Managed::create(client).with_settings(AgentSettings::default()))
+                .chatgpt_account("synthetic-chatgpt-account")
+                .attachment_metadata(AttachmentMetadata::named("deferred-host").unwrap())
+                .tools_async(async move {
+                    let _notice = notice;
+                    started.notify_one();
+                    tools_gate.notified().await;
+                    Tools::builder().without_defaults().build().unwrap()
+                });
+            let building = tokio::spawn(builder.build_with_prompt("combined immediate", "combined-operation"));
+            post_entered.notified().await;
+            if scenario == "cancelled" {
+                building.abort();
+                assert!(matches!(building.await, Err(error) if error.is_cancelled()));
+            } else {
+                let result = building.await.unwrap();
+                if scenario == "rejected" {
+                    assert!(result.is_err());
+                } else {
+                    let (agent, _, turn) = result.unwrap();
+                    assert_eq!(turn.result().await.unwrap().final_message(), "combined answer");
+                    assert!(lock(&fixture.inner.catalogs).is_empty(), "no partial catalog before preparation");
+                    if scenario == "late" {
+                        release.notify_one();
+                        fixture.wait_for_catalog().await;
+                        assert_eq!(lock(&fixture.inner.catalogs)[0]["attachment_id"], "deferred-host");
+                    }
+                    agent.disconnect().await.unwrap();
+                }
+            }
+            dropped.notified().await;
+            assert!(lock(&fixture.inner.submissions).is_empty(), "no repeated first prompt");
+            if scenario != "late" { assert!(lock(&fixture.inner.catalogs).is_empty()); }
+            println!("JOURNEY deferred-tools {scenario}: admission/answer independent of preparation; catalog and lifetime retained");
+            server.abort();
+        }
+    }).await.expect("deferred tool preparation cannot block admission, events, or cancellation");
+}
+
+#[tokio::test]
+async fn selected_first_prompt_document_uses_authoritative_model() {
+    use nanocodex_agent::input::{Prompt, UserInput};
+    use nanocodex_managed::InitialSettingsSelection;
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        for claude in [true, false] {
+            let requests = Arc::new(AtomicUsize::new(0));
+            let observed = requests.clone();
+            let app = Router::new().route("/v1/agent-runs", post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let observed = observed.clone();
+                async move {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(headers["idempotency-key"], "selected-document");
+                    assert_eq!(headers["accept"], "text/event-stream");
+                    assert_eq!(body["settings_selection"], json!({"policy":"sdk"}));
+                    assert!(body.get("settings").is_none());
+                    assert_eq!(body["input"], json!([
+                        {"type":"text", "text":"summarize synthetic document"},
+                        {"type":"file", "file_data":"data:text/plain;base64,aGVsbG8=", "filename":"fixture.txt"}
+                    ]));
+                    if !claude {
+                        return (StatusCode::BAD_REQUEST, Json(json!({"error":"unsupported_input"}))).into_response();
+                    }
+                    let mut receipt = turn_view(ACTIVE_REQUEST_ID, "accepted", "", "41", None, None);
+                    receipt["input"] = body["input"].clone();
+                    receipt["agent_id"] = AGENT_ID.into();
+                    receipt["session_id"] = SESSION_ID.into();
+                    receipt["turn_idempotency_key"] = "agent-run:document".into();
+                    let mut bytes = format!("event: run\ndata: {receipt}\n\n").into_bytes();
+                    bytes.extend_from_slice(&accepted_event(41, ACTIVE_REQUEST_ID, "summarize synthetic document"));
+                    bytes.extend_from_slice(&nested_event(42, ROOT_SOURCE_REQUEST_ID, None,
+                        "run.completed", json!({"status":"completed"})));
+                    bytes.extend_from_slice(&completed_event(43, ACTIVE_REQUEST_ID, "document answer"));
+                    Response::builder().status(StatusCode::CREATED)
+                        .header("content-type", "text/event-stream")
+                        .header("x-nanocodex-settings", json!({"model":"claude-sonnet-4-6","thinking":"medium","reasoning_mode":"standard","fast_mode":false}).to_string())
+                        .body(Body::from(bytes)).unwrap()
+                }
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let client = ManagedClient::new(format!("http://{address}"), ManagedApiKey::parse(format!("ncx_live_{}_{}", "a".repeat(12), "b".repeat(43))).unwrap()).unwrap();
+            let prompt = Prompt::content([
+                UserInput::Text { text: "summarize synthetic document".into() },
+                UserInput::File { file_data: "data:text/plain;base64,aGVsbG8=".into(), filename: Some("fixture.txt".into()) },
+            ]);
+            let result = Nanocodex::builder(Managed::create(client))
+                .settings_selection(InitialSettingsSelection::default())
+                .build_with_prompt(prompt, "selected-document").await;
+            if claude {
+                let (agent, _, turn) = result.unwrap();
+                assert_eq!(turn.result().await.unwrap().final_message(), "document answer");
+                agent.disconnect().await.unwrap();
+            } else {
+                let error = match result { Ok(_) => panic!("OpenAI must reject inline documents"), Err(error) => error };
+                assert!(error.to_string().contains("unsupported_input"), "{error}");
+            }
+            assert_eq!(requests.load(Ordering::SeqCst), 1, "document reaches exactly one authoritative admission");
+            println!("JOURNEY selected document: claude={claude}, POST=1, expected={}", if claude { "document answer" } else { "HTTP 400 unsupported_input" });
+            server.abort();
+        }
+    }).await.expect("selected document public HTTP/SSE journey timed out");
+}
+
 async fn combined_run(
     State(fixture): State<Fixture>,
     headers: HeaderMap,

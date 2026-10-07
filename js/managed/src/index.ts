@@ -50,7 +50,7 @@ import { gatewayAvailability, gatewayRuntime } from "./gateway-runtime";
 import { createSubagentRouteController, subagentRoutingPolicy, type RetainedChildRoute } from "./subagent-model-routing";
 import { SqliteProviderTelemetryStore, normalizeProviderColo, type ProviderObservation } from "./provider-telemetry";
 import { resolveThreadRoute, ROUTING_CANDIDATES, routingPolicySchema, ThreadRoutePin, type ThreadRoute, type RoutingAi } from "./thread-model-routing";
-import { AgentPresentationWriter, generatePresentationText, presentationPending, presentationRetryAt } from "./agent-presentation";
+import { AgentPresentationWriter, threadTitleSource, generateThreadTitle, generatePresentationText, presentationPending, presentationRetryAt } from "./agent-presentation";
 import { retireSessionProjects, isRetiredProjectCompletion } from "./retired-projects";
 import { downloadPath, downloadBrainFile, downloadHandFile, fileDownloadFailure, FileDownloadError } from "./file-download";
 import { callerContext, type CallerContext } from "./request-origin";
@@ -303,6 +303,8 @@ import {
 import {
   DEFAULT_AGENT_SETTINGS,
   isAgentModel,
+  isAgentThinking,
+  INITIAL_MODEL_THINKING,
   agentSettingsQuery,
   parseAgentCreateBody,
   parseAgentRunBody,
@@ -568,6 +570,7 @@ type SessionInitialization = {
   runtime_profile?: unknown;
   settings?: unknown;
   configuration?: unknown;
+  selection_fingerprint?: unknown;
 };
 
 type DeviceHostAttachment = {
@@ -2236,6 +2239,8 @@ async function managedFetchRoute(
         return json({ error: "turn_admission_invalid_response" }, { status: 502 });
       }
       const combined = json(receipt, { status: created.status });
+      const selectedSettings = created.headers.get("x-nanocodex-settings");
+      if (selectedSettings) combined.headers.set("x-nanocodex-settings", selectedSettings);
       const timing = created.headers.get("server-timing");
       if (timing) combined.headers.set("server-timing", timing);
       return combined;
@@ -2259,6 +2264,7 @@ async function managedFetchRoute(
       let durabilityArchive: unknown;
       let creationSettings = DEFAULT_AGENT_SETTINGS;
       let settingsProvided = false;
+      let settingsSelection: ReturnType<typeof parseAgentCreateBody>["settingsSelection"];
       let creationConfiguration: AgentConfiguration = {};
       let modelCatalog: Awaited<ReturnType<typeof availableManagedModels>> | undefined;
       try {
@@ -2290,7 +2296,9 @@ async function managedFetchRoute(
             throw new TypeError("model_routing owns model and thinking; omit settings");
           }
         }
-        if (!settingsProvided && !creationConfiguration.settings && !creationConfiguration.model_routing && body.durability === undefined) {
+        settingsSelection = body.settingsSelection;
+        if (settingsSelection && !firstTurn) throw new TypeError("settings_selection requires combined creation and prompt");
+        if (!settingsSelection && !settingsProvided && !creationConfiguration.settings && !creationConfiguration.model_routing && body.durability === undefined) {
           try {
             const selection = await selectDefaultManagedModel(env.NANOCODEX, principal.userId, principal.connectGrant ? {} : env);
             modelCatalog = selection.catalog;
@@ -2298,7 +2306,7 @@ async function managedFetchRoute(
             if (selection.default_model?.startsWith("claude-")) creationSettings = { ...DEFAULT_AGENT_SETTINGS, model: selection.default_model };
           } catch { return json({ error: "model_availability_unavailable" }, { status: 503 }); }
         }
-        if (creationSettings.model.startsWith("claude-")) {
+        if (!settingsSelection && creationSettings.model.startsWith("claude-")) {
           if (creationConfiguration.output_schema !== undefined || creationConfiguration.prompt_cache !== undefined || creationConfiguration.tools?.includes("WebSearch")) return json({ error: "claude_capability_unsupported" }, { status: 409 });
           if (principal.connectGrant) return json({ error: "claude_forbidden" }, { status: 403 });
           let catalog;
@@ -2393,6 +2401,7 @@ async function managedFetchRoute(
               organization_id: principal.organizationId, team_id: principal.teamId,
               authorization_epoch: principal.authorizationEpoch, public_origin: url.origin,
               settings: creationSettings, configuration: creationConfiguration,
+              ...(settingsSelection ? { settings_selection: settingsSelection } : {}),
               ...(firstTurn ? { first_turn: firstTurn } : {}),
             }),
           }, ownershipTimeoutMs, "agent creation", 5, (attempt) => {
@@ -2410,7 +2419,7 @@ async function managedFetchRoute(
         const streaming = firstTurn !== undefined && created.headers.get("content-type")?.startsWith("text/event-stream");
         // Keep full input in the body; only bounded timing/identity metadata
         // crosses this internal header on the streaming response.
-        const phases: Record<string, number> & { first_turn?: Record<string, unknown>; first_turn_status?: number; first_turn_summary?: unknown } = streaming
+        const phases: Record<string, number> & { first_turn?: Record<string, unknown>; first_turn_status?: number; first_turn_summary?: unknown; first_turn_settings?: ManagedAgentSettings } = streaming
           ? JSON.parse(created.headers.get("x-nanocodex-run-phases") ?? "null")
           : await created.json();
         if (!phases) {
@@ -2486,6 +2495,7 @@ async function managedFetchRoute(
             turn_idempotency_key: firstTurn.key, ...phases.first_turn },
           { status: phases.first_turn_status === 202 ? 201 : 200 });
         } else response = agentCreationResponse(url, agentId, creationSettings, true);
+        if (firstTurn && !streaming && phases.first_turn_settings) response.headers.set("x-nanocodex-settings", JSON.stringify(phases.first_turn_settings));
         response.headers.append("server-timing", `managed_create;dur=${createMs}, managed_session_create;dur=${sessionCreateMs}`);
         if (firstTurn && Number.isFinite(phases.first_turn_admit_ms)) response.headers.append("server-timing", `managed_first_turn_admit;dur=${phases.first_turn_admit_ms}`);
         if (preHandlerMs !== undefined) response.headers.append("server-timing", `managed_session_pre_handler;dur=${preHandlerMs}`);
@@ -3490,6 +3500,7 @@ function createManagedNamespaceRuntime(
   authorizationKey: (context: ToolContext) => string = () => "account",
   processStorage?: NamespaceProcessStorage,
   threadId?: string,
+  localPreparation?: (context: ToolContext, name: string | undefined, input: unknown) => NamespaceCaptureFilter | undefined,
 ): Readonly<{ tools: NamedTool[]; capture(context: ToolContext): Promise<void> }> {
   const runtime = createNamespaceExecutionRuntime(
     machines,
@@ -3501,13 +3512,30 @@ function createManagedNamespaceRuntime(
     threadId,
   );
   const captured = new Set<string>();
+  const locallyCaptured = new Set<string>();
   const preparations = new Map<string, Promise<void>>();
   const cellKey = (context: ToolContext): string => (
     `${context.sessionId}\u0000${context.parentCallId || context.callId}`
   );
-  const capture = async (context: ToolContext, toolName?: string): Promise<void> => {
+  const capture = async (context: ToolContext, toolName?: string, input?: unknown): Promise<void> => {
     const key = cellKey(context);
     if (captured.has(key)) return;
+    // A selected session route is already authorized and generation-bound by
+    // the local broker. Do not gate it on unrelated account or VM availability.
+    const localStarted = performance.now();
+    const localFilter = localPreparation?.(context, toolName, input);
+    if (localFilter) {
+      const workdir = (input as { workdir: string }).workdir;
+      runtime.capture(context, localFilter, false, true);
+      if (runtime.hasRoute(context, workdir)) {
+        if (!locallyCaptured.has(key)) {
+          locallyCaptured.add(key);
+          observeHandCall("namespace.prepare", toolName ?? "other", localStarted, "ok", context.callId,
+            { thread_id: threadId, session_id: context.sessionId, turn_id: context.turnId, parent_call_id: context.parentCallId });
+        }
+        return;
+      }
+    }
     const pending = preparations.get(key);
     if (pending !== undefined) return pending;
     const authority = authorizationKey(context);
@@ -3518,7 +3546,7 @@ function createManagedNamespaceRuntime(
         throw new ManagedRequestError(403, "namespace_forbidden", "the current authorization cannot use execution hands");
       }
       context.signal.throwIfAborted();
-      runtime.capture(context, filter || undefined);
+      runtime.capture(context, filter || undefined, true);
       captured.add(key);
     })();
     preparations.set(key, preparation);
@@ -3538,6 +3566,9 @@ function createManagedNamespaceRuntime(
     const prefix = `${sessionId}\u0000`;
     for (const key of captured) {
       if (key.startsWith(prefix)) captured.delete(key);
+    }
+    for (const key of locallyCaptured) {
+      if (key.startsWith(prefix)) locallyCaptured.delete(key);
     }
     for (const key of preparations.keys()) {
       if (key.startsWith(prefix)) preparations.delete(key);
@@ -3561,7 +3592,7 @@ function createManagedNamespaceRuntime(
           "the current authorization cannot use execution hands",
         );
       }
-      await capture(context, name);
+      await capture(context, name, input);
       return tool.handler(input, context);
     },
     releaseSession: (sessionId: string) => {
@@ -3570,6 +3601,7 @@ function createManagedNamespaceRuntime(
     },
     dispose: () => {
       captured.clear();
+      locallyCaptured.clear();
       preparations.clear();
       tool.dispose?.();
       if (name === "exec_command") brain?.tool.dispose?.();
@@ -5971,6 +6003,82 @@ export class DurableAgentSession extends DurableComputerObject {
       || (asserted.authorization.connectGrant
         && !asserted.authorization.connectGrant.connectors.includes("chatgpt")))
       return json({ error: "not_found" }, { status: 404 });
+    // Resolve exactly once inside the existing creation RPC. The durable record
+    // precedes initialization so crash/retry never needs a changed live catalog.
+    // It binds the caller's policy, pin, configuration and first input, not the
+    // resulting settings, and never stores the prompt itself.
+    const selectionRecordKey = "managed_initial_selection_v1";
+    if (initialization.settings_selection !== undefined || this.ctx.storage.kv.get(selectionRecordKey) !== undefined) {
+      try {
+        const selectionFailure = await this.ctx.blockConcurrencyWhile(async () => {
+          try {
+            if (this.#deleting || this.#deleted || this.#durabilityExported)
+              throw new ManagedRequestError(409, "agent_unavailable", "agent is unavailable");
+            const retained = this.ctx.storage.kv.get<{ fingerprint: string; settings: ManagedAgentSettings }>(selectionRecordKey);
+            const selection = initialization.settings_selection === undefined ? undefined
+              : parseAgentCreateBody(JSON.stringify({ settings_selection: initialization.settings_selection,
+                configuration: initialization.configuration })).settingsSelection;
+            const fingerprint = await hashText(canonicalJson({
+              session_id: initialization.session_id, owner_id: initialization.owner_id,
+              selection: selection ?? null, configuration: initialization.configuration ?? {}, first_turn: turn,
+            }));
+            if (retained) {
+              if (retained.fingerprint !== fingerprint)
+                throw new ManagedRequestError(409, "idempotency_conflict", "creation policy or first input differs from retained operation");
+              initialization.settings = this.#session() ? this.#settings() : retained.settings;
+              if (this.#session()) initialization.configuration = this.#configuration();
+              initialization.selection_fingerprint = fingerprint;
+              delete initialization.settings_selection;
+              return;
+            }
+            if (!selection) return;
+            if (this.#session())
+              throw new ManagedRequestError(409, "idempotency_conflict", "agent was created without this selection policy");
+            const configuration = parseConfiguration(initialization.configuration);
+            let catalog: Awaited<ReturnType<typeof availableManagedModels>>;
+            try { catalog = await availableManagedModels(this.env.NANOCODEX, asserted.ownerId,
+              asserted.authorization.connectGrant ? {} : this.env); }
+            catch { throw new ManagedRequestError(503, "model_availability_unavailable", "model catalog is unavailable"); }
+            const pinned = configuration.chatgpt_account_id !== undefined;
+            const entry = pinned
+              ? catalog.data.find(model => model.provider === "openai" && model.id === "gpt-6.1-sol")
+                ?? catalog.data.find(model => model.provider === "openai")
+              : catalog.data.find(model => model.id === catalog.default_model);
+            if (!entry) throw new ManagedRequestError(409, pinned ? "chatgpt_model_unavailable" : "no_available_models", "no model is available");
+            const modelDefault = INITIAL_MODEL_THINKING[entry.id];
+            const preferred = selection.policy === "cli" && entry.provider === "openai" ? "xhigh" : modelDefault;
+            const thinking = selection.thinking ?? (entry.thinking.includes(preferred) ? preferred
+              : entry.thinking.includes(modelDefault) ? modelDefault : entry.thinking[0]);
+            const reasoning_mode = selection.reasoning_mode ?? "standard";
+            const fast_mode = selection.fast_mode ?? (selection.policy === "cli" && entry.fast_mode);
+            if (!isAgentThinking(thinking) || !entry.thinking.includes(thinking)
+              || !entry.reasoning_modes.includes(reasoning_mode) || (fast_mode && !entry.fast_mode))
+              throw new ManagedRequestError(400, "model_settings_unavailable", "requested settings are unavailable");
+            const settings = validateAgentAdmissionSettings({ model: entry.id, thinking, reasoning_mode, fast_mode });
+            if (settings.model.startsWith("claude-")) {
+              if (asserted.authorization.connectGrant)
+                throw new ManagedRequestError(403, "claude_forbidden", "Claude requires account authority");
+              if (configuration.output_schema !== undefined || configuration.prompt_cache !== undefined || configuration.tools?.includes("WebSearch"))
+                throw new ManagedRequestError(409, "claude_capability_unsupported", "configuration is unsupported by Claude");
+            }
+            // Keep both model-independent validation above and model-specific
+            // admission here, before session creation or provider preparation.
+            assertModelAcceptsInput(settings.model, turn.input as PromptInput);
+            if (this.#session()) throw new ManagedRequestError(409, "idempotency_conflict", "agent was initialized concurrently");
+            this.ctx.storage.kv.put(selectionRecordKey, { fingerprint, settings });
+            initialization.settings = settings;
+            initialization.selection_fingerprint = fingerprint;
+            delete initialization.settings_selection;
+          } catch (error) { return error; }
+        });
+        if (selectionFailure) throw selectionFailure;
+      } catch (error) {
+        if (error instanceof ManagedRequestError) return json({ error: error.code, message: error.message }, {
+          status: error.status, headers: { "x-nanocodex-admission-rejected": "1" },
+        });
+        return json({ error: "invalid_request", message: errorMessage(error) }, { status: 400 });
+      }
+    }
     const created = await this.#createHttp(new Request("https://session.internal/create", {
       method: "POST", headers: request.headers, body: JSON.stringify(initialization),
     }), (session) => {
@@ -6026,7 +6134,7 @@ export class DurableAgentSession extends DurableComputerObject {
         first_turn_status: admitted.status, first_turn_admit_ms: admissionMs }));
       return new Response(events.body, { status: admitted.status === 202 ? 201 : 200, headers });
     }
-    return json({ ...phases, first_turn: turnReceipt, first_turn_status: admitted.status,
+    return json({ ...phases, first_turn: turnReceipt, first_turn_settings: this.#settings(), first_turn_status: admitted.status,
       first_turn_admit_ms: admissionMs,
       ...(admitted.headers.get("x-nanocodex-turn-created") === "1" ? { first_turn_summary: summary } : {}),
     });
@@ -6064,6 +6172,7 @@ export class DurableAgentSession extends DurableComputerObject {
       cancel(reason) { return reader.cancel(reason); },
     });
     const headers = new Headers(events.headers);
+    headers.set("x-nanocodex-settings", JSON.stringify(this.#settings()));
     headers.set("x-nanocodex-agent-id", sessionId);
     headers.set("x-nanocodex-turn-id", turnId);
     headers.set("location", `/v1/agents/${sessionId}/events`);
@@ -6340,6 +6449,13 @@ export class DurableAgentSession extends DurableComputerObject {
     let event: DurableEvent<StreamMessage> | undefined;
     try {
       this.ctx.storage.transactionSync(() => {
+        // Every initializer (combined, standalone, live and import) must honor
+        // a selection reserved before a crash or a failed initialization.
+        const reservation = this.ctx.storage.kv.get<{ fingerprint: string; settings: ManagedAgentSettings }>("managed_initial_selection_v1");
+        if (reservation && (initialization.selection_fingerprint !== reservation.fingerprint
+          || (!current && !sameAgentSettings(settings, reservation.settings)))) {
+          throw new ManagedRequestError(409, "idempotency_conflict", "initialization differs from reserved selection");
+        }
         const ownership = this.#initializationOwnership();
         if (this.#deleting || this.#deleted || ownership?.state === "deleted") {
           throw new ManagedRequestError(
@@ -8182,7 +8298,7 @@ export class DurableAgentSession extends DurableComputerObject {
     // Persist it with the managed adoption so cold recovery never derives a
     // different account- or memory-enriched form for the routed operation.
     const dispatchChunks = dispatchInputChunks(JSON.stringify(dispatchInput));
-    const firstPrompt = conversationTitle(promptInputText(input));
+    const firstPrompt = conversationTitle(threadTitleSource(promptInputText(input)));
     let event: DurableEvent<StreamMessage> | undefined;
     this.ctx.storage.transactionSync(() => {
       this.#assertDurabilityAdmissionActive();
@@ -8381,7 +8497,7 @@ export class DurableAgentSession extends DurableComputerObject {
     const now = Date.now();
     const accepted: StreamMessage = { type: "turn_accepted", id, input, replayed: false,
       ...(authorization.guestShareLinkId ? { author: "guest", share_link_id: authorization.guestShareLinkId } : {}) };
-    const firstPrompt = conversationTitle(promptInputText(input));
+    const firstPrompt = conversationTitle(threadTitleSource(promptInputText(input)));
     let event: DurableEvent<StreamMessage> | undefined;
     let cancellingEvent: DurableEvent<StreamMessage> | undefined;
     let cancellationRequested = false;
@@ -10122,7 +10238,7 @@ export class DurableAgentSession extends DurableComputerObject {
           },
     };
     const sandboxToolsByMount = new Map<string, ReturnType<typeof cloudflareSandboxTools>>();
-    const namespaceMachines = (context: ToolContext) => {
+    const namespaceMachines = (context: ToolContext): readonly NamespaceMachine[] => {
       const authorization = this.#authorizationForToolContext(context);
       if (!this.#canUseExecutionNamespace(authorization)) return [];
       const userHands = this.#hasFullAccountAuthority(authorization) ? this.#userHandMachines(context) : [];
@@ -10264,6 +10380,20 @@ export class DurableAgentSession extends DurableComputerObject {
       ]),
       this.#processSessions,
       session.session_id,
+      (context, name, input) => {
+        // CUA can also depend on the independently published account screen;
+        // retain full discovery for that contract and for inventory/process tools.
+        if (name !== "exec_command" || !input || typeof input !== "object") return undefined;
+        const workdir = (input as { workdir?: unknown }).workdir;
+        if (typeof workdir !== "string" || !workdir.startsWith("/")) return undefined;
+        const cwd = resolveNamespaceCwd("/brain", workdir);
+        const local = namespaceMachines(context).filter(machine => machine.id.startsWith("user:")
+          && this.#hostedTools.machineOnline(machine.id.slice("user:".length)));
+        if (!local.some(machine => [machine.root!, ...(machine.aliases ?? [])]
+          .some(root => cwd === root || cwd.startsWith(`${root}/`)))) return undefined;
+        const ids = new Set(local.map(machine => machine.id));
+        return machine => ids.has(machine.id);
+      },
     );
     const cloudTools: NamedTool[] = [
       ...(browserRuntime?.tools.map(tool => ({
@@ -12459,12 +12589,17 @@ export class DurableAgentSession extends DurableComputerObject {
       await response.body?.cancel();
       if (!response.ok) throw new Error("presentation delivery failed");
     }, async (kind, source) => {
-      // Advisory titles must not cross a provider-pinned Claude thread into
-      // Responses or borrow an unrelated OpenAI credential. Retain the
-      // deterministic admission title until native title generation exists.
-      if (this.#settings().model.startsWith("claude-")) return undefined;
-      const text = await generatePresentationText(this.#modelEgress(), this.ctx.id.toString(), kind, source,
-        this.#configuration().chatgpt_account_id);
+      // Titles use deployment-owned GLM even for Claude or gateway threads;
+      // they never borrow the main conversation's provider credential or route.
+      let text: string | undefined;
+      if (kind === "title") {
+        if (!this.env.AI) return undefined;
+        text = await generateThreadTitle(this.env.AI, source);
+      } else {
+        if (this.#settings().model.startsWith("claude-")) return undefined;
+        text = await generatePresentationText(this.#modelEgress(), this.ctx.id.toString(), kind, source,
+          this.#configuration().chatgpt_account_id);
+      }
       return this.#deleting || this.#deleted || this.#durabilityExported ? undefined : text;
     }, promise => this.ctx.waitUntil(promise.finally(() => this.#scheduleNextAlarm())));
   }
@@ -14163,6 +14298,13 @@ async function fetchCreateStage(
     try {
       onAttemptStart?.(attempt + 1);
       const response = await fetchWithDeadline(binding, input, init, timeoutMs, operation);
+      // Authoritative pre-admission selection errors are safe receipts, not
+      // uncertain transport failures. Preserve the catalog error for clients.
+      if (response.headers.get("x-nanocodex-admission-rejected") === "1") {
+        const headers = new Headers(response.headers);
+        headers.delete("x-nanocodex-admission-rejected");
+        return new Response(response.body, { status: response.status, headers });
+      }
       // A streaming create may have durably accepted the turn before finding
       // its subscriber limit. Preserve that 429/Retry-After for a keyed retry.
       if (response.status !== 408 && (response.status !== 429 || options.retryThrottled === false) && response.status < 500) {
