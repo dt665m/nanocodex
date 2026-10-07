@@ -1,8 +1,8 @@
 //! Provider-specific Messages agent loop. No OpenAI transport or CLI credentials.
 use crate::{
-    ClaudeClient, ClaudeToolSpec, ContentBlock, ContentDelta, Message, MessagesRequest, Role,
-    ServerToolDefinition, StopReason, StreamEvent, ToolDefinition, ToolResultContent, Usage,
-    collect_stream,
+    ClaudeClient, ClaudeError, ClaudeToolSpec, ContentBlock, ContentDelta, Message,
+    MessagesRequest, Role, ServerToolDefinition, StopReason, StreamEvent, ToolDefinition,
+    ToolResultContent, Usage, collect_stream,
 };
 use futures_util::StreamExt;
 use nanocodex_agent::{
@@ -19,6 +19,7 @@ use nanocodex_agent::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 mod durable;
+mod images;
 use crate::execution::{Admission, ClaudeExecutionPolicy, Step};
 pub use durable::rewind_checkpoint;
 use durable::{Cursor, Effect, Snapshot};
@@ -30,8 +31,13 @@ use std::{
         Arc, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    time::Duration,
 };
 use tokio::sync::{Mutex, Notify, oneshot};
+#[cfg(not(target_family = "wasm"))]
+use tokio::time::sleep;
+#[cfg(target_family = "wasm")]
+use wasmtimer::tokio::sleep;
 use web_time::Instant;
 
 fn estimate_text_tokens(text: &str) -> u64 {
@@ -598,6 +604,9 @@ impl ClaudeBuilder {
     }
     /// Register a Claude client tool that returns text, image, or document
     /// blocks in a single user tool_result. The caller owns capability checks.
+    /// Inline base64 images are bounded for the direct API before they join
+    /// request history, and unprocessable ones become text omissions. Durable
+    /// tool receipts retain the handler's original output.
     pub fn tool_blocks<F, Fut>(mut self, definition: ToolDefinition, function: F) -> Self
     where
         F: Fn(Value) -> Fut + Send + Sync + 'static,
@@ -974,20 +983,10 @@ impl ClaudeBuilder {
                                 "No matching tools".into(),
                             )));
                         }
-                        let names = matches
-                            .iter()
-                            .map(|tool| tool.name.as_str())
-                            .collect::<Vec<_>>();
-                        let mut references = matches
+                        let references = matches
                             .into_iter()
                             .map(|tool| json!({"type":"tool_reference","tool_name":tool.name}))
                             .collect::<Vec<_>>();
-                        // Interactive Claude Code also includes a short text
-                        // companion after its reference blocks. This is our
-                        // own neutral description, not a copied private prompt.
-                        references.push(json!({"type":"text","text":format!(
-                            "Loaded tools for the next request: {}", names.join(", ")
-                        )}));
                         Ok(ClaudeToolReply::success(ToolResultContent::Blocks(
                             references,
                         )))
@@ -1523,6 +1522,12 @@ impl Conversation {
             )));
         }
         messages.extend(self.messages.clone());
+        if !self.summary.is_empty() {
+            // Retained thinking predates the local summary's replacement prefix.
+            // New responses commit this packed history and clear the summary,
+            // so their thinking remains replayable on subsequent turns.
+            crate::strip_thinking(&mut messages);
+        }
         for notice in &self.recovery_notices {
             if !messages.iter().any(|message| {
                 message
@@ -1614,6 +1619,55 @@ fn current_server_turn_start(messages: &[Message]) -> Option<usize> {
             )
         })
         .then_some(start)
+}
+
+// Normalize custom handlers and older retained receipts at the request boundary.
+// The API expands native references into definitions and rejects mixed content.
+// Companions follow all receipts so parallel tool-result ordering stays valid.
+fn separate_tool_references(messages: &mut [Message]) {
+    for message in messages {
+        let mut companions = Vec::new();
+        for block in &mut message.content {
+            let ContentBlock::ToolResult {
+                content: ToolResultContent::Blocks(blocks),
+                is_error,
+                ..
+            } = block
+            else {
+                continue;
+            };
+            if !blocks.iter().any(|block| block["type"] == "tool_reference") {
+                continue;
+            }
+            if *is_error {
+                // A failed search must not introduce executable definitions.
+                for block in blocks {
+                    if block["type"] == "tool_reference" {
+                        *block = json!({"type":"text","text":block.to_string()});
+                    }
+                }
+                continue;
+            }
+            blocks.retain(|block| {
+                if block["type"] == "tool_reference" {
+                    return true;
+                }
+                // Only ordinary user content can move out of a tool result.
+                // Quoting other blocks avoids promoting nested protocol messages.
+                let companion = match serde_json::from_value::<ContentBlock>(block.clone()) {
+                    Ok(
+                        content @ (ContentBlock::Text { .. }
+                        | ContentBlock::Image { .. }
+                        | ContentBlock::Document { .. }),
+                    ) => content,
+                    _ => ContentBlock::text(block.to_string()),
+                };
+                companions.push(companion);
+                false
+            });
+        }
+        message.content.extend(companions);
+    }
 }
 
 fn client_discovered_tools(messages: &[Message]) -> HashSet<&str> {
@@ -1839,8 +1893,21 @@ impl Drop for DispatchForkBoundary<'_> {
     }
 }
 
+struct PendingSteer {
+    prompt: Prompt,
+    message_id: Option<String>,
+    index: u32,
+    after: u32,
+    boundary: Option<u32>,
+    durable: bool,
+}
+
 struct TurnSteering {
-    pending: std::collections::VecDeque<Prompt>,
+    pending: std::collections::VecDeque<PendingSteer>,
+    receipts: HashMap<String, (String, bool)>,
+    operation: Option<String>,
+    model_call_index: u32,
+    next_index: u32,
     revision: Option<u64>,
     accepting: bool,
 }
@@ -2194,6 +2261,7 @@ impl State {
             .cloned()
             .unwrap_or_else(|| self.request_template(self.speed()));
         request.messages = messages;
+        separate_tool_references(&mut request.messages);
         request.tools = tools;
         request.container = context.container.map(str::to_owned);
         if request.diagnostics.is_some() {
@@ -2282,106 +2350,160 @@ impl State {
                 });
             }
         }
-        if cancel.flag.load(Ordering::SeqCst) {
-            return Err(ResponseFailure {
-                error: NanocodexError::TurnCancelled,
-                recovery: if upgrade.is_some() { recovery } else { None },
-            });
-        }
-        let mut stream = tokio::select! {
-            result = client.stream(&request) => match result {
-                Ok(stream) => stream,
-                Err(error) => {
-                    // A rejected request has no remote effect. A transport or
-                    // server failure can occur after the provider admitted it.
-                    let uncertain = matches!(&error,
-                        crate::ClaudeError::Transport(_) | crate::ClaudeError::StreamError { .. }
-                        | crate::ClaudeError::IncompleteStream
-                    ) || matches!(&error, crate::ClaudeError::Http { status, .. } if *status >= 500);
-                    return Err(ResponseFailure {
-                        error: provider_error(error),
-                        recovery: if uncertain || upgrade.is_some() { recovery } else { None },
-                    });
-                }
-            },
-            () = cancel.cancelled() => return Err(ResponseFailure {
-                error: NanocodexError::TurnCancelled, recovery,
-            }),
-        };
-        let mut captured = Vec::new();
-        let mut first_event = None;
-        let mut first_output = None;
-        // Streamed text and the final assistant message must share one item
-        // identity. Clients fold the canonical message into the streamed row
-        // only when both identify the same provider message; a null delta ID
-        // beside a concrete final ID renders every Claude answer twice.
-        let mut message_id: Option<String> = None;
+        // Retries resend the admitted request inside one live execution, so a
+        // replayed receipt never reaches the network and each execution after a
+        // crash or reopen starts with a fresh budget.
+        let max_attempts = if context.disable_tools { 3 } else { 5 };
+        let mut attempt = 0;
         loop {
-            let event = tokio::select! {
-                event = stream.next() => event,
+            if cancel.flag.load(Ordering::SeqCst) {
+                return Err(ResponseFailure {
+                    error: NanocodexError::TurnCancelled,
+                    recovery: if upgrade.is_some() { recovery } else { None },
+                });
+            }
+            attempt += 1;
+            let mut accepted = false;
+            let mut published_text = false;
+            let mut first_event = None;
+            let mut first_output = None;
+            // Streamed text and the final assistant message must share one item
+            // identity. Clients fold the canonical message into the streamed row
+            // only when both identify the same provider message; a null delta ID
+            // beside a concrete final ID renders every Claude answer twice.
+            let mut message_id: Option<String> = None;
+            let opened = tokio::select! {
+                result = client.stream(&request) => result,
                 () = cancel.cancelled() => return Err(ResponseFailure {
                     error: NanocodexError::TurnCancelled, recovery,
                 }),
             };
-            match event {
-                Some(Ok(event)) => {
-                    first_event.get_or_insert_with(&elapsed_ns);
-                    if matches!(event, StreamEvent::ContentBlockDelta { .. }) {
-                        first_output.get_or_insert_with(&elapsed_ns);
-                    }
-                    if let Some(recovery) = &mut recovery {
-                        recovery.observe(&event);
-                    }
-                    if let StreamEvent::MessageStart { message } = &event {
-                        message_id = Some(message.id.clone());
-                    }
-                    if let (
-                        Some(events),
-                        StreamEvent::ContentBlockDelta {
-                            delta: ContentDelta::TextDelta { text },
-                            ..
-                        },
-                    ) = (events, &event)
-                    {
-                        self.emit(events,AgentEventKind::AssistantDelta,json!({"model_call_index":index,"item_id":message_id,"phase":null,"text":text}));
-                    }
-                    let terminal = matches!(event, StreamEvent::MessageStop);
-                    captured.push(Ok(event));
-                    if terminal {
-                        break;
+            let result = match opened {
+                Err(error) => Err(error),
+                Ok(mut stream) => {
+                    accepted = true;
+                    let mut captured = Vec::new();
+                    loop {
+                        let event = tokio::select! {
+                            event = stream.next() => event,
+                            () = cancel.cancelled() => return Err(ResponseFailure {
+                                error: NanocodexError::TurnCancelled, recovery,
+                            }),
+                        };
+                        let event = match event {
+                            Some(Ok(event)) => event,
+                            Some(Err(error)) => break Err(error),
+                            None => break Err(ClaudeError::IncompleteStream),
+                        };
+                        first_event.get_or_insert_with(&elapsed_ns);
+                        if matches!(event, StreamEvent::ContentBlockDelta { .. }) {
+                            first_output.get_or_insert_with(&elapsed_ns);
+                        }
+                        if let Some(recovery) = &mut recovery {
+                            recovery.observe(&event);
+                        }
+                        if let StreamEvent::MessageStart { message } = &event {
+                            message_id = Some(message.id.clone());
+                        }
+                        if let (
+                            Some(events),
+                            StreamEvent::ContentBlockDelta {
+                                delta: ContentDelta::TextDelta { text },
+                                ..
+                            },
+                        ) = (events, &event)
+                        {
+                            published_text = true;
+                            self.emit(events,AgentEventKind::AssistantDelta,json!({"model_call_index":index,"item_id":message_id,"phase":null,"text":text}));
+                        }
+                        let terminal = matches!(event, StreamEvent::MessageStop);
+                        captured.push(event);
+                        if terminal {
+                            let first = captured.remove(0);
+                            let rest = captured.into_iter().map(Ok);
+                            break collect_stream(first, futures_util::stream::iter(rest)).await;
+                        }
                     }
                 }
-                Some(Err(error)) => {
-                    return Err(ResponseFailure {
-                        error: provider_error(error),
-                        recovery,
+            };
+            let error = match result {
+                Ok(response) => {
+                    if let Some(effect) = active_effect {
+                        effect
+                            .complete(serde_json::to_value(&response).map_err(provider_error)?)
+                            .await?;
+                    }
+                    completed(
+                        &response,
+                        attempt,
+                        first_event.unwrap_or_default(),
+                        first_output,
+                    );
+                    return Ok(ResponseOutcome {
+                        message: response,
+                        upgrade,
                     });
                 }
-                None => {
-                    return Err(ResponseFailure {
-                        error: provider_error("stream ended without message_stop"),
-                        recovery,
-                    });
-                }
+                Err(error) => error,
+            };
+
+            // Server tools may execute before any block is observed, so only an
+            // explicit rejection proves that the request had no remote effect.
+            let uncertain = accepted
+                || matches!(
+                    &error,
+                    ClaudeError::Transport(_)
+                        | ClaudeError::StreamError { .. }
+                        | ClaudeError::IncompleteStream
+                )
+                || matches!(&error, ClaudeError::Http { status, .. } if *status >= 500);
+            let retry_after = match &error {
+                ClaudeError::Http { retry_after, .. } => *retry_after,
+                _ => None,
+            };
+            let jitter = 90 + (u64::from(index) * 31 + u64::from(attempt) * 17) % 21;
+            let backoff = Duration::from_millis(1_000 * 2_u64.pow(attempt - 1) * jitter / 100);
+            let delay = retry_after.map_or(backoff, |delay| delay.max(backoff));
+
+            // Published deltas cannot be withdrawn, and possible server effects
+            // need reconciliation rather than a blind repeat. A long server hint
+            // ends the call instead of being shortened into an early retry.
+            if attempt >= max_attempts
+                || !error.is_transient()
+                || published_text
+                || (uncertain && recovery.is_some())
+                || delay > Duration::from_secs(60)
+            {
+                return Err(ResponseFailure {
+                    error: provider_error(error),
+                    recovery: if uncertain || upgrade.is_some() {
+                        recovery
+                    } else {
+                        None
+                    },
+                });
+            }
+            if let Some(events) = events {
+                self.emit(
+                    events,
+                    AgentEventKind::ModelAttemptRetrying,
+                    json!({
+                        "model_call_index": index,
+                        "attempt": attempt,
+                        "next_attempt": attempt + 1,
+                        "max_attempts": max_attempts,
+                        "delay_ns": u64::try_from(delay.as_nanos()).unwrap_or(u64::MAX),
+                        "server_requested_delay": retry_after.is_some(),
+                        "error": error.to_string(),
+                    }),
+                );
+            }
+            // Cancellation during backoff is reported at the top of the loop.
+            tokio::select! {
+                () = cancel.cancelled() => {}
+                () = sleep(delay) => {}
             }
         }
-        let first = captured.remove(0).map_err(provider_error)?;
-        let response = collect_stream(first, futures_util::stream::iter(captured))
-            .await
-            .map_err(|error| ResponseFailure {
-                error: provider_error(error),
-                recovery,
-            })?;
-        if let Some(effect) = active_effect {
-            effect
-                .complete(serde_json::to_value(&response).map_err(provider_error)?)
-                .await?;
-        }
-        completed(&response, 1, first_event.unwrap_or_default(), first_output);
-        Ok(ResponseOutcome {
-            message: response,
-            upgrade,
-        })
     }
     async fn run(
         &self,
@@ -2613,11 +2735,12 @@ impl State {
             }
             crate::ClaudeLifecycleDecision::Continue => {}
         }
-        // Keep the entire latest assistant response and its following receipts.
-        // Splitting at the assistant boundary preserves signed/opaque blocks and
-        // every tool-use/result pair, including multimodal results. A pending
-        // server pause is retained in exactly the same way, without fake results.
+        // Keep the latest assistant response and its following receipts. Packing
+        // a local summary removes invalidated thinking; all other opaque blocks
+        // and tool-use/result pairs survive, including a pending server pause.
         let retained = if context.pending_continuation {
+            // A thinking-only response can disappear when a prior summary
+            // is packed, leaving no assistant content to retain.
             let start = unfinished_server_turn_start(&messages)
                 .or_else(|| current_server_turn_start(&messages))
                 .or_else(|| {
@@ -2625,7 +2748,7 @@ impl State {
                         .iter()
                         .rposition(|message| message.role == Role::Assistant)
                 })
-                .ok_or_else(|| provider_error("pending continuation has no assistant response"))?;
+                .unwrap_or(messages.len());
             messages.split_off(start)
         } else {
             Vec::new()
@@ -2759,37 +2882,134 @@ impl State {
         }
     }
 
+    async fn accept_steer(
+        &self,
+        turn: &mut TurnSteering,
+        id: Option<String>,
+        prompt: Prompt,
+    ) -> Result<()> {
+        if id.as_ref().is_some_and(|id| id.is_empty()) {
+            return Err(NanocodexError::InvalidRequest(
+                "steer identity must not be empty".into(),
+            ));
+        }
+        let input_json = serde_json::to_string(&prompt).map_err(provider_error)?;
+        if self.policy.is_none()
+            && let Some(id) = &id
+            && let Some((input, withdrawn)) = turn.receipts.get(id)
+        {
+            if input != &input_json {
+                return Err(NanocodexError::InvalidRequest(
+                    "steer identity was reused with different input".into(),
+                ));
+            }
+            if *withdrawn {
+                return Err(NanocodexError::InvalidRequest("steer was withdrawn".into()));
+            }
+            return Ok(());
+        }
+        if !turn.accepting {
+            return Err(NanocodexError::TurnNotSteerable);
+        }
+        if self.policy.is_some()
+            && matches!(&prompt.instruction, nanocodex_agent::input::PromptInput::Content(items) if items.iter().any(|item| matches!(item, nanocodex_agent::input::UserInput::LocalImage { .. })))
+        {
+            return Err(NanocodexError::InvalidRequest("durable Claude steering requires inline images; local image paths cannot be retained safely".into()));
+        }
+        let frozen = crate::prompt::freeze(prompt)?;
+        let capacity = turn.pending.len() < 8;
+        let local_index = || {
+            turn.next_index
+                .checked_add(1)
+                .ok_or_else(|| unsupported("Claude steer counter exhausted"))
+        };
+        let (index, durable) = if let (Some(policy), Some(operation)) =
+            (&self.policy, &turn.operation)
+            && policy.supports_steering()
+        {
+            let Some(index) = policy
+                .accept_steer(
+                    operation.clone(),
+                    id.clone(),
+                    turn.model_call_index,
+                    input_json.clone(),
+                    capacity,
+                )
+                .await?
+            else {
+                return Ok(());
+            };
+            (index, true)
+        } else {
+            if self.policy.is_some() && id.is_some() {
+                return Err(NanocodexError::InvalidRequest(
+                    "Claude execution policy does not support identified steering receipts".into(),
+                ));
+            }
+            if !capacity {
+                return Err(NanocodexError::SteerQueueFull);
+            }
+            (local_index()?, false)
+        };
+        turn.next_index = index;
+        if let Some(id) = &id {
+            turn.receipts.insert(id.clone(), (input_json, false));
+        }
+        turn.pending.push_back(PendingSteer {
+            prompt: frozen,
+            message_id: id,
+            index,
+            after: turn.model_call_index,
+            boundary: None,
+            durable,
+        });
+        Ok(())
+    }
+
     async fn consume_steering(
         &self,
         request: &BackendPrompt,
         cursor: &mut Cursor,
         pending: &mut Vec<Message>,
     ) -> Result<bool> {
-        let prompts = {
-            let mut turns = self.steering.lock().await;
-            let Some(turn) = turns.get_mut(&request.key) else {
-                return Ok(false);
-            };
-            let prompts = turn.pending.drain(..).collect::<Vec<_>>();
-            for prompt in &prompts {
-                if let Some(revision) = prompt.instruction_revision() {
-                    turn.revision = Some(revision);
-                }
-            }
-            if !prompts.is_empty() {
-                cursor.instruction_revision = turn.revision;
-            }
-            prompts
+        let mut turns = self.steering.lock().await;
+        let Some(turn) = turns.get_mut(&request.key) else {
+            return Ok(false);
         };
-        let consumed = !prompts.is_empty();
-        for prompt in prompts {
-            pending.extend(prompt_messages(&prompt)?);
-            cursor.steers = cursor.steers.saturating_add(1);
-            self.emit(
-                &request.events,
-                AgentEventKind::RunSteered,
-                json!({"steer_index": cursor.steers, "instruction_bytes": prompt.text_bytes()}),
-            );
+        let boundary = cursor.index.saturating_add(cursor.model_step_offset);
+        let mut consumed = false;
+        while turn
+            .pending
+            .front()
+            .is_some_and(|steer| steer.after < boundary)
+        {
+            let steer = turn.pending.front().expect("pending steer");
+            let messages = prompt_messages(&steer.prompt)?;
+            if steer.durable
+                && let (Some(policy), Some(operation)) = (&self.policy, &turn.operation)
+            {
+                policy
+                    .bind_steer(
+                        operation.clone(),
+                        steer.index,
+                        steer.boundary.unwrap_or(boundary),
+                    )
+                    .await?;
+            }
+            let steer = turn.pending.pop_front().expect("pending steer");
+            if let Some(revision) = steer.prompt.instruction_revision() {
+                turn.revision = Some(revision);
+            }
+            cursor.instruction_revision = turn.revision;
+            pending.extend(messages);
+            cursor.steers = cursor.steers.max(steer.index);
+            let mut data =
+                json!({"steer_index": steer.index, "instruction_bytes": steer.prompt.text_bytes()});
+            if let Some(id) = steer.message_id {
+                data["message_id"] = json!(id);
+            }
+            self.emit(&request.events, AgentEventKind::RunSteered, data);
+            consumed = true;
         }
         Ok(consumed)
     }
@@ -2937,6 +3157,37 @@ impl State {
                 Some(&request.prompt),
             )
             .await?;
+        if let (Some(policy), Some(operation)) = (&self.policy, &cursor.operation) {
+            let mut turns = self.steering.lock().await;
+            let turn = turns
+                .get_mut(&request.key)
+                .ok_or(NanocodexError::TurnStopped)?;
+            for steer in policy.retained_steers(operation.clone()).await? {
+                turn.next_index = turn.next_index.max(steer.index);
+                if steer.index <= cursor.steers
+                    || turn
+                        .pending
+                        .iter()
+                        .any(|pending| pending.index == steer.index)
+                {
+                    continue;
+                }
+                let prompt =
+                    serde_json::from_str(&steer.input_json).map_err(durable::recovery_error)?;
+                turn.pending.push_back(PendingSteer {
+                    prompt: crate::prompt::freeze(prompt)?,
+                    message_id: steer.message_id,
+                    index: steer.index,
+                    after: steer.accepted_after_model_call_index,
+                    boundary: steer.model_call_index,
+                    durable: true,
+                });
+            }
+            turn.pending
+                .make_contiguous()
+                .sort_by_key(|steer| steer.index);
+            turn.model_call_index = cursor.index.max(1);
+        }
         if cursor.prepared && conversation.lifecycle_started {
             *self.lifecycle_opened.lock().await = Some(
                 cursor
@@ -3112,6 +3363,9 @@ impl State {
                 .map(str::to_owned)
                 .collect::<HashSet<_>>();
             *self.discovered.lock().await = discovered.clone();
+            if let Some(turn) = self.steering.lock().await.get_mut(&request.key) {
+                turn.model_call_index = index.saturating_add(cursor.model_step_offset).max(1);
+            }
             let response = self
                 .response(
                     pending.clone(),
@@ -3125,7 +3379,10 @@ impl State {
                         previous_message_id: previous_message_id.as_deref(),
                         template: Some(&cursor.template),
                         wire_profile: cursor.wire_profile.as_ref(),
-                        effect: cursor.effect(self, &format!("model-{index}")),
+                        effect: cursor.effect(
+                            self,
+                            &format!("model-{}", index.saturating_add(cursor.model_step_offset)),
+                        ),
                     },
                 )
                 .await;
@@ -3158,6 +3415,12 @@ impl State {
                 conversation.recovery_notices.push(upgrade.notice);
             }
             let response = response.message;
+            if cursor.model_step_offset == 0 {
+                // The legacy in-flight effect has settled. Number the next
+                // model boundary positively before admitting its queued input.
+                cursor.model_step_offset = 1;
+                cursor.model_receipt_start = Some(index.saturating_add(2));
+            }
             previous_message_id = Some(response.id.clone());
             add_usage(&mut usage, &response.usage);
             let has_server_effects = response.content.iter().any(|block| {
@@ -3233,7 +3496,10 @@ impl State {
                         ContentBlock::ToolUse {
                             id, name, input, ..
                         } => {
-                            if response.stop_reason != Some(StopReason::ToolUse) {
+                            if !matches!(
+                                response.stop_reason,
+                                Some(StopReason::ToolUse | StopReason::MaxTokens)
+                            ) {
                                 return Err(provider_error(
                                     "tool_use block without tool_use stop reason",
                                 ));
@@ -3248,24 +3514,17 @@ impl State {
                                     "Claude reused an admitted tool_use id",
                                 ));
                             }
-                            // A recovered host can attach additional handlers, but that
-                            // must not enlarge this operation's admitted catalog.
-                            let definition = cursor
-                                .template
-                                .tools
-                                .iter()
-                                .find_map(|tool| match tool {
+                            // The frozen catalog owns dispatch eligibility, including
+                            // when recovery attaches new handlers. Calls outside it get
+                            // paired errors through the ordinary tool receipt path.
+                            let definition =
+                                cursor.template.tools.iter().find_map(|tool| match tool {
                                     ClaudeToolSpec::Client(tool) if tool.name == *name => {
                                         Some(tool)
                                     }
                                     _ => None,
-                                })
-                                .ok_or_else(|| {
-                                    provider_error(format!(
-                                        "Claude tool {name} is outside the admitted catalog"
-                                    ))
-                                })?;
-                            if definition.defer_loading
+                                });
+                            if definition.is_some_and(|tool| tool.defer_loading)
                                 && !discovered.contains(name)
                                 && !server_discovered.contains(name.as_str())
                             {
@@ -3273,18 +3532,15 @@ impl State {
                                     "Claude used deferred tool before discovery",
                                 ));
                             }
-                            let handler = if self.code_only && name != "exec" && name != "wait" {
+                            let handler = if definition.is_none()
+                                || (self.code_only && name != "exec" && name != "wait")
+                            {
                                 None
                             } else if cursor.dynamic_tool_names.contains(name) {
                                 dynamic_handlers.get(name)
                             } else {
                                 self.handlers.get(name)
                             };
-                            if self.policy.is_none() && handler.is_none() {
-                                return Err(provider_error(format!(
-                                    "unregistered Claude tool {name}"
-                                )));
-                            }
                             tool_calls.push((id, name, input, handler));
                         }
                         ContentBlock::Thinking { .. }
@@ -3316,7 +3572,7 @@ impl State {
                 Err(error) => {
                     if has_server_effects || unfinished_server_turn_start(&pending).is_some() {
                         // The complete response itself is invalid for replay
-                        // (for example an unregistered client call after a
+                        // (for example duplicate client call IDs after a
                         // server effect). Retain it as data, not an unpaired
                         // assistant tool message or a fabricated client result.
                         const EVIDENCE_LIMIT: usize = 64 * 1024;
@@ -3491,10 +3747,10 @@ impl State {
                 role: Role::Assistant,
                 content: response.content,
             });
-            if response.stop_reason == Some(StopReason::ToolUse) {
-                pending.push(Message::tool_results(
-                    results.into_iter().map(Option::unwrap).collect(),
-                ));
+            if has_tool_calls {
+                let mut results: Vec<_> = results.into_iter().map(Option::unwrap).collect();
+                images::prepare_tool_images(&mut results).await;
+                pending.push(Message::tool_results(results));
                 // Commit completed effects and explicit unknown-outcome receipts
                 // before returning cancellation or making another provider call.
                 // Process-restart durability still belongs to the embedding host.
@@ -3525,8 +3781,10 @@ impl State {
                 // Admit discovery/removal for the next request before persisting it.
                 // Reopening a prepared cursor never expands its original catalog.
                 self.refresh_dynamic_tools(&mut cursor);
-                self.advance_cursor(&mut cursor, conversation).await?;
-                continue;
+                if response.stop_reason == Some(StopReason::ToolUse) {
+                    self.advance_cursor(&mut cursor, conversation).await?;
+                    continue;
+                }
             }
             if response.stop_reason == Some(StopReason::PauseTurn) {
                 // Server tools continue with the same tool array and paused
@@ -3551,7 +3809,8 @@ impl State {
                 continue;
             }
             let exhausted = response.stop_reason == Some(StopReason::ModelContextWindowExceeded);
-            if has_server_effects || exhausted {
+            let output_exhausted = response.stop_reason == Some(StopReason::MaxTokens);
+            if has_server_effects || exhausted || output_exhausted {
                 // Complete provider content owns partial output and any server
                 // effects. Keep this boundary even if recovery or cancellation
                 // prevents the next assistant response.
@@ -3576,6 +3835,32 @@ impl State {
                     "server turn ended without a complete server-tool result; outcome unknown",
                 ));
             }
+            if output_exhausted {
+                if cancel.flag.load(Ordering::SeqCst) {
+                    return Err(NanocodexError::TurnCancelled);
+                }
+                // This budget is persisted with the admitted operation. Completed
+                // content and paired tool receipts are committed before checking it.
+                if cursor.output_continuations >= 3 {
+                    return Err(provider_error(
+                        "Claude output token limit exhausted after 3 continuations; partial output and completed tool results retained",
+                    ));
+                }
+                cursor.output_continuations += 1;
+                pending.push(Message::text(
+                    Role::User,
+                    "Continue the current task from the interrupted response. The output token limit was reached. Do not repeat completed tool actions. Any incomplete tool input was not executed; issue a fresh complete call if still needed.",
+                ));
+                // Automatic compaction rebuilds pending from this history. Keep
+                // the instruction with the interrupted boundary across that swap.
+                conversation.messages = pending.clone();
+                cursor.index = index + 1;
+                cursor.pending = pending.clone();
+                cursor.usage = usage.clone();
+                self.refresh_dynamic_tools(&mut cursor);
+                self.advance_cursor(&mut cursor, conversation).await?;
+                continue;
+            }
             if exhausted {
                 if cancel.flag.load(Ordering::SeqCst) {
                     return Err(NanocodexError::TurnCancelled);
@@ -3597,8 +3882,8 @@ impl State {
                         .await?,
                 );
                 // A user continuation closes the interrupted assistant turn.
-                // Its signed content and completed effects remain lossless;
-                // only fully resolved tool boundaries can reach this point.
+                // Partial text and completed effects remain lossless; only
+                // fully resolved tool boundaries can reach this point.
                 conversation.messages.push(Message::text(
                     Role::User,
                     "Continue the current task from the interrupted response. The context window was exhausted. Do not repeat completed tool actions.",
@@ -3686,6 +3971,7 @@ impl State {
                 }
             };
             if more_instructions {
+                cursor.index = index + 1;
                 self.consume_steering(request, &mut cursor, &mut pending)
                     .await?;
                 conversation.messages = pending.clone();
@@ -3783,6 +4069,25 @@ fn server_discovered_tools<'a>(
 
 fn prompt_messages(prompt: &Prompt) -> Result<Vec<Message>> {
     crate::prompt::messages(prompt)
+}
+
+impl Driver {
+    fn steer_input(
+        &self,
+        key: BackendTurnKey,
+        id: Option<String>,
+        prompt: Prompt,
+    ) -> BackendFuture<Result<()>> {
+        let state = self.state.clone();
+        Box::pin(async move {
+            if state.stopped.load(Ordering::SeqCst) {
+                return Err(NanocodexError::AgentStopped);
+            }
+            let mut turns = state.steering.lock().await;
+            let turn = turns.get_mut(&key).ok_or(NanocodexError::TurnStopped)?;
+            state.accept_steer(turn, id, prompt).await
+        })
+    }
 }
 
 impl LifecycleBackend for Driver {
@@ -3960,6 +4265,10 @@ impl LifecycleBackend for Driver {
                         key,
                         TurnSteering {
                             pending: std::collections::VecDeque::new(),
+                            receipts: HashMap::new(),
+                            operation: request_id.clone(),
+                            model_call_index: 1,
+                            next_index: 0,
                             revision: request.prompt.instruction_revision(),
                             accepting: true,
                         },
@@ -4024,7 +4333,7 @@ impl LifecycleBackend for Driver {
                     if turn.pending.len() >= 8 {
                         return Err(unsupported("Claude steering queue is full"));
                     }
-                    turn.pending.push_back(crate::prompt::freeze(prompt)?);
+                    state.accept_steer(turn, None, prompt).await?;
                     return Ok(BackendPromptRoute::Steered);
                 }
             }
@@ -4032,22 +4341,38 @@ impl LifecycleBackend for Driver {
         })
     }
     fn steer(&self, key: BackendTurnKey, prompt: Prompt) -> BackendFuture<Result<()>> {
+        self.steer_input(key, None, prompt)
+    }
+    fn steer_with_id(
+        &self,
+        key: BackendTurnKey,
+        id: String,
+        prompt: Prompt,
+    ) -> BackendFuture<Result<()>> {
+        self.steer_input(key, Some(id), prompt)
+    }
+    fn withdraw_steer(&self, key: BackendTurnKey, id: String) -> BackendFuture<Result<bool>> {
         let state = self.state.clone();
         Box::pin(async move {
-            let prompt = crate::prompt::freeze(prompt)?;
-            if state.stopped.load(Ordering::SeqCst) {
-                return Err(NanocodexError::AgentStopped);
-            }
             let mut turns = state.steering.lock().await;
             let turn = turns.get_mut(&key).ok_or(NanocodexError::TurnStopped)?;
-            if !turn.accepting {
-                return Err(NanocodexError::TurnNotSteerable);
+            let Some(steer) = turn.pending.back().filter(|steer| {
+                steer.message_id.as_deref() == Some(&id) && steer.boundary.is_none()
+            }) else {
+                return Ok(false);
+            };
+            if let (Some(policy), Some(operation)) = (&state.policy, &turn.operation) {
+                policy
+                    .withdraw_steer(operation.clone(), steer.index)
+                    .await?;
             }
-            if turn.pending.len() >= 8 {
-                return Err(unsupported("Claude steering queue is full"));
+            turn.pending.pop_back();
+            if let Some(receipt) = turn.receipts.get_mut(&id) {
+                receipt.1 = true;
             }
-            turn.pending.push_back(prompt);
-            Ok(())
+            // The journal reuses the withdrawn tail's index.
+            turn.next_index = turn.next_index.saturating_sub(1);
+            Ok(true)
         })
     }
     fn cancel(&self, key: BackendTurnKey) -> BackendFuture<Result<()>> {

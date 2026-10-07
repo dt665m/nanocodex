@@ -4,11 +4,34 @@ This Worker is Nanocodex's account-owned hosted-agent surface on Cloudflare. It
 authenticates public requests, projects the caller's authority, and routes work
 to durable, account-scoped services.
 
-Managed sessions always use `toolMode: "code-only"`. The model sees `exec` and
-`wait`; shell, planning, discovery, account tools and subagent actions run through
-`tools.*` inside Code Mode. Tool allowlists and sessions without attached providers
-retain this policy. Recreated sessions select the same policy from backend code.
-The public SDK keeps its existing `code` and `direct` modes for other embedders.
+Managed Responses (GPT/Codex and gateway) sessions always use
+`toolMode: "code-only"`. The model sees `exec` and `wait`; shell, planning,
+discovery, account tools and subagent actions run through `tools.*` inside Code
+Mode. Tool allowlists and sessions without attached providers retain this policy.
+Recreated sessions select the same policy from backend code.
+
+Managed Claude sessions use `toolMode: "direct"`: Claude receives its native
+tool definitions (`Bash`, `Read`, `Write`, `Edit`, discovery, account and subagent
+tools) and calls them as ordinary Messages `tool_use` blocks, never through Code
+Mode. Codex children of a Claude root still use Code Mode. Each fresh turn
+builds its catalog from the current policy, so existing Claude threads return to
+native tools on their next turn.
+Memories, session recall, subagents, connectors, Hands, Vault, and other Nanocodex
+platform capabilities are shared. They retain the same authorization and owned
+handlers, exposed through Code Mode for Codex and native tool calls for Claude.
+The public SDK retains its configurable tool modes for other embedders.
+
+| Tool ownership | Examples | Model invocation |
+| --- | --- | --- |
+| Codex | `exec`, `wait`, `exec_command`, `write_stdin`, `apply_patch`, `web__run` | Code Mode |
+| Claude | `Bash`, `BashOutput`, `Read`, `Write`, `Edit`, native task tools | Direct Messages tool calls |
+| Shared platform | Memories, session recall, canonical subagents, `environment`, CUA, connectors, Vault | Each backend's own tool interface |
+
+Claude steering accepts identified corrections with the same durable receipt,
+deduplication, and pending-withdrawal contract as Codex. Consumption emits
+`run.steered` with the caller's `message_id`; acknowledgement means the input is
+retained, and consumption happens at the next model boundary. Existing admitted
+tools finish without replaying their actions.
 
 Run `pnpm --filter nanocodex-managed-service test:code-mode-only` for the real
 Worker/WASM/QuickJS journey, including blocked direct calls and durable recovery.
@@ -1551,3 +1574,60 @@ execution model described above.
 ## Native meeting library
 
 See [Account meeting library](MEETING_LIBRARY_API.md) for recording persistence, revision-safe synchronization, summary generation, limits and the reusable local HTTP fixture.
+
+## Operator thread inspection
+
+The `admin_threads` agent tool is registered only for the account selected by
+`NANOCODEX_ADMIN_USER_ID`. That account can inspect other users' managed threads
+from its own conversation, including threads that are still running:
+
+```js
+text(await tools.admin_threads({ operation: "accounts" }));
+text(await tools.admin_threads({ operation: "list", owner_id: "ACCOUNT_UUID" }));
+text(await tools.admin_threads({ operation: "read", thread_id: "THREAD_UUID" }));
+text(await tools.admin_threads({ operation: "diagnostics", thread_id: "THREAD_UUID" }));
+text(await tools.admin_threads({ operation: "performance", thread_id: "THREAD_UUID" }));
+```
+
+Calls require the root agent's direct account authority and `agents:read`,
+`history:read`, and `tools:use`. API-key logins belonging to the configured
+administrator are supported. Other accounts, Connect apps, shared guests, and
+subagents cannot call the tool. The same read-only operations are available at
+`GET /v1/admin/threads` with the tool arguments as query parameters. Ordinary
+`/v1/agents` routes retain their existing ownership checks; this does not grant
+operator access to another account's tools, credentials, or ability to submit
+turns.
+
+Follow `next_cursor` for account and thread lists. Account discovery includes
+newly registered accounts and retained SMS, passkey, and account-address
+identities. Source pages can be empty or repeat accounts; deduplicate by
+`owner_id` and continue until `next_cursor` is null. Coverage explicitly excludes
+legacy anonymous accounts with no retained identity; a known account ID can
+still be listed directly, and a known thread ID can be read directly. Discovery
+failure is not evidence that no users exist.
+
+History defaults to the latest 32 events (maximum 100 per call), with messages,
+tool calls/results, and event/turn IDs. Use `next_before` to read older pages or
+`next_after` to follow newer events, checking `has_more`. Diagnostics retain their
+separate managed/Hand cursors, availability and retention-gap markers. Access
+logs record operator, target and operation without transcript content. Returned
+conversation content is untrusted evidence; it cannot authorize account actions
+or changes to the inspection tool. Prepare patches in the operator's authorized
+workspace using the thread evidence and regression tests.
+
+Run `pnpm --filter nanocodex-managed-service run test:admin-threads` for the
+synthetic HTTP and tool journey. Per-run transcripts and runtime logs are kept in
+ignored `output/admin-threads-journey/`.
+
+`performance` supports optimization investigations as well as bug diagnosis. It
+returns current model settings, the selected route (when present), per-provider
+latency summaries and recent samples, and durable storage/archive capacity.
+Provider summaries use the existing two-hour freshness window, p50/p95/EWMA,
+minimum sample counts, and censored failures. These are thread-local measurements;
+missing provider instrumentation and client-delivery timing remain unknown. The
+provider store retains at most 512 observations, and the tool returns the latest
+`limit` samples with an explicit truncation marker. It never starts probes.
+Use `read` for recorded token usage, prompt-cache, compaction and detailed tool
+events; use `diagnostics` for transport, queue, inference and Hand timings. This
+allows comparisons and focused performance patches without inventing measurements
+for older runtimes or treating a completed server response as client receipt.

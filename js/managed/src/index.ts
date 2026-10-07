@@ -82,6 +82,8 @@ import { serverHandTool } from "./ssh-hand-setup";
 import { parseEmailResume, resumeEmailWorkflow, type EmailResumeResult } from "./email-resume";
 import { phoneControlInput } from "./phone-control";
 import { accountAdmin } from "./account-admin";
+import { adminThreadsTool, routeAdminThreads, parseAdminThreadInput, threadProviderPerformance, type AdminThreadInput } from "./admin-threads";
+import { listAdminAccounts, listAdminThreads } from "./account-auth";
 import { accountCommunication } from "./account-communication";
 import { routeTodoRequest } from "./todo-inbox";
 import { phoneAdminConfigured } from "./phone-admin";
@@ -1526,7 +1528,7 @@ function isUniqueStringArray(value: unknown): value is string[] {
 }
 
 const SAFE_OBSERVATION_FIELDS = new Set([
-  "request_id", "turn_id", "failure_phase", "replay_mode", "next_attempt", "max_attempts",
+  "request_id", "turn_id", "failure_phase", "replay_mode", "replayed", "next_attempt", "max_attempts",
   "connection_generation", "runtime_generation", "model_call_index", "status_code", "retry_delay_ms", "duration_ms",
   "time_to_first_event_ms", "time_to_first_output_ms", "response_id",
   "opens_new_socket", "server_requested_delay",
@@ -1943,6 +1945,15 @@ async function managedFetchRoute(
     if (url.pathname === "/v1/router") {
       const principal = trustedAgentPrincipal ?? await authenticate(request, env, url);
       return routerDashboard(request, env, principal ?? undefined);
+    }
+    if (url.pathname === "/v1/admin/threads") {
+      const principal = trustedAgentPrincipal ?? await authenticate(request, env, url);
+      return routeAdminThreads(request, env.NANOCODEX_ADMIN_USER_ID, principal ?? undefined, async input => {
+        if (input.operation === "accounts") return json(await listAdminAccounts(env, input));
+        if (input.operation === "list") return json(await listAdminThreads(env, input as AdminThreadInput & { owner_id: string }));
+        const response = await env.NANOCODEX_SESSIONS.getByName(input.thread_id!).inspectForAdmin(principal!.userId, input);
+        return new Response(response.body, { status: response.status, headers: { "content-type": "application/json" } });
+      });
     }
     if (url.pathname === "/v1/account/admin") {
       const principal = trustedAgentPrincipal ?? await authenticate(request, env, url);
@@ -3500,7 +3511,8 @@ function createManagedNamespaceRuntime(
   authorizationKey: (context: ToolContext) => string = () => "account",
   processStorage?: NamespaceProcessStorage,
   threadId?: string,
-  localPreparation?: (context: ToolContext, name: string | undefined, input: unknown) => NamespaceCaptureFilter | undefined,
+  localPreparation?: (context: ToolContext, name: string | undefined, input: unknown) => NamespaceCaptureFilter | undefined | Promise<NamespaceCaptureFilter | undefined>,
+  recoverProcessTool?: Parameters<typeof createNamespaceExecutionRuntime>[7],
 ): Readonly<{ tools: NamedTool[]; capture(context: ToolContext): Promise<void> }> {
   const runtime = createNamespaceExecutionRuntime(
     machines,
@@ -3510,6 +3522,7 @@ function createManagedNamespaceRuntime(
     authorizationKey,
     processStorage,
     threadId,
+    recoverProcessTool,
   );
   const captured = new Set<string>();
   const locallyCaptured = new Set<string>();
@@ -3523,18 +3536,50 @@ function createManagedNamespaceRuntime(
     // A selected session route is already authorized and generation-bound by
     // the local broker. Do not gate it on unrelated account or VM availability.
     const localStarted = performance.now();
-    const localFilter = localPreparation?.(context, toolName, input);
-    if (localFilter) {
-      const workdir = (input as { workdir: string }).workdir;
-      runtime.capture(context, localFilter, false, true);
-      if (runtime.hasRoute(context, workdir)) {
-        if (!locallyCaptured.has(key)) {
-          locallyCaptured.add(key);
-          observeHandCall("namespace.prepare", toolName ?? "other", localStarted, "ok", context.callId,
-            { thread_id: threadId, session_id: context.sessionId, turn_id: context.turnId, parent_call_id: context.parentCallId });
-        }
-        return;
+    const localAuthority = authorizationKey(context);
+    const computer = toolName === CUA_JS_NAME || toolName === CUA_RESET_NAME;
+    const selectedWorkdir = (toolName === "exec_command" || computer) && input && typeof input === "object"
+      ? (input as { workdir?: unknown }).workdir : undefined;
+    if (typeof selectedWorkdir === "string" && runtime.hasRoute(context, selectedWorkdir, computer)) return;
+    const selectedKey = typeof selectedWorkdir === "string" ? key + "\u0000" + selectedWorkdir : undefined;
+    const selectedPending = selectedKey === undefined ? undefined : preparations.get(selectedKey);
+    if (selectedPending !== undefined) {
+      await selectedPending;
+      if (runtime.hasRoute(context, selectedWorkdir as string, computer)) return;
+    }
+    let resolveSelected: (() => void) | undefined;
+    let rejectSelected: ((error: unknown) => void) | undefined;
+    if (selectedKey !== undefined) {
+      const pending = new Promise<void>((resolve, reject) => { resolveSelected = resolve; rejectSelected = reject; });
+      void pending.catch(() => {});
+      preparations.set(selectedKey, pending);
+    }
+    try {
+      const localFilter = await localPreparation?.(context, toolName, input);
+      if (!canUseExecutionNamespace(context) || authorizationKey(context) !== localAuthority) {
+        throw new ManagedRequestError(403, "namespace_forbidden", "the current authorization cannot use execution hands");
       }
+      context.signal.throwIfAborted();
+      if (localFilter) {
+        const workdir = (input as { workdir: string }).workdir;
+        runtime.capture(context, localFilter, true, !computer);
+        if (runtime.hasRoute(context, workdir, computer)) {
+          if (!locallyCaptured.has(key)) {
+            locallyCaptured.add(key);
+            observeHandCall("namespace.prepare", toolName ?? "other", localStarted, "ok", context.callId,
+              { thread_id: threadId, session_id: context.sessionId, turn_id: context.turnId, parent_call_id: context.parentCallId });
+          }
+          return;
+        }
+      }
+    } catch (error) {
+      rejectSelected?.(error);
+      observeHandCall("namespace.prepare", toolName ?? "other", localStarted, context.signal.aborted ? "cancelled" : "failed", context.callId,
+        { thread_id: threadId, session_id: context.sessionId, turn_id: context.turnId, parent_call_id: context.parentCallId });
+      throw error;
+    } finally {
+      resolveSelected?.();
+      if (selectedKey !== undefined) preparations.delete(selectedKey);
     }
     const pending = preparations.get(key);
     if (pending !== undefined) return pending;
@@ -3592,7 +3637,10 @@ function createManagedNamespaceRuntime(
           "the current authorization cannot use execution hands",
         );
       }
-      await capture(context, name, input);
+      // Process IDs carry their original owner, authority and provider binding.
+      // The handler rechecks durable generation identity directly; inventory
+      // preparation cannot improve that binding and must never reroute a poll.
+      if (name !== "write_stdin") await capture(context, name, input);
       return tool.handler(input, context);
     },
     releaseSession: (sessionId: string) => {
@@ -4550,6 +4598,63 @@ export class DurableAgentSession extends DurableComputerObject {
     });
   }
 
+  /** Binding-only read surface. Operator identity comes from the guarded Worker,
+   * never an owner assertion supplied to the ordinary session routes. */
+  async inspectForAdmin(operatorId: string, raw: AdminThreadInput): Promise<{ status: number; body: string }> {
+    const reply = (status: number, body: unknown) => ({ status, body: JSON.stringify(body) });
+    if (!this.env.NANOCODEX_ADMIN_USER_ID || operatorId !== this.env.NANOCODEX_ADMIN_USER_ID)
+      return reply(403, { error: "forbidden" });
+    let input: AdminThreadInput;
+    try { input = parseAdminThreadInput(raw); } catch { return reply(400, { error: "invalid_request" }); }
+    if (input.operation !== "read" && input.operation !== "diagnostics" && input.operation !== "performance") return reply(400, { error: "invalid_request" });
+    const session = this.#session();
+    if (!session || session.session_id !== input.thread_id || this.#deleting || this.#deleted || this.#durabilityExported
+      || this.#durabilityImportState === "pending" || session.runtime_profile !== "managed") return reply(404, { error: "not_found" });
+    console.info({ type: "managed.admin_threads.target", operator_id: operatorId, owner_id: session.owner_id,
+      thread_id: session.session_id, operation: input.operation, at: Date.now() });
+    if (input.operation === "diagnostics") return reply(200, await this.#threadDiagnostics(session, input.after_managed ?? 0, input.after_hand ?? 0, input.limit));
+    if (input.operation === "performance") {
+      const observedAt = Date.now(), route = this.#threadRoute();
+      let capacity: unknown;
+      try { capacity = { available: true, ...managedCapacitySnapshot(this.ctx.storage, session.session_id,
+        this.#eventArchive.capacity(), this.#turnArchive.capacity(), this.#realtimeArchive.capacity()) }; }
+      catch { capacity = { available: false }; }
+      return reply(200, { thread_id: session.session_id, observed_at: observedAt, settings: this.#settings(),
+        routing: route ? { backend: route.backend, model: route.model, provider_model: route.provider_model,
+          thinking: route.thinking, policy_version: route.policy_version, router_duration_ms: route.router_duration_ms,
+          created_at: route.created_at } : null,
+        provider_telemetry: threadProviderPerformance(this.ctx.storage.sql, input.limit, observedAt), capacity,
+        evidence: { usage_cache_compaction: "Use read for retained usage, cache and compaction events, correlated by turn_id.",
+          tool_and_transport_timing: "Use diagnostics for managed/Hand boundary, queue and execution timing; read for detailed tool events.",
+          limitation: "Only measurements recorded by the original runtime are available. Missing data is unknown, never zero." } });
+    }
+    try {
+      const page = input.after === undefined
+        ? await this.#eventArchive.history(this.#eventLog, input.before, input.limit)
+        : await this.#eventArchive.historyAfter(this.#eventLog, input.after, input.limit);
+      return reply(200, { thread: { id: session.session_id, owner_id: session.owner_id,
+        organization_id: session.organization_id, team_id: session.team_id },
+        data: page.data.map(event => ({ cursor: event.cursor, created_at: event.created_at, turn_id: event.turn_id, ...event.message })),
+        has_more: page.has_more, latest_cursor: page.latest_cursor,
+        next_before: page.data[0]?.cursor ?? null, next_after: page.data.at(-1)?.cursor ?? input.after ?? null });
+    } catch { return reply(503, { error: "event_archive_unavailable" }); }
+  }
+
+  async #threadDiagnostics(session: SessionRow, managedAfter: number, handAfter: number, limit: number, signal?: AbortSignal): Promise<unknown> {
+    const managed = this.#diagnostics.page(session.session_id, managedAfter, limit, true);
+    let hand: unknown = { service: "hand.broker", available: false, events: [], next_after: handAfter, history_truncated: true };
+    try {
+      const target = new URL("https://account-tools.internal/diagnostics");
+      target.searchParams.set("thread_id", session.session_id);
+      target.searchParams.set("after", String(handAfter));
+      target.searchParams.set("limit", String(limit));
+      hand = await fetchResponseWithDeadline(this.env.NANOCODEX_ACCOUNT_TOOLS.getByName(session.owner_id), target.toString(), {
+        headers: { "x-nanocodex-owner-id": session.owner_id }, signal,
+      }, 2_000, "Hand diagnostics", response => response.ok ? response.json() : hand);
+    } catch { /* Explicit unavailable evidence; never fail the real operation. */ }
+    return { thread_id: session.session_id, services: [managed, hand] };
+  }
+
   async fetch(request: Request): Promise<Response> {
     return performanceScope(this.ctx.id.toString(), `session.${request.method} ${new URL(request.url).pathname}`,
       () => this.#measuredFetch(request));
@@ -5362,18 +5467,8 @@ export class DurableAgentSession extends DurableComputerObject {
         return json({ error: "forbidden" }, { status: 403 });
       const query = diagnosticQuery(url);
       if (!query) return json({ error: "invalid_diagnostics_page" }, { status: 400 });
-      const managed = this.#diagnostics.page(session.session_id, query.managedAfter, query.limit, true);
-      let hand: unknown = { service: "hand.broker", available: false, events: [], next_after: query.handAfter, history_truncated: true };
-      try {
-        const target = new URL("https://account-tools.internal/diagnostics");
-        target.searchParams.set("thread_id", session.session_id);
-        target.searchParams.set("after", String(query.handAfter));
-        target.searchParams.set("limit", String(query.limit));
-        hand = await fetchResponseWithDeadline(this.env.NANOCODEX_ACCOUNT_TOOLS.getByName(session.owner_id), target.toString(), {
-          headers: { "x-nanocodex-owner-id": session.owner_id }, signal: request.signal,
-        }, 2_000, "Hand diagnostics", response => response.ok ? response.json() : hand);
-      } catch { /* An unavailable service is explicit; local evidence remains readable. */ }
-      return json({ thread_id: session.session_id, services: [managed, hand] }, { headers: { "cache-control": "no-store" } });
+      return json(await this.#threadDiagnostics(session, query.managedAfter, query.handAfter, query.limit, request.signal),
+        { headers: { "cache-control": "no-store" } });
     }
     if (request.method === "GET" && url.pathname === "/events") {
       if (this.#deleting)
@@ -7963,6 +8058,8 @@ export class DurableAgentSession extends DurableComputerObject {
         input = promptInputText(this.#startupContext.enrich(id, input));
         assertActive();
       }
+      await this.#resolveTurnOriginHand(id, authorization, { sessionId: agent.sessionId });
+      assertActive();
       input = promptInputText(this.#startupContext.enrichTurnOrigin(id, input,
         this.#accountMachines(authorization, { sessionId: agent.sessionId })));
       // Claude receives queued voice lifecycle/transcript context inline.
@@ -8800,6 +8897,9 @@ export class DurableAgentSession extends DurableComputerObject {
         this.#eventTurnQueue.push(row.id);
         return agent;
       });
+      const originReady = dispatchInputJson !== undefined || row.state === "cancelling"
+        ? Promise.resolve() : agentReady.then(agent => this.#resolveTurnOriginHand(row.id,
+          parseTurnAuthorization(row.authorization_json), { sessionId: agent.sessionId }));
       let runtimeReadyAt = admissionStartedAt;
       void agentReady.then(() => { runtimeReadyAt = performance.now(); }, () => {});
       const bootstrap = dispatchInputJson !== undefined || row.state === "cancelling"
@@ -8811,6 +8911,7 @@ export class DurableAgentSession extends DurableComputerObject {
             const [account, agent] = await Promise.all([
               this.#startupAccountInfo(session, authorization),
               agentReady,
+              originReady,
             ]);
             assertActive();
             return {
@@ -8830,7 +8931,7 @@ export class DurableAgentSession extends DurableComputerObject {
         );
       // Drain construction even if bootstrap fails, so its admission-queue
       // publication cannot race the failure cleanup below.
-      const [runtimeResult, bootstrapResult] = await Promise.allSettled([agentReady, bootstrap]);
+      const [runtimeResult, bootstrapResult] = await Promise.allSettled([agentReady, Promise.all([bootstrap, originReady])]);
       const bootstrapReadyAt = performance.now();
       if (runtimeResult.status === "rejected") throw runtimeResult.reason;
       if (bootstrapResult.status === "rejected") throw bootstrapResult.reason;
@@ -9750,6 +9851,25 @@ export class DurableAgentSession extends DurableComputerObject {
     return shutdown;
   }
 
+  async #resolveTurnOriginHand(turnId: string, authorization: TurnAuthorization | undefined,
+    context: Pick<ToolContext, "sessionId" | "subagent">): Promise<void> {
+    const hand = this.#startupContext.reportedTurnHand(turnId);
+    if (!hand?.startsWith("user:") || !this.#hasFullAccountAuthority(authorization)
+      || !this.#canUseExecutionNamespace(authorization) || !this.#accountHostedTools
+      || this.#accountMachines(authorization, context).some(machine => machine.id === hand)) return;
+    // This account-scoped selected lookup has its own deadline and never joins
+    // the background inventory. Unknown/foreign claims remain unattributed.
+    const lookup = this.#accountHostedTools.refreshMachine(hand.slice("user:".length), context).catch(() => {});
+    // Attribution gets a shorter admission budget than an explicit Hand tool.
+    // A late authorized catalog update may serve environment(), but cannot
+    // rewrite the startup snapshot or frozen dispatch input. The provider
+    // checks its authorization generation again before publishing that update.
+    this.ctx.waitUntil(lookup);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try { await Promise.race([lookup, new Promise<void>(resolve => { timer = setTimeout(resolve, 1_500); })]); }
+    finally { clearTimeout(timer); }
+  }
+
   #refreshAccountHostedTools(session: SessionRow): void {
     this.#accountHostedTools ??= new AccountHostedToolsProvider(
       this.env.NANOCODEX_ACCOUNT_TOOLS,
@@ -10184,8 +10304,8 @@ export class DurableAgentSession extends DurableComputerObject {
       };
     };
     const codeEvaluatorStartedAt = performance.now();
-    // Every managed session uses Code Mode, including restricted tool catalogs
-    // and sessions with no attached provider. Evaluation remains lazy.
+    // Managed Responses sessions use Code Mode, including restricted tool
+    // catalogs and sessions with no attached provider. Evaluation remains lazy.
     const hostedRuntime = {
       codeEvaluator: managedCodeEvaluator(),
       toolMode: "code-only" as const,
@@ -10380,19 +10500,41 @@ export class DurableAgentSession extends DurableComputerObject {
       ]),
       this.#processSessions,
       session.session_id,
-      (context, name, input) => {
-        // CUA can also depend on the independently published account screen;
-        // retain full discovery for that contract and for inventory/process tools.
-        if (name !== "exec_command" || !input || typeof input !== "object") return undefined;
+      async (context, name, input) => {
+        // Capture only the selected Hand, including its independently published screen.
+        const computer = name === CUA_JS_NAME || name === CUA_RESET_NAME;
+        if ((name !== "exec_command" && !computer) || !input || typeof input !== "object") return undefined;
         const workdir = (input as { workdir?: unknown }).workdir;
         if (typeof workdir !== "string" || !workdir.startsWith("/")) return undefined;
         const cwd = resolveNamespaceCwd("/brain", workdir);
-        const local = namespaceMachines(context).filter(machine => machine.id.startsWith("user:")
-          && this.#hostedTools.machineOnline(machine.id.slice("user:".length)));
-        if (!local.some(machine => [machine.root!, ...(machine.aliases ?? [])]
-          .some(root => cwd === root || cwd.startsWith(`${root}/`)))) return undefined;
-        const ids = new Set(local.map(machine => machine.id));
-        return machine => ids.has(machine.id);
+        const known = namespaceMachines(context).filter(machine => machine.id.startsWith("user:"));
+        const selected = known.find(machine => [machine.root!, ...(machine.aliases ?? [])]
+          .some(root => cwd === root || cwd.startsWith(`${root}/`)));
+        if (!selected) return undefined;
+        const id = selected.id.slice("user:".length);
+        if (computer || !this.#hostedTools.machineOnline(id)) {
+          if (!this.#accountHostedTools) return undefined;
+          const started = performance.now();
+          try {
+            await this.#accountHostedTools.refreshMachine(id, context, computer);
+            observeHandCall("namespace.selected_lookup", name, started, "ok", context.callId,
+              { thread_id: session.session_id, session_id: context.sessionId, turn_id: context.turnId, parent_call_id: context.parentCallId });
+          } catch (error) {
+            observeHandCall("namespace.selected_lookup", name, started, context.signal.aborted ? "cancelled" : "failed", context.callId,
+              { thread_id: session.session_id, session_id: context.sessionId, turn_id: context.turnId, parent_call_id: context.parentCallId });
+            throw error;
+          }
+        }
+        // Incremental capture preserves earlier cell routes, including their
+        // original generation when another selected Hand is looked up later.
+        return machine => machine.id === selected.id;
+      },
+      (binding, context) => {
+        const authorization = this.#authorizationForToolContext(context);
+        if (!this.#canUseExecutionNamespace(authorization) || !this.#hasFullAccountAuthority(authorization)
+          || !binding.machineId.startsWith("user:")) return undefined;
+        return this.#accountHostedTools?.recoverProcessTool(
+          binding.machineId.slice("user:".length), binding.processSessionKey, context);
       },
     );
     const cloudTools: NamedTool[] = [
@@ -10619,6 +10761,28 @@ export class DurableAgentSession extends DurableComputerObject {
           }, input, context);
         },
       })),
+      ...(multiplayer || !this.env.NANOCODEX_ADMIN_USER_ID || session.owner_id !== this.env.NANOCODEX_ADMIN_USER_ID ? [] : [
+        adminThreadsTool(async (input, context) => {
+          context.signal.throwIfAborted();
+          const current = this.#session();
+          const auth = this.#authorizationForToolContext(context);
+          if (context.subagent !== undefined || !current || this.#deleting || this.#deleted || this.#durabilityExported
+            || current.owner_id !== this.env.NANOCODEX_ADMIN_USER_ID || current.owner_id !== session.owner_id
+            || current.authorization_epoch !== session.authorization_epoch || !auth || auth.connectGrant || auth.guestShareLinkId
+            || !(["agents:read", "history:read", "tools:use"] as const).every(capability => auth.capabilities.includes(capability)))
+            throw new ManagedRequestError(403, "forbidden", "admin_threads requires the configured administrator's direct root agent and read capabilities");
+          const principal: Principal = { kind: "account_session", userId: current.owner_id,
+            organizationId: current.organization_id, teamId: current.team_id, authorizationEpoch: current.authorization_epoch,
+            role: "owner", subjectId: `user:${current.owner_id}`, credentialId: `admin-tool:${context.callId}`, capabilities: auth.capabilities };
+          const query = new URLSearchParams(Object.entries(input).map(([key, value]) => [key, String(value)]));
+          const response = await managedFetch(new Request(new URL(`/v1/admin/threads?${query}`, session.public_origin), { signal: context.signal }),
+            this.env, this.ctx, principal, this.#routingOrigin().clientIngressColo);
+          if (!response.ok) { await response.body?.cancel(); throw new ManagedRequestError(response.status, "admin_threads_failed", "Thread inspection failed; check the account, thread and page cursor."); }
+          const result = await response.json();
+          context.signal.throwIfAborted();
+          return result;
+        }),
+      ]),
       ...(multiplayer ? [] : this.#memoryTools()),
       ...(multiplayer ? [] : [createVaultIntakeTool(context => this.#authorizeVaultTool(context)),
         createVaultRequestTool(this.env.NANOCODEX, () => this.#credentialSubject(), context => this.#authorizeVaultTool(context)),
@@ -10789,7 +10953,7 @@ export class DurableAgentSession extends DurableComputerObject {
         if (configuredNames.some(name => !nativeNames.has(name))) throw new Error("configuration names an unavailable Claude capability");
       }
       const claudeInstructions = [
-            "You are the durable Nanocodex assistant running the native Claude Messages backend on Cloudflare Workers. Run every tool action inside Code Mode exec with tools.*; use wait to observe yielded cells.",
+            "You are the durable Nanocodex assistant running the native Claude Messages backend on Cloudflare Workers. Call the declared tools directly as native tool calls.",
             "Use only the capabilities actually declared for this session. Bash(command, workdir) executes a shell command. Read(file_path), Write(file_path, content), and Edit(file_path, old_string, new_string) operate on /brain files. BashOutput polls an exact retained native shell session, if available. No process sandbox starts attached.",
             computer.instructions.replaceAll("exec_command", "Bash").replaceAll("write_stdin", "BashOutput"),
             "Use durable /brain for file work first. Native commands, package installation, builds, tests and servers require a suitable Hand: follow the placement and recovery order below before mounting cf_sandbox. A Hand's logical root already maps to its workspace: never append the host absolute workspace to workdir. Polls remain pinned to the original Hand. Never claim a build, installation, booking or payment succeeded merely because it started.",
@@ -10808,7 +10972,9 @@ export class DurableAgentSession extends DurableComputerObject {
             ...(configuration.environment?.skills.map(skill => `Available skill: ${skill.name}. Read /brain/skills/${skill.name}/SKILL.md before applying it.`) ?? []),
           ].join("\n\n");
       const claudeCapability: ClaudeOptions | undefined = claudeTools === undefined ? undefined : { model: isClaude ? this.#settings().model : "claude-sonnet-4-6", thinking: "low", instructions: claudeInstructions,
-            toolMode: "code-only", codeEvaluator: managedCodeEvaluator(),
+            // Claude uses native Messages tool calls. Code Mode remains the policy for
+            // Responses/Codex sessions, including Codex children of a Claude root.
+            toolMode: "direct",
             ...(configuredNames === undefined && configuration.multi_agent?.enabled !== false
               ? { subagents: { maxConcurrency: configuration.multi_agent?.enabled ? configuration.multi_agent.max_concurrent_subagents ?? 6 : 6 } } : {}),
             tools: [...claudeTools!.tools, ...(claudeTasks?.tools.filter(tool => configuredNames === undefined || configuredNames.includes(tool.name)) ?? [])],

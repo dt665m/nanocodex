@@ -29,7 +29,7 @@ struct ProfileEdit {
 
 impl Install {
     pub(crate) async fn run(self) -> Result<()> {
-        eprintln!("Installing the latest verified Nanocodex release…");
+        eprintln!("Installing the verified Nanocodex release…");
         let root = crate::update::install_latest().await?;
         let bin = root.join("bin");
         let executable = bin.join(if cfg!(windows) {
@@ -64,7 +64,7 @@ impl Install {
         }
         let unattended =
             !std::io::stdin().is_terminal() && !nanocodex_cli_auth::has_default_login();
-        if unattended && !cfg!(target_os = "macos") {
+        if unattended && !cfg!(any(target_os = "macos", target_os = "linux")) {
             println!(
                 "No interactive terminal detected. Finish setup with: {} setup",
                 executable.display()
@@ -80,8 +80,8 @@ impl Install {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
         if unattended {
-            // Installing the macOS service needs no account or interactive
-            // terminal. CLI sign-in will connect this prepared Hand later.
+            // Prepare the daemon before sign-in; login activates it later.
+            // Linux preparation requires administrator access.
             command.arg("--skip-account");
         }
         if std::env::var_os("NANOCODEX_COMPUTER").is_some_and(|value| !value.is_empty()) {

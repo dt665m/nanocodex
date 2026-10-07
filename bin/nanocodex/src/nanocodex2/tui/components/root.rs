@@ -184,6 +184,10 @@ pub(crate) enum RootEvent {
     TurnsCancelled,
     ForkReady,
     NewSessionFailed(String),
+    ReviewBranchesLoaded {
+        request_id: uuid::Uuid,
+        result: Result<Vec<crate::tui::review::Branch>, String>,
+    },
     SessionSearchResults {
         picker_id: u64,
         request_id: u64,
@@ -254,6 +258,7 @@ pub(crate) enum RootEvent {
 
 pub(crate) struct RestoredSessionProjection {
     transcript: Transcript,
+    subagents: SubagentTree,
     context_diagnostics: ContextDiagnostics,
     context_tokens: Option<u64>,
     recent_prompts: Vec<RecentPromptDraft>,
@@ -266,6 +271,7 @@ impl RestoredSessionProjection {
         records: impl IntoIterator<Item = Arc<TranscriptRecord>>,
     ) {
         for record in records {
+            self.subagents.observe_record(&record);
             if self.transcript.ignores_finished_run_event(&record) {
                 continue;
             }
@@ -328,6 +334,10 @@ pub(crate) enum RootEffect {
     OpenLink(String),
     ReloadConfig,
     NewSession(Model),
+    LoadReviewBranches {
+        request_id: uuid::Uuid,
+        workspace: PathBuf,
+    },
     SearchSessions {
         picker_id: u64,
         request_id: u64,
@@ -522,6 +532,10 @@ impl RootNode {
             "execution":if self.has_active_turns() {"running"} else {"idle"},
             "ui_blocked":self.blocking_task.is_some() || self.key_confirmation.is_some() || self.queue_edit.is_some(),
             "questions":{"supported":false}})
+    }
+
+    pub(crate) fn subagent_overlay_open(&self) -> bool {
+        matches!(self.overlay, Some(Overlay::Subagents(_)))
     }
 
     pub(crate) fn new(workspace: &Path, thinking: ReasoningEffort) -> Self {
@@ -815,6 +829,7 @@ impl RootNode {
     ) -> RestoredSessionProjection {
         let mut projection = RestoredSessionProjection {
             transcript: Transcript::with_effort(thinking),
+            subagents: SubagentTree::new(thinking),
             context_diagnostics: ContextDiagnostics::default(),
             context_tokens: None,
             recent_prompts: Vec::new(),
@@ -837,6 +852,16 @@ impl RootNode {
             .set_effort(self.composer.component().effort());
         self.seen_vault_requests
             .extend(projection.seen_vault_requests);
+        projection.subagents.set_workspace(&self.workspace);
+        projection.subagents.preserve_view_from(&self.subagents);
+        self.subagents = projection.subagents;
+        let _ = self
+            .composer
+            .component_mut()
+            .update(ComposerEvent::ActiveSubagents {
+                count: self.subagents.active_count(),
+                now: Instant::now(),
+            });
         self.transcript = Node::new(projection.transcript);
         self.context_diagnostics = projection.context_diagnostics;
         self.recent_prompts = projection.recent_prompts;
@@ -891,6 +916,16 @@ impl RootNode {
         projection.transcript.set_workspace(workspace);
         self.seen_vault_requests
             .extend(projection.seen_vault_requests);
+        projection.subagents.set_workspace(&self.workspace);
+        projection.subagents.preserve_view_from(&self.subagents);
+        self.subagents = projection.subagents;
+        let _ = self
+            .composer
+            .component_mut()
+            .update(ComposerEvent::ActiveSubagents {
+                count: self.subagents.active_count(),
+                now: Instant::now(),
+            });
         self.transcript = Node::new(projection.transcript);
         self.context_diagnostics = projection.context_diagnostics;
         self.recent_prompts = projection.recent_prompts;
@@ -2233,6 +2268,9 @@ impl RootNode {
                 return self
                     .apply_settings_command(SettingsCommand::Voice(crate::voice::Command::Toggle));
             }
+            Some(ActionsEffect::Trigger(Action::Subagents)) => {
+                self.overlay = Some(Overlay::Subagents(SubagentOverlay::Tree));
+            }
             Some(ActionsEffect::Trigger(Action::AgentId)) => {
                 self.overlay = None;
                 return ComponentUpdate {
@@ -3515,6 +3553,13 @@ impl RootNode {
                 self.overlay = None;
                 self.apply_code_review(crate::tui::review::Command::Run(target))
             }
+            Some(CodeReviewEffect::LoadBranches(request_id)) => ComponentUpdate {
+                effects: vec![RootEffect::LoadReviewBranches {
+                    request_id,
+                    workspace: self.workspace.clone(),
+                }],
+                render: RenderRequest::Immediate,
+            },
             Some(CodeReviewEffect::Dismiss) => {
                 self.overlay = None;
                 ComponentUpdate::render(RenderRequest::Immediate)
@@ -4155,6 +4200,16 @@ impl RootNode {
     }
 
     fn transcript_record(&mut self, record: Arc<TranscriptRecord>) -> ComponentUpdate<RootEffect> {
+        let subagents_changed = self.subagents.observe_record(&record);
+        if subagents_changed {
+            let _ = self
+                .composer
+                .component_mut()
+                .update(ComposerEvent::ActiveSubagents {
+                    count: self.subagents.active_count(),
+                    now: Instant::now(),
+                });
+        }
         if self
             .transcript
             .component()
@@ -4180,6 +4235,9 @@ impl RootNode {
             None
         };
         let mut update = self.update_transcript(TranscriptEvent::Record(record));
+        if subagents_changed {
+            update.render = update.render.max(RenderRequest::Streaming);
+        }
         if let Some(request) = private
             && self.seen_vault_requests.insert(format!(
                 "private:{}:{}",
@@ -4414,6 +4472,14 @@ impl Component for RootNode {
             RootEvent::TurnsCancelled => self.turns_cancelled(),
             RootEvent::ForkReady => self.fork_ready(),
             RootEvent::NewSessionFailed(message) => self.new_session_failed(message),
+            RootEvent::ReviewBranchesLoaded { request_id, result } => {
+                if let Some(Overlay::CodeReview(selector)) = &mut self.overlay {
+                    let update = selector.component_mut().branches_loaded(request_id, result);
+                    ComponentUpdate::render(update.render)
+                } else {
+                    ComponentUpdate::none()
+                }
+            }
             RootEvent::SessionSearchResults {
                 picker_id,
                 request_id,
@@ -5763,7 +5829,7 @@ mod live_control_tests {
         assert!(root.transcript.component().activity().active);
         assert_eq!(
             root.transcript.component().activity().status.as_deref(),
-            Some("Running exec command…")
+            Some("Agent 7: Running exec command…")
         );
         assert!(!root.has_active_turns());
         let mut terminal =

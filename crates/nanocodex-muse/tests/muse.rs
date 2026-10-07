@@ -2,7 +2,7 @@
 #![allow(missing_docs)]
 
 use eyre::{Result, eyre};
-use nanocodex_muse::{Model, Muse, Nanocodex, Thinking, Tools, tools::ToolExposure};
+use nanocodex_muse::{Model, Muse, Nanocodex, ServiceTier, Thinking, Tools, tools::ToolExposure};
 use serde_json::{Value, json};
 use std::time::Duration;
 use tokio::{
@@ -287,6 +287,7 @@ async fn file_edit_compaction_journey(model: Model) -> Result<()> {
         .exposure(ToolExposure::DirectOnly)
         .build()?;
     let (agent, mut events) = Nanocodex::builder(provider)
+        .service_tier(ServiceTier::Ultrafast)
         .workspace(workspace.path())
         .instructions("Complete the user's file task.")
         .tools(tools)
@@ -320,10 +321,19 @@ async fn file_edit_compaction_journey(model: Model) -> Result<()> {
         expected
     );
     assert_eq!(
+        usage
+            .estimated_cost()
+            .expect("cost from usage")
+            .service_tier(),
+        ServiceTier::Standard
+    );
+    assert_eq!(
         std::fs::read_to_string(workspace.path().join("hello.txt"))?,
         "hello Muse\n"
     );
+    agent.set_service_tier(ServiceTier::Priority).await?;
     timeout(Duration::from_secs(10), agent.compact()).await??;
+    agent.set_fast_mode(false).await?;
     assert_eq!(turn(&agent, "What did you create?").await?, "hello Muse");
     agent.shutdown().await?;
     server.await??;

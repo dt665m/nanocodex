@@ -69,9 +69,16 @@ pub(super) struct Cursor {
     pub(super) index: u32,
     #[serde(default)]
     pub(super) steers: u32,
+    // Legacy continuations keep their zero-based effect identities and kind.
+    #[serde(default)]
+    pub(super) model_step_offset: u32,
+    #[serde(default)]
+    pub(super) model_receipt_start: Option<u32>,
     // The retry budget belongs to the admitted turn, including durable replay.
     #[serde(default)]
     pub(super) context_recovery_attempted: bool,
+    #[serde(default)]
+    pub(super) output_continuations: u32,
 }
 impl Cursor {
     pub(super) fn effect<'a>(&'a self, state: &'a State, step: &str) -> Option<Effect<'a>> {
@@ -79,6 +86,11 @@ impl Cursor {
             policy: state.policy.as_deref()?,
             operation: self.operation.as_deref()?,
             step: step.to_owned(),
+            model_call: step
+                .strip_prefix("model-")
+                .and_then(|index| index.parse::<u32>().ok())
+                .zip(self.model_receipt_start)
+                .is_some_and(|(index, start)| index >= start),
         })
     }
 }
@@ -86,6 +98,7 @@ pub(super) struct Effect<'a> {
     policy: &'a dyn ClaudeExecutionPolicy,
     operation: &'a str,
     step: String,
+    model_call: bool,
 }
 impl Effect<'_> {
     pub(super) fn scoped(&self, scope: &str) -> Effect<'_> {
@@ -93,6 +106,7 @@ impl Effect<'_> {
             policy: self.policy,
             operation: self.operation,
             step: format!("{scope}-{}", self.step),
+            model_call: self.model_call,
         }
     }
 
@@ -101,7 +115,12 @@ impl Effect<'_> {
             .begin_step(
                 self.operation.to_owned(),
                 self.step.clone(),
-                kind.to_owned(),
+                if kind == "model" && self.model_call {
+                    "model_call"
+                } else {
+                    kind
+                }
+                .to_owned(),
                 input,
             )
             .await
@@ -222,7 +241,12 @@ impl State {
         if let (Some(policy), Some(operation)) = (&self.policy, operation)
             && let Some(value) = policy.continuation(operation.to_owned()).await?
         {
-            let cursor: Cursor = serde_json::from_value(value).map_err(recovery_error)?;
+            let mut cursor: Cursor = serde_json::from_value(value).map_err(recovery_error)?;
+            // Replay the old in-flight effect unchanged; subsequent model effects
+            // can participate in the shared steering consumption contract.
+            if cursor.model_receipt_start.is_none() {
+                cursor.model_receipt_start = Some(cursor.index.saturating_add(1));
+            }
             if cursor.operation.as_deref() != Some(operation)
                 || cursor.snapshot.provider != "claude"
                 || cursor.snapshot.version != 1
@@ -275,7 +299,10 @@ impl State {
             usage: Usage::default(),
             index: 0,
             steers: 0,
+            model_step_offset: 1,
+            model_receipt_start: Some(0),
             context_recovery_attempted: false,
+            output_continuations: 0,
         };
         // Task state snapshots and receipts must advance in the same order.
         #[cfg(all(feature = "tools", not(target_family = "wasm")))]
@@ -399,7 +426,15 @@ impl State {
                 result = self.call_tool(id, name, input, handler, events, cursor) => result?,
                 () = cancel.cancelled() => unknown(),
             }
-        } else if self.code_only && name != "exec" && name != "wait" {
+        } else if self.code_only
+            && name != "exec"
+            && name != "wait"
+            && cursor
+                .template
+                .tools
+                .iter()
+                .any(|tool| matches!(tool, ClaudeToolSpec::Client(tool) if tool.name == name))
+        {
             ContentBlock::tool_result_content(
                 id,
                 ToolResultContent::Text(format!(
@@ -410,9 +445,10 @@ impl State {
         } else {
             ContentBlock::tool_result_content(
                 id,
-                ToolResultContent::Text(format!(
-                    "Tool {name} is not available in the recovered host; no handler was invoked."
-                )),
+                ToolResultContent::Text(
+                    "Tool is not available in the admitted catalog or current host; no handler was invoked. Use an available tool."
+                        .into(),
+                ),
                 true,
             )
         };

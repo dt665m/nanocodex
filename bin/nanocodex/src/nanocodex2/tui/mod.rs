@@ -128,12 +128,14 @@ enum SteerTarget {
 enum SteerResolution {
     Admitted,
     Failed,
+    Rejected(String),
     Unconfirmed { error: String, active: bool },
     Stale,
 }
 
 enum SteerFailure {
     Inactive,
+    Rejected(String),
     Other(String),
 }
 
@@ -143,9 +145,17 @@ impl SteerFailure {
             if status.as_u16() == 409 && matches!(code.as_str(), "turn_not_active" | "turn_not_steerable"))
         {
             Self::Inactive
+        } else if Self::known_rejection(&error) {
+            Self::Rejected(error.to_string())
         } else {
             Self::Other(error.to_string())
         }
+    }
+
+    fn known_rejection(error: &ManagedError) -> bool {
+        matches!(error, ManagedError::Configuration(_))
+            || matches!(error, ManagedError::Http { status, code, .. }
+                if status.is_client_error() && code != "command_delivery_unknown")
     }
 
     fn backend(error: NanocodexError) -> Self {
@@ -159,6 +169,12 @@ impl SteerFailure {
             && matches!(code.as_str(), "turn_not_active" | "turn_not_steerable")
         {
             return Self::Inactive;
+        }
+        if let NanocodexError::Backend { source, .. } = &error
+            && let Some(managed) = source.downcast_ref::<ManagedError>()
+            && Self::known_rejection(managed)
+        {
+            return Self::Rejected(error.to_string());
         }
         Self::Other(error.to_string())
     }
@@ -465,6 +481,12 @@ enum RecoveryPhase {
     Disconnected,
 }
 
+struct ReviewBranchesCompletion {
+    pane: PaneId,
+    request_id: uuid::Uuid,
+    result: Result<Vec<review::Branch>, String>,
+}
+
 struct SessionSearchCompletion {
     pane: PaneId,
     picker_id: u64,
@@ -614,6 +636,8 @@ struct DriverRuntime {
     history_loads: JoinSet<HistoryCompletion>,
     history_replays: JoinSet<HistoryReplayCompletion>,
     history_prefetch: HistoryPrefetch,
+    history_tree_open: bool,
+    history_tree_failed: bool,
     history_generation: u64,
     history: HistoryWindow,
     history_sequences: HashMap<String, u64>,
@@ -634,6 +658,7 @@ struct DriverRuntime {
     recent_prompt_loads: HashMap<PaneId, u64>,
     connection: JoinSet<ConnectionResult>,
     session_list_cancellations: HashMap<(PaneId, u64), CancellationToken>,
+    review_branch_loads: JoinSet<ReviewBranchesCompletion>,
     session_searches: JoinSet<SessionSearchCompletion>,
     session_search_tasks: HashMap<PaneId, tokio::task::AbortHandle>,
     retry_target: Option<RetryTarget>,
@@ -1222,6 +1247,7 @@ impl DriverRuntime {
             self.history_loads = JoinSet::new();
             self.history_replays = JoinSet::new();
             self.history_prefetch.reset();
+            self.history_tree_failed = false;
             for (pane, id) in take_waiting_steer_failures(&mut self.waiting_steers) {
                 request_render(app.update(AppEvent::SteerFailed { pane, id }), scheduler);
             }
@@ -1334,6 +1360,7 @@ impl DriverRuntime {
                 active: self.steer_target_current(target),
             },
             Err(SteerFailure::Inactive) => SteerResolution::Failed,
+            Err(SteerFailure::Rejected(error)) => SteerResolution::Rejected(error),
         }
     }
 
@@ -1379,7 +1406,10 @@ impl DriverRuntime {
     }
 
     fn start_history_prefetch(&mut self, pane: PaneId) {
-        if !self.history_loads.is_empty() || !self.history_replays.is_empty() {
+        if (self.history_tree_open && self.history_tree_failed)
+            || !self.history_loads.is_empty()
+            || !self.history_replays.is_empty()
+        {
             return;
         }
         let Some(before) = self.history_prefetch.claim(&self.history) else {
@@ -1399,7 +1429,8 @@ impl DriverRuntime {
     }
 
     fn start_requested_history_replay(&mut self, pane: PaneId) {
-        if !self.history_replays.is_empty() {
+        if (self.history_tree_open && self.history_tree_failed) || !self.history_replays.is_empty()
+        {
             return;
         }
         let Some((requested_before, page)) = self
@@ -1434,6 +1465,27 @@ impl DriverRuntime {
         });
     }
 
+    fn update_tree_history(&mut self, open: bool) {
+        if open != self.history_tree_open {
+            self.history_tree_open = open;
+            self.history_tree_failed = false;
+            if !open {
+                // A closing overlay must not keep fetching or install a late projection.
+                self.history_generation = self.history_generation.wrapping_add(1);
+                self.history_loads = JoinSet::new();
+                self.history_replays = JoinSet::new();
+                self.history_prefetch.reset();
+            }
+        }
+        if open && !self.history_tree_failed && self.history.has_more {
+            // Consume the existing bounded prefetch queue one page at a time. Older
+            // child receipts may precede the entire newest transcript page.
+            self.history_prefetch.request_replay();
+            self.start_requested_history_replay(PaneId::Main);
+            self.start_history_prefetch(PaneId::Main);
+        }
+    }
+
     fn finish_history_replay(
         &mut self,
         pane: PaneId,
@@ -1445,6 +1497,7 @@ impl DriverRuntime {
                 // The requested page has already left the prefetch queue. Every later buffered
                 // page depends on its cursor, so none of them can be reached from the unchanged
                 // history window after a projection failure.
+                self.history_tree_failed = self.history_tree_open;
                 self.history_prefetch.reset();
                 self.start_history_prefetch(pane);
                 return Err(error);
@@ -1753,6 +1806,8 @@ impl DriverRuntime {
         self.history_loads = JoinSet::new();
         self.history_replays = JoinSet::new();
         self.history_prefetch.reset();
+        self.history_tree_open = false;
+        self.history_tree_failed = false;
         self.history = HistoryWindow::default();
         self.history_sequences.clear();
         self.history_records.clear();
@@ -2144,6 +2199,8 @@ async fn run_inner(
         history_loads: JoinSet::new(),
         history_replays: JoinSet::new(),
         history_prefetch: HistoryPrefetch::default(),
+        history_tree_open: false,
+        history_tree_failed: false,
         history_generation: 0,
         history: HistoryWindow::default(),
         history_sequences: HashMap::new(),
@@ -2164,6 +2221,7 @@ async fn run_inner(
         recent_prompt_loads: HashMap::new(),
         connection: JoinSet::new(),
         session_list_cancellations: HashMap::new(),
+        review_branch_loads: JoinSet::new(),
         session_searches: JoinSet::new(),
         session_search_tasks: HashMap::new(),
         retry_target: None,
@@ -2246,6 +2304,10 @@ async fn run_inner(
     routing_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     while !stopping {
+        runtime.update_tree_history(
+            app.root(PaneId::Main)
+                .is_some_and(RootNode::subagent_overlay_open),
+        );
         // Crossterm's reader can prequeue terminal bytes while HTTP is pending.
         // Drain at EVERY private phase boundary before drawing/enabling input.
         if runtime
@@ -2903,6 +2965,13 @@ async fn run_inner(
                 };
                 stopping = apply_update(update, &mut app, &mut runtime, &mut terminal, &mut scheduler).await?;
             }
+            Some(result) = runtime.review_branch_loads.join_next(), if !runtime.review_branch_loads.is_empty() => {
+                if let Ok(loaded) = result {
+                    request_render(app.update(AppEvent::ReviewBranchesLoaded {
+                        pane: loaded.pane, request_id: loaded.request_id, result: loaded.result,
+                    }), &mut scheduler);
+                }
+            }
             Some(result) = runtime.session_searches.join_next(), if !runtime.session_searches.is_empty() => {
                 if let Ok(search) = result {
                     request_render(app.update(AppEvent::SessionSearchResults {
@@ -3075,6 +3144,8 @@ async fn run_inner(
                             runtime.history_loads = JoinSet::new();
                             runtime.history_replays = JoinSet::new();
                             runtime.history_prefetch.reset();
+                            runtime.history_tree_open = false;
+                            runtime.history_tree_failed = false;
                             if !matches!(purpose, ConnectionPurpose::Startup) {
                                 // Unconsumed local output belongs to the previous session.
                                 // Preserve it until a resume succeeds, then drop it with
@@ -3617,6 +3688,12 @@ async fn run_inner(
                             // for explicit review even after the owning turn finishes.
                             app.update(AppEvent::SteerUnconfirmed { pane, id })
                         }
+                        SteerResolution::Rejected(error) => {
+                            if let Some(cancellation) = runtime.unresolved_steers.remove(&(pane, id)) { cancellation.cancel(); }
+                            runtime.steer_receipts.remove(&(pane, id));
+                            request_render(app.update(AppEvent::NotifyError { pane, error: format!("Steering rejected: {error}") }), &mut scheduler);
+                            app.update(if withdraw { AppEvent::SteerWithdrawn { pane, id } } else { AppEvent::SteerFailed { pane, id } })
+                        }
                         SteerResolution::Failed if withdraw => {
                             if let Some(cancellation) = runtime.unresolved_steers.remove(&(pane, id)) { cancellation.cancel(); }
                             runtime.steer_receipts.remove(&(pane, id));
@@ -3739,6 +3816,7 @@ async fn run_inner(
                 if let Some(result) = result {
                     match result {
                         Err(error) => {
+                            runtime.history_tree_failed = runtime.history_tree_open;
                             runtime.history_prefetch.reset();
                             runtime.start_history_prefetch(PaneId::Main);
                             request_render(
@@ -3790,6 +3868,7 @@ async fn run_inner(
                 if let Some(result) = result {
                     match result {
                         Err(error) => {
+                            runtime.history_tree_failed = runtime.history_tree_open;
                             runtime.history_prefetch.reset();
                             request_render(app.update(AppEvent::NotifyError {
                                 pane: PaneId::Main,
@@ -3801,6 +3880,7 @@ async fn run_inner(
                                 && generation == runtime.history_generation
                                 && runtime.history_prefetch.owns(&requested_before) => match result {
                             Err(error) => {
+                                runtime.history_tree_failed = runtime.history_tree_open;
                                 let _ = runtime.history_prefetch.fail(&requested_before);
                                 request_render(app.update(AppEvent::NotifyError {
                                     pane,
@@ -3812,6 +3892,7 @@ async fn run_inner(
                                     .history_prefetch
                                     .store(&requested_before, page)
                                 {
+                                    runtime.history_tree_failed = runtime.history_tree_open;
                                     let _ = runtime.history_prefetch.fail(&requested_before);
                                     request_render(app.update(AppEvent::NotifyError {
                                         pane,
@@ -3969,6 +4050,20 @@ async fn apply_update(
                 }
                 if let RootEffect::LoadRecentPrompts(drafts) = effect {
                     runtime.load_prompt_cache(pane, drafts);
+                    continue;
+                }
+                if let RootEffect::LoadReviewBranches {
+                    request_id,
+                    workspace,
+                } = effect
+                {
+                    runtime.review_branch_loads.spawn(async move {
+                        ReviewBranchesCompletion {
+                            pane,
+                            request_id,
+                            result: review::branches(&workspace).await,
+                        }
+                    });
                     continue;
                 }
                 if pane != PaneId::Main {
@@ -4641,6 +4736,7 @@ async fn apply_update(
                     }
                     RootEffect::CopyResponse(_) => unreachable!("handled before pane routing"),
                     RootEffect::SetTheme(_) => {}
+                    RootEffect::LoadReviewBranches { .. } => unreachable!("handled before pane routing"),
                     RootEffect::SearchSessions {
                         picker_id,
                         request_id,
@@ -5759,6 +5855,8 @@ mod tests {
             history_loads: JoinSet::new(),
             history_replays: JoinSet::new(),
             history_prefetch: HistoryPrefetch::default(),
+            history_tree_open: false,
+            history_tree_failed: false,
             history_generation: 1,
             history,
             history_sequences,
@@ -5779,6 +5877,7 @@ mod tests {
             recent_prompt_loads: HashMap::new(),
             connection: JoinSet::new(),
             session_list_cancellations: HashMap::new(),
+            review_branch_loads: JoinSet::new(),
             session_searches: JoinSet::new(),
             session_search_tasks: HashMap::new(),
             retry_target: None,

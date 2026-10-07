@@ -4,6 +4,7 @@
 // SessionModelEgress, broker vault and Rust OAuth state machine are production.
 // Only account bootstrap (synthetic identity) and external provider HTTP are fixtures.
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { test } from 'node:test';
 import { mkdir, writeFile, rm } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
@@ -73,7 +74,7 @@ function sse(block, stop, id, newline = "\n", terminal = true) {
   ];
   return new Response(events.filter(e=>terminal || e.type!=='message_stop').map(e=>`event: ${e.type}${newline}data: ${JSON.stringify(e)}${newline}${newline}`).join(''),{headers:{'content-type':'text/event-stream'}});
 }
-// Fixtures encode every authorized capability call through the shipped evaluator.
+// Responses fixtures use the shipped evaluator; Claude fixtures call tools directly.
 const nestedCode = (name, input) => `text("NESTED_RECEIPT:"+JSON.stringify(await tools.${name}(${JSON.stringify(input)})));`;
 const usedNested = block => {
   const code = block.input?.code ?? block.input?.input ?? block.input ?? '';
@@ -90,7 +91,7 @@ const assertStrict = definitions => assert.deepEqual(definitions.map(tool=>tool.
 
 test('Managed native Claude and mixed-family public delegation, account gates, cancellation and recovery', {timeout:240_000}, async () => {
   await mkdir(evidence,{recursive:true});
-  const trace = [], upstream = [], providerErrors = [], mediaRequests = []; let calls=0, summaries=0, writes=0, taskWrites=0, canonicalWrites=0, codexWrites=0, nestedWrites=0, allowResponses=false, sidebarCalls=0, holds=0, responsesAttempts=0, catalogOutage=false, catalogUnsupportedOnly=false, catalogRequests=0, catalogHold, retainedTaskId, mf;
+  const trace = [], upstream = [], providerErrors = [], mediaRequests = [], deniedCalls = []; let calls=0, summaries=0, writes=0, taskWrites=0, canonicalWrites=0, codexWrites=0, nestedWrites=0, allowResponses=false, sidebarCalls=0, holds=0, responsesAttempts=0, catalogOutage=false, catalogUnsupportedOnly=false, catalogRequests=0, catalogHold, retainedTaskId, mf;
   const framingRequests = {crOnly:0,truncated:0}, activeSteerRequests = [];
   let releaseActiveSteer;
   const mcpTrace = [], mcpOrigins = new Set(['https://developers.openai.com','https://mcp.tempo.xyz','https://mercator.sh','https://docs.mcp.cloudflare.com','https://viem.sh','https://vocs.dev']);
@@ -258,10 +259,12 @@ test('Managed native Claude and mixed-family public delegation, account gates, c
       assert.equal(JSON.parse(body.metadata.user_id).session_id,request.headers.get('x-claude-code-session-id'));
       assert.equal(request.headers.get('accept'),'application/json');
       assert.equal(body.output_config.effort,'low');
+      const system=JSON.stringify(body.system);
+      for(const invalid of ['Code Mode','exec_command','write_stdin','tool_search','tools.exec','Promise.all'])assert.ok(!system.includes(invalid),`native system must not demand ${invalid}`);
       const wireNames=(body.tools??[]).map(t=>t.name);
       const names=wireNames.map(name=>name.startsWith('_')?name.slice(1):name);
       assert.deepEqual(wireNames,names.map(name=>['web_search','code_execution','text_editor','computer'].includes(name.toLowerCase())?name:'_'+name));
-      assert.deepEqual(names.sort(),['exec','wait']);
+      for(const name of ['exec','wait','exec_command','apply_patch','web__run','tool_search'])assert.ok(!names.includes(name),`no Responses tool ${name}`);
       upstream.push({wire,request:calls,model:body.model,tool_names:names,wire_tool_names:wireNames,message_count:body.messages.length,
         tool_uses:body.messages.flatMap(message=>Array.isArray(message.content)?message.content.filter(block=>block.type==='tool_use').map(block=>block.name):[]),
         tool_result_count:body.messages.flatMap(message=>Array.isArray(message.content)?message.content.filter(block=>block.type==='tool_result'):[]).length,
@@ -293,33 +296,51 @@ test('Managed native Claude and mixed-family public delegation, account gates, c
       const canonicalRoot = encodedHistory.includes('Delegate canonical Claude child') || codexRoot;
       const unavailableChild = encodedHistory.includes('Try unavailable canonical child');
       const disabledChild = encodedHistory.includes('Try disabled canonical child');
-      const use = (name, input) => sse({type:'tool_use',id:`canonical-${name}-${calls}`,name:'exec',input:{code:nestedCode(name,input)}},'tool_use',`message-${calls}`);
+      const use = (name, input) => sse({type:'tool_use',id:`canonical-${name}-${calls}`,name,input},'tool_use',`message-${calls}`);
+      if (result && (result.tool_use_id.startsWith('denied-') || disabledChild)) {
+        const denied = body.messages.at(-2).content.find(block=>block.type==='tool_use'&&block.id===result.tool_use_id).name.replace(/^_/,'');
+        assert.equal(names.includes(denied),false,'denied tool remains outside the frozen catalog');
+        assert.equal(result.is_error,true,'an unadmitted call returns a paired error to the model');
+        deniedCalls.push(denied);
+        return sse({type:'text',text:`CLAUDE_TOOL_DONE_DENIED_${calls}`},'end_turn',`message-${calls}`);
+      }
+      if (encodedHistory.includes('SHARED_PLATFORM_NATIVE_PROBE')) {
+        for (const name of ['environment','memories__write','memories__read','find_session','read_session','spawn_agent','wait_agent','mcp__cua_repl__js','mcp__cua_repl__js_reset'])
+          assert.ok(names.includes(name),`Claude retains shared platform tool ${name}`);
+        const uses=body.messages.flatMap(message=>Array.isArray(message.content)?message.content.filter(block=>block.type==='tool_use').map(block=>block.name.replace(/^_/,'')):[]);
+        if (!uses.length) return use('environment',{});
+        assert.equal(result?.is_error??false,false,JSON.stringify(result));
+        if (uses.at(-1)==='environment') {
+          assert.match(JSON.stringify(result),/cloudflare-durable-object/);
+          return use('memories__write',{operation:'put',path:'memory/2026-01-01-claude-platform-proof.md',content:'SHARED_PLATFORM_MEMORY_PROOF'});
+        }
+        if (uses.at(-1)==='memories__write') return use('memories__read',{path:'memory/2026-01-01-claude-platform-proof.md'});
+        assert.match(JSON.stringify(result),/SHARED_PLATFORM_MEMORY_PROOF/);
+        return sse({type:'text',text:'CLAUDE_TOOL_DONE_SHARED_PLATFORM'},'end_turn',`message-${calls}`);
+      }
       if (encodedHistory.includes('MCP_LAZY_')) {
-        const uses = body.messages.flatMap(message=>Array.isArray(message.content)?message.content.filter(block=>block.type==='tool_use').flatMap(usedNested):[]);
+        const uses = body.messages.flatMap(message=>Array.isArray(message.content)?message.content.filter(block=>block.type==='tool_use').map(block=>block.name.replace(/^_/,'')):[]);
         if (!uses.length) {
-          assert.match(JSON.stringify(body.tools),/MCPToolSearch/); assert.match(JSON.stringify(body.tools),/MCPExecute/);
+          assert.ok(names.includes('MCPToolSearch') && names.includes('MCPExecute'),'fixed MCP schemas are available before discovery');
           return encodedHistory.includes('MCP_LAZY_DIRECT')
             ? use('MCPExecute',{name:'mcp__openaiDeveloperDocs__fixture_echo',arguments:{proof:'MCP_LAZY_PUBLIC_PROOF'}})
             : use('MCPToolSearch',{query:'fixture_echo',limit:8});
         }
         assert.equal(result?.is_error??false,false,JSON.stringify(result));
         if (uses.at(-1)==='MCPToolSearch') {
-          const catalog=receiptValue(result.content);
-          const names=catalog.flatMap(entry=>entry.type==='namespace'?entry.tools.map(tool=>entry.name+tool.name):[entry.name]);
-          const name=names.find(name=>name==='mcp__openaiDeveloperDocs__fixture_echo');
-          assert.ok(name,JSON.stringify(catalog));
-          return use('MCPExecute',{name,arguments:{proof:'MCP_LAZY_PUBLIC_PROOF'}});
+          assert.match(JSON.stringify(result),/mcp__openaiDeveloperDocs__fixture_echo/);
+          return use('MCPExecute',{name:'mcp__openaiDeveloperDocs__fixture_echo',arguments:{proof:'MCP_LAZY_PUBLIC_PROOF'}});
         }
         assert.match(JSON.stringify(result),/MCP_LAZY_PUBLIC_PROOF/);
         return sse({type:'text',text:'CLAUDE_TOOL_DONE_MCP_LAZY'},'end_turn',`message-${calls}`);
       }
       if (encodedHistory.includes('NESTED_CLAUDE_PARENT')) {
         assert.equal(body.model,'claude-opus-4-6','middle generation uses the native Claude provider');
-        const toolsUsed=body.messages.flatMap(message=>Array.isArray(message.content)?message.content.filter(block=>block.type==='tool_use').flatMap(usedNested):[]);
+        const toolsUsed=body.messages.flatMap(message=>Array.isArray(message.content)?message.content.filter(block=>block.type==='tool_use').map(block=>block.name.replace(/^_/,'')):[]);
         if (!toolsUsed.length) return use('spawn_agent',{role:'gateway proof specialist',task:'GATEWAY_GRANDCHILD_TASK: write proof, read it back, then submit result',harness:'codex',model:'mimo',thinking:'low',output_contract:{kind:'string'}});
         if (toolsUsed.includes('submit_result')) return sse({type:'text',text:'nested Claude parent finished'},'end_turn',`message-${calls}`);
         assert.equal(result?.is_error??false,false,JSON.stringify(result));
-        const decoded=receiptValue(result.content);
+        const decoded=JSON.parse(typeof result.content==='string'?result.content:JSON.stringify(result.content));
         if (toolsUsed.at(-1)==='spawn_agent') return use('wait_agent',{agent_ids:[decoded.agent_id],timeout_ms:10000});
         assert.equal(decoded.agents[0].status.state,'completed',JSON.stringify(decoded));
         assert.equal(decoded.agents[0].status.output,'GATEWAY_GRANDCHILD_DURABLE_PROOF');
@@ -327,7 +348,7 @@ test('Managed native Claude and mixed-family public delegation, account gates, c
       }
       if (canonicalTask && !canonicalRoot && !unavailableChild && !disabledChild) {
         assert.equal(body.model,'claude-opus-4-6','explicit child model is routed separately from the root');
-        const toolsUsed = body.messages.flatMap(message => Array.isArray(message.content) ? message.content.filter(block => block.type==='tool_use').flatMap(usedNested) : []);
+        const toolsUsed = body.messages.flatMap(message => Array.isArray(message.content) ? message.content.filter(block => block.type==='tool_use').map(block => block.name.replace(/^_/,'')) : []);
         if (!toolsUsed.includes('Write')) { canonicalWrites++; return use('Write',{file_path:'/brain/canonical-child.txt',content:'CANONICAL_DURABLE_CHILD_PROOF'}); }
         if (!toolsUsed.includes('submit_result')) {
           assert.equal(result?.is_error??false,false,'child Write retains managed execution authority');
@@ -336,9 +357,9 @@ test('Managed native Claude and mixed-family public delegation, account gates, c
         return sse({type:'text',text:'canonical child finished'},'end_turn',`message-${calls}`);
       }
       if (canonicalRoot || unavailableChild || disabledChild) {
-        const toolUses = body.messages.flatMap(message => Array.isArray(message.content) ? message.content.filter(block => block.type==='tool_use').flatMap(usedNested) : []);
+        const toolUses = body.messages.flatMap(message => Array.isArray(message.content) ? message.content.filter(block => block.type==='tool_use') : []);
         if (!toolUses.length) {
-          if (disabledChild) return sse({type:'tool_use',id:`denied-disabled-${calls}`,name:'spawn_agent',input:{}},'tool_use',`message-${calls}`);
+          assert.equal(names.includes('spawn_agent'),!disabledChild,'native subagents follow the managed enabled setting');
           return use('spawn_agent',{role:'proof specialist',task:codexRoot?'CANONICAL_CODEX_PROOF: write proof then submit result':'CANONICAL_CHILD_PROOF: write proof then submit result',harness:codexRoot?'codex':'claude',model:codexRoot?'gpt-6.1-sol':unavailableChild?'claude-sonnet-5-5':'claude-opus-4-6',thinking:'low',output_contract:{kind:'string'}});
         }
         if (unavailableChild) {
@@ -346,8 +367,8 @@ test('Managed native Claude and mixed-family public delegation, account gates, c
           return sse({type:'text',text:'CLAUDE_TOOL_DONE_UNAVAILABLE_CHILD'},'end_turn',`message-${calls}`);
         }
         const content = typeof result.content === 'string' ? result.content : JSON.stringify(result.content);
-        const decoded = receiptValue(result.content);
-        if (toolUses.at(-1)==='spawn_agent') return use('wait_agent',{agent_ids:[decoded.agent_id],timeout_ms:10000});
+        const decoded = JSON.parse(content);
+        if (toolUses.at(-1).name.replace(/^_/,'')==='spawn_agent') return use('wait_agent',{agent_ids:[decoded.agent_id],timeout_ms:10000});
         assert.equal(decoded.agents[0].status.state,'completed',content);
         assert.equal(decoded.agents[0].status.output,codexRoot?'CODEX_DURABLE_CHILD_PROOF':'CANONICAL_DURABLE_CHILD_PROOF');
         return sse({type:'text',text:'CLAUDE_TOOL_DONE_CANONICAL_CHILD'},'end_turn',`message-${calls}`);
@@ -367,7 +388,7 @@ test('Managed native Claude and mixed-family public delegation, account gates, c
         return new Response(events.map(e=>`event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`).join(''),{headers:{'content-type':'text/event-stream'}});
       }
       if(result) {
-        assert.equal(result.is_error??false, result.tool_use_id.startsWith('denied-'), 'only adversarial unregistered calls fail');
+        assert.equal(result.is_error??false,false,'admitted native tools succeed');
         return sse({type:'text',text:`CLAUDE_TOOL_DONE_${calls}`},'end_turn',`message-${calls}`);
       }
       const prompt = JSON.stringify(latest.content);
@@ -376,25 +397,25 @@ test('Managed native Claude and mixed-family public delegation, account gates, c
         summaries++; return sse({type:'text',text:'NATIVE_SUMMARY durable proof already written; never repeat Write'},'end_turn',`summary-${calls}`);
       }
       if(prompt.includes('Try forbidden Read')) {
-        assert.match(JSON.stringify(body.tools),/Write/);
+        assert.deepEqual(names,['Write'],'the final native catalog is the exact requested allowlist');
         return sse({type:'tool_use',id:`denied-read-${calls}`,name:'Read',input:{file_path:'/brain/proof.txt'}},'tool_use',`message-${calls}`);
       }
-      if(prompt.includes('Try forbidden Write')) return sse({type:'tool_use',id:`denied-${calls}`,name:'Write',input:{file_path:'/brain/denied.txt',content:'MUST_NOT_EXIST'}},'tool_use',`message-${calls}`);
-      if(prompt.includes('Read retained task receipt'))return use('TaskOutput',{task_id:retainedTaskId});
-      if(prompt.includes('Delegate native child')) return use('Task',{prompt:'CHILD_WRITE proof once',subagent_type:'worker'});
-      if(prompt.includes('CHILD_WRITE proof once')) { taskWrites++; return use('Write',{file_path:'/brain/child-proof.txt',content:'CLAUDE_NATIVE_CHILD_PROOF'}); }
+      if(!names.length) return sse({type:'tool_use',id:`denied-${calls}`,name:'Write',input:{file_path:'/brain/denied.txt',content:'MUST_NOT_EXIST'}},'tool_use',`message-${calls}`);
+      if(prompt.includes('Read retained task receipt'))return sse({type:'tool_use',id:`task-output-${calls}`,name:'TaskOutput',input:{task_id:retainedTaskId}},'tool_use',`message-${calls}`);
+      if(prompt.includes('Delegate native child')) return sse({type:'tool_use',id:`task-${calls}`,name:'Task',input:{prompt:'CHILD_WRITE proof once',subagent_type:'worker'}},'tool_use',`message-${calls}`);
+      if(prompt.includes('CHILD_WRITE proof once')) { taskWrites++; return sse({type:'tool_use',id:`child-write-${calls}`,name:'Write',input:{file_path:'/brain/child-proof.txt',content:'CLAUDE_NATIVE_CHILD_PROOF'}},'tool_use',`message-${calls}`); }
       if(prompt.includes('Hold until cancelled')) {
         holds++; return new Response(new ReadableStream({ start(controller) {
           controller.enqueue(new TextEncoder().encode(`event: message_start\ndata: ${JSON.stringify({type:'message_start',message:{id:'cancel-fixture',role:'assistant',model:body.model,content:[],usage:{input_tokens:10,output_tokens:0}}})}\n\n`));
         } }),{headers:{'content-type':'text/event-stream'}});
       }
-      assert.match(JSON.stringify(body.tools),/Bash/);assert.match(JSON.stringify(body.tools),/Write/);assert.match(JSON.stringify(body.tools),/Read/);
-      if(prompt.includes('Write durable proof')){writes++;return use('Write',{file_path:'/brain/proof.txt',content:'NATIVE_CLAUDE_DURABLE_PROOF'});}
+      assert.ok(names.includes('Bash'));assert.ok(names.includes('Write'));assert.ok(names.includes('Read'));
+      if(prompt.includes('Write durable proof')){writes++;return sse({type:'tool_use',id:`write-${calls}`,name:'Write',input:{file_path:'/brain/proof.txt',content:'NATIVE_CLAUDE_DURABLE_PROOF'}},'tool_use',`message-${calls}`);}
       if(prompt.includes('Read durable proof')){
-        assert.ok(JSON.stringify(body.messages).includes(summaries?'NATIVE_SUMMARY':'CLAUDE_TOOL_DONE_2'),'prior native history/summary persisted');
-        return use('Read',{file_path:'/brain/proof.txt'});
+        assert.ok(JSON.stringify(body.messages).includes(summaries?'NATIVE_SUMMARY':'NATIVE_CLAUDE_DURABLE_PROOF'),'prior native history/summary persisted');
+        return sse({type:'tool_use',id:`read-${calls}`,name:'Read',input:{file_path:'/brain/proof.txt'}},'tool_use',`message-${calls}`);
       }
-      return use('Bash',{command:prompt.includes('Check denied file')?'test ! -e /brain/denied.txt && echo NO_UNAUTHORIZED_FILE':'cat /brain/proof.txt',workdir:'/brain'});
+      return sse({type:'tool_use',id:`bash-${calls}`,name:'Bash',input:{command:prompt.includes('Check denied file')?'test ! -e /brain/denied.txt && echo NO_UNAUTHORIZED_FILE':'cat /brain/proof.txt',workdir:'/brain'}},'tool_use',`message-${calls}`);
     }
     const response = await claudeProvider(request); if(response)return response;
     return new Response('Unexpected external fixture request '+url.origin+url.pathname,{status:502});
@@ -471,6 +492,13 @@ test('Managed native Claude and mixed-family public delegation, account gates, c
     const created=await call('/v1/agents','POST',{},201), agent=created.agent_id;
     assert.equal(catalogRequests-beforeClaudeDefault,2,'Claude-only default and admission share one paginated live catalog');
     assert.equal((await call(`/v1/agents/${agent}`)).settings.model,'claude-sonnet-4-6');
+    const platform=(await call('/v1/agents','POST',{},201)).agent_id;
+    await turn(platform,'SHARED_PLATFORM_NATIVE_PROBE save and read a synthetic memory','journey-shared-platform');
+    const platformHistory=await call(`/v1/agents/${platform}/events/history?after=0&limit=256`);
+    const platformResults=platformHistory.data.filter(row=>row.event?.type==='tool.result').map(row=>row.event.payload);
+    for (const tool of ['environment','memories__write','memories__read'])
+      assert.ok(platformResults.some(result=>result.tool===tool&&result.status==='completed'),`native ${tool} completed through the Worker API`);
+    assert.match(JSON.stringify(platformHistory),/SHARED_PLATFORM_MEMORY_PROOF/);
     // The mobile picker uses /routing, whose body excludes settings-only fields.
     await call(`/v1/agents/${agent}/routing`,'POST',{model:'claude-opus-4-6',thinking:'medium'});
     const selected=await call(`/v1/agents/${agent}`);
@@ -552,10 +580,10 @@ test('Managed native Claude and mixed-family public delegation, account gates, c
     await turn(agent,'Read durable proof after summary','journey-after-summary');
     assert.equal(writes,1,'compaction/reopen never repeats prior effect');
     const noTools=(await call('/v1/agents','POST',{configuration:{tools:[]}},201)).agent_id;
-    assert.match(JSON.stringify(await turn(noTools,'Try forbidden Write','journey-no-tools','failed')),/outside the admitted catalog/);
+    await turn(noTools,'Try forbidden Write','journey-no-tools');
     await turn(agent,'Check denied file','journey-denied-file');
     const onlyWrite=(await call('/v1/agents','POST',{configuration:{tools:['Write']}},201)).agent_id;
-    assert.match(JSON.stringify(await turn(onlyWrite,'Try forbidden Read','journey-write-only','failed')),/outside the admitted catalog/);
+    await turn(onlyWrite,'Try forbidden Read','journey-write-only');
     assert.equal(mcpStarts(),0,'empty and non-MCP allowlists do not start MCP discovery');
     const beforeMcp = mcpStarts();
     const mcpAgent=(await call('/v1/agents','POST',{},201)).agent_id;
@@ -599,8 +627,9 @@ test('Managed native Claude and mixed-family public delegation, account gates, c
     await turn(unavailableCanonical,'Try unavailable canonical child','journey-canonical-unavailable');
     assert.equal(canonicalWrites,1,'unavailable model never reaches child tools');
     const disabledCanonical=(await call('/v1/agents','POST',{configuration:{multi_agent:{enabled:false}}},201)).agent_id;
-    assert.match(JSON.stringify(await turn(disabledCanonical,'Try disabled canonical child','journey-canonical-disabled','failed')),/outside the admitted catalog/);
+    await turn(disabledCanonical,'Try disabled canonical child','journey-canonical-disabled');
     assert.equal(canonicalWrites,1,'disabled child never executes');
+    assert.deepEqual(deniedCalls,['Write','Read','spawn_agent'],'every unadmitted call completes through a paired error');
     const childHistory=await call(`/v1/agents/${childAgent}/events/history?after=0&limit=256`);
     assert.match(JSON.stringify(childHistory),/Task/);assert.match(JSON.stringify(childHistory),/CLAUDE_NATIVE_CHILD_PROOF/);
     retainedTaskId=childHistory.data.find(row=>row.event?.type==='tool.result'&&row.event.payload.tool==='Task').event.payload.structured_result.task_id;
@@ -624,13 +653,20 @@ test('Managed native Claude and mixed-family public delegation, account gates, c
       for(let n=0;n<150&&!releaseActiveSteer;n++)await new Promise(r=>setTimeout(r,40));
       assert.equal(typeof releaseActiveSteer,'function','model request started and is held at the terminal boundary');
       const first='first managed steering correction', second='<realtime_delegation>\n<input>second managed é correction</input>\n</realtime_delegation>';
-      const unsupportedId=await call(`/v1/agents/${steered}/turns/journey-active-steer/steer`,'POST',{input:'identified correction must not be admitted',message_id:'unsupported-steer-id'},400);
-      assert.equal(unsupportedId.error,'invalid_request');
-      assert.match(unsupportedId.message,/identified steering is not supported by this backend/);
-      const unsupportedWithdrawal=await call(`/v1/agents/${steered}/turns/journey-active-steer/withdraw-steer`,'POST',{message_id:'unsupported-steer-id'},400);
-      assert.equal(unsupportedWithdrawal.error,'invalid_request');
-      assert.match(unsupportedWithdrawal.message,/steer withdrawal is not supported by this backend/);
-      await call(`/v1/agents/${steered}/turns/journey-active-steer/steer`,'POST',{input:first},202);
+      const steerPath=`/v1/agents/${steered}/turns/journey-active-steer`;
+      await call(`${steerPath}/steer`,'POST',{input:'WITHDRAWN_CORRECTION_MUST_NOT_REACH_MODEL',message_id:'withdrawn-steer'},202);
+      const withdrawal=await call(`${steerPath}/withdraw-steer`,'POST',{message_id:'withdrawn-steer'});
+      assert.equal(withdrawal.withdrawn,true,'pending identified Claude steering can be withdrawn');
+      assert.equal((await call(`${steerPath}/steer-receipt?message_id=withdrawn-steer`)).state,'withdrawn');
+      const correction={input:first,message_id:'tui-steer-first'};
+      await call(`${steerPath}/steer`,'POST',correction,202);
+      await call(`${steerPath}/steer`,'POST',correction,202);
+      const conflict=await call(`${steerPath}/steer`,'POST',{input:'different correction',message_id:correction.message_id},409);
+      assert.equal(conflict.error,'message_id_conflict','identified steering never reuses an ID for different input');
+      const pendingReceipt=await call(`${steerPath}/steer-receipt?message_id=${correction.message_id}`);
+      assert.equal(pendingReceipt.state,'accepted');
+      assert.equal(pendingReceipt.terminal,false);
+      assert.equal(pendingReceipt.input_key,createHash('sha256').update(JSON.stringify({instruction:first})).digest('hex'),'receipt fingerprints the exact browser input');
       const delegated=await call(`/v1/agents/${steered}/realtime/delegate`,'POST',{
         voice_session_id:activeVoice,operation_id:'active-voice-delegate',input:second},202);
       assert.equal(delegated.route,'steered',JSON.stringify(delegated));
@@ -648,18 +684,26 @@ test('Managed native Claude and mixed-family public delegation, account gates, c
       assert.match(JSON.stringify(result),/CLAUDE_TOOL_DONE_ACTIVE_STEER/);
       const consumed=await call(`/v1/agents/${steered}/events/history?after=0&limit=256`);
       const acknowledgements=consumed.data.filter(row=>row.event?.type==='run.steered');
-      assert.deepEqual(acknowledgements.map(row=>row.event.payload.steer_index),[1,2]);
+      assert.equal(acknowledgements.length,2,'duplicate admission and withdrawal never duplicate consumption');
+      assert.equal(acknowledgements[0].event.payload.message_id,correction.message_id,'native Claude consumption acknowledges the TUI identity');
       assert.equal(acknowledgements[0].event.payload.instruction_bytes,Buffer.byteLength(first));
       assert.ok(acknowledgements[1].event.payload.instruction_bytes>=Buffer.byteLength(second),'voice delegation retains its origin context');
       assert.ok(JSON.stringify(activeSteerRequests[1]).includes(JSON.stringify(second).slice(1,-1)),'voice steering preserves the complete instruction');
       assert.equal(activeSteerRequests.length,2,'one initial request and one ordered continuation');
+      assert.ok(!JSON.stringify(activeSteerRequests).includes('WITHDRAWN_CORRECTION_MUST_NOT_REACH_MODEL'));
+      const terminalReceipt=await call(`${steerPath}/steer-receipt?message_id=${correction.message_id}`);
+      assert.equal(terminalReceipt.state,'accepted');
+      assert.equal(terminalReceipt.input_key,pendingReceipt.input_key);
+      assert.equal(terminalReceipt.terminal,true);
+      await call(`${steerPath}/steer`,'POST',correction,202);
+      assert.equal((await call(`${steerPath}/withdraw-steer`,'POST',{message_id:correction.message_id})).withdrawn,false,'a consumed correction cannot be withdrawn');
       const terminalIndex=consumed.data.findIndex(row=>row.event?.type==='run.completed');
       assert.ok(terminalIndex>=0 && acknowledgements.every(row=>consumed.data.indexOf(row)<terminalIndex),'consumption precedes terminal completion');
       const stopped=await call(`/v1/agents/${steered}/realtime/stop`,'POST',{
         voice_session_id:activeVoice,operation_id:'active-voice-stop',transcript:[{role:'user',text:'ACTIVE_VOICE_TRANSCRIPT_PROOF'}]});
       assert.equal(stopped.stopped,true);
       assert.match(JSON.stringify(activeSteerRequests[0]),/Realtime conversation started/);
-      trace.push({scenario:'active Claude steering',requests:activeSteerRequests.length,steer_indices:[1,2],ordered:true,voice_route:delegated.route,voice_stopped:stopped.stopped,identified_steering_denied:400,withdrawal_denied:400});
+      trace.push({scenario:'active Claude steering',requests:activeSteerRequests.length,steer_indices:acknowledgements.map(row=>row.event.payload.steer_index),ordered:true,voice_route:delegated.route,voice_stopped:stopped.stopped,identified_steering:true,pending_withdrawal:true,duplicate_consumption:false,terminal_receipt:true});
 
       // CR-only SSE frames are valid; EOF without message_stop is not completion.
       const frames=[];
@@ -671,14 +715,14 @@ test('Managed native Claude and mixed-family public delegation, account gates, c
         assert.equal(events.data.filter(row=>row.event?.type==='run.completed').length,expected==='completed'?1:0,'truncated stream cannot publish successful terminal');
         frames.push({agent:framed,id,expected,input:marker});
       }
-      assert.deepEqual(framingRequests,{crOnly:1,truncated:1},'neither stream framing path auto-retries inference');
+      assert.deepEqual(framingRequests,{crOnly:1,truncated:5},'an unpublished truncated stream exhausts the transient retry budget');
       await mf.dispose();mf=new Miniflare(options);
       for(const {agent,id,expected,input} of frames) {
         assert.equal((await call(`/v1/agents/${agent}/turns/${id}`)).state,expected);
         await call(`/v1/agents/${agent}/turns`,'POST',{input,id},200);
       }
-      assert.deepEqual(framingRequests,{crOnly:1,truncated:1},'retained failure and completion survive restart without replay');
-      trace.push({scenario:'managed WASM SSE framing',...framingRequests,crOnly:'completed',missingMessageStop:'failed',automaticRetries:0,restartReplay:false});
+      assert.deepEqual(framingRequests,{crOnly:1,truncated:5},'retained failure and completion survive restart without replay');
+      trace.push({scenario:'managed WASM SSE framing',...framingRequests,crOnly:'completed',missingMessageStop:'failed',automaticRetries:4,restartReplay:false});
     }
 
     const beforeDeniedMcp=mcpStarts(), ownerMcpToken=token;
