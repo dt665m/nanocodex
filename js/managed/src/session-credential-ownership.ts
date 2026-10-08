@@ -76,6 +76,52 @@ export function sessionCredentialOwner(input: Readonly<{
 
 export { placementRegion as sessionModelRelayRegion } from "nanocodex/cloudflare/durable-placement";
 
+export const SESSION_TOOL_OWNER_HEADER = "x-nanocodex-session-tool-owner";
+const SESSION_MODEL_OWNER_HEADER = "x-nanocodex-session-model-owner";
+
+/**
+ * Route this Session's own tool egress through its private tool binding with a
+ * live local owner assertion. Generic egress would otherwise resolve the
+ * Session subject by calling back into this same Durable Object; that callback
+ * becomes the newest incoming request, so each later subrequest of the turn
+ * inherits a deeper Workers request chain until the platform depth limit fails
+ * brain storage, tools, and model calls alike.
+ *
+ * Caller-supplied tool and model owner headers are always removed. A request
+ * for this Session's subject never falls back to the callback path: unavailable
+ * ownership (deletion, export, import, inactive binding) fails closed here.
+ * Without the private binding (older deployments or directory subjects), traffic
+ * keeps the general broker, whose Session ownership callback stays authoritative
+ * and fails closed on denial.
+ */
+export function scopedSessionToolEgress(
+  general: Fetcher,
+  tool: Fetcher | undefined,
+  storageId: string,
+  subject: string,
+  owner: () => string | undefined,
+): Fetcher {
+  const direct = tool !== undefined && subject === managedCredentialSubject(storageId);
+  const fetch = (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const request = new Request(input, init);
+    request.headers.delete(SESSION_TOOL_OWNER_HEADER);
+    request.headers.delete(SESSION_MODEL_OWNER_HEADER);
+    if (!direct || request.headers.get("x-nanocodex-subject") !== subject) return general.fetch(request);
+    const current = owner();
+    if (!current) return Promise.reject(new Error("managed tool ownership is unavailable"));
+    request.headers.set(SESSION_TOOL_OWNER_HEADER, current);
+    return tool.fetch(request);
+  };
+  return { fetch, connect: (...args: Parameters<Fetcher["connect"]>) => general.connect(...args) } as unknown as Fetcher;
+}
+
+/** Exact provider-credential tool routes the Session sends privately. */
+const SESSION_MODEL_TOOL_URLS: ReadonlySet<string> = new Set([
+  "https://nanocodex.internal/v1/search",
+  "https://nanocodex.internal/v1/images/generations",
+  "https://nanocodex.internal/v1/images/edits",
+]);
+
 /** Preserve the SDK's context identity and scope only its private model egress. */
 export function scopedManagedModelEgress(
   binding: Fetcher,
@@ -102,13 +148,20 @@ export function scopedManagedModelEgress(
       // The retained session configuration owns selection, never a runtime header.
       request.headers.delete("x-nanocodex-chatgpt-account-id");
       if (chatGptAccountId !== undefined) request.headers.set("x-nanocodex-chatgpt-account-id", chatGptAccountId);
-      if (sessionModel && (request.url === "https://nanocodex.internal/v1/responses" || request.url === "https://nanocodex.internal/v1/messages") && (request.method === "GET" || request.method === "POST")) {
+      const transport = (request.url === "https://nanocodex.internal/v1/responses" || request.url === "https://nanocodex.internal/v1/messages") && (request.method === "GET" || request.method === "POST");
+      // The Session's own web search and image tools use the same model
+      // credential; without the private binding, egress would resolve this
+      // subject by calling back into this Session (Workers depth ratchet).
+      const tool = SESSION_MODEL_TOOL_URLS.has(request.url) && request.method === "POST";
+      if (sessionModel && (transport || tool)) {
         // Check authoritative local state at connection time, including every
-        // reconnect. Do not retain an owner across deletion or durability export.
+        // reconnect and tool call. Do not retain an owner across deletion or
+        // durability export; never fall back to the callback path.
         const owner = sessionModel.owner();
         if (!owner) throw new Error("managed model ownership is unavailable");
         request.headers.set("x-nanocodex-session-model-owner", owner);
-        const region = sessionModelRelayRegion(sessionModel.clientIngressColo?.());
+        // Placement applies to the model transport only, never to tool calls.
+        const region = transport ? sessionModelRelayRegion(sessionModel.clientIngressColo?.()) : undefined;
         if (region) request.headers.set("x-nanocodex-model-region", region);
         return sessionModel.binding.fetch(request);
       }

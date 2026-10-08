@@ -815,7 +815,10 @@ impl Terminal {
                 pixel_height: 0,
             })
             .unwrap();
-        let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_nanocodex2"));
+        let mut command = CommandBuilder::new(
+            std::env::var_os("NANOCODEX2_TEST_BINARY")
+                .unwrap_or_else(|| env!("CARGO_BIN_EXE_nanocodex2").into()),
+        );
         command.env_clear();
         command.env("PATH", std::env::var_os("PATH").unwrap_or_default());
         command.env("HOME", workspace.path());
@@ -1489,6 +1492,27 @@ impl Fixture {
         history_gate: Arc<tokio::sync::Semaphore>,
         reload_dir: Option<&Path>,
     ) -> Self {
+        Self::launch_with_catalog(
+            active,
+            attach,
+            initial_history,
+            history_gate,
+            reload_dir,
+            "available",
+            None,
+        )
+        .await
+    }
+
+    async fn launch_with_catalog(
+        active: bool,
+        attach: bool,
+        initial_history: Vec<Value>,
+        history_gate: Arc<tokio::sync::Semaphore>,
+        reload_dir: Option<&Path>,
+        catalog_mode: &'static str,
+        startup_prompt: Option<&str>,
+    ) -> Self {
         let cursor = initial_history
             .last()
             .and_then(|event| event["cursor"].as_str())
@@ -1527,12 +1551,18 @@ impl Fixture {
         let settings_requests = Arc::new(Mutex::new(Vec::new()));
         let model_route = Arc::new(Mutex::new(None));
         let app = Router::new()
-            .route("/v1/models", get(|headers: axum::http::HeaderMap| async move {
+            .route("/v1/models", get(move |headers: axum::http::HeaderMap| async move {
                 let authorization = format!("Bearer ncx_live_{}_{}", "a".repeat(12), "b".repeat(43));
                 let isolated_login = format!("Bearer ncx_live_{}_{}", "a".repeat(12), "c".repeat(43));
                 let supplied = headers.get("authorization").and_then(|value| value.to_str().ok());
                 assert!(supplied == Some(authorization.as_str()) || supplied == Some(isolated_login.as_str()));
-                Json(json!({
+                if catalog_mode == "held" {
+                    std::future::pending::<()>().await;
+                }
+                if catalog_mode == "unavailable" {
+                    return Err(axum::http::StatusCode::SERVICE_UNAVAILABLE);
+                }
+                Ok(Json(json!({
                     "object": "list", "default_model": "gpt-6-astra",
                     "data": [
                         {"id": "gpt-6-astra", "name": "Astra", "provider": "openai",
@@ -1545,7 +1575,7 @@ impl Fixture {
                         {"id": "mimo-v2.6-pro", "name": "MiMo V2.6 Pro", "provider": "gateway",
                             "thinking": ["low", "medium", "high"], "fast_mode": false, "reasoning_modes": ["standard"]}
                     ]
-                }))
+                })))
             }))
             .route("/v1/me", get(|headers: axum::http::HeaderMap| async move {
                 assert!(headers["authorization"].to_str().unwrap().starts_with("Bearer ncx_live_"));
@@ -1607,7 +1637,11 @@ impl Fixture {
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        let terminal = Terminal::start_with_reload_dir(&origin, attach, reload_dir);
+        let mut terminal = Terminal::start_with_reload_dir(&origin, attach, reload_dir);
+        if let Some(prompt) = startup_prompt {
+            terminal.wait_text("actions").await;
+            terminal.prompt(prompt, "\r");
+        }
         let events = tokio::time::timeout(TIMEOUT, connections.recv())
             .await
             .unwrap_or_else(|_| {
@@ -1741,6 +1775,60 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         self.server.abort();
+    }
+}
+
+// Invoke the shipped TUI over a real PTY/HTTP/WebSocket boundary. The optional
+// catalog never returns (or fails), but the first prompt must still complete.
+#[tokio::test]
+async fn terminal_hosted_defaults_do_not_wait_for_model_catalog() {
+    for catalog_mode in ["held", "unavailable"] {
+        let started = std::time::Instant::now();
+        let mut fixture = Fixture::launch_with_catalog(
+            false,
+            false,
+            Vec::new(),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            None,
+            catalog_mode,
+            Some("INSTANT_DEFAULT_PROMPT"),
+        )
+        .await;
+        let connected = started.elapsed();
+        assert_eq!(
+            *fixture.settings.lock().unwrap(),
+            json!({
+                "model": "gpt-6-astra", "thinking": "low",
+                "reasoning_mode": "standard", "fast_mode": false,
+            })
+        );
+        assert_eq!(*fixture.socket_paths.lock().unwrap(), ["/v1/agents/live"]);
+        let turn = fixture.submission("INSTANT_DEFAULT_PROMPT").await;
+        fixture.nested(
+            &turn,
+            "assistant.message",
+            json!({
+                "phase": "final_answer", "text": "HOSTED_DEFAULT_READY",
+            }),
+        );
+        fixture.complete(&turn);
+        fixture.terminal.wait_text("HOSTED_DEFAULT_READY").await;
+        eprintln!(
+            "JOURNEY catalog={catalog_mode}: hosted Astra/low/standard/fast=false; live connection={connected:?}; first answer={:?}",
+            started.elapsed()
+        );
+        fixture.terminal.input("\x03\x03");
+        tokio::time::timeout(TIMEOUT, async {
+            loop {
+                if let Some(status) = fixture.terminal.child.try_wait().unwrap() {
+                    assert!(status.success());
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("TUI did not close while catalog was unavailable");
     }
 }
 
@@ -6373,4 +6461,418 @@ async fn terminal_review_interrupts_and_returns_to_normal_chat() {
     fixture.terminal.wait_text("Enter send").await;
     review_journey_snapshot(&fixture, "Esc twice cancels the streamed review turn");
     review_journey_normal_turn(&mut fixture, "AFTER_REVIEW_INTERRUPT").await;
+}
+
+// Reproduce with NANOCODEX_INLINE_REVIEW_EVIDENCE=/absolute/output/inline-review
+// cargo test --locked -p nanocodex2-bin --test nanocodex2_tui_lifecycle terminal_inline_review -- --nocapture
+fn inline_review_evidence(terminal: &Terminal, name: &str, markdown: &str) -> String {
+    let screen = terminal.screen.lock().unwrap().screen().contents();
+    eprintln!("INLINE REVIEW {name}\ninput Markdown:\n{markdown}\nobserved screen:\n{screen}");
+    if let Some(directory) = std::env::var_os("NANOCODEX_INLINE_REVIEW_EVIDENCE") {
+        let directory = std::path::PathBuf::from(directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join(format!("{name}.screen.txt")), &screen).unwrap();
+        std::fs::write(
+            directory.join(format!("{name}.ansi")),
+            &*terminal.output.lock().unwrap(),
+        )
+        .unwrap();
+        std::fs::write(directory.join(format!("{name}.md")), markdown).unwrap();
+    }
+    screen
+}
+
+fn inline_review_diff(fixture: &Fixture) -> String {
+    review_journey_git(fixture, &["init", "--initial-branch=main"]);
+    let file = fixture.terminal._workspace.path().join("review limits.rs");
+    std::fs::write(
+        &file,
+        format!("fn limit() {{\n    let opening = 0;\n    let before = 1;\n    let ceiling = 40;\n    let after = 2;\n    let closing = 3;\n}}\n{}fn unrelated() {{ let UNRELATED_CONTEXT = 2; }}\n", "\n".repeat(14)),
+    )
+    .unwrap();
+    review_journey_git(fixture, &["add", "review limits.rs"]);
+    review_journey_commit(fixture);
+    std::fs::write(
+        &file,
+        format!("fn limit() {{\n    let opening = 0;\n    let before = 1;\n    let ceiling = 99;\n    let after = 2;\n    let closing = 3;\n}}\n{}fn unrelated() {{ let UNRELATED_CONTEXT = 3; }}\n", "\n".repeat(14)),
+    )
+    .unwrap();
+    let output = std::process::Command::new("git")
+        .args([
+            "--no-pager",
+            "diff",
+            "--no-ext-diff",
+            "--no-color",
+            "--unified=3",
+            "--",
+            "review limits.rs",
+        ])
+        .current_dir(fixture.terminal._workspace.path())
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    String::from_utf8(output.stdout).unwrap()
+}
+
+fn inline_review_markdown(diff: &str, side: &str, line: usize, title: &str, body: &str) -> String {
+    format!(
+        "```review\n{}\n```\n",
+        json!({
+            "file":"review limits.rs", "side":side, "line_start":line, "line_end":line,
+            "title":title, "body":body, "diff":diff,
+        })
+    )
+}
+
+async fn inline_review_begin(fixture: &mut Fixture) -> String {
+    fixture.terminal.prompt("/review --uncommitted", "\r");
+    let request = tokio::time::timeout(TIMEOUT, fixture.submissions.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let input = prompt_text(&request["input"]);
+    assert!(input.contains("uncommitted"), "{input}");
+    let turn = request["id"].as_str().unwrap().to_owned();
+    fixture.emit(
+        &turn,
+        json!({"type":"turn_accepted", "id":turn, "input":request["input"], "replayed":false}),
+    );
+    turn
+}
+
+fn inline_review_finish(fixture: &mut Fixture, turn: &str, markdown: &str) {
+    fixture.nested(
+        turn,
+        "assistant.message",
+        json!({"model_call_index":1,
+        "item_id":"inline-finding", "phase":"final_answer", "text":markdown}),
+    );
+    fixture.complete(turn);
+}
+
+fn inline_review_order(screen: &str, ordered: &[&str]) {
+    let positions: Vec<_> = ordered
+        .iter()
+        .map(|text| {
+            screen
+                .find(text)
+                .unwrap_or_else(|| panic!("missing {text:?}:\n{screen}"))
+        })
+        .collect();
+    assert!(
+        positions.windows(2).all(|pair| pair[0] < pair[1]),
+        "expected visual order {ordered:?}:\n{screen}"
+    );
+}
+
+// Inspect emitted terminal cells, including ANSI attributes, rather than private
+// renderer data. The old/new signs and Rust token colors must survive the PTY.
+async fn inline_review_anchor(terminal: &Terminal, old_side: bool) {
+    // The PTY reader can stop between a clear and the next frame. Inspect one
+    // complete visible frame, including its color attributes, after repaint.
+    let screen = tokio::time::timeout(TIMEOUT, async {
+        loop {
+            let screen = terminal.screen.lock().unwrap().screen().clone();
+            let (rows, cols) = screen.size();
+            let lines: Vec<String> = (0..rows)
+                .map(|row| {
+                    (0..cols)
+                        .map(|col| {
+                            let cell = screen.cell(row, col).unwrap().contents();
+                            if cell.is_empty() {
+                                " ".to_owned()
+                            } else {
+                                cell
+                            }
+                        })
+                        .collect()
+                })
+                .collect();
+            if ["let ceiling = 40;", "let ceiling = 99;", "let before = 1;"]
+                .iter()
+                .all(|needle| lines.iter().any(|line| line.contains(needle)))
+            {
+                break screen;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("complete review code frame visible");
+    let (rows, cols) = screen.size();
+    let code_row = |needle: &str| {
+        (0..rows)
+            .find(|row| {
+                (0..cols)
+                    .map(|col| {
+                        let cell = screen.cell(*row, col).unwrap().contents();
+                        if cell.is_empty() {
+                            " ".to_owned()
+                        } else {
+                            cell
+                        }
+                    })
+                    .collect::<String>()
+                    .contains(needle)
+            })
+            .expect("review code row visible")
+    };
+    let deleted = code_row("let ceiling = 40;");
+    let added = code_row("let ceiling = 99;");
+    let before = code_row("let before = 1;");
+    let row_text = |row| {
+        (0..cols)
+            .map(|col| {
+                let cell = screen.cell(row, col).unwrap().contents();
+                if cell.is_empty() {
+                    " ".to_owned()
+                } else {
+                    cell
+                }
+            })
+            .collect::<String>()
+    };
+    let removed = row_text(deleted);
+    let inserted = row_text(added);
+    assert!(removed.contains("4   │-"), "old line gutter: {removed}");
+    assert!(inserted.contains("  4 │+"), "new line gutter: {inserted}");
+    assert!(
+        row_text(before).contains("3 3 │"),
+        "context must show both absolute line numbers"
+    );
+    assert_eq!(removed.contains('┃'), old_side, "{removed}");
+    assert_eq!(inserted.contains('┃'), !old_side, "{inserted}");
+    let sign_color = |row, sign: &str| {
+        let col = (0..cols)
+            .find(|col| screen.cell(row, *col).unwrap().contents() == sign)
+            .unwrap();
+        screen.cell(row, col).unwrap().fgcolor()
+    };
+    assert_ne!(
+        sign_color(deleted, "-"),
+        sign_color(added, "+"),
+        "addition/deletion signs need distinct colors"
+    );
+    let text = row_text(added);
+    let start = text[..text.find("let ceiling").unwrap()].chars().count() as u16;
+    assert_ne!(
+        screen.cell(added, start).unwrap().fgcolor(),
+        screen.cell(added, start + 4).unwrap().fgcolor(),
+        "Rust keyword and identifier should retain syntax highlighting"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn terminal_inline_review_streams_wraps_copies_and_restores_snapshot() {
+    let mut fixture = Fixture::start().await;
+    let diff = inline_review_diff(&fixture);
+    let markdown = inline_review_markdown(
+        &diff,
+        "new",
+        4,
+        "[P1] Cap the ceiling",
+        "WRAP_START This permits requests above the documented safe limit and must retain all of this explanation when the terminal is narrow. WRAP_END",
+    );
+    let turn = inline_review_begin(&mut fixture).await;
+    // Split inside the fence and JSON value: neither network framing nor an
+    // incomplete JSON object may make the eventual finding disappear.
+    let cuts = [
+        0,
+        5,
+        markdown.find("ceiling").unwrap() + 4,
+        markdown.len() - 4,
+        markdown.len(),
+    ];
+    for (index, pair) in cuts.windows(2).enumerate() {
+        fixture.nested(&turn, "assistant.delta", json!({"model_call_index":1,
+            "item_id":"inline-finding", "phase":"final_answer", "text":&markdown[pair[0]..pair[1]]}));
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        inline_review_evidence(&fixture.terminal, &format!("new-stream-{index}"), &markdown);
+    }
+    fixture.terminal.wait_text("Cap the ceiling").await;
+    fixture.terminal.wait_text("┃").await;
+    fixture.terminal.wait_text("let after = 2;").await;
+    let screen = inline_review_evidence(&fixture.terminal, "new-stream-complete", &markdown);
+    assert!(
+        !screen.contains("UNRELATED_CONTEXT"),
+        "only the finding hunk belongs in its card: {screen}"
+    );
+    inline_review_order(
+        &screen,
+        &[
+            "let before = 1;",
+            "let ceiling = 40;",
+            "let ceiling = 99;",
+            "Cap the ceiling",
+            "WRAP_END",
+            "let after = 2;",
+        ],
+    );
+    inline_review_anchor(&fixture.terminal, false).await;
+    inline_review_finish(&mut fixture, &turn, &markdown);
+    fixture.terminal.wait_text("Enter send").await;
+    fixture.terminal.resize(68);
+    fixture.terminal.wait_text("WRAP_END").await;
+    // A resize is asynchronous. Wait until the long explanation actually wraps.
+    tokio::time::timeout(TIMEOUT, async {
+        loop {
+            let screen = fixture.terminal.screen.lock().unwrap().screen().contents();
+            if !screen
+                .lines()
+                .any(|line| line.contains("WRAP_START") && line.contains("WRAP_END"))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let screen = inline_review_evidence(&fixture.terminal, "new-narrow", &markdown);
+    inline_review_order(
+        &screen,
+        &[
+            "let ceiling = 99;",
+            "Cap the ceiling",
+            "WRAP_START",
+            "WRAP_END",
+            "let after = 2;",
+        ],
+    );
+    copy_journey_expect(&mut fixture, "/copy", "\r", &markdown).await;
+    inline_review_evidence(&fixture.terminal, "new-copy", &markdown);
+
+    // Reopen via the real attach command, against recorded service history,
+    // after the file no longer contains either version of the reviewed line.
+    std::fs::write(
+        fixture.terminal._workspace.path().join("review limits.rs"),
+        "WORKSPACE_REPLACED\n",
+    )
+    .unwrap();
+    fixture.terminal.input("\x03\x03");
+    fixture.terminal.wait_output("\x1b[?1049l").await;
+    let mut attached = Terminal::start_with_command(&fixture.origin, true, None, |command| {
+        command.cwd(fixture.terminal._workspace.path());
+    });
+    attached.wait_text("Enter send").await;
+    attached.wait_text("Cap the ceiling").await;
+    let screen = inline_review_evidence(&attached, "new-attach-after-workspace-change", &markdown);
+    inline_review_order(
+        &screen,
+        &[
+            "let before = 1;",
+            "let ceiling = 40;",
+            "let ceiling = 99;",
+            "Cap the ceiling",
+            "WRAP_END",
+            "let after = 2;",
+        ],
+    );
+    assert!(screen.contains("Review uncommitted changes"), "{screen}");
+    assert!(
+        !screen.contains("line_start"),
+        "internal review instructions must stay out of the transcript: {screen}"
+    );
+    inline_review_anchor(&attached, false).await;
+    assert!(!screen.contains("WORKSPACE_REPLACED"));
+    attached.input("\x03\x03");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn terminal_inline_review_old_side_and_ordinary_diff_remain_readable() {
+    let mut fixture = Fixture::start().await;
+    let diff = inline_review_diff(&fixture);
+    let markdown = inline_review_markdown(
+        &diff,
+        "old",
+        4,
+        "[P2] Preserve the cap",
+        "DELETION_COMMENT Keep the existing guard.",
+    );
+    let turn = inline_review_begin(&mut fixture).await;
+    inline_review_finish(&mut fixture, &turn, &markdown);
+    fixture.terminal.wait_text("DELETION_COMMENT").await;
+    fixture.terminal.wait_text("Enter send").await;
+    let screen = inline_review_evidence(&fixture.terminal, "old-anchor", &markdown);
+    inline_review_anchor(&fixture.terminal, true).await;
+    inline_review_order(
+        &screen,
+        &[
+            "let before = 1;",
+            "let ceiling = 40;",
+            "Preserve the cap",
+            "DELETION_COMMENT",
+            "let ceiling = 99;",
+            "let after = 2;",
+        ],
+    );
+    copy_journey_expect(&mut fixture, "/copy", "\r", &markdown).await;
+
+    fixture.terminal.prompt("Show the ordinary patch", "\r");
+    let turn = fixture.submission("Show the ordinary patch").await;
+    let ordinary = format!("ORDINARY_PATCH\n\n```diff\n{diff}```\n");
+    inline_review_finish(&mut fixture, &turn, &ordinary);
+    fixture.terminal.wait_text("ORDINARY_PATCH").await;
+    fixture.terminal.wait_text("Enter send").await;
+    let screen = inline_review_evidence(&fixture.terminal, "ordinary-diff", &ordinary);
+    let ordinary_screen = screen.split_once("ORDINARY_PATCH").unwrap().1;
+    inline_review_order(
+        ordinary_screen,
+        &[
+            "let before = 1;",
+            "let ceiling = 40;",
+            "let ceiling = 99;",
+            "let after = 2;",
+        ],
+    );
+    assert!(!ordinary_screen.contains("DELETION_COMMENT"));
+    copy_journey_expect(&mut fixture, "/copy", "\r", &ordinary).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn terminal_inline_review_unavailable_context_preserves_findings() {
+    let mut fixture = Fixture::start().await;
+    let diff = inline_review_diff(&fixture);
+    // A missing line, a different file, and malformed context cannot acquire an
+    // apparently precise inline anchor from the current workspace.
+    let cases = [
+        ("unmatched-line", inline_review_markdown(&diff, "new", 999, "[P1] Missing anchor", "UNMATCHED_FINDING")),
+        ("wrong-file", inline_review_markdown(&diff.replace("review limits.rs", "other.rs"), "old", 4, "[P1] Wrong file", "WRONG_FILE_FINDING")),
+        ("missing-diff", inline_review_markdown("", "new", 4, "[P1] Missing context", "MISSING_CONTEXT_FINDING")),
+        ("incomplete-hunk", inline_review_markdown(&diff.replace("@@ -1,7 +1,7 @@", "@@ -1,8 +1,7 @@"), "new", 4, "[P1] Truncated context", "INCOMPLETE_HUNK_FINDING")),
+        ("malformed-json", "```review\n{\"title\":\"[P1] Malformed finding\",\"body\":\"MALFORMED_FINDING\"\n```\n".to_owned()),
+    ];
+    for (name, markdown) in cases {
+        let turn = inline_review_begin(&mut fixture).await;
+        inline_review_finish(&mut fixture, &turn, &markdown);
+        let marker = match name {
+            "unmatched-line" => "UNMATCHED_FINDING",
+            "wrong-file" => "WRONG_FILE_FINDING",
+            "missing-diff" => "MISSING_CONTEXT_FINDING",
+            "incomplete-hunk" => "INCOMPLETE_HUNK_FINDING",
+            _ => "MALFORMED_FINDING",
+        };
+        fixture.terminal.wait_text(marker).await;
+        fixture.terminal.wait_text("Enter send").await;
+        let screen = inline_review_evidence(&fixture.terminal, name, &markdown);
+        if name != "malformed-json" {
+            // Locate the current card: prior turns may also have fallback labels.
+            let current = screen.rsplit_once("Review").expect("review card visible").1;
+            assert!(
+                current.to_lowercase().contains("context unavailable"),
+                "{current}"
+            );
+            assert!(
+                !current.contains('┃'),
+                "unavailable context must not mark a code anchor: {current}"
+            );
+            assert!(
+                !current.contains("let ceiling"),
+                "unmatched code must not masquerade as an anchored excerpt: {current}"
+            );
+        }
+        copy_journey_expect(&mut fixture, "/copy", "\r", &markdown).await;
+    }
 }

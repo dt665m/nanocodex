@@ -92,6 +92,23 @@ agent instruction, not a separate filesystem sandbox. Results stream into the
 conversation and normal turn cancellation and reconnect behavior apply. Finish
 or interrupt active work before starting another review.
 
+The transcript labels each review with its selected scope.
+Review findings appear beside a captured unified diff, with old/new line numbers,
+syntax highlighting, and the comment directly below its cited lines. Deleted-line
+findings attach to the old side. Only the hunk containing the finding is displayed in its card.
+The surrounding code travels with the answer,
+so reopening a session preserves the reviewed snapshot even after the workspace
+changes. If a finding has no usable matching diff, its comment remains visible
+with a context-unavailable notice.
+
+The review prompt requests one fenced `review` JSON object per finding, containing
+`file`, `side` (`new` or `old`), inclusive `line_start` / `line_end`, `title`, `body`,
+and the captured `diff`. The reviewer obtains the diff through its authorized
+workspace tools. This presentation validates file/hunk positions; it does not
+independently verify the reviewer's evidence. Ordinary prose remains readable,
+and `/copy` retains the original Markdown. Other clients may display the fenced
+payload as text until they support this presentation.
+
 The scope choices follow [Codex review targets](https://github.com/openai/codex/blob/rust-v0.107.0/codex-rs/core/src/review_prompts.rs).
 Nanocodex uses its existing managed turn transport rather than Codex's dedicated
 review-task protocol. The separate Managed2 text-only preview does not support
@@ -362,7 +379,7 @@ available without reopening the menu.
 ## Headless controls
 
 ```bash
-# Create with explicit initial settings; defaults are Sol, xhigh, standard, fast mode enabled.
+# Create with explicit initial settings; defaults are Astra, low, standard, fast mode disabled.
 nanocodex2 new --model astra --thinking high
 nanocodex2 run "Inspect this repository" --model sol --thinking high
 nanocodex2 run "Continue the review" --agent AGENT_ID
@@ -385,6 +402,11 @@ nanocodex2 cron list AGENT_ID
 nanocodex2 cron get AGENT_ID daily
 nanocodex2 cron delete AGENT_ID daily
 ```
+
+New terminal sessions, `new`, and `run` use the hosted defaults immediately:
+Astra, low reasoning effort, standard reasoning mode, and fast mode disabled.
+Startup does not wait for the model catalog; the terminal loads its model picker
+in the background. Select another model explicitly with `--model`.
 
 Creation flags on `run` apply only to new agents. Use `settings` to change an
 existing agent. Astra accepts low through max effort and standard reasoning
@@ -762,3 +784,8 @@ for `nestedVirtualization` and supported Windows configurations.
 Linux servers installed with `nanocodex hand install` keep their systemd service,
 private workspace, and machine identity across idempotent repairs. VM factories
 remain a separate `nanocodex2 host` capability and are not installed implicitly.
+
+To run the startup journeys against an installed or optimized build, set
+`NANOCODEX2_TEST_BINARY` to its absolute path when invoking the
+`nanocodex2_managed` or `nanocodex2_tui_lifecycle` test binaries. The synthetic
+account and terminal state remain isolated from your login.

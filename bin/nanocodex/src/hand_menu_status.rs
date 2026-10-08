@@ -47,8 +47,14 @@ async fn local_status() -> Value {
     let result = tokio::time::timeout(Duration::from_secs(3), async {
         let state = crate::hand_service::status().await?;
         let pending = crate::hand_service::is_pending().await?;
+        #[cfg(target_os = "macos")]
+        let keep_awake = std::env::var_os("HOME").and_then(|home| {
+            crate::hand_keep_awake::snapshot(std::path::Path::new(&home), state.pid).ok()
+        });
+        #[cfg(not(target_os = "macos"))]
+        let keep_awake: Option<Value> = None;
         Ok::<_, eyre::Report>(json!({"installed": state.installed, "loaded": state.loaded,
-            "pid": state.pid, "pending_login": pending, "error": null}))
+            "pid": state.pid, "pending_login": pending, "keep_awake": keep_awake, "error": null}))
     })
     .await;
     match result {
@@ -248,6 +254,11 @@ fn project_machines(value: &Value) -> std::result::Result<Vec<Value>, Failure> {
         .ok_or(UNKNOWN)?;
     let mut result = Vec::new();
     for machine in machines {
+        // Older servers may still return retired thread-local publishers.
+        // They no longer belong in the account Hand menu.
+        if machine["kind"] == "workspace" {
+            continue;
+        }
         let id = machine["id"].as_str().and_then(safe_text).ok_or(UNKNOWN)?;
         let name = machine["name"]
             .as_str()
@@ -257,7 +268,7 @@ fn project_machines(value: &Value) -> std::result::Result<Vec<Value>, Failure> {
             return Err(UNKNOWN);
         }
         let kind = match machine["kind"].as_str() {
-            Some(kind @ ("hand" | "workspace" | "vm")) => kind,
+            Some(kind @ ("hand" | "vm")) => kind,
             _ => return Err(UNKNOWN),
         };
         let (online, health, availability) =

@@ -1,7 +1,6 @@
 import { idempotentAgentId } from "nanocodex/cloudflare/managed-live";
 export { PhoneProvider } from "./phone-provider";
 import { routeAccountNavigation } from "./account-navigation";
-import { inventoryEntry, type HandInventoryEntry } from "./hand-inventory";
 import { CUA_JS_NAME, CUA_RESET_NAME } from "nanocodex-computer/contract";
 import { parseNativeVaultInjection } from "./browser-vault-injection";
 import type { VaultFieldResolution } from "./browser-vault-injection";
@@ -35,6 +34,7 @@ import { turnCanUseExecutionNamespace, turnCanProvisionExecutionProvider, execut
 export { turnCanUseExecutionNamespace } from "./execution-policy";
 import { liveAgentSettings, liveAgentFailure, liveAgentRequest } from "nanocodex/cloudflare/managed-live";
 import { durablePlacementOptions, withIngressPlacement } from "nanocodex/cloudflare/durable-placement";
+import { regionalApiKeyAuthorityRegion } from "./regional-api-key-authority";
 import { routerDashboard } from "./router-dashboard";
 import { routeObservation } from "./router-telemetry";
 import { isInferenceCredential, routeInferenceApi, type InferenceApiEnv } from "./inference-api";
@@ -75,7 +75,7 @@ import { threadSharingTools, redactSharedLinkTokens } from "./thread-sharing-too
 import { initializeTurnInputs, inputChunks, lazyTurnInput, readTurnInput, storeTurnInput } from "./managed-turn-input";
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import { ArchiveMaintenance } from "./archive-maintenance";
-import { managedCredentialSubject, scopedManagedModelEgress, sessionCredentialOwner } from "./session-credential-ownership";
+import { managedCredentialSubject, scopedManagedModelEgress, scopedSessionToolEgress, sessionCredentialOwner } from "./session-credential-ownership";
 import { remoteICE } from "./hand-remote-ice";
 import { REMOTE_VM_ASSERTION, type RemoteVMPublisher } from "./hand-remote";
 import { serverHandTool } from "./ssh-hand-setup";
@@ -124,7 +124,8 @@ import { createWorkspaceFilesystem, resolveNamespaceCwd } from "nanocodex-tools"
 import { SessionAttachments } from "./attachments";
 import { CLAUDE_INLINE_PREVIEW_MAX_BYTES, inlineClaudeAttachmentPreviews } from "./claude-attachments";
 import { CLAUDE_PENDING_CONTEXT_MAX_ENTRIES, CLAUDE_REALTIME_END, CLAUDE_REALTIME_START, claudeRealtimeContext, prependClaudeContext } from "./claude-realtime";
-import { createManagedImageFetch, managedImageReference } from "./managed-image-fetch";
+import { managedImageReference } from "./managed-image-fetch";
+import { managedImageFetch, managedWebFetch } from "./managed-tool-fetch";
 import { recentSessionImages, SESSION_IMAGE_REMEMBER_EVENT } from "./session-images";
 import { createR2ViewImage } from "./attachment-image";
 import { createBrainWorkspace } from "./brain-workspace";
@@ -177,6 +178,7 @@ import {
   HostedToolsBroker,
   type HostedToolsLeasedAttachmentRenewal,
 } from "./hosted-tools-broker";
+import { HOSTED_MACHINE_TOOL_NAMES } from "nanocodex-tools/hosted";
 import {
   AccountHostedTools,
   AccountHostedToolsCallRoutes,
@@ -494,6 +496,7 @@ export interface Env extends
   NANOCODEX_ACCOUNT_TOOLS: DurableObjectNamespace<AccountHostedTools>;
   NANOCODEX_HAND_RELAYS?: DurableObjectNamespace<RegionalHandRelay>;
   NANOCODEX_REGIONAL_HAND_RELAYS?: string;
+  NANOCODEX_REGIONAL_API_KEY_AUTHORITY?: string;
   NANOCODEX_TURN_KEY_ID?: string;
   NANOCODEX_TURN_API_TOKEN?: string;
   NANOCODEX_PHONE_BRIDGE_URL?: string;
@@ -515,6 +518,8 @@ export interface Env extends
   NANOCODEX: Fetcher;
   NANOCODEX_REALTIME?: Fetcher;
   NANOCODEX_SESSION_MODEL_EGRESS?: Fetcher;
+  /** Private Session tool egress; owner assertions avoid re-entrant subject callbacks. */
+  NANOCODEX_SESSION_TOOL_EGRESS?: Fetcher;
   NANOCODEX_X?: Fetcher;
   NANOCODEX_HISTORY: R2Bucket;
   NANOCODEX_WORKSPACES: R2Bucket;
@@ -750,6 +755,35 @@ function managedMountPublicProvider(mount: ManagedMountRow): string {
 function managedMountDisplayName(mount: ManagedMountRow): string {
   const provider = managedMountPublicProvider(mount);
   return `${provider === MANAGED_CLOUDFLARE_PROVIDER ? "Cloudflare" : provider} / ${mount.name}`.slice(0, 128);
+}
+
+/**
+ * Returned to a thread-scoped publisher that still sends a native Hand catalog.
+ * Kept short so the whole hint fits the 123-byte WebSocket close reason.
+ */
+const SESSION_WORKSPACE_HAND_RETIRED = "hand_migration_required: attach at /v1/account/tool-host";
+
+const SESSION_NATIVE_TOOL_NAMES: ReadonlySet<string> = new Set(HOSTED_MACHINE_TOOL_NAMES);
+
+/**
+ * Admits a thread tool-host catalog. Native machine catalogs are accepted only
+ * on a trusted leased VM route: its fixed route ID is injected by the Worker
+ * after verifying the server-issued lease grant and is never client-chosen.
+ * Machine metadata or kind alone never confers that trust.
+ */
+function admitSessionToolHostCatalog(candidate: Readonly<{
+  routeId: string;
+  machine: HostedMachine | undefined;
+  definitions: readonly Readonly<{ definition: Readonly<{ name: string }> }>[];
+}>, ownsAdmittedWork: () => boolean): void {
+  if (VM_HOST_ATTACHMENT_ROUTE.test(candidate.routeId)) return;
+  if (candidate.machine === undefined && !candidate.definitions.some(({ definition }) => (
+    SESSION_NATIVE_TOOL_NAMES.has(definition.name) || definition.name.startsWith("mcp__cua_repl__")
+  ))) return;
+  // A retired route may reconnect only as the exact executor runtime that owns
+  // already admitted work. It is never rediscovered: namespace routing reaches
+  // it solely through that work's runtime-pinned process key or call ledger.
+  if (!ownsAdmittedWork()) throw new Error(SESSION_WORKSPACE_HAND_RETIRED);
 }
 
 function vmHostMountAllocation(
@@ -1842,6 +1876,45 @@ async function managedFetchRoute(
       const inventory = await timeHandStage(request, "route", () =>
         env.NANOCODEX_ACCOUNT_TOOLS.getByName(principal.userId).handInventory(principal.userId));
       return json(inventory, { headers: { "cache-control": "no-store" } });
+    }
+    if (url.pathname === "/v1/account/hands/prune") {
+      if (request.method !== "POST" || url.search !== "") return json({ error: "invalid_request" }, { status: 400 });
+      const principal = trustedAgentPrincipal ?? await authenticate(request, env, url);
+      if (!principal) return json({ error: "unauthorized" }, { status: 401 });
+      if (principal.connectGrant || !principal.capabilities.includes("agents:write")
+        || !principal.capabilities.includes("tools:use")) return json({ error: "forbidden" }, { status: 403 });
+      if (principal.kind !== "api_key" && request.headers.get("origin") !== url.origin) {
+        return json({ error: "forbidden_origin" }, { status: 403 });
+      }
+      const pruned = await env.NANOCODEX_ACCOUNT_TOOLS.getByName(principal.userId).pruneMachines(principal.userId);
+      if ("error" in pruned) return json(pruned, { status: 404 });
+      return json(pruned, { headers: { "cache-control": "no-store" } });
+    }
+    const forgetHand = request.method === "DELETE" ? /^\/v1\/account\/hands\/([^/]+)$/.exec(url.pathname) : null;
+    if (forgetHand) {
+      let machineId: string;
+      try { machineId = decodeURIComponent(forgetHand[1]); }
+      catch { return json({ error: "invalid_request" }, { status: 400 }); }
+      if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(machineId)) {
+        return json({ error: "invalid_request" }, { status: 400 });
+      }
+      const force = url.searchParams.get("force") === "1";
+      if (url.search !== "" && !(force && [...url.searchParams.keys()].join() === "force")) {
+        return json({ error: "invalid_request" }, { status: 400 });
+      }
+      const principal = trustedAgentPrincipal ?? await authenticate(request, env, url);
+      if (!principal) return json({ error: "unauthorized" }, { status: 401 });
+      if (principal.connectGrant || !principal.capabilities.includes("agents:write")
+        || !principal.capabilities.includes("tools:use")) return json({ error: "forbidden" }, { status: 403 });
+      if (principal.kind !== "api_key" && request.headers.get("origin") !== url.origin) {
+        return json({ error: "forbidden_origin" }, { status: 403 });
+      }
+      const result = await env.NANOCODEX_ACCOUNT_TOOLS.getByName(principal.userId)
+        .forgetMachine(principal.userId, machineId, force);
+      if ("error" in result) {
+        return json(result, { status: result.error === "not_found" ? 404 : 409 });
+      }
+      return json(result, { headers: { "cache-control": "no-store" } });
     }
     if (url.pathname.startsWith("/v1/account/hands/")) {
       const principal = trustedAgentPrincipal ?? await authenticate(request, env, url);
@@ -3911,7 +3984,7 @@ export class DurableAgentSession extends DurableComputerObject {
   #nativeSecureInput(agentId: string): NativeSecureInput {
     return this.#nativeSecureInputRuntime ??= new NativeSecureInput(this.ctx.storage, agentId,
       this.env.NATIVE_SECURE_INPUT_SIGNING_KEY,
-      (machine, context) => this.#hostedTools.machineTool(machine, "native_secure_input", context)
+      (machine, context) => this.#leasedSessionMachineTool(machine, "native_secure_input", context)
         ?? this.#accountHostedTools?.machineTool(machine, "native_secure_input", context), this.env.NATIVE_SECURE_INPUT_HELPERS);
   }
   #presentation?: AgentPresentationWriter;
@@ -4199,13 +4272,14 @@ export class DurableAgentSession extends DurableComputerObject {
       Date.now(),
     );
     this.#hostedTools = new HostedToolsBroker(this.ctx, {
-      onCatalogChanged: () => this.#registerWorkspaceHands(),
       onCallObservation: observation => this.#observeHandBoundary("hand.call.broker", observation),
       onConnectionObservation: observation => this.#observeHandBoundary("hand.connection", observation),
       entryAllowed: (entry, connectGrantId, appToolCatalogDigest, context) => (
         this.#hostedToolAllowed(entry, connectGrantId, appToolCatalogDigest, context)
       ),
       renewLeasedAttachment: (renewal) => this.#renewVmHostAttachment(renewal),
+      beforeCatalogPublish: async (candidate) => admitSessionToolHostCatalog(candidate,
+        () => this.#retiredRouteOwnsAdmittedWork(candidate.routeId, candidate.runtimeId)),
     });
     this.#archiveMaintenance = new ArchiveMaintenance(this.ctx.storage);
     if (!this.ctx.storage.sql.exec<{ name: string }>("PRAGMA table_info(history_projection_outbox)")
@@ -4237,7 +4311,6 @@ export class DurableAgentSession extends DurableComputerObject {
       optionalPositiveInteger(this.env.MANAGED_REALTIME_ARCHIVE_RECENT_OPERATIONS),
     );
     this.#deleted = this.#initializationOwnership()?.state === "deleted";
-    this.#registerWorkspaceHands();
     const retainedSession = this.#session();
     this.#streamError = retainedSession?.stream_error ?? undefined;
     const constructorSyncMs = roundMilliseconds(performance.now() - constructorStartedAt);
@@ -4323,74 +4396,6 @@ export class DurableAgentSession extends DurableComputerObject {
     });
   }
 
-  /** Account-only safe RPC. Read fresh broker state; Connect routes are excluded
-   * even if legacy retained rows predate the publisher's scope validation. */
-  listWorkspaceHands(ownerId: string): { data: HandInventoryEntry[]; complete: boolean } {
-    const session = this.#session();
-    // A durable deletion tombstone can confirm retirement only to its owner.
-    const ownership = this.#initializationOwnership();
-    if (ownership?.state === "deleted" && ownership.owner_id === ownerId) return { data: [], complete: true };
-    if (!session || session.owner_id !== ownerId || this.#deleted || this.#deleting
-      || this.#durabilityExported || this.#durabilityImportState === "pending") return { data: [], complete: false };
-    const rows = this.ctx.storage.sql.exec<{ machines_json: string; connect_grant_id: string | null }>(
-      "SELECT machines_json,connect_grant_id FROM hosted_tool_routes WHERE catalog_json IS NOT NULL AND machines_json IS NOT NULL")
-      .toArray();
-    const machines = new Map<string, import("nanocodex-tools/hosted").HostedMachine>();
-    const counts = new Map<string, number>();
-    for (const row of rows) for (const machine of JSON.parse(row.machines_json) as import("nanocodex-tools/hosted").HostedMachine[]) {
-      counts.set(machine.id, (counts.get(machine.id) ?? 0) + 1);
-      if (row.connect_grant_id === null) machines.set(machine.id, machine);
-    }
-    const online = new Map(this.#hostedTools.catalogSnapshot().machines().map(entry => [entry.machine.id, entry.online]));
-    let complete = true;
-    const data: HandInventoryEntry[] = [];
-    for (const machine of machines.values()) {
-      // A retained account identity cannot authorize a different Connect route
-      // with the same ID. Conflicts remain unknown and do not expose that route.
-      const ambiguous = counts.get(machine.id)! > 1;
-      if (ambiguous) complete = false;
-      const connected = online.get(machine.id);
-      if (!ambiguous && connected === false) continue;
-      // Absence from discovery is uncertainty, not proof of disconnection.
-      if (connected === undefined) complete = false;
-      data.push(inventoryEntry(machine, ambiguous ? null : connected ?? null, true));
-    }
-    return { data, complete };
-  }
-
-  #workspacePublicationQueue: Promise<void> = Promise.resolve();
-
-  #registerWorkspaceHands(): void {
-    // Broker construction can notify before the Session field is assigned.
-    // Serialize refreshes and read state inside the queue. Retirement belongs
-    // to account polling, which compares the revision before deleting.
-    this.#workspacePublicationQueue = this.#workspacePublicationQueue.then(async () => {
-      for (let attempt = 0; attempt < 3; attempt++) {
-        const session = this.#session();
-        if (!session) return;
-        const result = this.listWorkspaceHands(session.owner_id);
-        // Never send unversioned empty writes: an RPC that timed out may still
-        // arrive after a reconnect. Account polling reclaims empty sessions.
-        if (result.data.length === 0) return;
-        try {
-          const accepted = await withHardDeadline("workspace Hand registration", 4_000, () =>
-            this.env.NANOCODEX_ACCOUNT_TOOLS.getByName(session.owner_id)
-              .registerWorkspaceHands(session.owner_id, session.session_id, result.data));
-          console.info({ type: accepted ? "hand.inventory.registered" : "hand.inventory.registration_rejected",
-            thread_id: session.session_id, hand_count: result.data.length, attempt: attempt + 1 });
-          // Rejection is an ownership/registry fence, never a transient retry.
-          return;
-        } catch (error) {
-          if (attempt === 2) throw error;
-          // Deployment can reset the account broker between publisher hydration
-          // and index publication. Retry this safe write without reconnecting a Hand.
-          await new Promise<void>(resolve => setTimeout(resolve, attempt === 0 ? 250 : 1_000));
-        }
-      }
-    }).catch(error => console.warn({ type: "hand.inventory.registration_failed", error: String(error) }));
-    this.ctx.waitUntil(this.#workspacePublicationQueue);
-  }
-
   #calendarPushQueue: Promise<unknown> = Promise.resolve();
   #calendarPushSerial<T>(run: () => Promise<T>): Promise<T> {
     const result = this.#calendarPushQueue.then(run);
@@ -4453,7 +4458,7 @@ export class DurableAgentSession extends DurableComputerObject {
       fetch:async(request:Request) => {
         authorize();
         if(!prepared) {await this.#ensureCredentialBinding(session,1000);authorize();prepared=true;}
-        return handleManagedEgress(request,this.env.NANOCODEX,this.#credentialSubject(),(capability,connection) => capability === "gcalendar" && connection === connectionId);
+        return handleManagedEgress(request,this.#toolEgress(),this.#credentialSubject(),(capability,connection) => capability === "gcalendar" && connection === connectionId);
       }};
   }
 
@@ -4551,7 +4556,7 @@ export class DurableAgentSession extends DurableComputerObject {
       const imported = await importCrmEmailPush({
         db: this.env.NANOCODEX_CRM, ownerId: wake.userId,
         authorize: () => { assertOwner(epoch); },
-        fetch: request => handleManagedEgress(request, this.env.NANOCODEX, this.#credentialSubject(),
+        fetch: request => handleManagedEgress(request, this.#toolEgress(), this.#credentialSubject(),
           (capability, connectionId) => capability === "gmail" && connectionId === selected),
       }, JSON.stringify(Object.fromEntries(Object.entries(emailEvent).filter(([key]) => key !== "messages"))));
       assertOwner(epoch);
@@ -5273,7 +5278,7 @@ export class DurableAgentSession extends DurableComputerObject {
             const provider = new AccountHostedToolsProvider(this.env.NANOCODEX_ACCOUNT_TOOLS, session.owner_id, () => true, session.session_id, this.env.NANOCODEX_HAND_RELAYS, new AccountHostedToolsCallRoutes(this.ctx.storage));
             await provider.refresh();
             return json(await this.#nativeSecureInput(session.session_id).submit(payload, context,
-              (machine, ctx) => this.#hostedTools.machineTool(machine, "native_secure_input", ctx)
+              (machine, ctx) => this.#leasedSessionMachineTool(machine, "native_secure_input", ctx)
                 ?? provider.machineTool(machine, "native_secure_input", ctx)));
           } finally { this.#fileReadAuthorizations.delete(context.sessionId); }
         }
@@ -5303,7 +5308,8 @@ export class DurableAgentSession extends DurableComputerObject {
         const provider = new AccountHostedToolsProvider(this.env.NANOCODEX_ACCOUNT_TOOLS, session.owner_id, () => true, session.session_id, this.env.NANOCODEX_HAND_RELAYS, new AccountHostedToolsCallRoutes(this.ctx.storage));
         await provider.refresh();
         const mounts = this.#managedMounts().filter(mount => executionMountOwner(mount) === undefined);
-        const discovered = [...this.#hostedTools.machines(), ...provider.machines()];
+        // Physical computers are account Hands; leased VMs resolve by mount below.
+        const discovered = [...provider.machines()];
         const leased = new Set(this.#managedMounts().flatMap(mount => mount.provider === "cloudflare"
           ? [`cf:${mount.provider_resource_id}`] : [vmHostMountAllocation(mount)?.machine_id].filter((id): id is string => id !== undefined)));
         const machines = discovered.filter(machine => !leased.has(machine.id)
@@ -5334,8 +5340,7 @@ export class DurableAgentSession extends DurableComputerObject {
           }
         } else if (machine) {
           workspace = machine.workspace;
-          exec = this.#hostedTools.machineTool(machine.id, "exec_command", context)
-            ?? provider.machineTool(machine.id, "exec_command", context);
+          exec = provider.machineTool(machine.id, "exec_command", context);
         } else if (root !== "/brain" && !this.#handPaths.roots().includes(root)
           && ![...roots.keys()].some(id => machineMountRoot(id) === root)) {
           throw new FileDownloadError("file_path_unmapped", "This path is outside the agent's Hands", 404);
@@ -10085,7 +10090,7 @@ export class DurableAgentSession extends DurableComputerObject {
     const computer = await createManagedComputerRuntime({
       computer: workspace,
       ...(multiplayer ? {} : { filesystem: createBrainWorkspace(this.#brainBucket(), session.session_id) }),
-      egress: this.env.NANOCODEX,
+      egress: this.#toolEgress(),
       mediaService: this.env.NANOCODEX_MEDIA,
       networkPolicy: configuration.environment?.network,
       ...(multiplayer ? {} : { subject: this.#credentialSubject() }),
@@ -10173,7 +10178,7 @@ export class DurableAgentSession extends DurableComputerObject {
           return authorization !== undefined && (authorization.connectGrant === undefined
             || authorization.connectGrant.connectors.includes(capability));
         },
-        fetch: (request, context, expectedCapability) => handleManagedEgress(request, this.env.NANOCODEX,
+        fetch: (request, context, expectedCapability) => handleManagedEgress(request, this.#toolEgress(),
           this.#credentialSubject(), (capability, connectionId) =>
             capability === expectedCapability && this.#toolConnectorAllowed(capability, connectionId, context)),
       }),
@@ -10332,7 +10337,7 @@ export class DurableAgentSession extends DurableComputerObject {
         const name = managedAccountMcpServerName(connection);
         nextServers[name] = accountMcpNames.get(connection.id) === connection.name && accountMcpServers[name]
           ? accountMcpServers[name]
-          : managedAccountMcpServers([connection], this.env.NANOCODEX, this.#credentialSubject(),
+          : managedAccountMcpServers([connection], this.#toolEgress(), this.#credentialSubject(),
             connectionId => this.#activeTurnMcpAllowed(connectionId))[name]!;
       }
       accountMcpNames = new Map(connections.map(connection => [connection.id, connection.name]));
@@ -10426,10 +10431,9 @@ export class DurableAgentSession extends DurableComputerObject {
       }
       const id = machineId.slice("user:".length);
       if (!this.#userHandMachines(context).some((machine) => machine.id === id)) return undefined;
-      const upstreamAvailable = name !== CUA_JS_NAME && name !== CUA_RESET_NAME
-        || this.#hostedTools.machineOnline(id);
-      return (upstreamAvailable ? this.#hostedTools.machineTool(id, name, context) : undefined)
-        ?? this.#accountHostedTools?.machineTool(id, name, context);
+      // The account broker owns physical computers. Retired session-scoped
+      // workspace routes never take new commands, even while still connected.
+      return this.#accountHostedTools?.machineTool(id, name, context);
     };
     const namespaceRuntime = multiplayer ? undefined : createManagedNamespaceRuntime(
       (context) => this.#canUseExecutionNamespace(this.#authorizationForToolContext(context)),
@@ -10512,7 +10516,7 @@ export class DurableAgentSession extends DurableComputerObject {
           .some(root => cwd === root || cwd.startsWith(`${root}/`)));
         if (!selected) return undefined;
         const id = selected.id.slice("user:".length);
-        if (computer || !this.#hostedTools.machineOnline(id)) {
+        {
           if (!this.#accountHostedTools) return undefined;
           const started = performance.now();
           try {
@@ -10533,8 +10537,13 @@ export class DurableAgentSession extends DurableComputerObject {
         const authorization = this.#authorizationForToolContext(context);
         if (!this.#canUseExecutionNamespace(authorization) || !this.#hasFullAccountAuthority(authorization)
           || !binding.machineId.startsWith("user:")) return undefined;
-        return this.#accountHostedTools?.recoverProcessTool(
-          binding.machineId.slice("user:".length), binding.processSessionKey, context);
+        const id = binding.machineId.slice("user:".length);
+        // A process admitted before session-scoped workspace Hands were retired
+        // stays pinned to its exact executor runtime until it exits. The key
+        // names that route and runtime, so no replacement publisher can match.
+        const pinned = this.#hostedTools.machineTool(id, "write_stdin", context);
+        if (pinned?.processSessionKey !== undefined && pinned.processSessionKey === binding.processSessionKey) return pinned;
+        return this.#accountHostedTools?.recoverProcessTool(id, binding.processSessionKey, context);
       },
     );
     const cloudTools: NamedTool[] = [
@@ -10618,11 +10627,11 @@ export class DurableAgentSession extends DurableComputerObject {
       })] : []),
       web({
         url: "https://managed-tools.internal/web-search",
-        fetch: managedWebFetch(this.env, this.#credentialSubject(), configuration.chatgpt_account_id),
+        fetch: managedWebFetch(this.#modelEgress(), this.ctx.id.toString()),
       }),
       imageGeneration({
         url: "https://managed-tools.internal/image-generation",
-        fetch: managedImageFetch(this.env, this.#credentialSubject(), configuration.chatgpt_account_id),
+        fetch: managedImageFetch(this.#modelEgress(), this.ctx.id.toString()),
         workspace: sharedBrainWorkspace,
         recentImages: async (sessionId, count) => {
           const rootSessionId = this.#imageSessionRoot(sessionId);
@@ -10748,7 +10757,7 @@ export class DurableAgentSession extends DurableComputerObject {
       ...(multiplayer ? [] : crmTools({
         db: this.env.NANOCODEX_CRM, ownerId: session.owner_id,
         authorization: context => this.#authorizationForToolContext(context),
-        calendarFetch: (request, context) => handleManagedEgress(request, this.env.NANOCODEX,
+        calendarFetch: (request, context) => handleManagedEgress(request, this.#toolEgress(),
           this.#credentialSubject(), (capability, connectionId) => capability === "gcalendar"
             && this.#toolConnectorAllowed(capability, connectionId, context)),
         automation: async (input, context) => {
@@ -10785,7 +10794,7 @@ export class DurableAgentSession extends DurableComputerObject {
       ]),
       ...(multiplayer ? [] : this.#memoryTools()),
       ...(multiplayer ? [] : [createVaultIntakeTool(context => this.#authorizeVaultTool(context)),
-        createVaultRequestTool(this.env.NANOCODEX, () => this.#credentialSubject(), context => this.#authorizeVaultTool(context)),
+        createVaultRequestTool(this.#toolEgress(), () => this.#credentialSubject(), context => this.#authorizeVaultTool(context)),
         createPhoneNumbersTool(this.env.NANOCODEX, session.owner_id, context => this.#authorizeVaultTool(context))]),
       ...(multiplayer ? [] : createProviderVaultTools(this.env.NANOCODEX, session.owner_id, context => this.#authorizeVaultTool(context))),
       ...(multiplayer ? [] : [permissionRequestTool((input, context) => this.#requestPermissions(input, context))]),
@@ -10821,7 +10830,7 @@ export class DurableAgentSession extends DurableComputerObject {
       })]),
       ...(multiplayer ? [] : [serverHandTool({
         owner: session.owner_id, subject: this.#credentialSubject(), origin: session.public_origin,
-        image: this.env.NANOCODEX_HAND_IMAGE, egress: this.env.NANOCODEX,
+        image: this.env.NANOCODEX_HAND_IMAGE, egress: this.#toolEgress(),
         hosts: this.env.NANOCODEX_ACCOUNT_TOOLS.getByName(session.owner_id),
         authorize: context => {
           context.signal.throwIfAborted();
@@ -11186,7 +11195,8 @@ export class DurableAgentSession extends DurableComputerObject {
   }
 
   async #refreshApiKeyAuthorization(authorization: TurnAuthorization): Promise<TurnAuthorization> {
-    const key = await resolvePermissionKey(this.env, this.#permissionIdentity(authorization), authorization.apiKeyObjectId);
+    const key = await resolvePermissionKey(this.env, this.#permissionIdentity(authorization), authorization.apiKeyObjectId,
+      regionalApiKeyAuthorityRegion(this.#routingOrigin().clientIngressColo, this.env.NANOCODEX_REGIONAL_API_KEY_AUTHORITY));
     if (!key) throw new ManagedRequestError(403, "login_unavailable", "This login was revoked or its account permissions changed. Sign in again.");
     return { ...authorization, capabilities: key.capabilities };
   }
@@ -12134,10 +12144,6 @@ export class DurableAgentSession extends DurableComputerObject {
     if (!this.#canUseExecutionNamespace(authorization)) return [];
     const userHands = this.#hasFullAccountAuthority(authorization) ? this.#userHandMachines(context) : [];
     const roots = this.#handPaths.assign(userHands, this.#managedMounts().map(mount => mount.root), this.#accountHostedTools?.machineRoots());
-    // Capability projection uses one indexed discovery view, not repeated
-    // catalog reconstruction inside namespace membership/route lookups.
-    const localCatalog = this.#hasFullAccountAuthority(authorization) ? this.#hostedTools.catalogSnapshot() : undefined;
-    const localOnline = new Set(localCatalog?.machines().filter(entry => entry.online).map(entry => entry.machine.id));
     return Object.freeze(projectHandProviders([
       ...this.#availableManagedMounts(authorization).map((mount) => {
         const hostMachine = mount.provider === "host" ? this.#hostMachineForMount(mount) : undefined;
@@ -12156,19 +12162,15 @@ export class DurableAgentSession extends DurableComputerObject {
       }),
       ...userHands.map((machine) => {
           const mount = roots.get(machine.id)!;
-          const upstream = localOnline.has(machine.id)
-            && localCatalog?.machineTool(machine.id, CUA_JS_NAME, context)
-            && localCatalog.machineTool(machine.id, CUA_RESET_NAME, context);
           return Object.freeze({
             id: `user:${machine.id}`,
             name: machine.name,
             kind: "user" as const,
-            online: this.#hostedTools.machineOnline(machine.id)
-              || this.#accountHostedTools?.machineOnline(machine.id, context) === true,
+            online: this.#accountHostedTools?.machineOnline(machine.id, context) === true,
             mount,
             aliases: [machineMountRoot(machine.id)],
             workspace: mount,
-            capabilities: upstream ? [...new Set([...machine.capabilities, "computer"])] : machine.capabilities,
+            capabilities: machine.capabilities,
             ...(machine.resources === undefined ? {} : { resources: machine.resources }),
           });
         }),
@@ -12187,6 +12189,39 @@ export class DurableAgentSession extends DurableComputerObject {
     return authorization !== undefined && authorization.connectGrant === undefined;
   }
 
+  /**
+   * True only while this exact retired ordinary route/runtime still owns a
+   * durable namespace process or an unsettled admitted call. Settled history,
+   * another runtime, or a reused machine ID never qualifies.
+   */
+  #retiredRouteOwnsAdmittedWork(routeId: string, runtimeId: string | undefined): boolean {
+    if (runtimeId === undefined) return false;
+    if (this.#processSessions.ownsProcessSessionKey(
+      JSON.stringify([routeId, "process-runtime", runtimeId, "write_stdin"]))) return true;
+    return this.ctx.storage.sql.exec<{ count: number }>(
+      `SELECT COUNT(*) AS count FROM hosted_tool_routes r JOIN hosted_tool_calls c
+         ON c.lease_id = r.lease_id AND c.generation = r.generation
+       WHERE r.route_id = ? AND r.runtime_id = ? AND c.host_runtime_id = ? AND c.state IN ('admitted', 'dispatched')`,
+      routeId, runtimeId, runtimeId,
+    ).one().count > 0;
+  }
+
+  /** Resolves a session-broker primitive only on a mounted, server-leased VM route. */
+  #leasedSessionMachineTool(
+    machineId: string,
+    name: Parameters<HostedToolsBroker["machineToolOnRoute"]>[2],
+    context?: Parameters<HostedToolsBroker["machineToolOnRoute"]>[3],
+  ): ReturnType<HostedToolsBroker["machineToolOnRoute"]> {
+    for (const mount of this.#managedMounts()) {
+      if (mount.provider !== "host" || mount.state !== "mounted") continue;
+      const allocation = vmHostMountAllocation(mount);
+      if (allocation?.machine_id === machineId && allocation.route_id !== undefined) {
+        return this.#hostedTools.machineToolOnRoute(allocation.route_id, machineId, name, context);
+      }
+    }
+    return undefined;
+  }
+
   #userHandMachines(
     context?: Pick<ToolContext, "sessionId" | "subagent">,
   ): readonly HostedMachine[] {
@@ -12195,10 +12230,9 @@ export class DurableAgentSession extends DurableComputerObject {
       const allocation = vmHostMountAllocation(mount);
       return allocation === undefined ? [] : [allocation.machine_id];
     }));
-    const machines = [
-      ...this.#hostedTools.machines(),
-      ...(this.#accountHostedTools?.machines(context) ?? []),
-    ];
+    // Only the account broker publishes physical computers. Session-scoped
+    // workspace routes are retired from discovery; leased VMs are mounts.
+    const machines = [...(this.#accountHostedTools?.machines(context) ?? [])];
     // Screen-only publishers have no shell attachment. Merge by identity so a
     // separately published screen never makes its native Hand ambiguous.
     for (const screen of this.#accountHostedTools?.screenMachines(context) ?? []) {
@@ -12723,6 +12757,21 @@ export class DurableAgentSession extends DurableComputerObject {
       return;
     }
     this.#publish(persistence.event!);
+  }
+
+  #toolEgress(): Fetcher {
+    return scopedSessionToolEgress(
+      this.env.NANOCODEX,
+      this.#credentialBinding?.strategy === "session_v1" ? this.env.NANOCODEX_SESSION_TOOL_EGRESS : undefined,
+      this.ctx.id.toString(), this.#credentialSubject(),
+      () => sessionCredentialOwner({
+        subject: this.#credentialSubject(), storageId: this.ctx.id.toString(),
+        binding: this.#credentialBinding, session: this.#session(),
+        initialization: this.#initializationOwnership(),
+        deleting: this.#deleting, deleted: this.#deleted,
+        exported: this.#durabilityExported, importPending: this.#durabilityImportState === "pending",
+      }),
+    );
   }
 
   #modelEgress(): Pick<Fetcher, "fetch"> {
@@ -14658,53 +14707,6 @@ function canonicalJson(value: unknown): string {
   return `{${Object.keys(object).sort().map((key) => (
     `${JSON.stringify(key)}:${canonicalJson(object[key])}`
   )).join(",")}}`;
-}
-
-function managedWebFetch(env: Env, subject: string, accountId?: string): typeof fetch {
-  return async (input, init) => {
-    const incoming = new Request(input, init);
-    const value = await incoming.json<{
-      commands?: unknown;
-      model?: unknown;
-      session_id?: unknown;
-    }>();
-    if (!value.commands || typeof value.commands !== "object" || Array.isArray(value.commands)
-      || typeof value.session_id !== "string" || !value.session_id
-      || (value.model !== undefined && !isAgentModel(value.model))) {
-      return json({ error: "invalid managed web request" }, { status: 400 });
-    }
-    return fetchManagedTool(env, subject, "/v1/search", {
-      id: value.session_id,
-      model: value.model ?? DEFAULT_AGENT_SETTINGS.model,
-      commands: value.commands,
-      settings: { allowed_callers: ["direct"], external_web_access: true },
-      max_output_tokens: 10_000,
-    }, accountId);
-  };
-}
-
-function managedImageFetch(env: Env, subject: string, accountId?: string): typeof fetch {
-  return createManagedImageFetch((path, body) => fetchManagedTool(env, subject, path, body, accountId));
-}
-
-function fetchManagedTool(
-  env: Env,
-  subject: string,
-  path: "/v1/search" | "/v1/images/generations" | "/v1/images/edits",
-  body: unknown,
-  accountId?: string,
-): Promise<Response> {
-  return env.NANOCODEX.fetch(new Request(`https://nanocodex.internal${path}`, {
-    method: "POST",
-    headers: {
-      authorization: "Bearer NANOCODEX_PROVIDER_CREDENTIAL",
-      "content-type": "application/json",
-      "user-agent": "nanocodex-managed/0.1.0",
-      "x-nanocodex-subject": subject,
-      ...(accountId ? { "x-nanocodex-chatgpt-account-id": accountId } : {}),
-    },
-    body: JSON.stringify(body),
-  }));
 }
 
 function authorized(request: Request, expected: string): boolean {

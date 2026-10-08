@@ -35,11 +35,89 @@ export async function guardedCommand(command, {cwd=process.cwd(),directory='.',e
     return readFileSync(output,'utf8').trim().split('\n').at(-1)==='active=true';
   }finally{rmSync(temporary,{recursive:true,force:true});}
 }
-export async function accountHealth(expectedRevision) {
-  const response=await fetch('https://nanocodex.gakonst.workers.dev/api/health',{signal:AbortSignal.timeout(20_000)});
-  assert.equal(response.status,200);const health=await response.json();
-  assert.equal(health.service,'nanocodex');assert.equal(health.runtime,'cloudflare-workers');assert.equal(health.status,'ok');
-  if(expectedRevision)assert.equal(health.deployment_sha,expectedRevision,'Account health must identify the released revision');
+// Account health failures are classified into this closed set. Annotations print
+// only the category, fixed text and a validated numeric HTTP status: never the
+// response body, parsed values, thrown error text or provider/network details.
+export const accountHealthMessages=Object.freeze({
+  http_status:'Account health returned an unexpected HTTP status',
+  timeout:'Account health request timed out',
+  network:'Account health request failed before a valid response',
+  invalid_json:'Account health response was not valid JSON',
+  invalid_shape:'Account health response was not a JSON object',
+  service_mismatch:'Account health service identity mismatch',
+  runtime_mismatch:'Account health runtime identity mismatch',
+  status_mismatch:'Account health status was not ok',
+  revision_missing:'Account health did not report a deployment revision',
+  revision_mismatch:'Account health must identify the released revision',
+});
+const healthDetails=new WeakMap();
+export class AccountHealthError extends Error {
+  constructor(category,status,observedRevision){
+    if(!Object.hasOwn(accountHealthMessages,category))throw new TypeError('Unknown account health category');
+    const httpStatus=category==='http_status'&&Number.isInteger(status)&&status>=100&&status<=599?status:undefined;
+    super(accountHealthMessages[category]+(httpStatus===undefined?'':` (HTTP ${httpStatus})`));
+    healthDetails.set(this,this.message);
+    this.name='AccountHealthError';this.category=category;
+    if(httpStatus!==undefined)this.httpStatus=httpStatus;
+    // Only a validated public Git revision is retained for diagnostics.
+    if(category==='revision_mismatch'&&isRevision(observedRevision))this.observedRevision=observedRevision;
+  }
+}
+const isRevision=value=>typeof value==='string'&&/^[a-f0-9]{40}$/.test(value);
+// Edge propagation of a new Worker version is eventually consistent, so a just
+// deployed revision or a transient 5xx/transport failure can be observed for a
+// few seconds after Wrangler reports success. Only those categories are retried;
+// identity, shape and non-transient HTTP failures fail on the first observation.
+const transientHealth=error=>error instanceof AccountHealthError&&(
+  ['revision_missing','revision_mismatch','timeout','network'].includes(error.category)||
+  (error.category==='http_status'&&(error.httpStatus===429||error.httpStatus>=500)));
+const healthAttempt=(attempts,seconds,last)=>
+  `after ${attempts} attempt${attempts===1?'':'s'} over ${seconds.toFixed(1)}s`+
+  (last.observedRevision?`; last observed revision ${last.observedRevision}`:'');
+export async function waitForAccountHealth(expectedRevision,{deadlineMs=120_000,timeoutMs=20_000,
+  retryDelayMs=2_000,maxRetryDelayMs=10_000,minimumProbeMs=5_000,probe=accountHealth,sleep=ms=>new Promise(done=>setTimeout(done,ms)),
+  now=Date.now,log=console.log,...options}={}) {
+  const started=now();
+  for(let attempts=1;;attempts++){
+    const remaining=deadlineMs-(now()-started);
+    try{
+      await probe(expectedRevision,{...options,timeoutMs:Math.max(1,Math.min(timeoutMs,remaining))});
+      if(attempts>1)log(`::notice title=Account health::healthy ${healthAttempt(attempts,(now()-started)/1000,{})}`);
+      return;
+    }catch(error){
+      if(!(error instanceof AccountHealthError))throw error;
+      const elapsed=now()-started;
+      const delay=Math.min(maxRetryDelayMs,retryDelayMs*attempts);
+      const diagnostic=`${healthDetails.get(error)} ${healthAttempt(attempts,elapsed/1000,error)}`+
+        (expectedRevision&&error.category.startsWith('revision_')?`; expected ${expectedRevision}`:'');
+      // Another attempt needs its delay plus a useful probe window inside the deadline.
+      if(!transientHealth(error)||elapsed+delay+Math.min(timeoutMs,minimumProbeMs)>deadlineMs){
+        // The final observation stays a real failure with bounded, validated detail.
+        healthDetails.set(error,diagnostic);
+        throw error;
+      }
+      log(`Account health not ready: ${diagnostic}; retrying in ${(delay/1000).toFixed(1)}s`);
+      await sleep(delay);
+    }
+  }
+}
+const transportCategory=error=>error?.name==='TimeoutError'||error?.name==='AbortError'?'timeout':'network';
+export async function accountHealth(expectedRevision,{url='https://nanocodex.gakonst.workers.dev/api/health',timeoutMs=20_000,request=globalThis.fetch}={}) {
+  const signal=AbortSignal.timeout(timeoutMs);
+  let response;
+  try{response=await request(url,{signal});}catch(error){throw new AccountHealthError(transportCategory(error));}
+  if(response.status!==200)throw new AccountHealthError('http_status',response.status);
+  let health;
+  try{health=await response.json();}
+  catch(error){throw new AccountHealthError(error instanceof SyntaxError?'invalid_json':transportCategory(error));}
+  if(health===null||typeof health!=='object'||Array.isArray(health))throw new AccountHealthError('invalid_shape');
+  if(health.service!=='nanocodex')throw new AccountHealthError('service_mismatch');
+  if(health.runtime!=='cloudflare-workers')throw new AccountHealthError('runtime_mismatch');
+  if(health.status!=='ok')throw new AccountHealthError('status_mismatch');
+  if(expectedRevision){
+    if(health.deployment_sha===undefined||health.deployment_sha===null)throw new AccountHealthError('revision_missing');
+    if(health.deployment_sha!==expectedRevision)throw new AccountHealthError('revision_mismatch',undefined,health.deployment_sha);
+  }
 }
 // Prepare only the next selected deployment phase. The same checkout and set of
 // completed targets let later consumers reuse dependencies already built here.
@@ -59,14 +137,15 @@ export async function prepareReleasePhase(plan, {cwd=process.cwd(),env=process.e
     repository:env.GITHUB_REPOSITORY,token:env.CLOUDFLARE_API_TOKEN});
 }
 
-export async function releaseWorkers(plan,{ledger=createDeploymentLedger(),isCurrent=currentRelease,run=guardedCommand,health=accountHealth,env=process.env,cwd=process.cwd(),prepare=prepareReleasePhase,verify=async()=>{}}={}){
+export async function releaseWorkers(plan,{ledger=createDeploymentLedger(),isCurrent=currentRelease,run=guardedCommand,health=waitForAccountHealth,env=process.env,cwd=process.cwd(),prepare=prepareReleasePhase,verify=async()=>{}}={}){
   if(plan.selected.includes('account'))assert.match(plan.revision,/^[a-f0-9]{40}$/);
   const results=[];
   const failures=[];
-  // Stage/component are controlled release metadata. Only ledger's fixed error
-  // messages may be included: child/provider error text can contain secrets.
+  // Stage/component are controlled release metadata. Only ledger and health
+  // classifier fixed messages may be included: child/provider error text can contain secrets.
   const describeFailure=(name,stage,error)=> {
-    const detail=error instanceof DeploymentLedgerError ? `: ${error.message}` : '';
+    const safeHealthDetail=healthDetails.get(error);
+    const detail=safeHealthDetail ? `: ${safeHealthDetail}` : error instanceof DeploymentLedgerError ? `: ${error.message}` : '';
     const description=`${name} ${stage}${detail}`;
     failures.push(description);
     console.error(`::error title=Worker release failed::${description}`);

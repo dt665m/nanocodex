@@ -11,6 +11,9 @@ account signed out; the local service can wait for sign-in. A local process does
 not establish account or server connectivity. Account verification, expired
 sign-in, network errors, and denied access each have distinct states. A failed
 or pending refresh never displays an old inventory as currently available.
+The warning icon retains the last observed account, inventory, or local-service
+warning while a refresh is checking. It clears only when a completed observation
+resolves the warning; its accessibility label also identifies the warning state.
 
 The menu shows one plain Hands list, with connected entries first and names
 sorted within each connection state. Up to twenty entries appear directly in
@@ -33,6 +36,13 @@ existing interactive flow. The companion reconciles the login process by PID and
 the private command directory when it exits, including after a crash.
 The companion refreshes every five seconds during sign-in, when reopened, and
 otherwise every thirty seconds. Opening the menu does not initiate sign-in.
+
+**Keep Mac Awake** is on by default and controls the standalone Hand's persisted
+idle-sleep setting. It changes without restarting the Hand or interrupting work.
+The display can turn off and macOS can lock normally; closing the lid or choosing
+Sleep can still suspend the Mac. Keeping awake uses more battery. The same setting
+is available through `nanocodex hand keep-awake on` or `off`; omit the value to
+inspect it. The menu refreshes the observed setting after a change.
 
 Start, Stop, Restart, Refresh Status, and Open Hand Log control or inspect the
 independent local Hand service. Mutating requests are serialized and never
@@ -75,4 +85,6 @@ python3 scripts/tests/hand-menu-bar-account-macos.py \
 This exercises the real AppKit menu with a synthetic account, including flat
 lists, identical names, the twenty-entry paging boundary, all pages of a larger
 inventory, and refresh retaining accessibility item identities while open.
+A delayed refresh preserves the expired-login warning; recovery clears it only
+after a healthy observation arrives.
 It does not install or stop the live service.

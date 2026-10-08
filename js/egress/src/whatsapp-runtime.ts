@@ -24,6 +24,14 @@ export const whatsappTransportFactory: WhatsAppTransportFactory = {
     // client versions and unrecognized companion platforms. Use the current
     // published web version when reachable with the Ubuntu desktop profile (macOS desktop makes WhatsApp close with 428 before issuing a code).
     const version = await currentWhatsAppVersion();
+    const diag = (label: string) => { try { callbacks.onDiagnostic?.(label); } catch {} };
+    // Record only short static message labels from warnings/errors. Objects,
+    // long strings and anything resembling codes or keys are dropped.
+    const label = (level: string) => (...args: unknown[]) => {
+      const text = args.find((arg): arg is string => typeof arg === 'string');
+      if (text && text.length <= 120 && !/[0-9A-Za-z+/=]{12,}/.test(text)) diag(`${level}:${text}`);
+    };
+    const logger = { ...silent, level: 'warn', warn: label('warn'), error: label('error'), fatal: label('fatal'), child() { return logger; } };
     const socket = makeWASocket({
       ...(version ? { version } : {}),
       auth: { creds: creds as ReturnType<typeof initAuthCreds>, keys: {
@@ -36,7 +44,7 @@ export const whatsappTransportFactory: WhatsAppTransportFactory = {
         },
         async set(data) { await callbacks.auth.setKeys(data as Record<string, Record<string, unknown | null>>); },
       } },
-      logger: silent as any,
+      logger: logger as any,
       markOnlineOnConnect: false,
       browser: Browsers.ubuntu('Desktop'),
       syncFullHistory: true,
@@ -55,19 +63,31 @@ export const whatsappTransportFactory: WhatsAppTransportFactory = {
         await callbacks.onEvents(events.slice(offset, offset + 1000));
       }
     };
+    // Protocol node tags only (no attributes beyond type/code), to see whether the
+    // phone's link_code_companion_reg / pair-success ever reach this socket.
+    for (const tag of ['CB:notification', 'CB:success', 'CB:failure', 'CB:stream:error', 'CB:iq,,pair-success', 'CB:iq,,pair-device', 'CB:ib']) {
+      (socket.ws as any).on?.(tag, (node: any) => {
+        const kind = String(node?.attrs?.type ?? node?.attrs?.code ?? node?.attrs?.reason ?? '').replace(/[^a-z0-9_:-]/gi, '').slice(0, 40);
+        const child = Array.isArray(node?.content) ? String(node.content[0]?.tag ?? '').replace(/[^a-z0-9_:-]/gi, '').slice(0, 40) : '';
+        diag(`node:${tag.replace('CB:', '')}${kind ? `:${kind}` : ''}${child ? `/${child}` : ''}`);
+      });
+    }
+    socket.ev.on('creds.update', update => { if ((update as any).me) diag('creds:me'); if ((update as any).registered) diag('creds:registered'); });
     socket.ev.on('creds.update', update => enqueue(() => callbacks.auth.saveCredentials(update as Record<string, unknown>)));
     socket.ev.on('connection.update', update => {
       // WebSocket open precedes Noise initialization. A QR update proves the
       // encrypted pair-device exchange is ready; retain only this boolean signal.
       if (update.qr || update.connection === 'open') pairingReadyResolve();
       if (update.connection === 'close') pairingReadyReject(new Error('WhatsApp closed before pairing was ready'));
+      if (update.qr) diag('qr');
       if (!update.connection) return;
       const status = (update.lastDisconnect?.error as any)?.output?.statusCode;
+      diag(`connection:${update.connection}${status ? `:${Number(status) || 'x'}` : ''}`);
       const terminal = status === DisconnectReason.loggedOut || status === DisconnectReason.badSession
         || status === DisconnectReason.connectionReplaced || status === DisconnectReason.multideviceMismatch
         || status === DisconnectReason.forbidden;
       enqueue(() => callbacks.onConnection({ state: update.connection!, loggedOut: status === DisconnectReason.loggedOut,
-        retryable: !stopped && !terminal }));
+        retryable: !stopped && !terminal, restartRequired: status === DisconnectReason.restartRequired }));
     });
     socket.ev.on('messages.upsert', ({ messages }) => enqueue(() => deliver(messages.flatMap(projectMessage))));
     socket.ev.on('messages.update', updates => enqueue(async () => {
@@ -111,6 +131,7 @@ export const whatsappTransportFactory: WhatsAppTransportFactory = {
           })]);
         } finally { if (timer !== undefined) clearTimeout(timer); }
         const code = await socket.requestPairingCode(phone);
+        diag(`code_issued:+${phone.slice(0, 2)}…${phone.slice(-2)}`);
         await pending;
         if (persistenceFailed) throw new Error('WhatsApp persistence failed');
         return code;

@@ -58,6 +58,12 @@ enum HandCommand {
     MenuStatus,
     /// Show local Hand service status as JSON.
     Status,
+    /// Keep this Mac available through idle sleep and screen lock (default: on).
+    KeepAwake {
+        /// Omit to inspect; on/off persists and applies without restarting the Hand.
+        #[arg(value_parser = ["on", "off"])]
+        setting: Option<String>,
+    },
     /// Start the local Hand service.
     Start,
     /// Stop the local Hand service.
@@ -66,6 +72,15 @@ enum HandCommand {
     Restart,
     /// Recover an interrupted coordinated CLI and device Hand update.
     Recover,
+    /// Ask the running macOS Hand service to request Screen Recording and
+    /// Accessibility consent for its own executable. You confirm in macOS.
+    Permissions {
+        /// Also open the matching System Settings pane for anything not yet allowed.
+        #[arg(long)]
+        open_settings: bool,
+    },
+    #[command(flatten)]
+    Registry(crate::hand_registry::Command),
 }
 
 pub(crate) fn ssh_target(value: &str) -> std::result::Result<String, String> {
@@ -82,28 +97,33 @@ pub(crate) fn ssh_target(value: &str) -> std::result::Result<String, String> {
 
 /// Automatic first launch is limited to the unprivileged macOS LaunchAgent.
 /// Hold the same lock as updates, then recheck ownership before any mutation.
-/// Existing or concurrently installed publishers always retain their identity.
+/// Existing or concurrently installed publishers always retain their identity
+/// and are never asked for consent; only an owner activated here is.
 async fn install_missing_user_service(executable: Option<PathBuf>) -> Result<()> {
     if !cfg!(target_os = "macos") {
         bail!(
             "Automatic Hand installation is unavailable on this platform. Run nanocodex setup to connect this computer."
         );
     }
-    let _lock = service_lock().await?;
-    let state = crate::hand_service::status().await?;
-    if (state.installed || state.loaded) && !crate::hand_service::is_pending().await? {
+    {
+        let _lock = service_lock().await?;
+        let state = crate::hand_service::status().await?;
+        if (state.installed || state.loaded) && !crate::hand_service::is_pending().await? {
+            crate::hand_menu_bar::ensure_with_warning(false).await;
+            return Ok(());
+        }
+        let account_file = nanocodex_cli_auth::saved_enrollment_account_file()?;
+        crate::hand_service::prepare(executable).await?;
+        crate::hand_service::connect_saved_login(
+            account_file,
+            nanocodex_cli_auth::managed_url_from_environment(None)?,
+            false,
+        )
+        .await?;
         crate::hand_menu_bar::ensure_with_warning(false).await;
-        return Ok(());
     }
-    let account_file = nanocodex_cli_auth::saved_enrollment_account_file()?;
-    crate::hand_service::prepare(executable).await?;
-    crate::hand_service::connect_saved_login(
-        account_file,
-        nanocodex_cli_auth::managed_url_from_environment(None)?,
-        false,
-    )
-    .await?;
-    crate::hand_menu_bar::ensure_with_warning(false).await;
+    // Output is discarded by the first-launch caller; macOS shows its own dialogs.
+    request_onboarding_permissions().await;
     Ok(())
 }
 
@@ -147,35 +167,40 @@ pub(crate) async fn prepare_default(executable: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-/// Activate only the owner selected by this successful saved account login.
+/// Activate only the owner selected by this successful saved account login,
+/// then request its OS permissions. Returns whether they are all allowed.
 pub(crate) async fn connect_saved_login(
     account_file: PathBuf,
     managed_url: String,
     credentials_changed: bool,
-) -> Result<()> {
+) -> Result<bool> {
     if cfg!(target_os = "linux") {
         let (origin, key) =
             nanocodex_cli_auth::saved_enrollment_credentials(&account_file, &managed_url)?;
-        return install_linux_with_login(Destination::Local, None, origin, key.as_str()).await;
+        install_linux_with_login(Destination::Local, None, origin, key.as_str()).await?;
+        return Ok(true);
     }
     if !cfg!(target_os = "macos") {
         bail!("Saved-login Hand activation is unavailable on this platform");
     }
-    let _lock = service_lock().await?;
-    crate::hand_service::connect_saved_login(account_file, managed_url, credentials_changed)
-        .await?;
-    crate::hand_menu_bar::ensure_with_warning(false).await;
+    {
+        let _lock = service_lock().await?;
+        crate::hand_service::connect_saved_login(account_file, managed_url, credentials_changed)
+            .await?;
+        crate::hand_menu_bar::ensure_with_warning(false).await;
+    }
     eprintln!("Hand service is installed and connected.");
-    Ok(())
+    Ok(request_onboarding_permissions().await)
 }
 
 /// One idempotent install entry point for guided setup and direct commands.
+/// Returns whether a local macOS Hand's OS permissions are all allowed.
 pub(crate) async fn install_default(
     target: Option<String>,
     port: Option<u16>,
     executable: Option<PathBuf>,
     account_file: Option<PathBuf>,
-) -> Result<()> {
+) -> Result<bool> {
     install_with(target, port, executable, account_file, None).await
 }
 
@@ -185,17 +210,20 @@ async fn install_with(
     executable: Option<PathBuf>,
     account_file: Option<PathBuf>,
     artifacts: Option<PathBuf>,
-) -> Result<()> {
+) -> Result<bool> {
     if target.is_none() && cfg!(target_os = "macos") {
         if artifacts.is_some() {
             bail!("--artifacts is only for a Linux Hand");
         }
-        let _lock = service_lock().await?;
-        eprintln!("Installing or repairing the local Hand service…");
-        crate::hand_service::ensure(executable, account_file).await?;
-        crate::hand_menu_bar::ensure_with_warning(true).await;
+        {
+            let _lock = service_lock().await?;
+            eprintln!("Installing or repairing the local Hand service…");
+            crate::hand_service::ensure(executable, account_file).await?;
+            crate::hand_menu_bar::ensure_with_warning(true).await;
+        }
         eprintln!("Hand service is installed and connected.");
-        return Ok(());
+        // Consent belongs to the connected launchd owner, after the lock.
+        return Ok(request_onboarding_permissions().await);
     }
     if target.is_none() && cfg!(target_os = "windows") {
         if artifacts.is_some() {
@@ -205,7 +233,8 @@ async fn install_with(
             bail!("--account-file is only for a local macOS Hand");
         }
         let _lock = crate::update::lock_service_operation()?;
-        return crate::windows_hand::ensure(executable).await;
+        crate::windows_hand::ensure(executable).await?;
+        return Ok(true);
     }
     if executable.is_some() || account_file.is_some() {
         bail!(
@@ -225,7 +254,8 @@ async fn install_with(
         },
         None => Destination::Local,
     };
-    install_linux(destination, artifacts).await
+    install_linux(destination, artifacts).await?;
+    Ok(true)
 }
 
 enum Destination {
@@ -433,7 +463,13 @@ async fn linux_service_action(action: &str) -> Result<()> {
 
 impl Hand {
     pub(crate) fn is_observation(&self) -> bool {
-        matches!(self.command, HandCommand::MenuStatus | HandCommand::Status)
+        matches!(
+            self.command,
+            HandCommand::MenuStatus
+                | HandCommand::KeepAwake { setting: None }
+                | HandCommand::Status
+                | HandCommand::Registry(crate::hand_registry::Command::List)
+        )
     }
 
     pub(crate) async fn run(self) -> Result<()> {
@@ -444,6 +480,13 @@ impl Hand {
                 | HandCommand::Status
                 | HandCommand::MenuStatus
                 | HandCommand::MenuBar
+                // Consent is requested inside the already-running service;
+                // its PID check, not the service lock, pins the target.
+                | HandCommand::Permissions { .. }
+                | HandCommand::KeepAwake { setting: None }
+                // Registry edits are account-side; they never touch this
+                // machine's service and must not queue behind its lock.
+                | HandCommand::Registry(_)
         ) {
             None
         } else {
@@ -464,7 +507,9 @@ impl Hand {
                 } else if if_missing {
                     install_missing_user_service(executable).await
                 } else {
-                    install_with(target, port, executable, account_file, artifacts).await
+                    install_with(target, port, executable, account_file, artifacts)
+                        .await
+                        .map(drop)
                 }
             }
             HandCommand::Connect {
@@ -480,10 +525,13 @@ impl Hand {
                     Some(origin) => origin,
                     None => nanocodex_cli_auth::managed_url_from_environment(None)?,
                 };
-                connect_saved_login(account_file, managed_url, credentials_changed).await
+                connect_saved_login(account_file, managed_url, credentials_changed)
+                    .await
+                    .map(drop)
             }
             HandCommand::MenuBar => crate::hand_menu_bar::show().await,
             HandCommand::MenuStatus => crate::hand_menu_status::run().await,
+            HandCommand::Registry(command) => command.run().await,
             HandCommand::Status => {
                 #[cfg(target_os = "linux")]
                 {
@@ -513,8 +561,177 @@ impl Hand {
             }
             HandCommand::Restart => crate::update::restart_hand().await,
             HandCommand::Recover => crate::update::recover_hand_update().await,
+            HandCommand::Permissions { open_settings } => request_permissions(open_settings).await,
+            HandCommand::KeepAwake { setting } => keep_awake(setting.as_deref()).await,
         }
     }
+}
+
+/// macOS permissions the Hand needs for live screen and input, by reply key.
+const PERMISSIONS: [(&str, &str, &str); 2] = [
+    (
+        "screenCapture",
+        "Screen & System Audio Recording (live screen)",
+        "Privacy_ScreenCapture",
+    ),
+    (
+        "input",
+        "Accessibility (mouse and keyboard control)",
+        "Privacy_Accessibility",
+    ),
+];
+
+/// Route the consent request to the process launchd is running. A request
+/// made by this CLI would be attributed to the terminal app, not the Hand.
+/// macOS skips already-allowed permissions and alone decides what is allowed.
+async fn ask_daemon_for_consent() -> Result<(u32, PathBuf, serde_json::Value)> {
+    let state = crate::hand_service::status().await?;
+    let (Some(pid), Some(executable)) = (state.pid, state.executable) else {
+        bail!("The Hand service is not running. Start it with `nanocodex hand start`, then retry.");
+    };
+    // The running daemon's own executable speaks its own IPC protocol.
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        Command::new(&executable)
+            .args(["__device-hand", "--request-permissions", "--daemon-pid"])
+            .arg(pid.to_string())
+            .arg("--daemon-executable")
+            .arg(&executable)
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .wrap_err("The running Hand did not answer the permission request")??;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let reason = stderr.lines().map(str::trim).find(|line| !line.is_empty());
+        bail!(
+            "The running Hand could not request permissions: {}\nIf it predates `nanocodex hand permissions`, update it with `nanocodex update` and retry.",
+            reason.unwrap_or("it exited without a reason")
+        );
+    }
+    let reply: serde_json::Value = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .rev()
+        .find_map(|line| serde_json::from_str(line).ok())
+        .ok_or_else(|| eyre::eyre!("The running Hand returned no permission status"))?;
+    for (key, ..) in PERMISSIONS {
+        if !reply["permissions"][key]["granted"].is_boolean()
+            || !reply["permissions"][key]["requested"].is_boolean()
+        {
+            bail!("The running Hand returned incomplete permission status; no grant was confirmed");
+        }
+    }
+    Ok((pid, executable, reply))
+}
+
+fn executable_name(executable: &std::path::Path) -> String {
+    executable.file_name().map_or_else(
+        || executable.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
+}
+
+/// Onboarding step after a connected macOS Hand is verified: request every
+/// required permission together so macOS shows its consent dialogs now, not at
+/// first screen or input use. Never undoes the connected service; returns
+/// whether macOS currently allows everything. Other platforms need no consent.
+pub(crate) async fn request_onboarding_permissions() -> bool {
+    if !cfg!(target_os = "macos") {
+        return true;
+    }
+    eprintln!(
+        "Requesting Screen Recording and Accessibility for this Hand… Confirm any macOS dialogs that appear; nothing is allowed until you do."
+    );
+    let (pid, executable, reply) = match ask_daemon_for_consent().await {
+        Ok(consent) => consent,
+        Err(error) => {
+            eprintln!(
+                "Warning: the Hand is connected, but its macOS permissions could not be requested: {error:#}\nAllow them with `nanocodex hand permissions --open-settings`."
+            );
+            return false;
+        }
+    };
+    let name = executable_name(&executable);
+    let pending: Vec<&str> = PERMISSIONS
+        .iter()
+        .filter(|(key, ..)| reply["permissions"][key]["granted"] != true)
+        .map(|(_, label, _)| *label)
+        .collect();
+    if pending.is_empty() {
+        eprintln!(
+            "✓ macOS allows the Hand ({name}, PID {pid}) Screen & System Audio Recording and Accessibility"
+        );
+        return true;
+    }
+    eprintln!(
+        "Action needed: allow {} for \"{name}\" in the macOS prompts or System Settings > Privacy & Security, then run `nanocodex hand restart`.\nLive screen and input stay unavailable until then. If no prompt appeared: nanocodex hand permissions --open-settings",
+        pending.join(" and ")
+    );
+    false
+}
+
+/// Explicit `hand permissions`: one request per invocation with full status.
+async fn request_permissions(open_settings: bool) -> Result<()> {
+    if !cfg!(target_os = "macos") {
+        bail!("Hand permissions are requested only on macOS; this platform needs no consent step");
+    }
+    let (pid, executable, reply) = ask_daemon_for_consent().await?;
+    println!(
+        "Asked the running Hand service (PID {pid}, {}) to request macOS permissions for itself.",
+        executable.display()
+    );
+    let mut pending = Vec::new();
+    for (key, label, pane) in PERMISSIONS {
+        let permission = &reply["permissions"][key];
+        let status = match (
+            permission["granted"].as_bool(),
+            permission["requested"].as_bool(),
+        ) {
+            (Some(true), Some(false)) => "already allowed",
+            (Some(true), _) => "allowed",
+            (Some(false), _) => {
+                pending.push(pane);
+                "waiting for you to allow it in macOS"
+            }
+            _ => "not reported by this Hand",
+        };
+        println!("  {label}: {status}");
+    }
+    if pending.is_empty() {
+        println!("If live screen is still unavailable, restart the Hand: nanocodex hand restart");
+        return Ok(());
+    }
+    let name = executable_name(&executable);
+    println!(
+        "Nothing is allowed until you confirm it. macOS shows its prompt only once per Hand executable; if none appeared, enable \"{name}\" in System Settings > Privacy & Security{}.",
+        if open_settings {
+            ""
+        } else {
+            " (or rerun with --open-settings)"
+        }
+    );
+    println!(
+        "After allowing, restart the Hand so it uses the new permission: nanocodex hand restart"
+    );
+    if open_settings {
+        for pane in pending {
+            let url = format!("x-apple.systempreferences:com.apple.preference.security?{pane}");
+            let opened = Command::new("/usr/bin/open")
+                .arg(&url)
+                .stdin(Stdio::null())
+                .status()
+                .await
+                .is_ok_and(|status| status.success());
+            if !opened {
+                eprintln!(
+                    "Could not open System Settings ({url}); open Privacy & Security manually."
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -577,5 +794,62 @@ mod tests {
             ])
             .is_err()
         );
+    }
+}
+
+async fn keep_awake(setting: Option<&str>) -> Result<()> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = setting;
+        bail!("Hand keep-awake is currently available on macOS");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use crate::hand_keep_awake as preference;
+        let home =
+            PathBuf::from(std::env::var_os("HOME").ok_or_else(|| eyre::eyre!("HOME is unset"))?);
+        if !home.is_absolute() {
+            bail!("HOME must be absolute");
+        }
+        let owner = crate::hand_service::status().await?;
+        let before = preference::snapshot(&home, owner.pid)?;
+        if let Some(setting) = setting {
+            let enabled = setting == "on";
+            if owner.pid.is_some() && before["supported_daemon"] != true {
+                bail!(
+                    "The running Hand has not reported keep-awake support. Update the Hand and retry; no setting was changed."
+                );
+            }
+            if enabled && before["environment_override"] == true {
+                bail!(
+                    "The Hand service has {}=0. Remove that service override and restart it before enabling keep-awake; no setting was changed.",
+                    preference::ENVIRONMENT
+                );
+            }
+            preference::write(
+                &preference::setting_path(&home),
+                &json!({"enabled": enabled}),
+            )?;
+            if owner.pid.is_some() {
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+                loop {
+                    let observed = preference::snapshot(&home, owner.pid)?;
+                    if observed["active"] == enabled && observed["error"].is_null() {
+                        break;
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        bail!(
+                            "Keep-awake preference was saved, but the running Hand has not confirmed applying it. Inspect with `nanocodex hand keep-awake`; do not assume its assertion changed."
+                        );
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
+        }
+        // Re-read launchd after a concurrent service change; an old receipt
+        // must never claim the replacement owner's assertion is active.
+        let owner = crate::hand_service::status().await?;
+        println!("{}", preference::snapshot(&home, owner.pid)?);
+        Ok(())
     }
 }

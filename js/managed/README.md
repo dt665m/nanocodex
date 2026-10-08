@@ -209,10 +209,44 @@ would break already-created sessions.
 In production, the private `NANOCODEX_SESSION_MODEL_EGRESS` binding targets
 egress's `SessionModelEgress` entrypoint. New-strategy Sessions validate retained
 ownership locally for each model WebSocket connection, reconnect, and HTTPS request, avoiding
-a broker callback into the originating Session. This binding is not exposed to
-tools. Credential selection remains live in the broker. Without the optional
+a broker callback into the originating Session. Apart from the Session's own
+managed web search and image generation/editing tools, which use the same model
+credential and send exact `POST` `/v1/search`, `/v1/images/generations`, and
+`/v1/images/edits` requests through it with the same per-request owner check
+(and without placement), this binding is not exposed to tools. Roll that tool
+routing out only after egress whose `SessionModelEgress` accepts those routes is
+live; older egress rejects them with 403. Credential selection remains live in the broker. Without the optional
 binding, the transport retains the usual broker ownership lookup; legacy
 directory subjects retain their existing authority.
+
+The private `NANOCODEX_SESSION_TOOL_EGRESS` binding targets egress's
+`SessionToolEgress` entrypoint for the Session's own tool traffic: Just Bash
+HTTP/curl, connector and MCP requests, Vault requests, and SSH. The Session
+removes any caller-supplied `x-nanocodex-session-tool-owner` header and sets it
+from local retained ownership on every request; unavailable ownership fails
+closed without a callback. Without this binding, egress resolves the subject by
+calling `ManagedAgentOwnership`, which calls back into the same Session. In a
+Durable Object the newest incoming request supplies the channel for later
+subrequests, and turns run under `waitUntil`, so each callback leaves the rest of
+the turn about three Worker invocations deeper. A burst of tool requests can then
+exhaust the Workers request-chain depth limit and fail brain storage, tools, and
+Claude/Responses model calls until a shallower request (alarm or client) arrives.
+Roll out in two releases. The production pipeline
+(`scripts/cloudflare/deploy-workers.mjs`) deploys egress in its `broker` phase
+after managed, so the first release ships egress `SessionToolEgress` and the
+managed code with the binding absent from `wrangler.jsonc`. Add the
+`NANOCODEX_SESSION_TOOL_EGRESS` binding only in a later release, after egress
+exporting `SessionToolEgress` is live; a binding to a missing entrypoint would
+fail all session_v1 tool traffic. Residual callbacks remain by design for the
+private browser credential routes (`browser-vault.internal` `/v1/login`,
+`/v1/totp`, `/v1/fields`, `/v1/save`): they are human/private-browser steps,
+not bursty tool traffic, and `SessionToolEgress` rejects those routes. Owner-path
+routes (for example Gmail push cleanup under `/users/{owner}/...`) never perform
+a Session callback. Without the binding (or for directory-strategy
+subjects) tool traffic keeps the general broker and its authoritative
+ownership callback, which still fails closed on denial; with the binding, a
+request for the Session's own subject never falls back to that callback, and
+unavailable local ownership rejects the request before any binding call.
 
 Hosted Responses requests can fall back from WebSockets to streaming HTTPS through
 that same private binding. Compaction permits the initial request plus two retries

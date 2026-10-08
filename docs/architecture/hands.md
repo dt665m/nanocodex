@@ -28,23 +28,65 @@ closing the menu. `nanocodex hand menu-bar` installs, repairs, or reopens the ic
 See the [menu-bar companion](../../macos/HandMenuBar/README.md) for build and lifecycle
 details.
 
-The account-only `GET /v1/account/hands/inventory` combines retained account
-registrations with workspace publishers registered when their sessions hydrate
-or update their catalogs. Transient publication failures retry up to three times
-with a bounded deadline, without reconnecting the Hand. It excludes
-Connect-scoped routes and returns only
-names, IDs, kind and connection state. Discovery has a four-second deadline and
-eight concurrent workspace reads. Unavailable sources retain known identities
-as unknown. Definitively disconnected workspace publishers disappear; owner-verified
-deleted-session tombstones also reclaim their registry slots. Account-owned
-offline devices remain retained. Session publications are serialized, and polling
-prunes only the registry revision it read, protecting concurrent reconnects.
-The 64-session bound applies to retained live or uncertain sessions; overflow
-remains durably partial because rejected publishers may not have republished.
-A full registry marks coverage partial rather than
-silently presenting an incomplete list as complete. Older workspace sessions
-join this registry when next opened. Existing `/v1/account/hands` consumers
-retain their live-only contract; screen advertisements remain a separate source.
+The account-only `GET /v1/account/hands/inventory` combines live and retained
+account registrations. It excludes thread tool hosts and Connect-scoped
+routes and returns only names, IDs, kind and connection state. Discovery has a
+four-second deadline. Unavailable account sources retain known identities as
+unknown and mark the inventory incomplete; account-owned offline devices remain
+retained. The obsolete workspace registry and its overflow marker are removed
+when an account broker starts. The response retains the legacy
+`known_account_and_workspace` coverage token for released clients, while its
+data contains only account Hands. Existing `/v1/account/hands` consumers retain
+their live-only contract; screen advertisements remain a separate source.
+
+Both `nanocodex hand` and `nanocodex2 hand` expose `list`, `forget <id>`, and
+`prune`. Forget removes account routing, retaining runtime tombstones; it refuses
+connected or uncertain Hands unless `--force` is supplied. Prune removes only
+Hands confirmed offline and rechecks them before removal. The matching SDK
+methods are `client.hand.list()`, `client.hand.forget(id, { force: true })`, and
+`client.hand.prune()`. Mutations require direct account `agents:write` and
+`tools:use`; Connect grants cannot remove Hands.
+
+Run `pnpm --filter nanocodex-managed-service test:hand-inventory` for the real
+HTTP/WebSocket journey covering legacy-index retirement, account isolation,
+authorization, offline retention, and migration rejection of thread-scoped
+native catalogs. Each run writes its request and catalog evidence under ignored
+`output/hand-inventory-journey/`.
+
+### One account Hand per computer
+
+Physical computers attach only to the account broker at
+`/v1/account/tool-host`; that one Hand provides shell, code, screen and CUA to
+every thread. Thread-scoped workspace Hands are retired. A thread tool host
+(`/v1/agents/:id/tool-host`) that publishes machine metadata or a canonical
+machine primitive (`exec_command`, `write_stdin`, `preview`,
+`native_secure_input`, `validate_app`, `mcp__cua_repl__*`) is refused before
+publication with `catalog_contract_mismatch` carrying
+`hand_migration_required`. Thread tool hosts may still publish other tools
+(SDK `toolsTarget(agentId)` MCP/app tools). Leased VM attachments remain
+thread-scoped: their fixed `vm-host:<allocation>:<epoch>` route is injected by
+the Worker only after verifying the server-issued lease grant, so machine kind
+or metadata alone never qualifies.
+
+Routes retained from older services are not deleted. They leave discovery,
+inventory, file reads, secure input and new namespace routing even while
+connected. The exact runtime that still owns a durable namespace process or an
+unsettled admitted call may reconnect solely to finish that work: `write_stdin`
+reaches it through the process's runtime-pinned key, and no other runtime or
+reused machine ID matches. Once that work settles, the runtime's reconnect is
+refused like any new thread-scoped catalog. The desktop runtime publishes only
+its account Hand and drops saved thread-scoped Hand records.
+
+Run `pnpm --filter nanocodex-managed-service test:hand-retirement` for the
+upgrade journey: an older service build admits a thread-scoped Hand and a
+process, the candidate restarts on the same durable storage, hides that Hand,
+finishes the pinned process, refuses a fresh thread-scoped native publisher and
+admits a non-native thread catalog. Set `NANOCODEX_RETIREMENT_BASELINE=<ref>`
+to choose the older build and `NANOCODEX_RETIREMENT_CANDIDATE=<ref>` to replay
+another revision. This upgrade fixture requires Git history containing the
+baseline commit `f8a2b451dabba74cff003d6ec54d32cb06fd113b`; shallow checkouts
+must fetch that commit before running it. Evidence is written under ignored
+`output/hand-retirement-journey/`.
 
 The broker durably claims each call before sending it once. The daemon owns execution; a socket carries requests and replies. Each admitted source call has one durable transport command ID. The living Hand keeps its running task or immutable terminal receipt until the broker records the result and acknowledges it.
 
@@ -63,7 +105,27 @@ The real SQLite/WebSocket/PTY recovery journey runs with `pnpm --filter nanocode
 
 On macOS, the standalone daemon prevents idle system sleep by default using `/usr/bin/caffeinate -i -w <daemon PID>`. The assertion starts after exclusive publisher ownership and state opening, survives reconnects and client disconnects, and ends when the daemon shuts down. It does not keep the display awake or bypass lid-close sleep. If the helper cannot start, the daemon logs a warning and continues without sleep inhibition. Linux and Windows do not acquire this assertion.
 
-Set `NANOCODEX_HAND_KEEP_AWAKE=0` in the standalone service environment to opt out (for launchd, use its plist `EnvironmentVariables` dictionary and reload the service when convenient). An environment variable in an observing terminal does not change an already running service. The macOS app’s `keepMacAwake` preference controls its own ProcessInfo assertion separately; it does not configure the standalone daemon.
+Use **Keep Mac Awake** in the standalone Hand menu, or `nanocodex hand keep-awake on|off`.
+Omit the value to inspect JSON containing the saved `configured` preference,
+effective `enabled` value and `active` daemon assertion (null if unconfirmed).
+The setting defaults to on, persists in `~/.nanocodex/hand-keep-awake.json`, and
+applies within one second without restarting the service or interrupting work.
+The daemon owns its watcher through reconnects and releases the assertion on
+shutdown. Screen locking and display sleep work normally; keeping awake uses
+more battery. This does not unlock the Mac or permit interaction with protected
+login screens.
+
+The existing `NANOCODEX_HAND_KEEP_AWAKE=0` service-environment opt-out remains
+an override. The menu shows it and disables its checkbox; remove that override
+and restart the service to resume control through the persistent setting. An
+environment variable in an observing terminal does not change a running service.
+
+Run `node bin/nanocodex/tests/hand_keep_awake_e2e.mjs /absolute/path/to/nanocodex`
+on a running updated macOS Hand to verify off/on, persisted settings, unchanged
+owner PID, and the actual macOS idle-system assertion. The journey restores the
+original preference and never locks, stops, or restarts the Hand.
+
+The macOS app’s `keepMacAwake` preference controls its own ProcessInfo assertion separately; it does not configure the standalone daemon.
 
 ## Install
 
@@ -109,6 +171,30 @@ sudo python3 scripts/install-hand-service.py --user "$USER" --binary /path/to/na
 ```
 
 The installer creates one machine-wide launchd service on macOS or systemd service on Linux, running as that non-root user. It uses the user's saved account login and existing `vm.json` configuration. It neither copies credentials into the service definition nor requires a terminal or app to stay open. Host tools work without a GUI; desktop capture needs the platform's GUI session and permissions.
+
+On macOS the Hand needs Screen & System Audio Recording (live screen) and
+Accessibility (mouse and keyboard input). Installation requests both together as
+soon as the activated owner is verified connected, instead of at first screen or
+input use: `nanocodex hand install`, `nanocodex setup`, `nanocodex hand connect`
+(also run after a successful CLI/TUI login), and the first-launch
+`hand install --if-missing` that activates a new owner. A dormant
+`hand install --prepare` service has no running process and asks nothing until a
+login activates it. An existing owner returned by `--if-missing`, ordinary
+daemon startup, status and workspace attachment never request consent.
+
+The request runs in the capturing process, with its PID verified against launchd
+and the local socket peer; macOS shows its own dialogs and grants access only
+after user consent. Already-allowed permissions are not requested again. A
+pending or failed request never undoes the installed, connected service: setup
+reports that it is waiting for permissions rather than complete, with the
+recovery command. `nanocodex hand permissions` repeats the request and reports
+pending and granted permissions separately; `--open-settings` opens the matching
+privacy panes. Restart the Hand after granting access. Unsigned or ad-hoc signed
+local builds can require consent again when their executable identity changes.
+`nanocodex setup --skip-computer` skips only the optional upstream Computer Use
+app, which is a separately signed macOS app with its own consent on first use;
+the Hand's own permissions are still requested. `--skip-hand` requests none.
+
 
 For a custom login, pass `--managed-url https://your-server` and `--account-file /absolute/path/to/nanocodex-account.json` to the installer. These select the existing login without copying its secret.
 

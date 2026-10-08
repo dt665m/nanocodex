@@ -19,9 +19,12 @@ mod eval;
 )))]
 #[path = "eval_unsupported.rs"]
 mod eval;
+#[cfg(target_os = "macos")]
+mod hand_keep_awake;
 mod hand_login;
 mod hand_menu_bar;
 mod hand_menu_status;
+mod hand_registry;
 mod hand_service;
 mod hand_setup;
 mod install;
