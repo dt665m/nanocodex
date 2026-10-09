@@ -37,7 +37,7 @@ scripts.MIXED = `
 scripts.RECONNECT = `
   text(await tools.exec_command({cmd:"printf PINNED_LOCAL",workdir:"/${localMachine}",shell:"/bin/sh",login:false}));
   text(await tools.exec_command({cmd:"printf DISCOVERED_ACCOUNT",workdir:"/${machine}",shell:"/bin/sh",login:false}));
-  try { const result=await tools.exec_command({cmd:"printf WRONG_GENERATION",workdir:"/${localMachine}",shell:"/bin/sh",login:false}); text(result); }
+  try { const result=await tools.exec_command({cmd:"printf REFRESHED_COMMAND",workdir:"/${localMachine}",shell:"/bin/sh",login:false}); text(result); }
   catch(error) { text({stale_route:error.message}); }
 `;
 scripts.RECOVER = scripts.LOCAL;
@@ -96,6 +96,8 @@ export class FixturePool extends DurableObject {
 export class FixtureSession extends DurableAgentSession {
   async fetch(request) {
     if(new URL(request.url).pathname==='/__seed') {
+      // Fresh sessions defer schema setup to their first production handler.
+      await (await super.fetch(new Request('https://fixture.internal/__initialize'))).body?.cancel();
       this.ctx.storage.sql.exec("INSERT OR IGNORE INTO session_state(singleton,session_id,owner_id,organization_id,team_id,authorization_epoch,public_origin,runtime_profile,last_active) VALUES(1,?,?,?,?,1,'https://fixture.internal/','managed',?)",'${thread}','${owner}','${organization}','${team}',Date.now());
       this.ctx.storage.sql.exec("INSERT OR IGNORE INTO managed_configuration VALUES(1,?)",JSON.stringify({environment:{files:[],skills:[],setup_commands:[],network:{access:'enabled'}}}));
       this.ctx.storage.sql.exec("UPDATE managed_agent_settings SET model='gpt-6.1-sol',thinking='low'");
@@ -245,8 +247,13 @@ test("fresh shipped Code Mode cells prepare selected routes without changing dis
     await localAttachment.close();localAttachment=connectLocal();assert.equal((await localAttachment.connect()).connected,true);
     assert.equal((await request("/account-tools/__fixture",{method:"POST",body:JSON.stringify({delay_ms:0})})).status,204);
     const reconnected=await reconnectTurn;
-    assert.match(JSON.stringify(reconnected.turn),/stale_route/);
-    assert.doesNotMatch(JSON.stringify(reconnected.turn),/WRONG_GENERATION/);
+    // This later command was never admitted on the old runtime. Recovery may
+    // refresh the same physical Hand, while admitted commands/processes stay pinned.
+    assert.match(JSON.stringify(reconnected.turn),/REFRESHED_COMMAND/);
+    assert.doesNotMatch(JSON.stringify(reconnected.turn),/stale_route/);
+    assert.equal(wire.filter(row=>row.direction==='local-broker' && row.frame.type==='call'
+      && row.frame.input?.cmd==='printf REFRESHED_COMMAND').length,1,
+      'a fresh command through a stale cell executes exactly once on the same Hand');
     const recovered=await runTurn("RECOVER");assert.match(JSON.stringify(recovered.turn),/LOCAL_INDEPENDENT/);
     }
     const excluded=await runTurn("EXCLUDED");

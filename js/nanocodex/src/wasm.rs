@@ -167,9 +167,6 @@ extern "C" {
     #[wasm_bindgen(js_namespace = ["globalThis", "nanocodexHost"], js_name = cancelCode)]
     fn host_cancel_code(session_id: &str);
 
-    #[wasm_bindgen(js_namespace = ["globalThis", "nanocodexHost"], js_name = toolMode)]
-    fn host_tool_mode(definition_host_id: u32, session_id: &str) -> String;
-
     #[wasm_bindgen(catch, js_namespace = ["globalThis", "nanocodexHost"], js_name = toolDefinitions)]
     fn host_tool_definitions(definition_host_id: u32, session_id: &str) -> Result<String, JsValue>;
 
@@ -249,11 +246,15 @@ extern "C" {
         host_context_ref: Option<&str>,
     ) -> Result<(), JsValue>;
 
+    #[wasm_bindgen(catch, js_namespace = ["globalThis", "nanocodexHost"], js_name = subagentStatus)]
+    fn host_subagent_status(session_id: &str, status_json: &str) -> Result<(), JsValue>;
+
     #[wasm_bindgen(catch, js_namespace = ["globalThis", "nanocodexHost"], js_name = releaseSubagentSession)]
     fn host_release_subagent_session(
         host_definition_id: u32,
         root_session_id: &str,
         session_id: &str,
+        detach: bool,
     ) -> Result<(), JsValue>;
 }
 
@@ -319,9 +320,12 @@ impl nanocodex_subagents::SpawnRouter for JavaScriptSpawnRouter {
         }
         let promise = host_route_subagent(self.host_definition_id, &request.to_string())
             .map_err(|_| std::io::Error::other("subagent routing host rejected request"))?;
-        let value = JsFuture::from(promise)
-            .await
-            .map_err(|_| std::io::Error::other("subagent routing failed or was not authorized"))?;
+        let value = JsFuture::from(promise).await.map_err(|error| {
+            std::io::Error::other(format!(
+                "subagent routing failed or was not authorized: {}",
+                host_error_message(&error)
+            ))
+        })?;
         let route: JavaScriptSpawnRoute = serde_json::from_str(
             &value
                 .as_string()
@@ -747,11 +751,7 @@ impl JavaScriptCodeModeHost {
     fn new(definition_host_id: u32) -> Self {
         Self {
             definition_host_id,
-            mode: match host_tool_mode(definition_host_id, "").as_str() {
-                "direct" => EmbeddedToolMode::Direct,
-                "code-only" => EmbeddedToolMode::CodeOnly,
-                _ => EmbeddedToolMode::Code,
-            },
+            mode: EmbeddedToolMode::CodeOnly,
         }
     }
 }
@@ -1602,6 +1602,7 @@ struct WasmSubagents {
     hosts: Arc<Mutex<HashMap<String, u32>>>,
     sessions: Rc<RefCell<HashMap<(String, SubagentId), String>>>,
     event_forwarders: Rc<Cell<usize>>,
+    flush_updates: tokio::sync::mpsc::UnboundedSender<oneshot::Sender<()>>,
 }
 
 struct WasmBatchParentCleanup {
@@ -1654,6 +1655,7 @@ impl WasmSubagents {
     ) -> Self {
         let sessions = Rc::new(RefCell::new(HashMap::new()));
         let event_forwarders = Rc::new(Cell::new(0));
+        let (flush_updates, flush_requests) = tokio::sync::mpsc::unbounded_channel();
         forward_subagent_updates(
             host_definition_id,
             Arc::downgrade(&registry),
@@ -1662,6 +1664,7 @@ impl WasmSubagents {
             Rc::clone(&event_forwarders),
             Arc::clone(&parents),
             Arc::clone(&hosts),
+            flush_requests,
         );
         Self {
             host_definition_id,
@@ -1671,6 +1674,7 @@ impl WasmSubagents {
             parents,
             sessions,
             event_forwarders,
+            flush_updates,
         }
     }
 
@@ -1700,8 +1704,20 @@ impl WasmSubagents {
         });
     }
 
+    /// Tears down a root's live subtree. This is a runtime shutdown, not a
+    /// close: children detach from the host and stay restorable from the
+    /// root's durable task-tree journal with their bindings intact.
     async fn close_all(&self, root_session_id: &str) -> std::io::Result<()> {
         self.control.close_all(root_session_id).await?;
+        // All close updates are now queued. Preserve their individual release
+        // reasons before fallback teardown removes any remaining host bindings.
+        let (complete, completed) = oneshot::channel();
+        self.flush_updates.send(complete).map_err(|_| {
+            std::io::Error::other("subagent update forwarding stopped before shutdown")
+        })?;
+        completed.await.map_err(|_| {
+            std::io::Error::other("subagent update forwarding stopped during shutdown")
+        })?;
         release_subagent_scope(
             self.host_definition_id,
             &self.sessions,
@@ -3363,9 +3379,25 @@ fn forward_subagent_updates(
     event_forwarders: Rc<Cell<usize>>,
     parents: Arc<Mutex<HashMap<String, AgentHandle>>>,
     hosts: Arc<Mutex<HashMap<String, u32>>>,
+    mut flush_requests: tokio::sync::mpsc::UnboundedReceiver<oneshot::Sender<()>>,
 ) {
     spawn_local(async move {
-        while let Some(scoped) = updates.recv().await {
+        while let Some(scoped) = std::future::poll_fn(|cx| {
+            // Prioritize queued updates. Acknowledging only an empty queue also
+            // waits for any earlier asynchronous binding operation to finish.
+            match updates.poll_recv(cx) {
+                std::task::Poll::Ready(update) => std::task::Poll::Ready(update),
+                std::task::Poll::Pending => {
+                    while let std::task::Poll::Ready(Some(complete)) = flush_requests.poll_recv(cx)
+                    {
+                        let _ = complete.send(());
+                    }
+                    std::task::Poll::Pending
+                }
+            }
+        })
+        .await
+        {
             let root_session_id = scoped.root_session_id;
             match scoped.update {
                 SubagentUpdate::Added(descriptor) => {
@@ -3413,6 +3445,7 @@ fn forward_subagent_updates(
                     let session_id = sessions.borrow_mut().remove(&(root_session_id.clone(), id));
                     if let Some(session_id) = session_id {
                         remove_subagent_parent(&parents, &session_id);
+                        // Only an explicit close permanently releases a child.
                         if let Err(error) = host_release_subagent_session(
                             hosts
                                 .lock()
@@ -3421,12 +3454,25 @@ fn forward_subagent_updates(
                                 .unwrap_or(host_definition_id),
                             &root_session_id,
                             &session_id,
+                            scoped.detach,
                         ) {
                             report_subagent_host_error("releasing a subagent session", &error);
                         }
                     }
                 }
-                SubagentUpdate::Status { .. } | SubagentUpdate::Message(_) => {}
+                SubagentUpdate::Status { id, status } => {
+                    let session_id = sessions
+                        .borrow()
+                        .get(&(root_session_id.clone(), id))
+                        .cloned();
+                    if let Some(session_id) = session_id
+                        && let Ok(encoded) = serde_json::to_string(&status)
+                        && let Err(error) = host_subagent_status(&session_id, &encoded)
+                    {
+                        report_subagent_host_error("forwarding a subagent status", &error);
+                    }
+                }
+                SubagentUpdate::Message(_) => {}
             }
         }
         let session_ids = sessions
@@ -3434,6 +3480,7 @@ fn forward_subagent_updates(
             .drain()
             .map(|((root_session_id, _), session_id)| (root_session_id, session_id))
             .collect::<Vec<_>>();
+        // The registry is gone; its durable children only detach.
         for (root_session_id, session_id) in session_ids {
             remove_subagent_parent(&parents, &session_id);
             if let Err(error) = host_release_subagent_session(
@@ -3444,6 +3491,7 @@ fn forward_subagent_updates(
                     .unwrap_or(host_definition_id),
                 &root_session_id,
                 &session_id,
+                true,
             ) {
                 report_subagent_host_error("releasing a subagent session", &error);
             }
@@ -3507,6 +3555,7 @@ fn release_subagent_scope(
                 .unwrap_or(host_definition_id),
             root_session_id,
             &session_id,
+            true,
         ) {
             report_subagent_host_error("releasing a subagent session", &error);
         }
@@ -3698,7 +3747,8 @@ impl WasmSubagents {
         let agents = subagents
             .registry
             .directory(session_id, task.include_completed, task.include_self)
-            .await;
+            .await
+            .map_err(js_error)?;
         serde_json::to_string(&WasmSubagentDirectoryReport { agents }).map_err(js_error)
     }
     pub async fn send_subagent_message(

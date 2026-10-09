@@ -1,6 +1,6 @@
 import { gatewayAvailability, type GatewaySecrets } from "./gateway-runtime";
 import { fetchResponseWithDeadline } from "./deadline";
-import { DEFAULT_AGENT_SETTINGS, type ManagedAgentSettings } from "./agent-settings";
+import { DEFAULT_AGENT_SETTINGS, DEFAULT_OPENAI_AGENT_SETTINGS, type ManagedAgentSettings } from "./agent-settings";
 
 type ModelRuntime = GatewaySecrets & { NANOCODEX_THREAD_ROUTING?: string };
 const openAIModels = [["gpt-6-astra", "GPT-6 Astra"], ["gpt-6.1-sol", "GPT-6.1 Sol"], ["gpt-6-luna", "GPT-6 Luna"]] as const;
@@ -15,31 +15,74 @@ async function credentialStatus(broker: Fetcher, userId: string) {
     });
 }
 
-/** Choose the preferred default without enumerating an unrelated provider.
- * Status is always live; fallback reuses it only within this request. */
-export async function selectDefaultManagedModel(broker: Fetcher, userId: string, runtime: ModelRuntime = {}): Promise<{
+/** Choose the preferred default from the live, account-authorized catalog.
+ * Claude Opus 5.5 is preferred; callers that cannot run Claude (Connect grants,
+ * Responses-only configuration) pass `claude: false` for the OpenAI fallback.
+ * Status is always live; the returned catalog is reused only within this request. */
+export async function selectDefaultManagedModel(broker: Fetcher, userId: string, runtime: ModelRuntime = {}, options: { claude?: boolean } = {}): Promise<{
   default_model: ManagedAgentSettings["model"] | null;
   catalog?: Awaited<ReturnType<typeof availableManagedModels>>;
 }> {
   const status = await credentialStatus(broker, userId);
-  if ((connected(status.chatgpt) || connected(status.openai))
-    && openAIModels.some(([id]) => id === DEFAULT_AGENT_SETTINGS.model)) {
-    return { default_model: DEFAULT_AGENT_SETTINGS.model };
+  if ((options.claude === false || !connected(status.claude))
+    && (connected(status.chatgpt) || connected(status.openai))) {
+    return { default_model: DEFAULT_OPENAI_AGENT_SETTINGS.model };
   }
+  if (options.claude === false) return { default_model: null };
   const catalog = await modelsFromStatus(broker, userId, runtime, status);
   return { default_model: catalog.default_model, catalog };
 }
 
+/** Initial settings for a selected default model: its own initial effort. */
+export function defaultSettingsForModel(model: ManagedAgentSettings["model"]): ManagedAgentSettings {
+  return model === DEFAULT_AGENT_SETTINGS.model ? DEFAULT_AGENT_SETTINGS
+    : model === DEFAULT_OPENAI_AGENT_SETTINGS.model ? DEFAULT_OPENAI_AGENT_SETTINGS
+      : { ...DEFAULT_OPENAI_AGENT_SETTINGS, model };
+}
+
 /** Catalog admission comes from the account broker, never a client label. */
+/** Native Claude models children may use: every model the Rust Claude harness supports, gated by the account's live grant. */
+const NATIVE_CLAUDE_CHILD_MODELS = ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-1", "claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"] as const;
+export async function availableClaudeChildModels(broker: Fetcher, userId: string): Promise<string[]> {
+  if (!connected((await credentialStatus(broker, userId)).claude)) return [];
+  const allowed = await fetchResponseWithDeadline(broker,
+    `https://broker.internal/users/${encodeURIComponent(userId)}/credentials/claude/models`, {}, 15_000,
+    "Claude model availability", async response => {
+      if (!response.ok) throw new Error("Claude model catalog is unavailable");
+      return response.json<{ models: Array<{ id: string }> }>();
+    });
+  if (!Array.isArray(allowed.models)) throw new Error("invalid Claude model catalog");
+  // Provider IDs may carry a date suffix (claude-haiku-4-5-20251001).
+  return NATIVE_CLAUDE_CHILD_MODELS.filter(id => allowed.models.some(model => model.id === id || model.id.startsWith(`${id}-`)));
+}
+
 export async function availableManagedModels(broker: Fetcher, userId: string, runtime: ModelRuntime = {}) {
   return modelsFromStatus(broker, userId, runtime, await credentialStatus(broker, userId));
+}
+
+/**
+ * Creation-time check for one explicitly requested Claude model. Skips the
+ * full credential status read (which wakes the Claude WASM state machine);
+ * the egress listing resolves the credential itself and is isolate-cached.
+ */
+export async function claudeModelAvailable(broker: Fetcher, userId: string, model: string): Promise<boolean> {
+  return fetchResponseWithDeadline(broker,
+    `https://broker.internal/users/${encodeURIComponent(userId)}/credentials/claude/models`,
+    { headers: { "x-nanocodex-catalog-cache": "allow" } }, 15_000,
+    "Claude model availability", async response => {
+      if (response.status === 409) { await response.body?.cancel(); return false; }
+      if (!response.ok) throw new Error("Claude model catalog is unavailable");
+      const allowed = await response.json<{ models: Array<{ id: string }> }>();
+      if (!Array.isArray(allowed.models)) throw new Error("invalid Claude model catalog");
+      return allowed.models.some(entry => entry.id === model);
+    });
 }
 
 async function modelsFromStatus(broker: Fetcher, userId: string, runtime: ModelRuntime, status: Record<string, unknown>) {
   const data: Array<{ id: ManagedAgentSettings["model"]; name: string; provider: string; thinking: string[]; fast_mode: boolean; reasoning_modes: string[] }> = [];
   if (connected(status.chatgpt) || connected(status.openai)) {
     for (const [id, name] of openAIModels)
-      data.push({ id, name, provider: "openai", thinking: [...(id === "gpt-6-luna" ? ["none"] : []), "low", "medium", "high", "xhigh", "max"], fast_mode: true, reasoning_modes: id === "gpt-6-astra" ? ["standard"] : ["standard", "pro"] });
+      data.push({ id, name, provider: "openai", thinking: [...(id === "gpt-6-luna" ? ["none"] : []), "low", "medium", "high", "xhigh", "max"], fast_mode: true, reasoning_modes: ["standard", "pro"] });
   }
   // Provider access is independent from credentials being connected. The public
   // catalog is the intersection of that live grant and this runtime's verified
@@ -73,5 +116,7 @@ async function modelsFromStatus(broker: Fetcher, userId: string, runtime: ModelR
     }
     } catch { claudeUnavailable = true; if (!data.length) throw new Error("Claude model catalog is unavailable"); }
   }
-  return { partial: claudeUnavailable || claudePartial, availability: { claude: { connected: connected(status.claude), available: data.some(model => model.provider === "claude"), ...(claudeUnavailable ? { error: "claude_models_unavailable" } : {}) } }, object: "list" as const, data, default_model: data.find(model => model.id === DEFAULT_AGENT_SETTINGS.model)?.id ?? data.find(model => model.provider === "claude")?.id ?? data[0]?.id ?? null };
+  return { partial: claudeUnavailable || claudePartial, availability: { claude: { connected: connected(status.claude), available: data.some(model => model.provider === "claude"), ...(claudeUnavailable ? { error: "claude_models_unavailable" } : {}) } }, object: "list" as const, data, default_model: data.find(model => model.id === DEFAULT_AGENT_SETTINGS.model)?.id
+    ?? data.find(model => model.id === DEFAULT_OPENAI_AGENT_SETTINGS.model)?.id
+    ?? data.find(model => model.provider === "claude")?.id ?? data[0]?.id ?? null };
 }

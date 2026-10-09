@@ -323,6 +323,8 @@ export type HostedToolsCallObservation = Readonly<{
   host_stage?: HostedToolDiagnosticStage;
   host_elapsed_ms?: number;
   reason_code?: HostedToolsDiagnosticReason;
+  /** Fixed schema field names only; never retained/proposed values. */
+  conflict_fields?: readonly ImmutableCallField[];
   outcome?: HostedToolCallOutcome["status"] | "failed";
   success?: boolean;
   duration_ms?: number;
@@ -367,6 +369,13 @@ export type HostedToolsBrokerCoreOptions = Readonly<{
   /** Optional operator resource limit; ordinary attachments have no fixed call cap. */
   maxInFlight?: number;
   maxCallsPerGeneration?: number;
+  /**
+   * Bounded wait for a recoverable route's exact lease/generation to resume
+   * after transient transport loss before reporting a new call unavailable.
+   * Only never-admitted calls wait; nothing is dispatched until the same
+   * runtime epoch is routable again. Defaults to 0 (report immediately).
+   */
+  reconnectAdmissionWaitMs?: number;
   persistence: HostedToolsBrokerPersistence;
   /** Resume exact live hibernated sockets instead of forcing every route to reconnect. */
   resumeRetainedSockets?: boolean;
@@ -428,6 +437,7 @@ export class HostedToolsBrokerCore {
   readonly #randomUUID: () => string;
   readonly #maxInFlight: number | undefined;
   readonly #maxCallsPerGeneration: number;
+  readonly #reconnectAdmissionWaitMs: number;
   readonly #persistence: HostedToolsBrokerPersistence;
   readonly #onCatalogChanged: ((definitions: readonly HostedToolsProviderDefinition[]) => void) | undefined;
   readonly #beforeCatalogPublish: HostedToolsBrokerCoreOptions["beforeCatalogPublish"];
@@ -460,6 +470,10 @@ export class HostedToolsBrokerCore {
       throw new TypeError("maxInFlight must be a positive safe integer");
     }
     this.#maxCallsPerGeneration = options.maxCallsPerGeneration ?? Number.MAX_SAFE_INTEGER;
+    this.#reconnectAdmissionWaitMs = options.reconnectAdmissionWaitMs ?? 0;
+    if (!Number.isSafeInteger(this.#reconnectAdmissionWaitMs) || this.#reconnectAdmissionWaitMs < 0) {
+      throw new TypeError("reconnectAdmissionWaitMs must be a non-negative safe integer");
+    }
     if (!Number.isSafeInteger(this.#maxCallsPerGeneration) || this.#maxCallsPerGeneration < 1) {
       throw new TypeError("maxCallsPerGeneration must be a positive safe integer");
     }
@@ -1603,7 +1617,11 @@ export class HostedToolsBrokerCore {
           ...(context.turnId === undefined ? {} : { turnId: context.turnId }),
           model: context.model ?? "unknown",
           input: input as Record<string, unknown> | string,
-          outputTokenBudget: 10_000,
+          // This adapter generates the budget; replay must retain the admitted
+          // default across releases. Explicit invoke budgets and input remain
+          // subject to the strict immutable-call comparison below.
+          outputTokenBudget: this.#persistence.callBySource(context.sessionId, context.callId)
+            ?.output_token_budget ?? Number.MAX_SAFE_INTEGER,
           ...(context.signal === undefined ? {} : { signal: context.signal }),
         });
         if (outcome.status === "completed") {
@@ -1753,12 +1771,13 @@ export class HostedToolsBrokerCore {
     } catch { /* Diagnostic enumeration cannot change generation retirement. */ }
   }
 
-  #invokeCall(
+  async #invokeCall(
     binding: HostedToolsCatalogBinding,
     request: HostedToolsInvokeRequest,
   ): Promise<HostedToolsInvocationOutcome> {
     const receivedAt = performance.now();
-    if (binding.machine && binding.wireName === "write_stdin" && binding.runtimeId) {
+    const rebindProcess = () => {
+      if (!binding.machine || binding.wireName !== "write_stdin" || !binding.runtimeId) return;
       // Rebind only the transport of the exact process-owning runtime. A new
       // runtime can reuse numeric process IDs and must never receive this poll
       // or stdin. Already-admitted calls still resolve through their ledger.
@@ -1766,8 +1785,17 @@ export class HostedToolsBrokerCore {
         && candidate.machine?.id === binding.machine!.id && candidate.wireName === binding.wireName
         && candidate.runtimeId === binding.runtimeId);
       if (current) binding = current;
+    };
+    rebindProcess();
+    let retained = this.#persistence.callBySource(request.sessionId, request.callId);
+    if (!retained && !this.#routingSocketForState(this.#persistence.state(binding.routeId))) {
+      // A never-admitted call may wait (bounded) for the same runtime epoch to
+      // resume after transient transport loss. Replacement or retirement ends
+      // the wait at once; the caller then refreshes with ledger evidence.
+      await this.#awaitRouteResume(binding, request);
+      rebindProcess();
+      retained = this.#persistence.callBySource(request.sessionId, request.callId);
     }
-    const retained = this.#persistence.callBySource(request.sessionId, request.callId);
     const diagnosticIdentity = {
       name: binding.wireName, session_id: request.sessionId, source_call_id: request.callId, thread_id: request.threadId,
       lease_id: retained?.lease_id ?? binding.leaseId, generation: retained?.generation ?? binding.generation,
@@ -1778,7 +1806,7 @@ export class HostedToolsBrokerCore {
     };
     if (!retained && !this.#routingSocketForState(this.#persistence.state(binding.routeId))) {
       this.#observe("admission_failed", diagnosticIdentity, { reason_code: "attachment_unavailable", outcome: "unavailable" });
-      return Promise.resolve(preAdmissionUnavailable("Hosted machine is reconnecting"));
+      return preAdmissionUnavailable("Hosted machine is reconnecting");
     }
 
     const leaseId = binding.leaseId;
@@ -1946,6 +1974,27 @@ export class HostedToolsBrokerCore {
     return promise;
   }
 
+  async #awaitRouteResume(binding: HostedToolsCatalogBinding, request: HostedToolsInvokeRequest): Promise<void> {
+    if (this.#reconnectAdmissionWaitMs <= 0 || request.signal?.aborted) return;
+    const exact = (state: HostedToolsStateRow | undefined) => state !== undefined && state.host_id === binding.hostId
+      && state.lease_id === binding.leaseId && state.generation === binding.generation;
+    const initial = this.#persistence.state(binding.routeId);
+    if (!exact(initial) || !this.#canRecover(initial!)) return;
+    const startedAt = this.#now();
+    const until = Math.min(startedAt + this.#reconnectAdmissionWaitMs, request.deadlineAt ?? Number.MAX_SAFE_INTEGER);
+    const signal = request.signal;
+    while (this.#now() < until && !signal?.aborted) {
+      await new Promise<void>(resolve => {
+        const done = () => { clearTimeout(timer); signal?.removeEventListener("abort", done); resolve(); };
+        const timer = setTimeout(done, Math.max(1, Math.min(50, until - this.#now())));
+        signal?.addEventListener("abort", done, { once: true });
+      });
+      const state = this.#persistence.state(binding.routeId);
+      if (!exact(state)) return;
+      if (this.#routingSocketForState(state)) return;
+    }
+  }
+
   #attachmentIsPresent(
     binding: HostedToolsCatalogBinding,
     now: number,
@@ -1969,9 +2018,10 @@ export class HostedToolsBrokerCore {
   }
 
   async #repeatedCall(existing: HostedToolsCallRow, proposed: HostedToolsCallRow, binding: HostedToolsCatalogBinding, signal?: AbortSignal): Promise<HostedToolsInvocationOutcome> {
+    const matches = sameImmutableCall(existing, proposed);
     this.#observe("replay", { ...existing, thread_id: existing.thread_id ?? proposed.thread_id },
-      sameImmutableCall(existing, proposed) ? {} : { reason_code: "call_conflict" });
-    if (!sameImmutableCall(existing, proposed)) {
+      matches ? {} : { reason_code: "call_conflict", conflict_fields: immutableCallDifferences(existing, proposed) });
+    if (!matches) {
       const state = this.#stateForLease(existing.lease_id, existing.generation);
       const socket = this.#socketForState(state);
       if (socket) this.#fence(socket, "call ID was reused with different immutable fields", 1008, "call_conflict");
@@ -2538,6 +2588,19 @@ function canonicalJson(value: unknown): string {
     }
     return item;
   });
+}
+
+const IMMUTABLE_CALL_FIELDS = [
+  "call_id", "session_id", "source_call_id", "turn_id", "host_id", "lease_id",
+  "generation", "model", "name", "input_json", "output_token_budget",
+  "output_byte_budget", "deadline_at",
+] as const satisfies readonly (keyof HostedToolsCallRow)[];
+type ImmutableCallField = (typeof IMMUTABLE_CALL_FIELDS)[number];
+
+function immutableCallDifferences(left: HostedToolsCallRow, right: HostedToolsCallRow): readonly ImmutableCallField[] {
+  return Object.freeze(IMMUTABLE_CALL_FIELDS.filter(field => field === "turn_id"
+    ? (left.turn_id ?? null) !== (right.turn_id ?? null)
+    : left[field] !== right[field]));
 }
 
 function sameImmutableCall(left: HostedToolsCallRow, right: HostedToolsCallRow): boolean {

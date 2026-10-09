@@ -4,6 +4,7 @@ import {
   type ReactNode,
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
@@ -24,8 +25,8 @@ import {
 import { ElevenLabsSettings } from "./ElevenLabsSettings.js";
 const defaultElevenLabsManager = createElevenLabsManager();
 
-import { SlidersHorizontal, X } from "lucide-react";
-import { TerminalComposer } from "./TerminalComposer.js";
+import { ChevronDown, X } from "lucide-react";
+import { TerminalComposer, type ComposerAttachment, type ComposerAttachmentPolicy } from "./TerminalComposer.js";
 import { TerminalTranscriptSurface } from "./TerminalTranscriptSurface.js";
 import type { VoiceTerminalEntry } from "./TerminalTranscriptSurface.js";
 import type {
@@ -42,6 +43,7 @@ export type AgentTerminalAccessory = Readonly<{
 /** Shared website terminal presentation. Runtime and authorization policy stay with its consumer. */
 export function AgentTerminalView({
   accessory,
+  attachments,
   agent,
   agentError,
   composer,
@@ -65,6 +67,8 @@ export function AgentTerminalView({
   welcome,
 }: {
   accessory?(controls: AgentTerminalAccessory): ReactNode;
+  /** Enables composer attachments; the agent must accept structured prompt input. */
+  attachments?: ComposerAttachmentPolicy | undefined;
   agent: Agent | undefined;
   agentError: string | undefined;
   /** Replaces the default composer without detaching the transcript controller. */
@@ -96,6 +100,7 @@ export function AgentTerminalView({
   const [touchDraft, setTouchDraft] = useState(initialDraft ?? "");
   const [pendingTouchSubmission, setPendingTouchSubmission] = useState<{
     input: string;
+    attachments: readonly ComposerAttachment[];
     submittedAt: number;
   }>();
   const [followTailRequest, setFollowTailRequest] = useState(0);
@@ -196,15 +201,15 @@ export function AgentTerminalView({
   }, [agentError, agentStatus, onStateChange, retryAgent]);
 
   const unavailableMessage = inactiveMessage?.({ agentError, agentStatus });
-  const submitTouchPrompt = useCallback((input: string) => {
-    if (!input.trim()) return;
+  const submitTouchPrompt = useCallback((input: string, attached: readonly ComposerAttachment[] = []) => {
+    if (!input.trim() && attached.length === 0) return;
     const submittedAt = performance.now();
     setFollowTailRequest((current) => current + 1);
     if (agentStatus !== "ready") {
-      setPendingTouchSubmission({ input, submittedAt });
+      setPendingTouchSubmission({ input, attachments: attached, submittedAt });
       return;
     }
-    void voiceState.noteTypedInput().then(() => submitPrompt(controller, submittedPrompts.current, input, submittedAt, promptIntent));
+    void voiceState.noteTypedInput().then(() => submitPrompt(controller, submittedPrompts.current, input, submittedAt, promptIntent, attached));
     setTouchDraft("");
   }, [agentStatus, controller, promptIntent, voiceState.noteTypedInput]);
   useEffect(() => {
@@ -215,6 +220,7 @@ export function AgentTerminalView({
       pendingTouchSubmission.input,
       pendingTouchSubmission.submittedAt,
       promptIntent,
+      pendingTouchSubmission.attachments,
     ));
     setPendingTouchSubmission(undefined);
     setTouchDraft("");
@@ -222,13 +228,21 @@ export function AgentTerminalView({
   const cancelTouchTurn = useCallback(() => {
     if (agentStatus === "ready") void voiceState.noteTypedInput().then(() => controller.cancel());
   }, [agentStatus, controller, voiceState.noteTypedInput]);
+  // The snapshot changes every streamed frame; its submit control is stable per controller.
+  const submitToController = controller.submit;
   const submitAccessoryPrompt = useCallback((input: string) => {
     if (agentStatus !== "ready") return;
     const submittedAt = performance.now();
     setFollowTailRequest((current) => current + 1);
     retainSubmittedPrompt(submittedPrompts.current, input, submittedAt);
-    void voiceState.noteTypedInput().then(() => controller.submit(input, { intent: "queue" }));
-  }, [agentStatus, controller, voiceState.noteTypedInput]);
+    void voiceState.noteTypedInput().then(() => submitToController(input, { intent: "queue" }));
+  }, [agentStatus, submitToController, voiceState.noteTypedInput]);
+
+  // A stable renderer lets completed transcript rows skip rendering while tokens stream.
+  const agentReady = agentStatus === "ready";
+  const transcriptRenderTool = useMemo(() => renderTool
+    ? (tool: ToolActivity) => renderTool(tool, { agentReady, submit: submitAccessoryPrompt })
+    : undefined, [agentReady, renderTool, submitAccessoryPrompt]);
 
   const terminal = (
     <TerminalTranscriptSurface
@@ -242,6 +256,7 @@ export function AgentTerminalView({
           </div>)}
         </div> : null}
         <TerminalComposer
+          attachments={attachments}
           controls={(voice || controls) ? <>
             {voice ? <VoiceControl agentReady={agentStatus === "ready"} voice={voiceState} initialSettings={voiceOptions} elevenLabsManager={elevenLabsManager} /> : null}
             {controls?.({ agentReady: agentStatus === "ready" })}
@@ -265,7 +280,9 @@ export function AgentTerminalView({
       inactiveMessage={unavailableMessage ?? ""}
       isLoadingOlder={controller.isLoadingOlder}
       mode={mode}
-      renderTool={renderTool ? (tool) => renderTool(tool, { agentReady: agentStatus === "ready", submit: submitAccessoryPrompt }) : undefined}
+      running={terminalRunning}
+      activity={controller.status}
+      renderTool={transcriptRenderTool}
       showToolCalls={showToolCalls}
       userLabel={userLabel}
       status={agentStatus}
@@ -304,7 +321,9 @@ export function VoiceControl({
   const [showSettings, setShowSettings] = useState(false);
   const [settingsError, setSettingsError] = useState<string>();
   const [applying, setApplying] = useState(false);
-  const statusText = voice.statusText ?? (voice.isActive ? voice.voice : undefined);
+  // The pressed mic already says voice is live; "Voice active (cove)" would only
+  // repeat the voice name, which belongs in preferences.
+  const statusText = voice.statusText && !/^Voice active\b/.test(voice.statusText) ? voice.statusText : undefined;
   const saveSettings = async () => {
     const next = { ...settings, voice: selectedVoice };
     if (next.outputProvider === "elevenlabs" && !next.elevenLabsVoiceId) {
@@ -325,6 +344,7 @@ export function VoiceControl({
     } finally { setApplying(false); }
   };
   return <>
+    <span className="agent-voice-control">
     <button
       className="agent-voice-button"
       type="button"
@@ -338,27 +358,10 @@ export function VoiceControl({
       </svg>
       <span className="agent-terminal-sr-only">Voice</span>
     </button>
-    {engaged ? <>
-      <button type="button" className="agent-voice-mute-button" aria-label={voice.muted ? "Unmute microphone" : "Mute microphone"}
-        aria-pressed={voice.muted} onClick={() => voice.toggleMuted()}>{voice.muted ? "Unmute" : "Mute"}</button>
-      <meter className="agent-voice-level" aria-label="Microphone level" min={0} max={1} value={voice.microphoneLevel} />
-      <meter className="agent-voice-level" aria-label="Speaker level" min={0} max={1} value={voice.speakerLevel} />
-    </> : null}
-    {(settings.outputProvider ?? "openai") === "openai" ? <select
-      aria-label="Voice"
-      className="agent-voice-select"
-      value={selectedVoice}
-      disabled={engaged}
-      onChange={(event) => { setSelectedVoice(event.target.value as NonNullable<UseVoiceReturnType["voice"]>); }}
-    >
-      {Voice.voices.map((name) => <option key={name} value={name}>
-        {name[0]!.toUpperCase() + name.slice(1)}
-      </option>)}
-    </select> : null}
     <div className="agent-voice-preferences">
-      <button type="button" aria-label="Voice settings" aria-expanded={showSettings}
+      <button type="button" aria-label="Voice settings" title="Voice settings" aria-expanded={showSettings}
         onClick={() => { setShowSettings(!showSettings); }}>
-        <SlidersHorizontal aria-hidden="true" />
+        <ChevronDown aria-hidden="true" />
       </button>
       {showSettings ? <div className="agent-voice-settings" role="group" aria-label="Voice preferences">
         <label>Speech provider<select value={settings.outputProvider ?? "openai"} onChange={(event) => {
@@ -400,6 +403,13 @@ export function VoiceControl({
         </button>
       </div> : null}
     </div>
+    </span>
+    {engaged ? <>
+      <button type="button" className="agent-voice-mute-button" aria-label={voice.muted ? "Unmute microphone" : "Mute microphone"}
+        aria-pressed={voice.muted} onClick={() => voice.toggleMuted()}>{voice.muted ? "Unmute" : "Mute"}</button>
+      <meter className="agent-voice-level" aria-label="Microphone level" min={0} max={1} value={voice.microphoneLevel} />
+      <meter className="agent-voice-level" aria-label="Speaker level" min={0} max={1} value={voice.speakerLevel} />
+    </> : null}
     {voice.isActive ? (
       <button
         className="agent-voice-cancel-button"
@@ -466,7 +476,13 @@ function submitPrompt(
   input: string,
   submittedAt: number,
   intent?: "queue" | "steer",
+  attachments: readonly ComposerAttachment[] = [],
 ) {
+  if (attachments.length > 0) {
+    // The controller reports structured prompts by their readable marker text.
+    void controller.submit(input, { attachments: attachments.map(({ item }) => item) });
+    return;
+  }
   retainSubmittedPrompt(submittedPrompts, input, submittedAt);
   void controller.submit(input, intent === undefined ? undefined : { intent });
 }

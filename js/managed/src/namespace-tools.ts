@@ -167,6 +167,12 @@ export function createNamespaceExecutionRuntime(
   // Discovery selects a backend once for this exact captured Hand. Never retry
   // a failed probe or retarget an action after publication changes.
   const dynamicComputers = new WeakMap<MountedHand, Promise<MountedHand>>();
+  // Remember the contract the model has read, not a previous cell's handlers.
+  // Each new cell probes its captured route before accepting continued input.
+  const discoveredContracts = new Map<string, string>();
+  const computerContract = (hand: MountedHand): string => JSON.stringify([
+    hand.cuaBackend, hand.cua?.definition, hand.cuaReset?.definition,
+  ]);
   const discoverDynamicComputer = async (hand: MountedHand, context: ToolContext): Promise<MountedHand> => {
     const result = await hand.cua!.handler({}, context);
     context.signal.throwIfAborted();
@@ -216,6 +222,9 @@ export function createNamespaceExecutionRuntime(
     for (const key of cells.keys()) {
       if (key.startsWith(cellPrefix)) cells.delete(key);
     }
+    for (const key of discoveredContracts.keys()) {
+      if (key.startsWith(cellPrefix)) discoveredContracts.delete(key);
+    }
     for (const [sessionId, binding] of sessions) {
       if (binding.ownerSessionId === ownerSessionId) sessions.delete(sessionId);
     }
@@ -223,6 +232,7 @@ export function createNamespaceExecutionRuntime(
   const dispose = (): void => {
     cells.clear();
     sessions.clear();
+    discoveredContracts.clear();
   };
 
   const computerParameters = {
@@ -250,13 +260,16 @@ export function createNamespaceExecutionRuntime(
     }
     let hand = binding.hands.get(route.mount.mountId);
     const providerInput = without(value, "workdir");
+    const contractKey = `${context.sessionId}\u0000${JSON.stringify([binding.authorizationKey, hand?.machineId, hand?.root])}`;
+    const discovering = name === CUA_JS_NAME && Object.keys(providerInput).length === 0;
     if (hand?.cua?.definition?.description?.startsWith("NANOCODEX_DYNAMIC_CUA_V1.")) {
       let pending = dynamicComputers.get(hand);
       if (!pending) {
-        if (name !== CUA_JS_NAME || Object.keys(providerInput).length !== 0)
-          throw new Error("Discover this Hand with only workdir before sending dynamic CUA input");
         context.signal.throwIfAborted();
-        pending = discoverDynamicComputer(hand, context);
+        // The read-only probe and the requested action are distinct durable
+        // calls; sharing an ID would conflict with the action's input receipt.
+        pending = discoverDynamicComputer(hand, discovering ? context
+          : { ...context, callId: `${context.callId}/cua-discovery` });
         dynamicComputers.set(hand, pending);
       }
       hand = await pending;
@@ -276,11 +289,12 @@ export function createNamespaceExecutionRuntime(
         const definition = tool.definition;
         if (!definition || typeof definition.description !== "string"
           || !definition.parameters || typeof definition.parameters !== "object") {
-          throw new Error(`Hand ${hand.root} has no discovered ${toolName} contract; reconnect its CUA provider`);
+          throw new Error(`Hand ${hand.root} has no discovered ${toolName} contract (status: unavailable). No action was dispatched.`);
         }
         return { ...definition, name: toolName };
       });
       observeHandCall("namespace.invoke", name, routeStarted, "ok", context.callId, correlation(context));
+      discoveredContracts.set(contractKey, computerContract(hand));
       return { workdir: hand.root, machine_id: hand.machineId,
         backend: hand.cuaBackend, tools: [CUA_JS_NAME, CUA_RESET_NAME], definitions,
         browser_interaction: BACKGROUND_BROWSER_INSTRUCTIONS,
@@ -311,14 +325,14 @@ export function createNamespaceExecutionRuntime(
 
   const tools: ToolMap = {
     [CUA_JS_NAME]: {
-      description: "Use a Hand's CUA provider. Set workdir on every call, just like exec_command. First call with only {workdir} to read that Hand's exact descriptions and schemas without executing an action; then add those provider arguments alongside workdir. OpenAI Sky/CUA is preferred when attached. For browser work use its browser API and agent-owned background tabs/tab groups; preserve the user’s foreground focus. Use native browser-window input only when the browser API cannot handle the task. VM, Cloudflare, and native Hands can fall back to their controllable screen action contract. Nanocodex strips only workdir before forwarding. Calls dispatch immediately; follow the provider’s contract for concurrent calls. /brain has no desktop.",
+      description: "Use a Hand's CUA provider. Set workdir on every call, just like exec_command. Pass provider arguments (e.g. {code}) alongside workdir; actions work immediately. Optionally call with only {workdir} to read that Hand's exact provider descriptions and schemas without executing anything. OpenAI Sky/CUA is preferred when attached. For browser work use its browser API and agent-owned background tabs/tab groups; preserve the user’s foreground focus. Use native browser-window input only when the browser API cannot handle the task. VM, Cloudflare, and native Hands can fall back to their controllable screen action contract. Nanocodex strips only workdir before forwarding. Calls dispatch immediately; follow the provider’s contract for concurrent calls. /brain has no desktop.",
       parameters: computerParameters,
       supportsParallelToolCalls: true,
       handler: (input, context) => computerCall(CUA_JS_NAME, input, context),
       releaseSession, dispose,
     },
     [CUA_RESET_NAME]: {
-      description: "Reset the CUA provider on the Hand selected by this call's workdir. Read its reset contract using mcp__cua_repl__js({workdir}) first. Pass provider reset arguments alongside workdir; only workdir is consumed by Nanocodex. A workdir-only reset forwards {}. Calls dispatch immediately; follow the provider’s contract for concurrent JS and reset calls.",
+      description: "Reset the CUA provider on the Hand selected by this call's workdir. Pass provider reset arguments alongside workdir; only workdir is consumed by Nanocodex. A workdir-only reset forwards {}. Calls dispatch immediately; follow the provider’s contract for concurrent JS and reset calls.",
       parameters: computerParameters,
       supportsParallelToolCalls: true,
       handler: (input, context) => computerCall(CUA_RESET_NAME, input, context),

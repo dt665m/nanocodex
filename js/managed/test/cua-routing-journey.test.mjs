@@ -37,8 +37,13 @@ const scripts = {
   UPSTREAM: `text({hand:(await tools.environment({})).hands["user:${machine}"]}); ${discovery}
     text(await tools.mcp__cua_repl__js({workdir:"/${machine}",code:"UPSTREAM_OK"}));
     text(await tools.mcp__cua_repl__js_reset({workdir:"/${machine}"}));`,
+  CONTINUED_ACTION: `text(await tools.mcp__cua_repl__js({workdir:"/${machine}",code:"CONTINUED_OK"}));`,
+  CHANGED_CONTRACT: `try { text(await tools.mcp__cua_repl__js({workdir:"/${machine}",code:"CHANGED_OK"})); } catch(error) { text({error:error.message}); }`,
+  CONTINUED_RESET: `text(await tools.mcp__cua_repl__js_reset({workdir:"/${machine}"}));`,
   PREFERRED: `${discovery} text(await tools.mcp__cua_repl__js({workdir:"/${machine}",code:"PREFERRED_OK"}));`,
-  PINNED_UPSTREAM: `${discovery} await new Promise(resolve=>setTimeout(resolve,3000)); ${discovery}
+  // Keep this synthetic model turn open through the bounded reconnect wait.
+  PINNED_UPSTREAM: `// @exec: {"yield_time_ms": 20000}
+${discovery} await new Promise(resolve=>setTimeout(resolve,3000)); ${discovery}
     try { text(await tools.mcp__cua_repl__js({workdir:"/${machine}",code:"MUST_NOT_RETARGET"})); } catch(error) { text({error:error.message}); }`,
   SCREEN: `${discovery} text(await tools.mcp__cua_repl__js({workdir:"/${machine}",action:"observe"}));`,
   BAD_SCROLL: `try { text(await tools.mcp__cua_repl__js({workdir:"/${machine}",action:"scroll",deltaY:120})); } catch(error) { text({error:error.message}); }`,
@@ -69,6 +74,8 @@ export class ObservedAccountHostedTools extends AccountHostedTools {
 export class FixtureSession extends DurableAgentSession {
   async fetch(request) {
     if(new URL(request.url).pathname==='/__seed') {
+      // Fresh sessions defer schema setup to their first production handler.
+      await (await super.fetch(new Request('https://fixture.internal/__initialize'))).body?.cancel();
       this.ctx.storage.sql.exec("INSERT OR IGNORE INTO session_state (singleton,session_id,owner_id,organization_id,team_id,authorization_epoch,public_origin,runtime_profile,last_active) VALUES (1,?,?,?,?,1,'https://fixture.internal/','managed',?)",'${thread}','${owner}','${organization}','${team}',Date.now());
       this.ctx.storage.sql.exec("INSERT OR IGNORE INTO managed_configuration VALUES (1, ?)",JSON.stringify({environment:{files:[],skills:[],setup_commands:[],network:{access:'enabled'}}}));
       this.ctx.storage.sql.exec("UPDATE managed_agent_settings SET model='gpt-6.1-sol',thinking='low'");
@@ -181,12 +188,12 @@ test("managed CUA cells prefer live upstream, pin routes, and recover screen fal
       const id = `00000000-0000-7000-8000-${String(turnNumber++).padStart(12, "0")}`;
       const accepted = await request(`/v1/agents/${thread}/turns`, { method: "POST", headers: extraHeaders, body: JSON.stringify({ id, input: `CUA_${scenario}` }) });
       assert.equal(accepted.status, 202, JSON.stringify(accepted));
-      return async () => waitFor(async () => {
+      return async (completionTimeout = 10_000) => waitFor(async () => {
         const turn = await request(`/v1/agents/${thread}/turns/${accepted.value.turn_id}`);
         assert.equal(turn.status, 200, JSON.stringify(turn));
         assert.ok(!["failed", "cancelled"].includes(turn.value.state), JSON.stringify(turn));
         return turn.value.state === "completed" ? turn.value : undefined;
-      }, `${scenario} turn completion`);
+      }, `${scenario} turn completion`, completionTimeout);
     };
     const runTurn = async (scenario, extraHeaders) => (await startTurn(scenario, extraHeaders))();
     const callFrames = () => wire.filter(row => row.direction === "broker" && row.frame.type === "call" && !(row.frame.name === "mcp__cua_repl__js" && Object.keys(row.frame.input).length === 0));
@@ -321,6 +328,19 @@ test("managed CUA cells prefer live upstream, pin routes, and recover screen fal
     assert.deepEqual(callFrames().map(row => row.frame.input), [{ code: "UPSTREAM_OK" }, {}]);
     assert.equal(screenCalls().length, 0);
 
+    const continued = await runTurn("CONTINUED_ACTION");
+    assert.match(rendered(continued), /CONTINUED_OK/);
+    const continuedReset = await runTurn("CONTINUED_RESET");
+    assert.match(rendered(continuedReset), /UPSTREAM_RESET_OK/);
+    assert.equal(dynamicProbes, 4, "new cells validate the previously read contract");
+    assert.equal(callFrames().length, 4, "continued action and reset dispatch once each");
+
+    providerDefinitions[0].description = "Changed upstream contract";
+    const changed = await runTurn("CHANGED_CONTRACT");
+    assert.match(rendered(changed), /CHANGED_OK/);
+    assert.equal(callFrames().length, 5, "changed contract dispatches without a separate discovery call");
+    providerDefinitions[0].description = "Synthetic upstream CUA JavaScript";
+
     const screen = await publishScreen();
     const preferredStart = records.length;
     const preferred = await runTurn("PREFERRED");
@@ -331,7 +351,7 @@ test("managed CUA cells prefer live upstream, pin routes, and recover screen fal
     assert.equal(preferredLookups[0].snapshot.screens.length, 1);
     assert.equal(preferredLookups[0].snapshot.tools.filter(tool => tool.provider === "screens").length, 1, "selected screen includes its dispatch route");
     assert.match(rendered(preferred), /PREFERRED_OK/);
-    assert.equal(callFrames().length, 3);
+    assert.equal(callFrames().length, 6);
     assert.equal(screenCalls().length, 0, "the live upstream pair wins even with a published screen");
 
     const pinnedDone = await startTurn("PINNED_UPSTREAM");
@@ -342,17 +362,19 @@ test("managed CUA cells prefer live upstream, pin routes, and recover screen fal
     await waitFor(async () => (await snapshot()).machines.find(entry => entry.machine.id === machine)?.online === false,
       "upstream disconnect visible in account catalog");
     assert.equal(stages("PINNED_UPSTREAM", "namespace.route").length, 1, "disconnect must precede the old cell's second discovery");
-    const pinned = await pinnedDone();
+    // The fixed action waits at most 10s for its exact runtime to reconnect,
+    // after the scenario's 3s pause; it must never move to the fallback screen.
+    const pinned = await pinnedDone(16_000);
     assert.deepEqual(stages("PINNED_UPSTREAM", "namespace.invoke").map(row => [row.call_id, row.outcome]), [
       ["call_cua_PINNED_UPSTREAM/code-1", "ok"],
       ["call_cua_PINNED_UPSTREAM/code-2", "ok"],
       ["call_cua_PINNED_UPSTREAM/code-3", "unavailable"],
     ], "both discoveries complete on the pinned contract and the disconnected action returns unavailable");
-    assert.equal(dynamicProbes, 4, "repeat discovery must reuse the pinned descriptor without another remote probe");
+    assert.equal(dynamicProbes, 7, "repeat discovery must reuse the pinned descriptor without another remote probe");
     assert.match(rendered(pinned), /upstream/);
     assert.doesNotMatch(rendered(pinned), /native_screen/);
     assert.equal(screenCalls().length, 0, "an old cell never falls through to a newly available backend");
-    assert.equal(callFrames().length, 3);
+    assert.equal(callFrames().length, 6);
 
     const fresh = await runTurn("SCREEN");
     assert.match(rendered(fresh), /native_screen/);
@@ -392,7 +414,7 @@ test("managed CUA cells prefer live upstream, pin routes, and recover screen fal
     assert.match(rendered(recovered), /Screen action completed/);
     assert.equal(screenCalls().length, 4);
     assert.deepEqual(screenCalls().slice(2).map(row => row.frame.input), [{ action: "observe" }, { action: "release" }]);
-    assert.equal(callFrames().length, 3, "no fallback or recovery may reach the disconnected upstream publisher");
+    assert.equal(callFrames().length, 6, "no fallback or recovery may reach the disconnected upstream publisher");
     const requests = records.filter(row => row.type === "fixture.model.request");
     assert.equal(new Set(requests.map(row => row.socket_id)).size, 1, "all scenarios must share the warm managed runtime");
     const history = await request(`/v1/agents/${thread}/events/history?after=0&limit=256`);

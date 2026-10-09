@@ -105,6 +105,39 @@ describe("account Hosted Tools provider", () => {
     expect(discoveries).toBe(1);
   });
 
+  it("exposes only the current generation's in-flight inventory for admission to join", async () => {
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const provider = new AccountHostedToolsProvider(fakeNamespace(new Map([[ACCOUNT_A, async () => {
+      await held;
+      return Response.json(snapshot);
+    }]])), ACCOUNT_A, () => true);
+    expect(provider.pendingRefresh()).toBeUndefined();
+    const refreshing = provider.refresh();
+    const pending = provider.pendingRefresh();
+    expect(pending).toBeDefined();
+    expect(provider.machines()).toEqual([]);
+    release();
+    await pending;
+    await refreshing;
+    expect(provider.machines().map(machine => machine.id)).toEqual(["laptop"]);
+    expect(provider.pendingRefresh()).toBeUndefined();
+    // An authorization change fences the old request: admission must not join it.
+    let releaseStale!: () => void;
+    const stale = new Promise<void>(resolve => { releaseStale = resolve; });
+    const fenced = new AccountHostedToolsProvider(fakeNamespace(new Map([[ACCOUNT_A, async () => {
+      await stale;
+      return Response.json(snapshot);
+    }]])), ACCOUNT_A, () => true);
+    const old = fenced.refresh();
+    expect(fenced.pendingRefresh()).toBeDefined();
+    fenced.invalidate();
+    expect(fenced.pendingRefresh()).toBeUndefined();
+    releaseStale();
+    await old;
+    expect(fenced.machines()).toEqual([]);
+  });
+
   it("joins screen discovery by machine identity without promoting an offline factory", async () => {
     const target = { machine_id: "laptop", machine_name: "Build laptop", id: "desktop", name: "Desktop",
       kind: "desktop", generation: "screen-generation", width: 1280, height: 800, controllable: true, agent_tools: true };
@@ -316,12 +349,13 @@ describe("account Hosted Tools provider", () => {
         }] }] });
       }
       calls.push(await request.json<Record<string, unknown>>());
-      return new Response(null, { status: 409 });
+      // The account shard's ledger proves each attempt was never admitted.
+      return Response.json({ error: "stale_catalog", admission: "none" }, { status: 409 });
     }]])), ACCOUNT_A, () => true);
     await provider.refresh();
     await expect(provider.machineTool("laptop", "exec_command")!.handler(
       { cmd: "fixture-effect" }, { sessionId: "agent", callId: "stable-effect" },
-    )).resolves.toMatchObject({ success: false, structuredResult: { status: "ambiguous" } });
+    )).resolves.toMatchObject({ success: false, structuredResult: { status: "unavailable", admitted: false, resent: false } });
     expect(discoveries).toBe(2);
     expect(calls).toHaveLength(2);
     expect(calls[1]).toEqual({ ...calls[0], route_token: "route-2" });
@@ -385,7 +419,7 @@ describe("account Hosted Tools provider", () => {
         return Response.json({ ...snapshot, tools: [{ ...snapshot.tools[0], route_token: `personal-${discoveries}` }] });
       }
       calls.push(await request.json<Record<string, unknown>>());
-      if (calls.length === 1) return new Response(null, { status });
+      if (calls.length === 1) return Response.json({ admission: "none" }, { status });
       return Response.json({ output: "contact found", structured_result: null, success: true, metadata: null, value: null });
     }]])), ACCOUNT_A, () => true);
     await provider.refresh();
@@ -413,7 +447,8 @@ describe("account Hosted Tools provider", () => {
         calls.push(await request.json<Record<string, unknown>>());
         if (mode === "transport") throw new Error("connection lost");
         if (mode === "truncated") return new Response("{");
-        return new Response(null, { status: mode === "server" ? 503 : 409 });
+        return mode === "server" ? new Response(null, { status: 503 })
+          : Response.json({ error: "stale_catalog", admission: "none" }, { status: 409 });
       }]])), ACCOUNT_A, () => allowed);
       await provider.refresh();
       const result = await provider.resolve("fixture__lookup")!.handler({}, { sessionId: "agent", callId: "lookup" });
@@ -960,7 +995,8 @@ describe("process session transport recovery", () => {
       second.addEventListener("message", event => { sent.push(JSON.parse(String(event.data))); });
       for (const chars of ["", "must not reach process 1\n"]) {
         await expect(f.router.execute("write_stdin", { session_id: session, chars }, f.context(`poll-${chars.length}`)))
-          .resolves.toMatchObject({ success: false, output: expect.stringContaining("cannot prove session continuity") });
+          .resolves.toMatchObject({ success: false, structuredResult: { status: "unavailable", reason: "process_runtime_replaced" },
+            output: expect.stringContaining("cannot be routed to the replacement runtime") });
       }
       expect(sent).toEqual([]);
     } finally { await f.close(); }

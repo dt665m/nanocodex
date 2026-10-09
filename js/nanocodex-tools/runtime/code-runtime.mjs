@@ -386,7 +386,7 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
         });
         let resolvedIdentity;
         try {
-          canonicalIdentity ??= Promise.resolve(journal ? extras.effectIdentity?.(sessionId, parentCallId, turnId, controller.signal) ?? {} : {});
+          canonicalIdentity ??= Promise.resolve(cell?.effectIdentity ?? (journal ? extras.effectIdentity?.(sessionId, parentCallId, turnId, controller.signal) ?? {} : {}));
           resolvedIdentity = await canonicalIdentity;
           controller.signal.throwIfAborted();
         }
@@ -610,7 +610,7 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
       if (journal?.beginCell || journal?.commitStore) {
         try {
           if (!journal.beginCell || !journal.commitStore) throw effectUnknown(new Error("incomplete durable cell store protocol"));
-          canonicalIdentity ??= Promise.resolve(extras.effectIdentity?.(sessionId, parentCallId, turnId, controller.signal) ?? {});
+          canonicalIdentity ??= Promise.resolve(cell?.effectIdentity ?? extras.effectIdentity?.(sessionId, parentCallId, turnId, controller.signal) ?? {});
           cellContext = { ...await canonicalIdentity, sessionId, parentCallId, callId: parentCallId,
             name: "code-cell", source, input: null, ...(turnId == null ? {} : { turnId }) };
           const entries = await journal.beginCell(cellContext);
@@ -705,14 +705,30 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
   }
 
   function executeCodeObserved(source, sessionId = "default", parentCallId = "exec", model = "unknown", turnId, localDefinitions, executeLocalTool) {
-    return observeOperation(sessionId, parentCallId, (observation) => {
+    return observeOperation(sessionId, parentCallId, async (observation) => {
       const options = parseExec(source);
       const cell = {
         id: `${cellGeneration}:${nextCellId++}`, sessionId, parentCallId, controller: new AbortController(),
-        content: [], updates: [], completedCalls: [], notifications: [], turn: turns.get(sessionId) ?? 0,
-        budget: options.max_output_tokens ?? 10_000, result: undefined, observing: false,
+        startedAt: performance.now(), content: [], updates: [], completedCalls: [], notifications: [], turn: turns.get(sessionId) ?? 0,
+        budget: options.max_output_tokens, result: undefined, observing: false,
       };
       cells.set(cell.id, cell);
+      if (extras.effectJournal?.observations) {
+        try {
+          // Resolve once: the canonical host identity resolver consumes admission.
+          cell.effectIdentity = await extras.effectIdentity?.(sessionId, parentCallId, turnId, cell.controller.signal) ?? {};
+          await observationJournal(() => extras.effectJournal.observations.register({
+            ...cell.effectIdentity, sessionId, parentCallId, callId: parentCallId,
+            name: "code-cell", source: options.source, input: null,
+            ...(turnId == null ? {} : { turnId }),
+          }, cell.id));
+          if (cells.get(cell.id) !== cell) throw Object.assign(
+            new Error("Code Mode cell cancelled during durable admission; no guest source executed"), { code: "CODE_EFFECT_UNKNOWN" });
+        } catch (error) {
+          if (cells.get(cell.id) === cell) cells.delete(cell.id);
+          throw error;
+        }
+      }
       cell.completion = executeCode(options.source, sessionId, parentCallId, model, (update) => {
         // Keep queued completions immutable; the invocation record is mutable
         // until the nested call finishes. Original call IDs survive every wait.
@@ -720,14 +736,28 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
         if (cell.observation) cell.observation.push(encoded);
         else cell.updates.push(encoded);
         if (update.type === "nested_call_completed") cell.completedCalls.push(update.call);
-      }, cell, turnId, localDefinitions, executeLocalTool).then((result) => {
+      }, cell, turnId, localDefinitions, executeLocalTool).then(async (result) => {
         const completed = JSON.parse(result);
         if (!completed.success && typeof completed.output === "string") {
           cell.content.push({ type: "input_text", text: completed.output.split("Output:\n").slice(1).join("Output:\n") || completed.output });
         }
+        // A yielded evaluator can finish while the model is thinking, before
+        // another wait. Persist that terminal evidence immediately: the next
+        // observer may arrive in a replacement runtime. Do not drain live
+        // output here; the foreground observer still owns delivery.
+        // Cancellation/reset is not a terminal checkpoint: dispatched effects
+        // can still be unknown. finished proves normal store finalization.
+        if (extras.effectJournal?.observations && cell.finished) {
+          await recordCellObservation(cell, JSON.stringify({
+            output: withStatus(completed.success ? "Script completed" : "Script failed", cell.startedAt, cell.content),
+            success: completed.success,
+            cell: { origin_call_id: cell.parentCallId, running: false },
+            nested_calls: cell.completedCalls, notifications: cell.notifications,
+          }), false);
+        }
         cell.result = { success: completed.success };
         cell.wake?.();
-      }, (error) => {
+      }).catch((error) => {
         if (error?.code === "host_interrupted") cell.interruption = error;
         cell.content.push({ type: "input_text", text: errorMessage(error) });
         cell.result = { success: false };
@@ -738,20 +768,51 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
   }
 
   function waitCodeObserved(input, sessionId = "default", callId = "wait") {
-    return observeOperation(sessionId, callId, (observation) => {
+    return observeOperation(sessionId, callId, async (observation) => {
       const options = parseCellOptions(input, ["cell_id", "yield_time_ms", "max_tokens", "terminate"], ["max_tokens"], true);
       if (typeof options.cell_id !== "string") throw new TypeError("wait requires a string cell_id");
       if (options.terminate !== undefined && typeof options.terminate !== "boolean") throw new TypeError("terminate must be boolean");
       const cell = cells.get(options.cell_id);
-      if (!cell || cell.sessionId !== sessionId) throw new Error(`exec cell ${options.cell_id} not found`);
+      if (!cell || cell.sessionId !== sessionId) {
+        if (extras.effectJournal?.observations) {
+          const recovered = await observationJournal(() => extras.effectJournal.observations.recover(sessionId, options.cell_id));
+          if (recovered !== null) {
+            const result = JSON.parse(recovered);
+            result.output = limitCodeOutput(result.output, options.max_tokens);
+            return JSON.stringify(result);
+          }
+        }
+        // Cells hold live evaluator promises, not durable continuations. A
+        // retained exec/wait receipt can outlive this registry after recovery.
+        // Never rerun guest source to repair a missing wait: nested effects may
+        // have executed even when their final receipt was not acknowledged.
+        // Do not reveal another session's cell or infer cancellation/completion
+        // from absence. The ID prefix proves only a generation mismatch.
+        const generation = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}):[1-9][0-9]*$/i.exec(options.cell_id)?.[1];
+        const reason = generation && generation !== cellGeneration
+          ? "The cell ID belongs to a different runtime generation."
+          : "The cell is unavailable in this session.";
+        throw new Error(`CODE_CELL_UNAVAILABLE: exec cell ${options.cell_id} not found. ${reason} `
+          + "Its execution outcome is unknown; this wait cannot resume it or confirm termination. "
+          + "Do not rerun the script or retry uncertain effects. Reconcile the original exec and nested call IDs "
+          + "against retained tool receipts or external state; reuse original operation identities where supported.");
+      }
       if (cell.observing) throw new Error(`exec cell ${cell.id} already has an active observer`);
       cell.turn = turns.get(sessionId) ?? 0;
       if (options.terminate && !cell.finished && !cell.result) {
         cell.terminated = true;
         cell.controller.abort(new Error(CANCELLATION_MESSAGE));
       }
-      return observeCell(cell, observation, options.yield_time_ms ?? 10_000, options.max_tokens ?? 10_000);
+      return observeCell(cell, observation, options.yield_time_ms ?? 10_000, options.max_tokens);
     });
+  }
+
+  async function observationJournal(operation) {
+    try { return await operation(); }
+    catch (cause) {
+      if (cause?.code === "CODE_EFFECT_UNKNOWN" || cause?.code === "host_interrupted") throw cause;
+      throw Object.assign(new Error("Code Mode observation journal interrupted", { cause }), { code: "host_interrupted" });
+    }
   }
 
   function observeOperation(sessionId, callId, operation) {
@@ -765,6 +826,19 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
         output: `Script failed\nOutput:\n${errorMessage(error)}`, success: false, nested_calls: [],
       });
     }).finally(() => observation.close());
+  }
+
+  function recordCellObservation(cell, encoded, running) {
+    if (!extras.effectJournal?.observations) return Promise.resolve();
+    // Storage acknowledgement yields. Serialize terminal checkpoints with
+    // foreground observations so a delayed running snapshot cannot overwrite
+    // proof of completion. A failed write poisons this owner's chain.
+    cell.recording = (cell.recording ?? Promise.resolve()).then(async () => {
+      if (running && cell.terminalRecorded) return;
+      await observationJournal(() => extras.effectJournal.observations.record(cell.sessionId, cell.id, encoded));
+      if (!running) cell.terminalRecorded = true;
+    });
+    return cell.recording;
   }
 
   async function observeCell(cell, observation, yieldTime, budget) {
@@ -791,19 +865,29 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
       const status = cell.terminated ? "Script terminated"
         : result ? (result.success ? "Script completed" : "Script failed")
         : `Script running with cell ID ${cell.id}`;
-      const output = withStatus(status, startedAt, cell.content.splice(0));
-      if (result) cells.delete(cell.id);
+      // Acknowledgement follows durability. Capture lengths so output arriving
+      // during storage.sync is left for the next observation.
+      const contentCount = cell.content.length;
+      const completedCount = cell.completedCalls.length;
+      const notificationCount = cell.notifications.length;
+      const output = withStatus(status, startedAt, cell.content.slice(0, contentCount));
       let limited = limitCodeOutput(output, budget);
       if (result?.success === false && Array.isArray(limited) && limited.every((item) => item.type === "input_text")) {
         limited = limited.map((item) => item.text).join("");
       }
-      return JSON.stringify({
+      const encoded = JSON.stringify({
         output: limited,
         success: cell.terminated || (result?.success ?? true),
         cell: { origin_call_id: cell.parentCallId, running: !result },
-        nested_calls: cell.completedCalls.splice(0),
-        notifications: cell.notifications.splice(0),
+        nested_calls: cell.completedCalls.slice(0, completedCount),
+        notifications: cell.notifications.slice(0, notificationCount),
       });
+      await recordCellObservation(cell, encoded, !result);
+      cell.content.splice(0, contentCount);
+      cell.completedCalls.splice(0, completedCount);
+      cell.notifications.splice(0, notificationCount);
+      if (result) cells.delete(cell.id);
+      return encoded;
     } finally {
       clearTimeout(timer);
       stopPreemptWake?.();
@@ -866,17 +950,20 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
     }
     for (const [id, cell] of cells) {
       if ((sessionId === undefined || cell.sessionId === sessionId)
-        && (turn === undefined || cell.turn === turn)) cells.delete(id);
+        && (turn === undefined || cell.turn === turn)) {
+        cell.controller.abort(new Error(CANCELLATION_MESSAGE));
+        cells.delete(id);
+      }
     }
     closeCodeObservations(sessionId, turn);
   }
 
-  function releaseSession(sessionId) {
+  function releaseSession(sessionId, options) {
     turnLifecycle.release(sessionId);
     cancel(sessionId);
     const binding = subagentBindingsBySession.get(sessionId);
     if (binding !== undefined) {
-      subagentSessions?.release?.(sessionId, binding.hostContextRef);
+      subagentSessions?.release?.(sessionId, binding.hostContextRef, options);
     }
     turns.delete(sessionId);
     stores.delete(sessionId);
@@ -890,6 +977,7 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
     for (const execution of activeExecutions) {
       execution.controller.abort(new Error(CANCELLATION_MESSAGE));
     }
+    for (const cell of cells.values()) cell.controller.abort(new Error(CANCELLATION_MESSAGE));
     cells.clear();
     turns.clear();
     stores.clear();

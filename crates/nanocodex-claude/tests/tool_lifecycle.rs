@@ -56,6 +56,7 @@ async fn replay_is_rejected(after_compaction: bool) {
         "synthetic",
     );
     let (agent, _) = Nanocodex::builder(Claude::new(client, "test"))
+        .max_tokens(128_000)
         .tool(
             ToolDefinition {
                 name: "effect".into(),

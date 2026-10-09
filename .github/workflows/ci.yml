@@ -3,15 +3,13 @@ name: CI
 permissions: {}
 
 on:
-  push:
-    branches: [master]
+  # Master only deploys (cloudflare.yml). CI runs on PRs, the merge queue and
+  # manual dispatch; nothing runs on master pushes or a schedule.
   pull_request:
     # ready_for_review reruns a draft's fast lane with the heavy matrix.
     types: [opened, synchronize, reopened, ready_for_review]
   merge_group:
   workflow_dispatch:
-  schedule:
-    - cron: "23 5 * * *"
 
 env:
   CARGO_TERM_COLOR: always
@@ -24,7 +22,7 @@ env:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
-  # Only superseded PR runs are cancelled; master and merge-queue runs finish.
+  # Only superseded PR runs are cancelled; merge-queue runs finish.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -145,7 +143,6 @@ jobs:
         run: |
           node --test scripts/tests/direct-cua-host.test.mjs scripts/tests/direct-browser-host.test.mjs crates/experimental/nanocodex-computer/tests/linux-sky/host.test.mjs crates/experimental/nanocodex-computer/tests/windows-sky/host.test.mjs crates/experimental/nanocodex-computer/tests/windows-sky/unsupported.test.mjs
           python3 scripts/test_install_linux_sky_host.py
-          python3 scripts/test_install_upstream_cua.py
       - name: Check shared native capture policy and platform adapters
         # Temporarily disabled: CI tests are paused.
         if: needs.changes.outputs.tests == 'true'
@@ -166,8 +163,6 @@ jobs:
           cargo test --locked -p nanocodex-managed --lib phone_services
           cargo test --locked -p nanocodex2-bin --test nanocodex2_connectors --test nanocodex2_vault
           cargo test --locked -p nanocodex2-bin --bin nanocodex2 account_management_journeys
-      - name: Exercise Managed2 CLI through HTTP and WebSocket
-        run: node bin/nanocodex/tests/managed2_cli_e2e.mjs
       - name: Resolve the trusted loopback origin on macOS
         if: runner.os == 'macOS'
         run: printf '\n::1 nanocodex.localhost\n' | sudo tee -a /etc/hosts > /dev/null
@@ -709,12 +704,16 @@ jobs:
           name: nanocodex-wasm
           path: js/nanocodex
       - uses: ./.github/actions/turbo-cache
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.npm
+          key: npm-examples-${{ runner.os }}-${{ hashFiles('examples/privy/package-lock.json', 'examples/better-auth/package-lock.json') }}
       - name: Install JS consumer dependencies
         run: |
           pnpm install --frozen-lockfile
           pnpm exec turbo run build --only --filter nanocodex-tools
-          npm ci --prefix examples/privy
-          npm ci --prefix examples/better-auth
+          npm ci --prefer-offline --no-audit --no-fund --prefix examples/privy
+          npm ci --prefer-offline --no-audit --no-fund --prefix examples/better-auth
       - name: Test JS runtime
         # Temporarily disabled: CI tests are paused.
         if: needs.changes.outputs.tests == 'true'
@@ -760,9 +759,28 @@ jobs:
           # durable storage, then deploys this checkout. History comes from the
           # authenticated checkout; no credentials are persisted for test steps.
           pnpm --filter nanocodex-managed-service exec node --test \
-            test/hand-retirement-journey.test.mjs \
             test/hand-preparation-journey.test.mjs \
-            test/cua-routing-journey.test.mjs
+            test/cua-routing-journey.test.mjs \
+            test/hand-paths-journey.test.mjs \
+            test/hand-reconnect-agent-journey.test.mjs
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: hand-paths-and-reconnect-journeys
+          path: |
+            output/hand-paths-journey/**/evidence.json
+            output/hand-reconnect-agent-journey/**/trace.json
+            output/hand-reconnect-agent-journey/**/wire.json
+            output/hand-reconnect-agent-journey/**/runtime.log
+          if-no-files-found: warn
+      - name: Exercise startup durability and regional credentials
+        timeout-minutes: 5
+        run: |
+          pnpm --filter nanocodex-managed-service run test:startup
+          # The egress journeys bundle the broker, whose WhatsApp protocol bundle is
+          # generated (gitignored) from the pinned bridge; prepare it first.
+          pnpm --filter nanocodex-egress-service run prepare:whatsapp
+          node --test js/egress/test/session-model-journey.test.mjs
       - name: Exercise private-input account admission
         timeout-minutes: 5
         run: node js/managed/test/private-input-admission-journey.mjs

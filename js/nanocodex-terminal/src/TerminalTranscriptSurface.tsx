@@ -1,7 +1,6 @@
 "use client";
 
 import {
-  type ComponentProps,
   type ReactNode,
   memo,
   useEffect,
@@ -10,13 +9,16 @@ import {
   useRef,
   useState,
 } from "react";
-import { projectToolOutput, type AgentEntry, type GeneratedOutput, type ToolActivity } from "nanocodex-react/agent";
-import { ArrowDown, Check, Copy } from "lucide-react";
-import { Streamdown } from "streamdown";
-import { GeneratedOutputView } from "./GeneratedOutputView.js";
+import type { AgentEntry, ToolActivity } from "nanocodex-react/agent";
+import { ArrowDown, Check, CircleAlert, Copy, FileText, Image as ImageIcon } from "lucide-react";
+import { looksLikeRawError, presentAgentError, presentAssistantText } from "./errorPresentation.js";
+import { RichMarkdown } from "./RichMarkdown.js";
 
 import type { AgentStatus, AgentTerminalMode } from "./types.js";
-import { boundedToolDetail, presentTool } from "./toolPresentation.js";
+import {
+  LiveStatus, SubagentBlock, WorkGroup, groupTranscript, readableActivity, subagentRoles,
+  type TranscriptRow,
+} from "./TranscriptActivity.js";
 
 export type VoiceTerminalEntry = Readonly<{
   afterEntryId?: string;
@@ -52,6 +54,8 @@ export function TerminalTranscriptSurface({
   inactiveMessage,
   isLoadingOlder,
   mode,
+  running = false,
+  activity,
   showToolCalls = true,
   renderTool,
   userLabel,
@@ -67,6 +71,10 @@ export function TerminalTranscriptSurface({
   inactiveMessage: string;
   isLoadingOlder: boolean;
   mode: AgentTerminalMode;
+  /** The agent is producing the latest turn; drives live work groups and the activity line. */
+  running?: boolean;
+  /** Controller phase, such as "Running exec_command", shown while running. */
+  activity?: string;
   showToolCalls?: boolean;
   renderTool?(tool: ToolActivity): ReactNode;
   userLabel?(entry: Extract<AgentEntry, { kind: "user" }>): string | undefined;
@@ -91,6 +99,14 @@ export function TerminalTranscriptSurface({
     [entries, voiceEntries],
   );
   const visibleWelcome = transcriptEntries.length === 0 ? welcome : undefined;
+  // Streaming replaces only the changed tail entry. Reusing unchanged rows and
+  // role labels lets completed rows skip rendering on every token.
+  const rows = useReusedRows(transcriptEntries);
+  const roles = useStableRoles(entries);
+  const [turnStartedAt, setTurnStartedAt] = useState(() => Date.now());
+  useEffect(() => { if (running) setTurnStartedAt(Date.now()); }, [running]);
+  const lastRow = rows.at(-1);
+  const streamingAnswer = lastRow?.type === "entry" && lastRow.entry.kind === "assistant" && lastRow.entry.streaming;
 
   useLayoutEffect(() => {
     const element = transcript.current;
@@ -174,6 +190,8 @@ export function TerminalTranscriptSurface({
         role="log"
         aria-live="off"
         onWheel={(event) => {
+          // Scrolling up releases the tail at once, before a streamed resize can pull the reader back.
+          if (event.deltaY < 0 && event.currentTarget.scrollTop > 0) followTail.current = false;
           if (event.deltaY < 0) loadOlderNearTop(event.currentTarget, true);
           else if (event.deltaY > 0) rearmShortHistory(event.currentTarget);
         }}
@@ -181,6 +199,7 @@ export function TerminalTranscriptSurface({
         onTouchMove={(event) => {
           const y = event.touches[0]?.clientY;
           if (y !== undefined && touchY.current !== undefined && y > touchY.current) {
+            if (event.currentTarget.scrollTop > 0) followTail.current = false;
             loadOlderNearTop(event.currentTarget, true);
           } else if (y !== undefined && touchY.current !== undefined && y < touchY.current) {
             rearmShortHistory(event.currentTarget);
@@ -200,17 +219,18 @@ export function TerminalTranscriptSurface({
       >
         <div className="agent-dom-transcript-inner">
           {visibleWelcome ? <article className="agent-terminal-markdown is-assistant is-welcome">
-            <Streamdown components={MARKDOWN_COMPONENTS} controls={false} linkSafety={LINK_SAFETY} mode="static" skipHtml>
+            <RichMarkdown>
               {visibleWelcome}
-            </Streamdown>
+            </RichMarkdown>
           </article> : null}
-          {transcriptEntries.map((entry) => (
-            <TerminalEntryView entry={entry} key={entry.id} showToolCalls={showToolCalls} renderTool={renderTool} userLabel={userLabel} />
+          {rows.map((row, index) => (
+            <TranscriptRowView key={row.id} row={row} live={running && index === rows.length - 1}
+              roles={roles} showToolCalls={showToolCalls} renderTool={renderTool} userLabel={userLabel} />
           ))}
+          {running && !streamingAnswer ? <LiveStatus activity={readableActivity(activity)} startedAt={turnStartedAt} /> : null}
           {status !== "ready" && inactiveMessage ? (
-            <p className="agent-terminal-status" role={status === "error" ? "alert" : "status"}>
-              {inactiveMessage}
-            </p>
+            status === "error" ? <ErrorNotice text={inactiveMessage} className="agent-terminal-status" />
+              : <p className="agent-terminal-status" role="status">{looksLikeRawError(inactiveMessage) ? presentAgentError(inactiveMessage).summary : inactiveMessage}</p>
           ) : null}
           <div className="agent-transcript-keyboard-spacer" aria-hidden="true" />
         </div>
@@ -351,80 +371,89 @@ function decodeRealtimeText(text: string): string {
     .replaceAll("&amp;", "&");
 }
 
+function useReusedRows<E extends { id: string; kind: string }>(entries: readonly E[], nested = false): TranscriptRow<E>[] {
+  const committed = useRef<readonly TranscriptRow<E>[]>([]);
+  const rows = useMemo(() => groupTranscript(entries, committed.current, nested), [entries, nested]);
+  useLayoutEffect(() => { committed.current = rows; }, [rows]);
+  return rows;
+}
+
+function useStableRoles(entries: readonly AgentEntry[]): ReadonlyMap<number, string> {
+  const committed = useRef<ReadonlyMap<number, string>>(new Map());
+  const roles = useMemo(() => {
+    const next = subagentRoles(entries);
+    const previous = committed.current;
+    return next.size === previous.size && [...next].every(([id, role]) => previous.get(id) === role) ? previous : next;
+  }, [entries]);
+  useLayoutEffect(() => { committed.current = roles; }, [roles]);
+  return roles;
+}
+
+type RowProps = {
+  showToolCalls: boolean;
+  renderTool?: ((tool: ToolActivity) => ReactNode) | undefined;
+  userLabel?: ((entry: Extract<AgentEntry, { kind: "user" }>) => string | undefined) | undefined;
+};
+
+const TranscriptRowView = memo(function TranscriptRowView({ row, live, roles, ...props }: RowProps & {
+  row: TranscriptRow<TerminalEntry>;
+  live: boolean;
+  roles: ReadonlyMap<number, string>;
+}) {
+  if (row.type === "entry") return <TerminalEntryView entry={row.entry} {...props} />;
+  if (row.type === "work") return <WorkGroup entries={row.entries} live={live} showToolCalls={props.showToolCalls}
+    renderTool={props.renderTool} renderEntry={(entry) => <TerminalEntryView entry={entry} {...props} />} />;
+  return <SubagentRowView row={row} live={live} roles={roles} {...props} />;
+});
+
+function SubagentRowView({ row, live, roles, ...props }: RowProps & {
+  row: Extract<TranscriptRow<TerminalEntry>, { type: "agent" }>;
+  live: boolean;
+  roles: ReadonlyMap<number, string>;
+}) {
+  const nested = useReusedRows<TerminalEntry>(row.entries, true);
+  return <SubagentBlock agentId={row.agentId} role={roles.get(row.agentId)} entries={row.entries} live={live}>
+    {nested.map((child, index) => <TranscriptRowView key={child.id} row={child} live={live && index === nested.length - 1} roles={roles} {...props} />)}
+  </SubagentBlock>;
+}
+
 const TerminalEntryView = memo(function TerminalEntryView({
   entry,
   showToolCalls,
   renderTool,
   userLabel,
-}: {
-  entry: TerminalEntry;
-  showToolCalls: boolean;
-  renderTool?(tool: ToolActivity): ReactNode;
-  userLabel?(entry: Extract<AgentEntry, { kind: "user" }>): string | undefined;
-}) {
+}: RowProps & { entry: TerminalEntry }) {
   const voice = isVoiceEntry(entry);
-  if (!voice && entry.responseIdentity?.agentId != null) return (
-    <details className="agent-terminal-child" data-agent-id={entry.responseIdentity.agentId}>
-      <summary>Agent {entry.responseIdentity.agentId} activity</summary>
-      <TerminalEntryView entry={{ ...entry, responseIdentity: { ...entry.responseIdentity, agentId: undefined } }} showToolCalls={showToolCalls} renderTool={renderTool} userLabel={userLabel} />
-    </details>
-  );
-  if (entry.kind === "user") return <pre className="agent-terminal-user" data-source={voice ? "voice" : undefined}>
-    {voice ? <span className="agent-terminal-entry-label">voice</span> : !voice && (userLabel?.(entry) || entry.author === "guest") ? <span className="agent-terminal-entry-label">{userLabel?.(entry) || "Guest"}</span> : null}{entry.text}
-  </pre>;
-  if (entry.kind === "assistant" || entry.kind === "reasoning") return (
-    <article className={`agent-terminal-markdown is-${entry.kind}`} data-source={voice ? "voice" : undefined}>
-      {voice ? <span className="agent-terminal-entry-label">voice</span> : null}
-      {entry.kind === "reasoning" ? <span className="agent-terminal-entry-label">thinking{entry.streaming ? "…" : ""}</span> : null}
-      <Streamdown
-        caret={entry.streaming ? "block" : undefined}
-        components={MARKDOWN_COMPONENTS}
-        controls={MARKDOWN_CONTROLS}
-        isAnimating={entry.streaming}
-        linkSafety={LINK_SAFETY}
-        mode={entry.streaming ? "streaming" : "static"}
-        skipHtml
-      >{entry.text}</Streamdown>
-      {entry.kind === "assistant" && !entry.streaming && entry.text.trim() ? <ResponseActions text={entry.text} /> : null}
-    </article>
-  );
-  if (entry.kind === "error") return <p className="agent-terminal-error" role="alert">! {entry.text}</p>;
+  if (entry.kind === "user") return <UserMessage entry={entry} voice={voice}
+    label={voice ? "voice" : userLabel?.(entry as Extract<AgentEntry, { kind: "user" }>) || ("author" in entry && entry.author === "guest" ? "Guest" : undefined)} />;
+  if (entry.kind === "assistant" || entry.kind === "reasoning") return <AssistantMessage entry={entry} voice={voice} />;
+  if (entry.kind === "error") return <ErrorNotice text={entry.text} className="agent-terminal-error" />;
   if (entry.kind === "plan") return <ol className="agent-terminal-plan">
     {entry.update.plan.map((step, index) => <li key={`${index}-${step.step}`} data-status={step.status}>
       <span aria-hidden="true">{step.status === "completed" ? "✓" : step.status === "in_progress" ? "→" : "·"}</span>
       {step.step}
     </li>)}
   </ol>;
-  if (entry.kind === "tool") return <div className="agent-terminal-tool-entry">
-    {showToolCalls ? <TerminalToolView tool={entry.tool} /> : null}
-    {renderToolTree(entry.tool, renderTool)}
-    <GeneratedOutputView items={generatedToolOutput(entry.tool)} />
-  </div>;
+  // Tools are normally grouped; this path only covers a lone tool outside a group.
+  if (entry.kind === "tool") return <WorkGroup entries={[entry]} live={false} showToolCalls={showToolCalls}
+    renderTool={renderTool} renderEntry={() => null} />;
   return null;
 });
 
-function renderToolTree(tool: ToolActivity, render: ((tool: ToolActivity) => ReactNode) | undefined): ReactNode {
-  if (!render) return null;
-  return <>{render(tool)}{tool.children.map(child => <div key={child.callId}>{renderToolTree(child, render)}</div>)}</>;
-}
+type ProseEntry = Readonly<{ kind: "assistant" | "reasoning" | "user"; text: string; streaming: boolean }>;
 
-function generatedToolOutput(tool: ToolActivity): GeneratedOutput[] {
-  const items: GeneratedOutput[] = [];
-  const seen = new Set<string>();
-  function append(tool: ToolActivity) {
-    const output = tool.generatedOutput ?? projectToolOutput(tool.images?.map((image_url, index) => ({
-      type: "input_image", image_url, name: `${presentTool(tool).title} result ${index + 1}`,
-    })));
-    const emitsText = ["exec", "wait"].includes(tool.name.split(".").at(-1) ?? "");
-    for (const item of output) {
-      if (item.kind === "text" && !emitsText) continue;
-      const key = item.kind === "text" ? `text:${item.text}` : `${item.kind}:${item.url}`;
-      if (!seen.has(key)) { seen.add(key); items.push(item); }
-    }
-    tool.children.forEach(append);
-  }
-  append(tool);
-  return items;
+function AssistantMessage({ entry, voice }: { entry: ProseEntry; voice: boolean }) {
+  // Only a settled answer that is entirely a payload envelope is reinterpreted.
+  const settled = entry.kind === "assistant" && !entry.streaming && /^\s*[{[]/.test(entry.text);
+  const shown = useMemo(() => settled ? presentAssistantText(entry.text) : undefined, [settled, entry.text]);
+  if (shown?.kind === "error") return <ErrorNotice text={shown.text} className="agent-terminal-error" />;
+  const text = shown?.text ?? entry.text;
+  return <article className={`agent-terminal-markdown is-${entry.kind}`} data-source={voice ? "voice" : undefined}>
+    {voice ? <span className="agent-terminal-entry-label">voice</span> : null}
+    {entry.kind === "reasoning" ? <span className="agent-terminal-entry-label">thinking{entry.streaming ? "…" : ""}</span> : null}
+    <RichMarkdown streaming={entry.streaming}>{text}</RichMarkdown>
+    {entry.kind === "assistant" && !entry.streaming && text.trim() ? <ResponseActions text={text} /> : null}
+  </article>;
 }
 
 function ResponseActions({ text }: { text: string }) {
@@ -443,73 +472,58 @@ function ResponseActions({ text }: { text: string }) {
   </div>;
 }
 
-function MarkdownInput({
-  node: _node,
-  ref: _ref,
-  ...props
-}: ComponentProps<"input"> & { node?: unknown }) {
-  return <input
-    {...props}
-    aria-label={props["aria-label"] ?? (props.type === "checkbox" ? "Checklist item" : undefined)}
-  />;
+type UserAttachment = Readonly<{ kind: "image" | "file" | "document" | "audio"; name?: string | undefined; url?: string | undefined }>;
+const ATTACHMENT_MARKER = /^\[(image|audio|file|document)(?::\s*(.+))?\]$/;
+const ATTACHED_FILE_BLOCK = /<attached_file name="([^"]*)"[^>]*>[\s\S]*?<\/attached_file>/g;
+
+/** Splits trailing attachment markers (and any inlined file envelopes) out of user prose. */
+export function splitUserAttachments(text: string): { text: string; attachments: UserAttachment[] } {
+  const attachments: UserAttachment[] = [];
+  let body = text.replace(ATTACHED_FILE_BLOCK, (_match, name: string) => {
+    attachments.push({ kind: "file", name: name.replaceAll("&quot;", '"').replaceAll("&lt;", "<").replaceAll("&gt;", ">").replaceAll("&amp;", "&") });
+    return "";
+  });
+  const lines = body.split("\n");
+  const trailing: UserAttachment[] = [];
+  while (lines.length) {
+    const marker = ATTACHMENT_MARKER.exec(lines.at(-1)!.trim());
+    if (!marker) break;
+    lines.pop();
+    trailing.unshift({ kind: marker[1] as UserAttachment["kind"], ...(marker[2] ? { name: marker[2] } : {}) });
+  }
+  body = lines.join("\n").trimEnd();
+  return { text: body, attachments: [...attachments, ...trailing] };
 }
 
-const MARKDOWN_COMPONENTS = { input: MarkdownInput };
-const MARKDOWN_CONTROLS = { code: { copy: true, download: false }, table: false, mermaid: false } as const;
-const LINK_SAFETY = { enabled: true } as const;
+function UserMessage({ entry, label, voice }: { entry: TerminalEntry & { text: string }; label?: string | undefined; voice: boolean }) {
+  const { text, attachments: markers } = useMemo(() => splitUserAttachments(entry.text), [entry.text]);
+  const local = "attachments" in entry ? entry.attachments : undefined;
+  // Local previews carry thumbnails; history only has markers in the same order.
+  const attachments: UserAttachment[] = local?.length ? local.map((item, index) => ({ ...markers[index], ...item })) : markers;
+  return <div className="agent-terminal-user" data-source={voice ? "voice" : undefined}>
+    {label ? <span className="agent-terminal-entry-label">{label}</span> : null}
+    {text ? <p className="agent-terminal-user-text">{text}</p> : null}
+    {attachments.length ? <ul className="agent-user-attachments" aria-label="Attachments">
+      {attachments.map((item, index) => <li key={index} className={`is-${item.kind}`}>
+        {item.kind === "image" && item.url ? <img src={item.url} alt={item.name ?? "Attached image"} />
+          : <>{item.kind === "image" ? <ImageIcon aria-hidden="true" /> : <FileText aria-hidden="true" />}
+            <span>{item.name ?? (item.kind === "image" ? "Image" : item.kind === "audio" ? "Audio" : item.kind === "document" ? "Document" : "File")}</span></>}
+      </li>)}
+    </ul> : null}
+  </div>;
+}
 
-function TerminalToolView({ isChild = false, tool }: { isChild?: boolean; tool: ToolActivity }) {
-  const presentation = presentTool(tool);
-  const semanticWrapper = tool.name === "exec" && tool.children.length > 0;
-  const input = semanticWrapper ? undefined : tool.input ?? tool.arguments;
-  const output = semanticWrapper ? undefined : tool.output ?? tool.result;
-  const status = tool.status === "completed" ? "Succeeded"
-    : tool.status === "running" ? "Running"
-      : tool.status === "cancelled" ? "Cancelled" : "Failed";
-  return <details
-    className={`agent-terminal-tool is-${tool.status}${isChild ? " is-child" : ""}`}
-    {...(tool.status === "failed" || tool.status === "cancelled" || tool.children.length > 0
-      ? { open: true }
-      : {})}
-  >
-    <summary>
-      <span className="agent-terminal-tool-glyph" aria-hidden="true">
-        {tool.status === "completed" ? "✓" : tool.status === "running" ? "→" : "!"}
-      </span>
-      <span className="agent-terminal-tool-heading">
-        <strong>{presentation.title}</strong>
-        {presentation.subject ? <span>{presentation.subject}</span> : null}
-        {presentation.outputSummary ? <span>{presentation.outputSummary}</span> : null}
-      </span>
-      <span className="agent-terminal-tool-meta">
-        {presentation.source ? <span className="agent-terminal-tool-source">{presentation.source}</span> : null}
-        <span className="agent-terminal-tool-status" role={tool.status === "running" ? "status" : undefined}>
-          {status}
-        </span>
-        {presentation.duration ? <span>{presentation.duration}</span> : null}
-      </span>
-    </summary>
-    <div className="agent-terminal-tool-body">
-      <p className="agent-terminal-tool-wire"><span>Wire name</span> <code>{tool.name}</code></p>
-      {presentation.inputDetail || input ? <section className="agent-terminal-tool-detail">
-        <h4>{presentation.inputDetail?.label ?? "Input"}</h4>
-        <pre>{boundedToolDetail(presentation.inputDetail?.value ?? input ?? "")}</pre>
-      </section> : null}
-      {presentation.outputDetails?.map((detail) => <section
-        className="agent-terminal-tool-detail agent-terminal-tool-result"
-        key={detail.label}
-      >
-        <h4>{detail.label}</h4>
-        <pre>{boundedToolDetail(detail.value)}</pre>
-      </section>)}
-      {!presentation.outputDetails && output ? <section className="agent-terminal-tool-detail agent-terminal-tool-result">
-        <h4>Output</h4>
-        <pre>{boundedToolDetail(output)}</pre>
-      </section> : null}
-      {presentation.previewUrl ? <p className="agent-terminal-tool-preview">
-        <a href={presentation.previewUrl} rel="noopener noreferrer" target="_blank">Open preview</a>
-      </p> : null}
-      {tool.children.map((child) => <TerminalToolView isChild key={child.callId} tool={child} />)}
+/** Tidy inline notice: one readable sentence; raw source only behind Details. */
+function ErrorNotice({ text, className }: { text: string; className: string }) {
+  const { summary, detail } = useMemo(() => presentAgentError(text), [text]);
+  return <div className={`${className} agent-error-notice`} role="alert">
+    <CircleAlert className="agent-error-notice-icon" aria-hidden="true" />
+    <div className="agent-error-notice-body">
+      <p>{summary}</p>
+      {detail ? <details className="agent-tool-protocol agent-error-notice-details">
+        <summary>Details</summary>
+        <pre>{detail}</pre>
+      </details> : null}
     </div>
-  </details>;
+  </div>;
 }

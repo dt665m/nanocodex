@@ -115,8 +115,7 @@ failure categories, call correlation, and queries for command retry sequences.
 
 Correlate `hand.call.broker` observations by `transport_call_id` and connection
 identity. A session-attached Hand uses the session broker directly; an account
-Hand can use the account broker or a regional relay. Measure the route actually
-selected, since those paths have different preparation and transport costs.
+Hand uses the account broker.
 
 On WebSocket `host_progress` and `receipt` observations:
 
@@ -151,3 +150,60 @@ local workerd/account-broker journey and `test:hand-preparation` for managed
 Code Mode route preparation. Their ignored `output/` artifacts contain source
 hashes, timings, public diagnostics, and ownership/recovery evidence. Local
 journey durations do not establish a production WAN latency improvement.
+
+## Fresh session startup
+
+Correlate the public live-create request, `DurableAgentSession`, and private
+egress spans by their native trace ID. Keep client connection readiness,
+`managed.turn.accepted`, provider socket readiness, and first answer output as
+separate boundaries. A CLI that does not emit connection readiness has no
+measurement for that boundary; provider socket readiness is not a substitute.
+
+`session.create.commit` observes the storage synchronization promise without
+adding an awaited application barrier. Its duration includes the Durable Object
+output gate for the first write batch. Removing the observer does not remove
+that gate. Synchronous constructor timings can be zero because the Worker clock
+does not advance during synchronous execution; they do not establish zero CPU.
+Use native invocation CPU measurements with their stated scope.
+
+`managed.credential.prewarm` records the authenticated edge preparation's region,
+fixed outcome, and elapsed duration. This preparation runs concurrently with
+session creation. `egress.credential.snapshot` distinguishes a regional hit
+(`snapshot`) from a canonical fill (`filled`) and reports the canonical duration
+when applicable. A cold fill still reaches the canonical credential broker;
+a warm regional hit does not. Neither event logs credential material.
+
+Compare durations measured on one clock. Do not subtract timestamps on different
+Workers to label the residual as an exact cold-start, routing, or scheduling
+cost. Discovery, credential preparation, storage commit, and provider setup may
+overlap: their durations are not necessarily additive. Confirm overlap with
+causal span relationships and controlled runtime journeys, then measure actual
+fresh-client startup on the deployed revision.
+
+## Managed recovery inspection
+
+The guarded administrator `admin_threads` diagnostics response includes a
+`recovery` snapshot of retained turn safety counters and Code Mode effect
+metadata. The request's `limit` bounds each collection (maximum 100), ordered
+by newest insertion; `has_more` explicitly marks omitted older rows. This
+snapshot does not include archived turns or parse the root runtime head.
+
+Compare `abrupt_attempts` with the ordinary `attempt_count`: they measure
+separate recovery paths. Missing safety rows remain null. Effect receipt
+inspection returns chunk counts, never receipt contents, inputs,
+source, hashes or credentials. Receipt scans stop at 257 chunks; `truncated`
+means the reported count is a lower bound, not verified integrity. Receipt metadata uses
+the chunk-key index and never reads or casts receipt bodies. A failed receipt
+query is marked unavailable on that effect; other safety/effect metadata remains
+readable. Snapshot-level failures include a fixed stage code without SQL errors.
+Unavailable tables or snapshots are explicit. Reads do not acquire runtime
+ownership, settle operations or replenish recovery budgets. Ordinary owner
+and Connect diagnostics do not expose this administrator snapshot.
+
+`stopped_root_effects` additionally selects up to ten stopped operations from
+the newest 100 safety rows. Each operation returns at most ten effects (or the
+smaller requested limit), ordered by descending model ordinal and parent call.
+Lookups use the retained root runtime session ID and original operation ID, so
+newer child activity cannot hide these root effects. Missing root identity makes
+this collection explicitly unavailable; it never guesses a session ID. Collection
+and per-operation truncation are explicit. No runtime-head payload is loaded.

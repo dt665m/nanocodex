@@ -9,7 +9,7 @@ export function initialState(status = "Ready") {
   };
 }
 
-export function queuePrompt(state, id, text, historyEntryId) {
+export function queuePrompt(state, id, text, historyEntryId, attachments) {
   const displayImmediately = !state.running && state.queuedPrompts.length === 0;
   const turnId = historyTurnId(historyEntryId);
   return {
@@ -17,8 +17,9 @@ export function queuePrompt(state, id, text, historyEntryId) {
     entries: displayImmediately ? [...state.entries, {
       id: historyEntryId ?? `user-${id}`, kind: "user", text, promptId: id,
       ...(turnId === undefined ? {} : { turnId }),
+      ...(attachments?.length ? { attachments } : {}),
     }] : state.entries,
-    queuedPrompts: [...state.queuedPrompts, { id, text, historyEntryId, turnId }],
+    queuedPrompts: [...state.queuedPrompts, { id, text, historyEntryId, turnId, ...(attachments?.length ? { attachments } : {}) }],
     displayedQueuedPrompt: displayImmediately ? id : state.displayedQueuedPrompt,
     pendingTurns: state.pendingTurns + 1,
     status: state.running ? "Prompt queued" : "Starting",
@@ -253,6 +254,7 @@ export function applyAgentEvents(state, events) {
           mutableEntries().push({
             id: promptEntryId, kind: "user", text: prompt.text, promptId: prompt.id,
             ...(prompt.turnId === undefined ? {} : { turnId: prompt.turnId }),
+            ...(prompt.attachments ? { attachments: prompt.attachments } : {}),
           });
         }
         next = {
@@ -606,7 +608,7 @@ function hasTypedToolOutput(value, depth = 0) {
   const decoded = decodeJsonString(value);
   if (Array.isArray(decoded)) return decoded.slice(0, 64).some(item => hasTypedToolOutput(item, depth + 1));
   if (!isObject(decoded)) return false;
-  if (["input_text", "text", "output_text", "input_image", "image", "resource", "resource_link"].includes(decoded.type)) return true;
+  if (["input_text", "text", "output_text", "input_image", "image", "output_image", "image_url", "audio", "input_audio", "output_audio", "video", "input_video", "output_video", "document", "file", "input_file", "output_file", "resource", "resource_link"].includes(decoded.type)) return true;
   return ["content", "output", "result", "structuredContent"].some(key => hasTypedToolOutput(decoded[key], depth + 1));
 }
 
@@ -649,7 +651,7 @@ function completedTool(tool, payload, status, terminalPoll = false) {
       ? {}
       : { metadata: payload.metadata }),
     result: summarizeToolResult(tool.name, generatedOutput.some(item => item.kind !== "text") ? formatToolOutput(result) : result, status),
-    output: terminal && isObject(result) ? JSON.stringify(result) : boundedMultiline(formatToolOutput(result)),
+    output: terminal && isObject(result) ? JSON.stringify(result) : boundedMultiline(formatToolOutput(result), 160, 12_000),
   };
 }
 
@@ -736,7 +738,8 @@ function isEmptyTerminalPoll(tool, value) {
 }
 
 function serializeToolDetail(value) {
-  return boundedMultiline(formatValue(value));
+  // Inputs carry file edits and patches; keep enough for a readable diff.
+  return boundedMultiline(formatValue(value), 400, 24_000);
 }
 
 function summarizeToolArguments(tool, value) {
@@ -795,12 +798,12 @@ function compact(value) {
   return [...normalized].length <= 180 ? normalized : `${[...normalized].slice(0, 180).join("")}…`;
 }
 
-function boundedMultiline(value) {
+function boundedMultiline(value, maxLines = 24, maxCharacters = 4_000) {
   const lines = value.trim().split("\n");
-  const output = lines.slice(0, 24).join("\n");
+  const output = lines.slice(0, maxLines).join("\n");
   const characters = [...output];
-  if (characters.length > 4_000) return `${characters.slice(0, 4_000).join("")}…`;
-  return lines.length > 24 ? `${output}\n…` : output;
+  if (characters.length > maxCharacters) return `${characters.slice(0, maxCharacters).join("")}…`;
+  return lines.length > maxLines ? `${output}\n…` : output;
 }
 
 function formatValue(value) {

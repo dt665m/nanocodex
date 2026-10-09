@@ -94,7 +94,7 @@ const EXEC_DESCRIPTION: &str = r#"Run JavaScript code to orchestrate/compose too
 - Accepts raw JavaScript source text, not JSON, quoted strings, or markdown code fences.
 - You may optionally start the tool input with a first-line pragma like `// @exec: {"yield_time_ms": 10000, "max_output_tokens": 1000}`.
 - `yield_time_ms` asks `exec` to yield early if the script is still running. Defaults to 10000 ms.
-- `max_output_tokens` sets the token budget for direct `exec` results. Defaults to 10000 tokens.
+- `max_output_tokens` sets the token budget for direct `exec` results. Omit for unlimited output.
 - When the JS code is fully evaluated, the isolate's lifetime ends and unawaited promises are silently discarded.
 
 - Global helpers:
@@ -118,7 +118,11 @@ pub(crate) fn exec_description(
     code_mode_only: bool,
 ) -> String {
     let mut description = EXEC_DESCRIPTION.to_owned();
-    description.push_str("\n- `ALL_TOOLS` is the catalog of callable nested tools for this execution. A tool exposed separately by the host is not necessarily callable through `tools`; use its direct tool entry when it is absent from this catalog.");
+    if code_mode_only {
+        description.push_str("\n- `ALL_TOOLS` is the catalog of callable nested tools for this execution. All tools must be called through `tools` inside `exec`; only `exec` and `wait` are top-level entrypoints.");
+    } else {
+        description.push_str("\n- `ALL_TOOLS` is the catalog of callable nested tools for this execution. A tool exposed separately by the host is not necessarily callable through `tools`; use its direct tool entry when it is absent from this catalog.");
+    }
     description.push_str("\n- Nanocodex extension: calling a missing nested tool rejects locally with `TOOL_NOT_AVAILABLE`; it does not dispatch a tool. An unfinished nested call may have executed even when its cell ends; an `outcome: unknown` receipt is not permission to retry it.");
     if !provider_summaries.is_empty() {
         description.push_str("\n\nAdditional runtime-provided nested tools:");

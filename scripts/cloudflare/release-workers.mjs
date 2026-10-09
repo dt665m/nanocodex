@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
-import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -9,7 +9,7 @@ import { createDeploymentLedger, DeploymentLedgerError } from './deployment-ledg
 import { releaseTag } from './live-worker-state.mjs';
 import { currentRelease } from './current-production-release.mjs';
 import { phases } from './deploy-workers.mjs';
-import { readPlan, releaseFingerprints, buildSelected } from './release-plan.mjs';
+import { readPlan, buildSelected, startBuilds } from './release-plan.mjs';
 import { resolveReleasedImages } from './released-images.mjs';
 import { configureReleasedAccount } from './released-account-image.mjs';
 
@@ -18,7 +18,7 @@ const commands=Object.fromEntries([...Object.values(phases).flat(),
   ['account','js/account',['npx','wrangler','deploy','--config','dist/nanocodex/wrangler.ci.json']],
 ].map(([name,directory,command])=>[name,{directory,command}]));
 // Publish named managed entry points before the broker binds to them.
-export const releasePhases=[['x'],['media'],['managed'],['egress'],['email','dialog','connect-api','astra','chief-of-staff','playground'],['account']];
+export const releasePhases=[['x','media'],['managed'],['egress'],['email','dialog','connect-api','astra','chief-of-staff','playground'],['account']];
 
 export async function guardedCommand(command, {cwd=process.cwd(),directory='.',env=process.env,input,launch=spawn}={}) {
   const temporary=mkdtempSync(join(tmpdir(),'nanocodex-release-'));
@@ -75,7 +75,7 @@ const healthAttempt=(attempts,seconds,last)=>
   `after ${attempts} attempt${attempts===1?'':'s'} over ${seconds.toFixed(1)}s`+
   (last.observedRevision?`; last observed revision ${last.observedRevision}`:'');
 export async function waitForAccountHealth(expectedRevision,{deadlineMs=120_000,timeoutMs=20_000,
-  retryDelayMs=2_000,maxRetryDelayMs=10_000,minimumProbeMs=5_000,probe=accountHealth,sleep=ms=>new Promise(done=>setTimeout(done,ms)),
+  retryDelayMs=500,maxRetryDelayMs=2_000,minimumProbeMs=5_000,probe=accountHealth,sleep=ms=>new Promise(done=>setTimeout(done,ms)),
   now=Date.now,log=console.log,...options}={}) {
   const started=now();
   for(let attempts=1;;attempts++){
@@ -119,16 +119,28 @@ export async function accountHealth(expectedRevision,{url='https://nanocodex.gak
     if(health.deployment_sha!==expectedRevision)throw new AccountHealthError('revision_mismatch',undefined,health.deployment_sha);
   }
 }
+// Run the package's installed Wrangler instead of resolving it through npx.
+export function localWrangler(command,directory,exists=existsSync){
+  if(command[0]!=='npx'||command[1]!=='wrangler')return command;
+  return exists(join(directory,'node_modules/.bin/wrangler'))?['node_modules/.bin/wrangler',...command.slice(2)]:command;
+}
+export function buildEnvironment(env){
+  const buildEnv={...env};
+  for(const key of ['ASTRA_MANAGED_API_KEY','ASTRA_MPP_SECRET','TEMPO_API_KEY'])delete buildEnv[key];
+  return buildEnv;
+}
 // Prepare only the next selected deployment phase. The same checkout and set of
 // completed targets let later consumers reuse dependencies already built here.
 export async function prepareReleasePhase(plan, {cwd=process.cwd(),env=process.env,
   completedTargets=new Set(),run=execFileSync,managed=resolveReleasedImages,
-  account=configureReleasedAccount}={}) {
-  const buildEnv={...env};
-  for(const key of ['ASTRA_MANAGED_API_KEY','ASTRA_MPP_SECRET','TEMPO_API_KEY'])delete buildEnv[key];
-  const buildRun=(command,args,options)=>run(command,args,{...options,cwd,env:buildEnv});
-  if(plan.selected.includes('astra'))buildRun('npm',['ci','--prefix','examples/astra-mpp-trial'],{stdio:'inherit'});
-  buildSelected(plan,buildRun,completedTargets);
+  account=configureReleasedAccount,builds}={}) {
+  if(builds)await builds.ready(plan.selected);
+  else{
+    const buildEnv=buildEnvironment(env);
+    const buildRun=(command,args,options)=>run(command,args,{...options,cwd,env:buildEnv});
+    if(plan.selected.includes('astra'))buildRun('npm',['ci','--prefix','examples/astra-mpp-trial'],{stdio:'inherit'});
+    buildSelected(plan,buildRun,completedTargets);
+  }
   if(plan.selected.includes('managed'))await managed({cwd,account:env.CLOUDFLARE_ACCOUNT_ID,
     repository:env.GITHUB_REPOSITORY,epoch:env.MANAGED_IMAGE_CACHE_EPOCH||'1',
     requireCurrent:(env.RELEASE_ONLY||'').split(',').includes('managed')});
@@ -137,7 +149,7 @@ export async function prepareReleasePhase(plan, {cwd=process.cwd(),env=process.e
     repository:env.GITHUB_REPOSITORY,token:env.CLOUDFLARE_API_TOKEN});
 }
 
-export async function releaseWorkers(plan,{ledger=createDeploymentLedger(),isCurrent=currentRelease,run=guardedCommand,health=waitForAccountHealth,env=process.env,cwd=process.cwd(),prepare=prepareReleasePhase,verify=async()=>{}}={}){
+export async function releaseWorkers(plan,{ledger=createDeploymentLedger(),isCurrent=currentRelease,run=guardedCommand,health=waitForAccountHealth,env=process.env,cwd=process.cwd(),prepare=prepareReleasePhase,verify=async()=>{},completedTargets=new Set()}={}){
   if(plan.selected.includes('account'))assert.match(plan.revision,/^[a-f0-9]{40}$/);
   const results=[];
   const failures=[];
@@ -150,7 +162,6 @@ export async function releaseWorkers(plan,{ledger=createDeploymentLedger(),isCur
     failures.push(description);
     console.error(`::error title=Worker release failed::${description}`);
   };
-  const completedTargets=new Set();
   const result=(pending,state)=>{
     results.push({name:pending.name,state,seconds:(Date.now()-pending.started)/1000});
     if(state==='success')console.log(`::notice title=Worker released::${pending.name} verified at ${new Date().toISOString()}`);
@@ -162,12 +173,19 @@ export async function releaseWorkers(plan,{ledger=createDeploymentLedger(),isCur
     try{
       if(!await isCurrent()){results.push({name,state:'superseded',seconds:0});return;}
       stage='ledger admission';
-      pending.record=await ledger.start(name,plan.fingerprints[name]);
+      pending.record=await ledger.start(name,plan.fingerprints[name],plan.topology?{topology:plan.topology}:undefined);
       console.log(`Deploying ${name}`);
       const spec=commands[name];
       const childEnv={...env};
       for(const key of ['ASTRA_MANAGED_API_KEY','ASTRA_MPP_SECRET','TEMPO_API_KEY'])delete childEnv[key];
-      const command=[...spec.command,'--message',env.DEPLOY_MESSAGE??'','--tag',releaseTag(plan.fingerprints[name])];
+      const command=[...localWrangler(spec.command,resolve(cwd,spec.directory)),'--message',env.DEPLOY_MESSAGE??'','--tag',releaseTag(plan.fingerprints[name])];
+      // Parallel plans prove configs and released image refs are unchanged, so
+      // skip Wrangler's per-container-application comparison (~1s per app).
+      if(plan.parallel){
+        const at=command.indexOf('--containers-rollout');
+        if(at>=0)command[at+1]='none';
+        else if(name==='account'||name==='managed')command.push('--containers-rollout','none');
+      }
       if(name==='account')command.push('--var',`DEPLOYMENT_SHA:${plan.revision}`);
       if(name==='astra'){
         const secrets=Object.fromEntries([
@@ -198,7 +216,10 @@ export async function releaseWorkers(plan,{ledger=createDeploymentLedger(),isCur
     }
   }
   try{
-    for(const phase of releasePhases){
+    // Unchanged topology: one parallel phase (one health check). Otherwise the
+    // dependency-ordered phases publish entrypoints before their consumers.
+    const phases=plan.parallel?[releasePhases.flat()]:releasePhases;
+    for(const phase of phases){
       const selected=phase.filter(name=>plan.selected.includes(name));
       if(!selected.length)continue;
       // Avoid starting unrelated compilation after a newer push supersedes us.
@@ -247,8 +268,15 @@ export async function releaseWorkers(plan,{ledger=createDeploymentLedger(),isCur
   }
 }
 if(process.argv[1]&&resolve(process.argv[1])===fileURLToPath(import.meta.url)){
+  // The plan step computed fingerprints earlier in this same job and checkout;
+  // recomputing them (git walk plus image lookups) before and after every phase
+  // only added latency.
   const plan=readPlan();
-  assert.deepEqual(plan.fingerprints,await releaseFingerprints(),'Release inputs changed after planning');
-  await releaseWorkers(plan,{verify:async()=>
-    assert.deepEqual(plan.fingerprints,await releaseFingerprints(),'Release inputs changed during preparation')});
+  const completedTargets=new Set();
+  // All builds start now; each phase waits only for its own targets.
+  const builds=startBuilds(plan,{env:buildEnvironment(process.env),completedTargets});
+  try{
+    await releaseWorkers(plan,{completedTargets,
+      prepare:(phase,options)=>prepareReleasePhase(phase,{...options,builds})});
+  }finally{builds.stop();}
 }

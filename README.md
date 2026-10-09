@@ -207,6 +207,11 @@ process protocol that applications must adopt. See
 [`bin/nanocodex`](bin/nanocodex), the [examples index](examples/README.md), and
 the [release switcher documentation](bin/nanocodex/src/update.rs).
 
+For local checkout development, build with `cargo build -p nanocodex-bin -p nanocodex2-bin`
+and run `./target/debug/nanocodex`. See [local macOS development](docs/architecture/hands.md#local-macos-development)
+for signing and restarting the existing Hand directly from `target/debug` or
+`target/release`.
+
 To install a branch or an open pull request from source, run
 `nanocodex update --branch master` or `nanocodex update --pr 123`. Both commands fetch the selected
 revision and compile the CLI and Hand locally with Cargo. PR selection also
@@ -215,6 +220,13 @@ requires `gh`. The updater reuses its checkout and Cargo cache under
 `nightly` profile without release LTO. Cargo timing reports are saved under
 `~/.nanocodex/source-build/target/cargo-timings` (or your `CARGO_TARGET_DIR`).
 These source builds do not package the native voice runtime.
+
+On macOS, run `nanocodex hand permissions --guide` to open a floating guide
+beside System Settings for Screen Recording and Accessibility. Drag the Hand
+executable into the list, or enable its existing entry. The guide checks the
+running Hand's permissions, advances through missing permissions, and restarts
+it when both are allowed. Use `nanocodex hand permissions --check --json` for
+read-only status. The menu companion offers **Allow Screen & Input Permissions…**.
 
 For managed agents, `nanocodex2 login` signs in with an SMS code and saves an
 account key; `nanocodex2 status` verifies it, and `nanocodex2 logout` removes the
@@ -377,7 +389,8 @@ family. Null values inherit the parent family and its current settings; switchin
 families uses the selected family's defaults. Mixed children share the same task
 tree, result contracts and lifecycle tools. Each family uses its own credentials,
 native tools and transcript format. A model from the wrong family fails before
-provider dispatch. Claude aliases are `opus`, `sonnet`, `fable` and `haiku`.
+provider dispatch. Claude aliases are `opus`, `sonnet`, `fable` and `haiku`;
+`haiku` selects Claude Haiku 5.5, and `claude-haiku-4-5` still selects Haiku 4.5.
 
 Libraries compose the same routing through [`Harness`](crates/nanocodex/README.md)
 with concrete provider builders and host-owned construction recipes.
@@ -564,6 +577,10 @@ JavaScript execution tool to the model; inside a cell, ordinary code can loop,
 branch, fan out with `Promise.all`, and call typed tools through
 `await tools.<name>(...)`. The runtime bounds code, tool output, process output,
 and cancellation while keeping the model-facing schema compact.
+
+The Claude CLI uses the same Code Mode engine with `--claude`.
+Both native runtimes share the canonical subagent tools and discovered CUA
+provider. See the [tool catalogs and Claude Code Mode usage](docs/TOOL_RUNTIMES.md).
 
 MCP is part of the native tools crate rather than a separate agent runtime.
 The `nanocodex` CLI and Cloudflare managed agents (including `nanocodex2`

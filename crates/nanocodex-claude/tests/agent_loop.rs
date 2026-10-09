@@ -98,6 +98,7 @@ async fn calls_outside_the_catalog_get_paired_errors_and_the_turn_continues() {
         ClaudeClient::new(reqwest::Client::new(), endpoint, "synthetic"),
         "test",
     ))
+    .max_tokens(128_000)
     .tool(
         ToolDefinition {
             name: "exec".into(),
@@ -168,54 +169,56 @@ async fn calls_outside_the_catalog_get_paired_errors_and_the_turn_continues() {
 }
 
 #[tokio::test]
-async fn sonnet_55_uses_its_million_token_window_before_compacting() {
+async fn million_token_models_use_their_window_before_compacting() {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let calls = Arc::new(AtomicUsize::new(0));
-    let received = calls.clone();
-    let app = Router::new().route(
-        "/v1/messages",
-        post(move |Json(body): Json<Value>| {
-            let received = received.clone();
-            async move {
-                assert_eq!(body["model"], "claude-sonnet-5-5");
-                received.fetch_add(1, Ordering::SeqCst);
-                let response = stream(vec![json!({"type":"text","text":"answer"})], "end_turn")
-                    .replace("\"input_tokens\":3", "\"input_tokens\":300000");
-                ([("content-type", "text/event-stream")], response)
-            }
-        }),
-    );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let client = ClaudeClient::new(
-        reqwest::Client::new(),
-        format!("http://{address}/v1/messages"),
-        "synthetic",
-    );
-    let (agent, _) = Nanocodex::builder(Claude::new(client, "claude-sonnet-5-5"))
-        .build()
-        .unwrap();
-    for prompt in ["first", "second"] {
+    for model in ["claude-sonnet-5-5", "claude-haiku-5-5"] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let received = calls.clone();
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move |Json(body): Json<Value>| {
+                let received = received.clone();
+                async move {
+                    assert_eq!(body["model"], model);
+                    received.fetch_add(1, Ordering::SeqCst);
+                    let response = stream(vec![json!({"type":"text","text":"answer"})], "end_turn")
+                        .replace("\"input_tokens\":3", "\"input_tokens\":300000");
+                    ([("content-type", "text/event-stream")], response)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = ClaudeClient::new(
+            reqwest::Client::new(),
+            format!("http://{address}/v1/messages"),
+            "synthetic",
+        );
+        let (agent, _) = Nanocodex::builder(Claude::new(client, model))
+            .build()
+            .unwrap();
+        for prompt in ["first", "second"] {
+            assert_eq!(
+                agent
+                    .prompt(prompt)
+                    .await
+                    .unwrap()
+                    .result()
+                    .await
+                    .unwrap()
+                    .final_message(),
+                "answer"
+            );
+        }
+        agent.shutdown().await.unwrap();
+        server.abort();
         assert_eq!(
-            agent
-                .prompt(prompt)
-                .await
-                .unwrap()
-                .result()
-                .await
-                .unwrap()
-                .final_message(),
-            "answer"
+            calls.load(Ordering::SeqCst),
+            2,
+            "300K input must not trigger compaction in {model}'s 1M window"
         );
     }
-    agent.shutdown().await.unwrap();
-    server.abort();
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        2,
-        "300K input must not trigger compaction in Sonnet 5.5's 1M window"
-    );
 }
 
 #[tokio::test]
@@ -446,6 +449,7 @@ async fn failed_compaction_and_cancelled_turn_keep_previous_context() {
         "synthetic",
     );
     let (agent, _) = Nanocodex::builder(Claude::new(client, "test"))
+        .max_tokens(128_000)
         .build()
         .unwrap();
     agent.prompt("first").await.unwrap().result().await.unwrap();
@@ -529,6 +533,7 @@ async fn auto_compacts_at_usage_threshold_before_next_prompt() {
         "synthetic",
     );
     let (agent, _) = Nanocodex::builder(Claude::new(client, "test"))
+        .max_tokens(128_000)
         .context_window_tokens(10)
         .build()
         .unwrap();
@@ -688,6 +693,7 @@ async fn independent_tools_can_execute_concurrently_but_results_remain_one_order
         "synthetic",
     );
     let (agent, _) = Nanocodex::builder(Claude::new(client, "test"))
+        .max_tokens(128_000)
         .parallel_tools(true) // caller asserts the registered tool invocations are independent
         .tool(
             ToolDefinition {
@@ -813,7 +819,7 @@ async fn claude_client_tool_can_return_multimodal_blocks_without_codex_result_sh
         format!("http://{address}/v1/messages"),
         "synthetic",
     );
-    let (agent,_)=Nanocodex::builder(Claude::new(client,"test"))
+    let (agent,_)=Nanocodex::builder(Claude::new(client,"test")).max_tokens(128_000)
         .tool_blocks(ToolDefinition { name:"ReadImage".into(), description:"Test image".into(), input_schema:json!({"type":"object"}),strict:None,defer_loading:false }, |_| async {
             Ok(vec![json!({"type":"text","text":"image follows"}),json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":png(1, 1)}})])
         }).build().unwrap();
@@ -902,6 +908,7 @@ async fn tool_images_fit_many_image_limit_before_history_crosses_twenty() {
     };
     let image = |data: String| json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":data}});
     let (agent, _) = Nanocodex::builder(Claude::new(client, "test"))
+        .max_tokens(128_000)
         .tool_blocks(capture, move |input| {
             let blocks = if input["batch"] == 1 {
                 vec![
@@ -1030,6 +1037,7 @@ async fn cancelled_tool_batch_retains_completed_and_unknown_results(parallel: bo
         "synthetic",
     );
     let (agent, mut events) = Nanocodex::builder(Claude::new(client, "test"))
+        .max_tokens(128_000)
         .parallel_tools(parallel)
         .tool(
             ToolDefinition {
@@ -1394,6 +1402,7 @@ async fn cancellation_at_completed_handler_boundary(parallel: bool) {
         "synthetic",
     );
     let (agent, mut events) = Nanocodex::builder(Claude::new(client, "test"))
+        .max_tokens(128_000)
         .parallel_tools(parallel)
         .tool(
             ToolDefinition {
@@ -1517,6 +1526,7 @@ async fn queued_ephemeral_cancellation_retires_without_aborting_active_model_or_
             "synthetic",
         );
         let (agent, _) = Nanocodex::builder(Claude::new(client, "test"))
+            .max_tokens(128_000)
             .tool(
                 ToolDefinition {
                     name: "effect".into(),
@@ -1717,6 +1727,7 @@ async fn response_usage_arrives_before_tool_completion_and_excludes_summary() {
         "synthetic",
     );
     let (agent, mut events) = Nanocodex::builder(Claude::new(client, "test"))
+        .max_tokens(128_000)
         .tool(
             ToolDefinition {
                 name: "hold".into(),
@@ -1877,6 +1888,7 @@ async fn steering_acknowledges_consumption_at_tool_and_terminal_boundaries() {
             "synthetic",
         );
         let (agent, mut events) = Nanocodex::builder(Claude::new(client, "test"))
+            .max_tokens(128_000)
             .tool(
                 ToolDefinition {
                     name: "hold".into(),
@@ -2010,6 +2022,7 @@ async fn streamed_text_and_final_message_share_one_response_identity() {
         "synthetic",
     );
     let (agent, mut events) = Nanocodex::builder(Claude::new(client, "test"))
+        .max_tokens(128_000)
         .tool(
             ToolDefinition {
                 name: "lookup".into(),
@@ -2263,7 +2276,7 @@ async fn prompt_images_and_documents_become_native_claude_blocks() {
     let (agent, _) = Nanocodex::builder(Claude::new(client, "claude-opus-5-5"))
         .build()
         .unwrap();
-    let png = STANDARD.encode(b"\x89PNG\r\n\x1a\nsynthetic");
+    let png = png(1, 1);
     let pdf = STANDARD.encode(b"%PDF-1.7\nsynthetic invoice\n%%EOF");
     let notes = STANDARD.encode("Quarterly notes: revenue up.".as_bytes());
     let prompt = Prompt::content([
@@ -2299,6 +2312,49 @@ async fn prompt_images_and_documents_become_native_claude_blocks() {
         );
     }
 
+    // Subsequent turns replay the admitted content rather than flattening media.
+    agent
+        .prompt("Recall the attachments")
+        .await
+        .unwrap()
+        .result()
+        .await
+        .unwrap();
+    {
+        let log = requests.lock().unwrap();
+        assert_eq!(
+            log[1]["messages"][0]["content"],
+            log[0]["messages"][0]["content"]
+        );
+    }
+    for (format, mime) in [
+        (ImageFormat::Jpeg, "image/jpeg"),
+        (ImageFormat::Gif, "image/gif"),
+        (ImageFormat::WebP, "image/webp"),
+    ] {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        DynamicImage::new_rgb8(1, 1)
+            .write_to(&mut bytes, format)
+            .unwrap();
+        let data = STANDARD.encode(bytes.into_inner());
+        agent
+            .prompt(Prompt::content([UserInput::Image {
+                image_url: format!("data:{mime};base64,{data}"),
+                detail: None,
+            }]))
+            .await
+            .unwrap()
+            .result()
+            .await
+            .unwrap();
+        let log = requests.lock().unwrap();
+        let messages = log.last().unwrap()["messages"].as_array().unwrap();
+        assert_eq!(
+            messages.last().unwrap()["content"][0],
+            json!({"type":"image","source":{"type":"base64","media_type":mime,"data":data}})
+        );
+    }
+
     let rejected = |file_data: String, filename: Option<&str>| {
         Prompt::content([UserInput::File {
             file_data,
@@ -2306,6 +2362,14 @@ async fn prompt_images_and_documents_become_native_claude_blocks() {
         }])
     };
     for (prompt, expected) in [
+        (
+            rejected("data:video/mp4;base64,AAAAAGZ0eXA=".into(), None),
+            "application/pdf and text/plain",
+        ),
+        (
+            rejected("data:audio/wav;base64,UklGRg==".into(), None),
+            "application/pdf and text/plain",
+        ),
         (
             rejected(format!("data:application/zip;base64,{pdf}"), None),
             "application/pdf and text/plain",
@@ -2348,9 +2412,17 @@ async fn prompt_images_and_documents_become_native_claude_blocks() {
     }
     assert_eq!(
         requests.lock().unwrap().len(),
-        1,
+        5,
         "invalid media never reaches the provider"
     );
+    let artifact = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../output/claude-host-integration");
+    std::fs::create_dir_all(&artifact).unwrap();
+    std::fs::write(
+        artifact.join("prompt-media-requests.json"),
+        serde_json::to_vec_pretty(&*requests.lock().unwrap()).unwrap(),
+    )
+    .unwrap();
     agent.shutdown().await.unwrap();
     server.abort();
 }
@@ -2401,6 +2473,7 @@ async fn truncated_complete_tool_block_is_never_dispatched_or_finalized() {
         "synthetic",
     );
     let (agent, mut events) = Nanocodex::builder(Claude::new(client, "test"))
+        .max_tokens(128_000)
         .tool(
             ToolDefinition {
                 name: "mutate".into(),
@@ -2474,4 +2547,109 @@ async fn truncated_complete_tool_block_is_never_dispatched_or_finalized() {
     }
     agent.shutdown().await.unwrap();
     server.abort();
+}
+
+// Per-tool gating (Claude Code scheduling): consecutive declared parallel-safe
+// calls overlap, while an undeclared call waits for them and runs alone before
+// any later call starts. Results stay in response order in one user message.
+#[tokio::test]
+async fn parallel_safe_tools_overlap_only_in_runs_and_unsafe_calls_stay_ordered() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let received = captured.clone();
+    let app = Router::new().route(
+        "/v1/messages",
+        post(move |Json(body): Json<Value>| {
+            let received = received.clone();
+            async move {
+                let index = {
+                    let mut requests = received.lock().unwrap();
+                    requests.push(body);
+                    requests.len()
+                };
+                let blocks = if index == 1 {
+                    vec![
+                        json!({"type":"tool_use","id":"r1","name":"read","input":{}}),
+                        json!({"type":"tool_use","id":"r2","name":"read","input":{}}),
+                        json!({"type":"tool_use","id":"w1","name":"write","input":{}}),
+                        json!({"type":"tool_use","id":"r3","name":"read","input":{}}),
+                    ]
+                } else {
+                    vec![json!({"type":"text","text":"done"})]
+                };
+                (
+                    [("content-type", "text/event-stream")],
+                    stream(blocks, if index == 1 { "tool_use" } else { "end_turn" }),
+                )
+                    .into_response()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let trace = Arc::new(Mutex::new(Vec::<String>::new()));
+    let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let definition = |name: &str| ToolDefinition {
+        name: name.into(),
+        description: "Synthetic".into(),
+        input_schema: json!({"type":"object"}),
+        strict: None,
+        defer_loading: false,
+    };
+    let handler = |kind: &'static str| {
+        let (trace, active, peak) = (trace.clone(), active.clone(), peak.clone());
+        move |_input: Value, invocation: nanocodex_claude::ClaudeToolInvocation| {
+            let (trace, active, peak) = (trace.clone(), active.clone(), peak.clone());
+            async move {
+                let id = invocation.call_id;
+                trace.lock().unwrap().push(format!("start {id}"));
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                trace.lock().unwrap().push(format!("end {id}"));
+                Ok::<_, String>(nanocodex_claude::ClaudeToolReply::success(
+                    nanocodex_claude::ToolResultContent::Text(format!("{kind} {id}")),
+                ))
+            }
+        }
+    };
+    let client = ClaudeClient::new(
+        reqwest::Client::new(),
+        format!("http://{address}/v1/messages"),
+        "synthetic",
+    );
+    let (agent, _) = Nanocodex::builder(Claude::new(client, "test"))
+        .max_tokens(128_000)
+        .parallel_safe_tools(["read"])
+        .tool_with_context(definition("read"), handler("read"))
+        .tool_with_context(definition("write"), handler("write"))
+        .build()
+        .unwrap();
+    let result = agent.prompt("go").await.unwrap().result().await.unwrap();
+    assert_eq!(result.final_message(), "done");
+    let trace = trace.lock().unwrap().clone();
+    let at = |entry: &str| trace.iter().position(|e| e == entry).unwrap();
+    // r1 and r2 overlap; w1 starts only after both finish; r3 only after w1.
+    assert!(
+        at("start r2") < at("end r1") && at("start r1") < at("end r2"),
+        "{trace:?}"
+    );
+    assert!(
+        at("end r1") < at("start w1") && at("end r2") < at("start w1"),
+        "{trace:?}"
+    );
+    assert!(at("end w1") < at("start r3"), "{trace:?}");
+    assert_eq!(peak.load(Ordering::SeqCst), 2);
+    let requests = captured.lock().unwrap();
+    let returned = &requests[1]["messages"][2]["content"];
+    let ids: Vec<_> = returned
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["tool_use_id"].clone())
+        .collect();
+    assert_eq!(ids, [json!("r1"), json!("r2"), json!("w1"), json!("r3")]);
 }

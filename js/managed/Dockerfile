@@ -1,89 +1,8 @@
 # syntax=docker/dockerfile:1
-# Build against the same libc family as the Sandbox runtime. The publisher is
-# the shared Rust Hand implementation; Go remains only a developer toolchain.
-FROM ubuntu:22.04 AS screen-helpers
-RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    ca-certificates curl git xz-utils python3 build-essential pkg-config binutils \
-    meson ninja-build libwayland-dev libwayland-bin libxkbcommon-dev libpixman-1-dev libpng-dev \
-    && rm -rf /var/lib/apt/lists/*
-WORKDIR /source
-COPY .generated/remote-rust/scripts/build-linux-screen-helpers.sh .generated/remote-rust/scripts/build-linux-screen-helpers.py ./scripts/
-COPY .generated/remote-rust/scripts/tests/linux-screen-helpers-bundle.py ./scripts/tests/
-RUN scripts/build-linux-screen-helpers.sh --auto /out/linux-screen-helpers.tar.gz /tmp/screen-build
-
-FROM --platform=$TARGETPLATFORM ubuntu:22.04 AS hand-chef
-# Explicit upstream refresh without disabling normal source-layer reuse.
-ARG NANOCODEX_IMAGE_CACHE_EPOCH=1
-RUN test -n "$NANOCODEX_IMAGE_CACHE_EPOCH"
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential ca-certificates curl git cmake pkg-config libssl-dev clang libpulse-dev libxkbcommon-dev \
-    libasound2-dev libudev-dev libwayland-dev libpipewire-0.3-dev libspa-0.2-dev uuid-dev \
-    && rm -rf /var/lib/apt/lists/*
-ENV CARGO_HOME=/usr/local/cargo RUSTUP_HOME=/usr/local/rustup PATH=/usr/local/cargo/bin:${PATH}
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-    | sh -s -- -y --profile minimal --default-toolchain 1.97.0
-# Install once in the toolchain layer, independently of application sources.
-RUN cargo install cargo-chef --version 0.1.78 --locked --jobs 2
-WORKDIR /source
-
-FROM hand-chef AS hand-planner
-COPY .generated/remote-rust/ ./
-RUN cargo chef prepare --recipe-path recipe.json
-
-FROM hand-chef AS hand
-COPY --from=hand-planner /source/recipe.json recipe.json
-# Cook only the recipe in this otherwise empty directory. Keep target AND Cargo
-# sources in image layers so a fresh builder can reuse the exported dependencies.
-RUN CARGO_BUILD_JOBS=2 cargo chef cook --release --locked -p nanocodex2-bin --bin nanocodex2 --recipe-path recipe.json
-RUN apt-get update && apt-get install -y --no-install-recommends python3 \
-    && rm -rf /var/lib/apt/lists/*
-COPY .generated/remote-rust/ ./
-COPY --from=screen-helpers /out/linux-screen-helpers.tar.gz /opt/linux-screen-helpers.tar.gz
-RUN NANOCODEX_LINUX_SCREEN_BUNDLE=/opt/linux-screen-helpers.tar.gz \
-    CARGO_BUILD_JOBS=2 cargo build --release --locked -p nanocodex2-bin --bin nanocodex2 \
-    && mkdir -p /out && cp target/release/nanocodex2 /out/nanocodex-remote \
-    && python3 scripts/tests/linux-screen-helpers-bundle.py \
-       --binary /out/nanocodex-remote /opt/linux-screen-helpers.tar.gz
-
-# The SDK's Ubuntu 22.04 base has no labwc package. Bundle the VM's Debian
-# desktop stack with its own loader, preserving the SDK and shell libraries.
-FROM debian:trixie-slim AS desktop-libs
-# Explicit upstream refresh without disabling normal source-layer reuse.
-ARG NANOCODEX_IMAGE_CACHE_EPOCH=1
-RUN test -n "$NANOCODEX_IMAGE_CACHE_EPOCH"
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git xz-utils libwayland-dev libxkbcommon-dev labwc foot ffmpeg grim wlr-randr xwayland patchelf \
-    && rm -rf /var/lib/apt/lists/*
-
-# Compile natively even on Apple Silicon; Zig's generated translate-c executable
-# currently traps under Rosetta. The linker uses the target image's libraries.
-FROM --platform=$BUILDPLATFORM golang:1.26.5-trixie AS waymote
-# Explicit upstream refresh without disabling normal source-layer reuse.
-ARG NANOCODEX_IMAGE_CACHE_EPOCH=1
-RUN test -n "$NANOCODEX_IMAGE_CACHE_EPOCH"
-ARG BUILDARCH
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git xz-utils pkg-config && rm -rf /var/lib/apt/lists/*
-RUN case "$BUILDARCH" in \
-      arm64) arch=aarch64; checksum=ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17 ;; \
-      amd64) arch=x86_64; checksum=70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00 ;; \
-      *) exit 1 ;; \
-    esac && curl --fail --location "https://ziglang.org/download/0.16.0/zig-${arch}-linux-0.16.0.tar.xz" -o /tmp/zig.tar.xz \
-    && echo "$checksum  /tmp/zig.tar.xz" | sha256sum --check \
-    && mkdir /opt/zig && tar -xf /tmp/zig.tar.xz --strip-components=1 -C /opt/zig
-COPY --from=desktop-libs /usr/include /sysroot/usr/include
-COPY --from=desktop-libs /usr/lib/x86_64-linux-gnu /sysroot/usr/lib/x86_64-linux-gnu
-WORKDIR /src/waymote
-RUN git init && git remote add origin https://github.com/rockorager/waymote.git \
-    && git fetch --depth=1 origin 69f585e6a1dfb84a3ac8135f1a0536aa9d75f6c5 && git checkout --detach FETCH_HEAD \
-    && PKG_CONFIG_SYSROOT_DIR=/sysroot PKG_CONFIG_LIBDIR=/sysroot/usr/lib/x86_64-linux-gnu/pkgconfig \
-       /opt/zig/zig build -Dtarget=x86_64-linux-gnu.2.41 -Dcpu=baseline -Doptimize=ReleaseFast
-
-FROM desktop-libs AS desktop
-# Explicit upstream refresh without disabling normal source-layer reuse.
-ARG NANOCODEX_IMAGE_CACHE_EPOCH=1
-RUN test -n "$NANOCODEX_IMAGE_CACHE_EPOCH"
-COPY --from=waymote /src/waymote/zig-out/bin/waymote-streamd /src/waymote/zig-out/bin/waymote-streamd
-COPY scripts/bundle-hand-desktop.sh /tmp/bundle-hand-desktop.sh
-RUN sh /tmp/bundle-hand-desktop.sh
+# Static Cloudflare sandbox image: OS packages, language toolchains and the
+# creative/document toolkit. Cloudflare sandboxes are execution environments,
+# not Hands: nothing here compiles or ships Nanocodex. Only edits to this file,
+# the toolkit or check-dev-stack.sh rebuild the image.
 
 # Linux toolchains; Apple SDKs and xcodebuild remain on macOS CI.
 FROM golang:1.26.5-bookworm AS go-toolchain
@@ -208,20 +127,7 @@ COPY --chmod=0755 scripts/check-dev-stack.sh /usr/local/bin/nanocodex-check-dev-
 ARG CI_TESTS_ENABLED=true
 RUN if [ "$CI_TESTS_ENABLED" != "false" ]; then sh /usr/local/bin/nanocodex-check-dev-stack; fi
 
-COPY --from=hand /out/nanocodex-remote /usr/local/bin/nanocodex-remote
-COPY --from=desktop /opt/nanocodex-desktop /opt/nanocodex-desktop
-COPY --from=desktop /out/desktop-bin/ /usr/local/bin/
-# wlroots uses this compiled-in path when starting Xwayland.
-RUN ln -s /usr/local/bin/Xwayland /usr/bin/Xwayland
-COPY --from=desktop /usr/share/X11/xkb /usr/share/X11/xkb
-COPY --from=desktop /usr/share/terminfo /usr/share/terminfo
-COPY --from=desktop /etc/xdg/foot /etc/xdg/foot
-COPY .generated/hand/labwc /etc/nanocodex-desktop
-
 EXPOSE 3000
 EXPOSE 5173
 EXPOSE 8000
 EXPOSE 8080
-
-# These images provision both helpers; no host/manual helper setup is needed.
-ENV NANOCODEX_WAYMOTE=/usr/local/bin/waymote-streamd NANOCODEX_GRIM=/usr/local/bin/grim

@@ -16,7 +16,9 @@ import type { AgentControllerEvent } from "nanocodex-react/agent";
 import type { ArtifactDocument } from "nanocodex/tools/artifact";
 import type { ManagedCreateSettings } from "nanocodex/managed";
 import {
+  AgentFileProvider,
   AgentTerminalView,
+  type AgentFileReader,
   type AgentTerminalMode,
   type AgentTerminalState,
 } from "nanocodex-terminal";
@@ -38,7 +40,6 @@ import {
 } from "./browserMcp";
 import { clientFailureMessage } from "./clientFailure";
 import { AgentModelMenu } from "./AgentModelMenu";
-import { attachManagedBrowserHand } from "./managedBrowserHand";
 import { useAccountSession } from "./AccountSession";
 import { RemoteScreens } from "./RemoteScreens";
 import { managedConversationQueryOptions, managedTerminalAgent, openManagedAgent } from "./managedAgentRuntime";
@@ -260,6 +261,9 @@ export const ManagedAgentTerminal = memo(function ManagedAgentTerminal({
     reasoningMode: wireSettings.reasoning_mode, fastMode: wireSettings.fast_mode,
   } : terminalDefaultSettings(source);
   const settingsReady = stateQuery.isSuccess && Boolean(wireSettings);
+  // Images and text files reach every model; inline PDFs need a Claude model.
+  const documents = settings.model.startsWith("claude-");
+  const attachmentPolicy = useMemo(() => ({ documents }), [documents]);
   const [locallyStarted, setLocallyStarted] = useState(false);
   const conversationStarted = locallyStarted || stateQuery.data?.accepted_turns !== 0;
   const settingsMutation = useMutation({
@@ -273,48 +277,19 @@ export const ManagedAgentTerminal = memo(function ManagedAgentTerminal({
       } : undefined);
     },
   });
-  const [browserHand, setBrowserHand] = useState<Awaited<ReturnType<typeof attachManagedBrowserHand>>>();
-  const [browserHandSettledFor, setBrowserHandSettledFor] = useState<typeof managed>();
-  const [browserHandAttempt, setBrowserHandAttempt] = useState(0);
-  useEffect(() => {
-    const controller = new AbortController();
-    let hand: Awaited<ReturnType<typeof attachManagedBrowserHand>> | undefined;
-    let retry: ReturnType<typeof setTimeout> | undefined;
-    const reconnect = () => {
-      if (!controller.signal.aborted) {
-        retry = setTimeout(() => setBrowserHandAttempt((current) => current + 1), 1_000);
-      }
-    };
-    setBrowserHand(undefined);
-    void attachManagedBrowserHand(managed, controller.signal).then((attached) => {
-      if (controller.signal.aborted) {
-        void attached.close();
-        return;
-      }
-      hand = attached;
-      setBrowserHand(attached);
-      void hand.closed().then(() => {
-        if (controller.signal.aborted) return;
-        setBrowserHand(undefined);
-        reconnect();
-      });
-    }).catch((error) => {
-      if (controller.signal.aborted) return;
-      console.warn("nanocodex:browser_hand_attach_failed", { error: errorMessage(error) });
-      reconnect();
-    }).finally(() => {
-      if (!controller.signal.aborted) setBrowserHandSettledFor(managed);
-    });
-    return () => {
-      controller.abort();
-      if (retry) clearTimeout(retry);
-      if (hand) void hand.close();
-    };
-  }, [accountId, browserHandAttempt, managed]);
   const retryAgent = useCallback(() => {
-    setBrowserHandAttempt((current) => current + 1);
     void stateQuery.refetch();
   }, [stateQuery.refetch]);
+  const readAgentFile = useCallback<AgentFileReader>(async (path, signal) => {
+    const response = await fetch(`/v1/agents/${encodeURIComponent(agentId)}/files?path=${encodeURIComponent(path)}`, {
+      credentials: "same-origin", cache: "no-store", redirect: "error", referrerPolicy: "no-referrer", signal,
+    });
+    if (!response.ok) {
+      const body = await response.json().catch(() => undefined) as { message?: string } | undefined;
+      throw new Error(body?.message ?? `File unavailable (${response.status})`);
+    }
+    return response.blob();
+  }, [agentId]);
   const recordConversationActivity = useCallback((input: string) => {
     setLocallyStarted(true);
     onConversationActivity(input);
@@ -324,15 +299,13 @@ export const ManagedAgentTerminal = memo(function ManagedAgentTerminal({
   ) => {
     await settingsMutation.mutateAsync(patch);
   }, [settingsMutation.mutateAsync]);
-  // Keep the first prompt queued while this page's hand is still attaching,
-  // so the host can include it in the initial environment snapshot. A failed
-  // optional hand does not block the managed brain or subsequent reconnects.
-  const startupReady = browserHandSettledFor === managed || (settingsReady && conversationStarted);
   return (
     <>
     <PhoneCallsPanel key={`${accountId}:${agentId}`} parentAgentId={agentId} enabled={Boolean(accountId) && mode !== "hidden"} />
+    <AgentFileProvider read={readAgentFile}>
     <AgentTerminalView
-      agent={startupReady ? agent : undefined}
+      agent={agent}
+      attachments={attachmentPolicy}
       initialDraft={initialDraft}
       agentError={stateQuery.error?.message}
       inactiveMessage={({ agentError, agentStatus }) => inactiveTerminalMessage({
@@ -365,15 +338,8 @@ export const ManagedAgentTerminal = memo(function ManagedAgentTerminal({
           <RemoteScreens key={managed.id} />
         </>
       )}
-      accessory={({ agentReady, submit }) => browserHand ? (
-        <ArtifactDock
-          agentReady={agentReady}
-          onPrompt={(artifact, prompt, path) => submit(artifactFollowOnPrompt(artifact, path, prompt))}
-          workspace={browserHand.workspace}
-          workspaceId={browserHand.workspaceId}
-        />
-      ) : null}
     />
+    </AgentFileProvider>
     </>
   );
 });

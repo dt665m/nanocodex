@@ -19,19 +19,22 @@ export const images = {
   },
   sandbox: {
     dockerfile: 'js/managed/Dockerfile', context: 'js/managed', source: './Dockerfile',
+    // Only what lands in the image. Build/publish tooling is not an input.
     inputs: ['js/managed/Dockerfile', 'js/managed/Dockerfile.dockerignore', 'js/managed/.dockerignore',
-      'js/managed/scripts/prepare-hand-image.mjs', 'js/managed/scripts/bundle-hand-desktop.sh',
-      'js/managed/scripts/check-dev-stack.sh', 'hands/remote/image/labwc',
-      'crates/nanocodex-vm/image/toolkit'],
-    package: 'nanocodex2-bin',
+      'js/managed/scripts/check-dev-stack.sh', 'crates/nanocodex-vm/image/toolkit'],
+    // No Rust package: Cloudflare sandboxes are execution environments, not Hands.
   },
 };
 const commonInputs = ['scripts/cloudflare/managed-images.mjs', 'scripts/cloudflare/wrangler-docker.mjs',
   'scripts/cloudflare/managed-image-inputs.py'];
+export function rustInputs(pkg, cwd = process.cwd()) {
+  return JSON.parse(execFileSync('python3', [fileURLToPath(new URL('./managed-image-inputs.py', import.meta.url)), pkg], { cwd, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 }));
+}
 export function imageInputs(image, cwd = process.cwd()) {
   assert.ok(images[image], 'unknown managed image');
-  const rust = JSON.parse(execFileSync('python3', [fileURLToPath(new URL('./managed-image-inputs.py', import.meta.url)), images[image].package], { cwd, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 }));
-  return [...images[image].inputs, ...rust, ...commonInputs];
+  const rust = images[image].package ? rustInputs(images[image].package, cwd) : [];
+  // Rust images also key on the Cargo input resolver; the static sandbox image does not.
+  return [...images[image].inputs, ...rust, ...(images[image].package ? commonInputs : [])];
 }
 export function fingerprint(image, account, epoch = '1', cwd = process.cwd()) {
   assert.ok(images[image], 'unknown managed image');

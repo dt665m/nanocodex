@@ -92,6 +92,7 @@ const MAX_SPONSORED_CALL_IDS = 64;
 
 export interface BrokerEnv extends CredentialVaultEnv {
   AGENT_SUBJECTS: DurableObjectNamespace<AgentSubjectDirectory>;
+  USER_CREDENTIALS?: DurableObjectNamespace<UserCredentialBroker>;
   CHIEF_OF_STAFF_OPENAI_API_KEY?: string;
   NANOCODEX_SPONSORED_CHATGPT_USER_ID?: string;
   CHATGPT_ISSUER?: string;
@@ -100,7 +101,7 @@ export interface BrokerEnv extends CredentialVaultEnv {
   LOCAL_CHATGPT_BOOTSTRAP?: string;
 }
 
-export type UserCredentialSnapshot = Readonly<{
+export type ModelCredentialValue = Readonly<{
   kind: "openai" | "chatgpt";
   secret: string;
   accountId?: string;
@@ -110,6 +111,7 @@ export type UserCredentialSnapshot = Readonly<{
   provenance?: "user" | "sponsor";
 }>;
 
+export type ClaudeCredentialValue = ClaudeSubscription.PrivateCredential;
 type ApiKeyCredential = { secret: string; createdAt: number; revision: number };
 type ChatGptCredential = {
   accessToken: string;
@@ -339,6 +341,9 @@ function credentialMetric(detail: Readonly<Record<string, unknown>>): void {
   try { console.info(detail); } catch { /* Observation must not affect credential state. */ }
 }
 
+/** TEMPORARY: #890 placement row, removed with #recoverFromHome. */
+const MOVED_PLACEMENT_KEY = "broker-placement-v1";
+
 export class UserCredentialBroker extends DurableObject<BrokerEnv> {
   readonly #state: DurableObjectState;
   readonly #env: BrokerEnv;
@@ -363,9 +368,13 @@ export class UserCredentialBroker extends DurableObject<BrokerEnv> {
     this.#env = env;
     this.#vault = new CredentialVault(env, `user/${state.id.toString()}`);
     const startedAt = Date.now();
+    // TEMPORARY: an #890 home object only serves exportMovedRows; its rows are
+    // sealed under the legacy object's scope and must not load here.
+    if (state.id.name?.startsWith("~home/")) { this.#ready = Promise.reject(new Error("retired credential home")); this.#ready.catch(() => {}); return; }
     this.#ready = state.blockConcurrencyWhile(async () => {
       let completed = false;
       try {
+        await this.#recoverFromHome();
         await this.#initialize();
         this.#committedWalletIdentity = this.#credentials.wallet ? publicRootWallet(this.#credentials.wallet) : null;
         this.#activatedAt = Date.now();
@@ -381,6 +390,30 @@ export class UserCredentialBroker extends DurableObject<BrokerEnv> {
         });
       }
     });
+  }
+
+  // TEMPORARY one-shot recovery of #890's region homes. Delete after it has run.
+  // A legacy object whose rows #890 moved holds only {state:"moved",target}
+  // under this key; pull the sealed rows back verbatim (they were sealed under
+  // this object's scope) and drop the tombstone. The home is never used again.
+  async #recoverFromHome(): Promise<void> {
+    const placement = await this.#state.storage.get<{ state?: string; target?: string }>(MOVED_PLACEMENT_KEY);
+    if (!placement) return;
+    if (placement.state === "moved" && typeof placement.target === "string" && this.#env.USER_CREDENTIALS) {
+      const rows = await this.#env.USER_CREDENTIALS.getByName(placement.target).exportMovedRows() as [string, unknown][];
+      await this.#state.storage.transaction(async (transaction) => {
+        for (let index = 0; index < rows.length; index += 128) await transaction.put(Object.fromEntries(rows.slice(index, index + 128)));
+        await transaction.delete(MOVED_PLACEMENT_KEY);
+      });
+      credentialMetric({ type: "egress.credential.home_recovered", rows: rows.length });
+    } else await this.#state.storage.delete(MOVED_PLACEMENT_KEY);
+  }
+
+  /** TEMPORARY: raw sealed rows of an #890 home object, for its legacy object. */
+  async exportMovedRows(): Promise<[string, unknown][]> {
+    const rows: [string, unknown][] = [];
+    for (const [key, value] of await this.#state.storage.list()) if (key !== MOVED_PLACEMENT_KEY) rows.push([key, value]);
+    return rows;
   }
 
   async readWalletIdentity(): Promise<ReturnType<typeof publicRootWallet> | null> {
@@ -416,7 +449,7 @@ export class UserCredentialBroker extends DurableObject<BrokerEnv> {
   /** Read the live snapshot under the same serialization and recovery as HTTP. */
   async resolveModelCredential(recover: boolean, revision?: number, accountId?: string): Promise<{
     status: number;
-    credential: UserCredentialSnapshot | null;
+    credential: ModelCredentialValue | null;
     resolve_ms: number;
     activation_ms: number;
     activation_age_ms: number;
@@ -525,6 +558,19 @@ export class UserCredentialBroker extends DurableObject<BrokerEnv> {
     }
   }
 
+  // Memory-only Claude model listing (IDs/names, no secrets). Egress requests
+  // fan out across isolates; this per-user object is the shared cache point.
+  #claudeModels: { rows: Array<{ id: string; display_name: string }>; until: number } | undefined;
+  /** Private RPC: last successful Claude model listing, if still fresh. */
+  readClaudeModels(): Array<{ id: string; display_name: string }> | null {
+    return this.#claudeModels && this.#claudeModels.until > Date.now() ? this.#claudeModels.rows : null;
+  }
+  /** Private RPC: retain a successful listing for a bounded window. */
+  storeClaudeModels(rows: Array<{ id: string; display_name: string }>, ttlMs: number): void {
+    if (!Array.isArray(rows) || rows.length > 1000 || !(ttlMs > 0 && ttlMs <= 10 * 60_000)) return;
+    this.#claudeModels = { rows, until: Date.now() + ttlMs };
+  }
+
   /** Private service-binding RPC only: never expose this credential to account clients. */
   resolveClaudeCredential(recover = false, rejectedRevision?: string): Promise<{
     status: number; credential: ClaudeCredential | null;
@@ -549,6 +595,8 @@ export class UserCredentialBroker extends DurableObject<BrokerEnv> {
       }
     }, { operation: "credential_rpc" });
   }
+
+
 
   #claudeSubscription(): Promise<ClaudeSubscription.Subscription> {
     return this.#claude ??= this.#openClaudeSubscription().catch(() => {
@@ -704,6 +752,13 @@ export class UserCredentialBroker extends DurableObject<BrokerEnv> {
     }
   }
 
+
+
+
+
+
+
+
   async #initialize(): Promise<void> {
     let phaseStartedAt = Date.now();
     const advance = (phase: CredentialActivationPhase): void => {
@@ -752,6 +807,7 @@ export class UserCredentialBroker extends DurableObject<BrokerEnv> {
       if (url.pathname === "/v1/claude/login/start" && request.method === "POST") {
         if (await hasRequestPayload(request)) return jsonError(400, "invalid_request");
         this.#claudeCredential = undefined;
+        this.#claudeModels = undefined;
         return json({ state: "pending", ...await (await this.#claudeSubscription()).startLogin() }, 200);
       }
       if (url.pathname === "/v1/claude/login/status" && request.method === "GET") {
@@ -763,6 +819,7 @@ export class UserCredentialBroker extends DurableObject<BrokerEnv> {
           || body.code.length === 0 || body.code.length > 8192) return jsonError(400, "invalid_claude_code");
         try {
           this.#claudeCredential = undefined;
+        this.#claudeModels = undefined;
           return json(await (await this.#claudeSubscription()).completeLogin(body.code), 200);
         } catch {
           // Never reflect a provider response or private completion material.
@@ -772,6 +829,7 @@ export class UserCredentialBroker extends DurableObject<BrokerEnv> {
       }
       if (url.pathname === "/v1/claude" && request.method === "DELETE") {
         this.#claudeCredential = undefined;
+        this.#claudeModels = undefined;
         await (await this.#claudeSubscription()).logout();
         return json(await this.#claudePublicStatus(), 200);
       }
@@ -1855,7 +1913,7 @@ export class UserCredentialBroker extends DurableObject<BrokerEnv> {
     revision: number | undefined,
     accountId?: string,
     resolveId?: string,
-  ): Promise<UserCredentialSnapshot> {
+  ): Promise<ModelCredentialValue> {
     if (accountId !== undefined && (typeof accountId !== "string" || !/^[\x21-\x7e]{1,256}$/.test(accountId))) {
       throw new BrokerFailure(400, "invalid_chatgpt_account");
     }
@@ -2325,6 +2383,7 @@ export class UserCredentialBroker extends DurableObject<BrokerEnv> {
         ));
       }
     }
+    // A durable pending revocation keeps retrying across restarts.
     return times.length ? Math.min(...times) : undefined;
   }
 }

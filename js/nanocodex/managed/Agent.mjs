@@ -136,11 +136,17 @@ function managedCreateOptions(options) {
   if (!options || typeof options !== "object" || Array.isArray(options)) {
     throw new TypeError("managed agent options must be an object");
   }
-  const { settings, configuration, definitionId, environmentTemplateId, idempotencyKey: creationKey, ...clientOptions } = options;
+  const { scope, settings, configuration, definitionId, environmentTemplateId, idempotencyKey: creationKey, ...clientOptions } = options;
   if (creationKey !== undefined && (typeof creationKey !== "string" || !IDEMPOTENCY_KEY.test(creationKey))) {
     throw new TypeError("invalid managed creation idempotency key");
   }
+  if (scope !== undefined && (!scope || typeof scope !== "object" || Array.isArray(scope)
+    || (scope.type === "personal" ? Object.keys(scope).join() !== "type"
+      : scope.type !== "team" || Object.keys(scope).sort().join() !== "team_id,type"
+        || typeof scope.team_id !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(scope.team_id))))
+    throw new TypeError("scope must be personal or an explicit team ID");
   const extensions = {
+    ...(scope === undefined ? {} : { scope }),
     ...(configuration === undefined ? {} : { configuration }),
     ...(definitionId === undefined ? {} : { definition_id: templateId(definitionId) }),
     ...(environmentTemplateId === undefined ? {} : { environment_template_id: templateId(environmentTemplateId) }),
@@ -164,9 +170,6 @@ function managedCreateOptions(options) {
   }
   if (["gpt-6-astra", "gpt-6.1-sol"].includes(settings.model) && settings.thinking === "none") {
     throw new TypeError("GPT-6 Astra and GPT-6.1 Sol require low, medium, high, xhigh, or max thinking");
-  }
-  if (settings.model === "gpt-6-astra" && settings.reasoningMode === "pro") {
-    throw new TypeError("GPT-6 Astra does not support pro reasoning mode");
   }
   if (settings.model.startsWith("claude-") && (!["low", "medium", "high"].includes(settings.thinking) || settings.reasoningMode !== "standard" || settings.fastMode)) throw new TypeError("unsupported Claude settings");
   return {
@@ -448,9 +451,6 @@ function managedSettingsPatch(patch) {
   if (["gpt-6-astra", "gpt-6.1-sol"].includes(patch.model) && patch.thinking === "none") {
     throw new TypeError("GPT-6 Astra and GPT-6.1 Sol require low, medium, high, xhigh, or max thinking");
   }
-  if (patch.model === "gpt-6-astra" && patch.reasoningMode === "pro") {
-    throw new TypeError("GPT-6 Astra does not support pro reasoning mode");
-  }
   return JSON.stringify({
     ...(Object.hasOwn(patch, "model") ? { model: patch.model } : {}),
     ...(Object.hasOwn(patch, "thinking") ? { thinking: patch.thinking } : {}),
@@ -466,7 +466,6 @@ function managedSettings(value) {
     || (["@cf/zai-org/glm-5.3", "kimi-k3", "mimo-v2.6-pro"].includes(value.model) && (!(value.model === "kimi-k3" ? ["low", "high"] : ["low", "medium", "high"]).includes(value.thinking) || value.reasoning_mode === "pro"))
     || (["gpt-6-astra", "gpt-6.1-sol"].includes(value.model) && value.thinking === "none")
     || (value.model.startsWith("claude-") && (!["low", "medium", "high"].includes(value.thinking) || value.reasoning_mode !== "standard" || value.fast_mode))
-    || (value.model === "gpt-6-astra" && value.reasoning_mode === "pro")
   ) {
     throw new ManagedError("invalid_response", "managed agent settings are malformed");
   }

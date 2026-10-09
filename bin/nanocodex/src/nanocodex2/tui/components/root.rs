@@ -180,6 +180,7 @@ pub(crate) enum RootEvent {
     },
     ManagedTurnFinished,
     ManagedActiveTurns(usize),
+    SharedAccess(bool),
     ShellFinished,
     TurnsCancelled,
     ForkReady,
@@ -502,7 +503,7 @@ pub(crate) struct RootNode {
     pending_session_list: Option<u64>,
     next_session_list: u64,
     reflection_input: bool,
-    managed2_preview: bool,
+    shared_thread: Option<bool>,
 }
 
 impl RootNode {
@@ -594,78 +595,93 @@ impl RootNode {
             pending_session_list: None,
             next_session_list: 0,
             reflection_input: false,
-            managed2_preview: false,
+            shared_thread: None,
         }
     }
 
-    /// Keep the ordinary chat presentation while withholding controls that the
-    /// separate Managed2 text API cannot execute.
-    pub(crate) fn set_managed2_preview(&mut self) {
-        self.managed2_preview = true;
+    pub(crate) fn set_shared_thread(&mut self, writable: bool) {
+        self.shared_thread = Some(writable);
         self.fork_available = false;
-        self.composer
-            .component_mut()
-            .set_backend_label("Managed2 · text only");
+        self.composer.component_mut().set_shared_access(writable);
     }
 
-    fn managed2_terminal(&mut self, event: Event) -> ComponentUpdate<RootEffect> {
+    fn shared_terminal(&mut self, event: Event, writable: bool) -> ComponentUpdate<RootEffect> {
         if matches!(event, Event::Resize(_, _)) {
             return ComponentUpdate::render(RenderRequest::Immediate);
         }
-        if self.overlay.is_some() {
-            if matches!(&event, Event::Key(key) if key.kind == KeyEventKind::Press
-                && matches!(key.code, KeyCode::Esc | KeyCode::Enter))
-            {
-                self.overlay = None;
-                return ComponentUpdate::render(RenderRequest::Immediate);
-            }
-            return ComponentUpdate::none();
-        }
-        if matches!(&event, Event::Key(key) if key.kind == KeyEventKind::Press
-            && key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL)
-        {
+        if is_control_c(&event) {
             return ComponentUpdate {
                 effects: vec![RootEffect::Shutdown],
                 render: RenderRequest::None,
             };
         }
+        if self.overlay.is_some() {
+            if is_escape(&event) || is_submit_enter(&event) {
+                self.overlay = None;
+                return ComponentUpdate::render(RenderRequest::Immediate);
+            }
+            return ComponentUpdate::none();
+        }
+        if is_control_key(&event, 'o') {
+            return self.update_transcript(TranscriptEvent::ToggleExpandAll);
+        }
+        if self.transcript.component().updates_banner_clicked(&event) {
+            return self.update_transcript(TranscriptEvent::FollowTail);
+        }
+        if let Some(command) = self.transcript.component().scroll_command(&event) {
+            let load_older = self.transcript.component().should_load_older_after(command);
+            let transcript = self.transcript.update(TranscriptEvent::Scroll(command));
+            return ComponentUpdate {
+                effects: load_older
+                    .then_some(RootEffect::LoadOlderHistory)
+                    .into_iter()
+                    .collect(),
+                render: transcript.render,
+            };
+        }
         if let Event::Key(key) = &event {
-            if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
-                || matches!(key.code, KeyCode::BackTab | KeyCode::Esc)
-            {
+            if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                 return ComponentUpdate::none();
             }
             if matches!(key.code, KeyCode::Enter | KeyCode::Tab) && key.modifiers.is_empty() {
                 let draft = self.composer.component().draft().trim();
-                if key.code == KeyCode::Enter && matches!(draft, "/exit" | "/quit") {
+                if matches!(draft, "/exit" | "/quit") {
                     return ComponentUpdate {
                         effects: vec![RootEffect::Shutdown],
                         render: RenderRequest::None,
                     };
                 }
-                // Route private-command intent to the explicit Managed2 denial,
-                // never to a model prompt or a password-capable legacy panel.
-                let private_command =
-                    draft
-                        .strip_prefix("/secure-input")
-                        .is_some_and(|remaining| {
-                            remaining.is_empty() || remaining.starts_with(char::is_whitespace)
-                        });
-                if (draft.starts_with('/') && draft != "/id" && !private_command)
-                    || draft.starts_with('!')
-                {
-                    self.notification = Some(Notification::plain(
-                        "Managed2 accepts text, /id, and /exit only.".to_owned(),
-                        Color::Yellow,
-                    ));
+                if draft == "/id" {
+                    return ComponentUpdate {
+                        effects: vec![RootEffect::ShowAgentId],
+                        render: RenderRequest::Immediate,
+                    };
+                }
+                let message = if !writable {
+                    Some("This shared thread is read only.")
+                } else if draft.starts_with('/') || draft.starts_with('!') {
+                    Some("Shared threads accept text, /id, and /exit only.")
+                } else if self.has_active_turns() {
+                    Some("Wait for the active turn before sending another message.")
+                } else {
+                    None
+                };
+                if let Some(message) = message {
+                    self.notification =
+                        Some(Notification::plain(message.to_owned(), Color::Yellow));
                     return ComponentUpdate::render(RenderRequest::Immediate);
+                }
+                // Tab must not create a queued mutation that could send later.
+                if key.code == KeyCode::Tab {
+                    return ComponentUpdate::none();
                 }
             }
         }
-        if !matches!(&event, Event::Key(_) | Event::Paste(_)) {
-            return ComponentUpdate::none();
+        if matches!(&event, Event::Key(_) | Event::Paste(_)) {
+            self.edit_composer(ComposerEvent::Terminal(event))
+        } else {
+            ComponentUpdate::none()
         }
-        self.edit_composer(ComposerEvent::Terminal(event))
     }
 
     pub(crate) fn fork(&self, workspace: &Path, thinking: ReasoningEffort) -> Self {
@@ -1273,8 +1289,8 @@ impl RootNode {
     }
 
     fn update_terminal(&mut self, event: Event) -> ComponentUpdate<RootEffect> {
-        if self.managed2_preview {
-            return self.managed2_terminal(event);
+        if let Some(writable) = self.shared_thread {
+            return self.shared_terminal(event, writable);
         }
         if self.voice_status.is_some() && is_control_key(&event, 'x') {
             if matches!(&event, Event::Key(key) if key.kind != KeyEventKind::Press) {
@@ -3205,9 +3221,7 @@ impl RootNode {
         priority: RenderRequest,
     ) -> ComponentUpdate<RootEffect> {
         let update = self.composer.component_mut().update(event);
-        if !self.managed2_preview
-            && let Some(ComposerEffect::Settings(command)) = &update.effect
-        {
+        if let Some(ComposerEffect::Settings(command)) = &update.effect {
             return self.apply_settings_command(command.clone());
         }
         // Copy is a local control even while a turn is active. Intercept both
@@ -3285,17 +3299,10 @@ impl RootNode {
             // Goal controls are intercepted by the managed server and must not
             // wait behind active model work or an unacknowledged steer.
             Some(ComposerEffect::Submit(prompt))
-                if !self.managed2_preview
-                    && prompt.display_text().split_whitespace().next() == Some("/goal") =>
+                if prompt.display_text().split_whitespace().next() == Some("/goal") =>
             {
                 self.in_flight_turns = self.in_flight_turns.saturating_add(1);
                 vec![RootEffect::Submit(prompt)]
-            }
-            Some(ComposerEffect::Submit(prompt))
-                if self.managed2_preview && self.has_active_turns() =>
-            {
-                self.queue.component_mut().push(prompt);
-                Vec::new()
             }
             Some(ComposerEffect::Submit(prompt)) if self.side_pane && self.has_active_turns() => {
                 self.queue.component_mut().push(prompt);
@@ -4290,7 +4297,8 @@ impl Component for RootNode {
         match event {
             RootEvent::Terminal(event) => self.update_terminal(event),
             RootEvent::PasteImage(data_url) => {
-                if self.blocking_task.is_some()
+                if self.shared_thread.is_some()
+                    || self.blocking_task.is_some()
                     || self.overlay.is_some()
                     || (self.queue.component().focused() && self.queue_edit.is_none())
                 {
@@ -4465,6 +4473,10 @@ impl Component for RootNode {
             }
             RootEvent::ManagedTurnFinished => self.agent_turn_finished(),
             RootEvent::ManagedActiveTurns(count) => self.managed_active_turns(count),
+            RootEvent::SharedAccess(writable) => {
+                self.set_shared_thread(writable);
+                ComponentUpdate::render(RenderRequest::Immediate)
+            }
             RootEvent::ShellFinished => {
                 self.in_flight_shells = self.in_flight_shells.saturating_sub(1);
                 ComponentUpdate::none()

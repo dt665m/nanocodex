@@ -19,7 +19,17 @@ export const AGENT_THINKING = [
     "max",
 ];
 export const AGENT_REASONING_MODES = ["standard", "pro"];
+/** Preferred settings for a new agent when the caller does not choose a model.
+ * Account availability still decides; see DEFAULT_OPENAI_AGENT_SETTINGS. */
 export const DEFAULT_AGENT_SETTINGS = Object.freeze({
+    model: "claude-opus-5-5",
+    thinking: "medium",
+    reasoning_mode: "standard",
+    fast_mode: false,
+});
+/** Default for Responses-only surfaces (live/ephemeral agents, legacy imports)
+ * and the fallback when Claude is unavailable or unsupported. */
+export const DEFAULT_OPENAI_AGENT_SETTINGS = Object.freeze({
     model: "gpt-6-astra",
     thinking: "low",
     reasoning_mode: "standard",
@@ -38,10 +48,10 @@ export function parseAgentSettingsQuery(search) {
             throw new TypeError("invalid agent settings query");
         }
     }
-    const model = search.get("model") ?? DEFAULT_AGENT_SETTINGS.model;
-    const thinking = search.get("thinking") ?? DEFAULT_AGENT_SETTINGS.thinking;
+    const model = search.get("model") ?? DEFAULT_OPENAI_AGENT_SETTINGS.model;
+    const thinking = search.get("thinking") ?? DEFAULT_OPENAI_AGENT_SETTINGS.thinking;
     const reasoningMode = search.get("reasoning_mode")
-        ?? DEFAULT_AGENT_SETTINGS.reasoning_mode;
+        ?? DEFAULT_OPENAI_AGENT_SETTINGS.reasoning_mode;
     const encodedFastMode = search.get("fast_mode");
     if (!isAgentModel(model)
         || !isAgentThinking(thinking)
@@ -56,7 +66,7 @@ export function parseAgentSettingsQuery(search) {
         thinking,
         reasoning_mode: reasoningMode,
         fast_mode: encodedFastMode === null
-            ? DEFAULT_AGENT_SETTINGS.fast_mode
+            ? DEFAULT_OPENAI_AGENT_SETTINGS.fast_mode
             : encodedFastMode === "true",
     });
 }
@@ -119,9 +129,6 @@ export function validateAgentSettings(settings) {
     }
     if (["gpt-6-astra", "gpt-6.1-sol"].includes(settings.model) && settings.thinking === "none") {
         throw new TypeError("GPT-6 Astra and GPT-6.1 Sol require low, medium, high, xhigh, or max thinking");
-    }
-    if (settings.model === "gpt-6-astra" && settings.reasoning_mode === "pro") {
-        throw new TypeError("GPT-6 Astra does not support pro reasoning mode");
     }
     return settings;
 }

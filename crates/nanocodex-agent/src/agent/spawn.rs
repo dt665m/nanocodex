@@ -112,6 +112,7 @@ where
             config,
             tools,
             spawn_factory: codex.spawn_factory,
+            child_journal: codex.child_journal,
             lineage_id,
             provider_session_id,
             prompt_cache_key,
@@ -165,10 +166,16 @@ where
     if let Some(factory) = &spawner.spawn_factory {
         child_handle = child_handle.with_spawn_factory(factory.clone());
     }
+    child_handle = child_handle.with_child_journal(spawner.child_journal.clone());
     let tools = spawner
         .tools
         .materialize(child_handle.clone())?
         .for_session(&session_id_text);
+    if tools.exposure() != nanocodex_oai_tools::ToolExposure::CodeModeOnly {
+        return Err(NanocodexError::InvalidRequest(
+            "Nanocodex agents require CodeModeOnly tool exposure; direct exposure is only available to standalone tool runtimes".to_owned(),
+        ));
+    }
     let prompt_cache_key = spawner
         .prompt_cache_key
         .as_deref()
@@ -322,7 +329,7 @@ pub(super) fn validate_model_reasoning_mode(
             (if model == Model::Glm53 {
                 "GLM-5.3 does not support pro reasoning mode"
             } else {
-                "GPT-6 Astra does not support pro reasoning mode"
+                "the selected gateway model does not support pro reasoning mode"
             })
             .to_owned(),
         ))

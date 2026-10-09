@@ -1,7 +1,8 @@
 import { parseConfiguration, type AgentConfiguration } from "./agent-configuration";
-import { AGENT_MODELS, AGENT_THINKING, AGENT_REASONING_MODES, DEFAULT_AGENT_SETTINGS, parseAgentSettingsQuery, agentSettingsQuery, parseAgentSettingsPatch, parseCompleteAgentSettings, validateAgentSettings, validateAgentAdmissionSettings, isAgentModel, isAgentThinking, isAgentReasoningMode, type ManagedAgentSettings, type ManagedAgentSettingsPatch } from "nanocodex/cloudflare/agent-settings";
-export { AGENT_MODELS, AGENT_THINKING, AGENT_REASONING_MODES, DEFAULT_AGENT_SETTINGS, parseAgentSettingsQuery, agentSettingsQuery, parseAgentSettingsPatch, parseCompleteAgentSettings, validateAgentSettings, validateAgentAdmissionSettings, isAgentModel, isAgentThinking, isAgentReasoningMode, type ManagedAgentSettings, type ManagedAgentSettingsPatch };
+import { AGENT_MODELS, AGENT_THINKING, AGENT_REASONING_MODES, DEFAULT_AGENT_SETTINGS, DEFAULT_OPENAI_AGENT_SETTINGS, parseAgentSettingsQuery, agentSettingsQuery, parseAgentSettingsPatch, parseCompleteAgentSettings, validateAgentSettings, validateAgentAdmissionSettings, isAgentModel, isAgentThinking, isAgentReasoningMode, type ManagedAgentSettings, type ManagedAgentSettingsPatch } from "nanocodex/cloudflare/agent-settings";
+export { AGENT_MODELS, AGENT_THINKING, AGENT_REASONING_MODES, DEFAULT_AGENT_SETTINGS, DEFAULT_OPENAI_AGENT_SETTINGS, parseAgentSettingsQuery, agentSettingsQuery, parseAgentSettingsPatch, parseCompleteAgentSettings, validateAgentSettings, validateAgentAdmissionSettings, isAgentModel, isAgentThinking, isAgentReasoningMode, type ManagedAgentSettings, type ManagedAgentSettingsPatch };
 export type ManagedAgentCreateBody = Readonly<{
+  scope?: { type: "personal" } | { type: "team"; team_id: string };
   durability?: unknown;
   configuration?: AgentConfiguration;
   definition_id?: string;
@@ -18,7 +19,7 @@ export type ManagedAgentRunBody = Readonly<{
 
 export function parseAgentCreateBody(encoded: string): ManagedAgentCreateBody {
   if (!encoded.trim()) {
-    return { settings: DEFAULT_AGENT_SETTINGS, settingsProvided: false };
+    return { settings: DEFAULT_OPENAI_AGENT_SETTINGS, settingsProvided: false };
   }
   const value = JSON.parse(encoded) as unknown;
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -26,13 +27,23 @@ export function parseAgentCreateBody(encoded: string): ManagedAgentCreateBody {
   }
   const body = value as Record<string, unknown>;
   const keys = Object.keys(body);
-  if (keys.some((key) => !["durability", "settings", "configuration", "definition_id", "environment_template_id", "settings_selection"].includes(key))
+  if (keys.some((key) => !["scope", "durability", "settings", "configuration", "definition_id", "environment_template_id", "settings_selection"].includes(key))
     || (Object.hasOwn(body, "durability") && body.durability === undefined)
     || (Object.hasOwn(body, "settings") && body.settings === undefined)) {
     throw new TypeError("agent creation body contains unsupported or missing fields");
   }
   for (const key of ["definition_id", "environment_template_id"]) {
     if (body[key] !== undefined && (typeof body[key] !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(body[key] as string))) throw new TypeError("invalid template ID");
+  }
+  if (body.scope !== undefined) {
+    const scope = body.scope as Record<string, unknown>;
+    if (!scope || typeof scope !== "object" || Array.isArray(scope)
+      || (scope.type === "personal" ? Object.keys(scope).join() !== "type"
+        : scope.type !== "team" || Object.keys(scope).sort().join() !== "team_id,type"
+          || typeof scope.team_id !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(scope.team_id)))
+      throw new TypeError("scope must be personal or an explicit team ID");
+    if (scope.type === "team" && body.durability !== undefined)
+      throw new TypeError("personal session archives cannot be imported into team context");
   }
   const settingsProvided = Object.hasOwn(body, "settings");
   const settingsSelection = body.settings_selection === undefined ? undefined : parseInitialSettingsSelection(body.settings_selection);
@@ -50,10 +61,14 @@ export function parseAgentCreateBody(encoded: string): ManagedAgentCreateBody {
     ...(Object.hasOwn(body, "durability") ? { durability: body.durability } : {}),
     settings: settingsProvided
       ? validateAgentAdmissionSettings(parseCompleteAgentSettings(body.settings))
-      : DEFAULT_AGENT_SETTINGS,
+      // Baseline for omitted settings when no default is selected (imports,
+      // configuration-owned settings or routing). New agents select from the
+      // live catalog in the managed API, preferring DEFAULT_AGENT_SETTINGS.
+      : DEFAULT_OPENAI_AGENT_SETTINGS,
     ...(configuration === undefined ? {} : { configuration }),
     ...(body.definition_id === undefined ? {} : { definition_id: body.definition_id as string }),
     ...(body.environment_template_id === undefined ? {} : { environment_template_id: body.environment_template_id as string }),
+    ...(body.scope === undefined ? {} : { scope: body.scope as ManagedAgentCreateBody["scope"] }),
     settingsProvided,
     ...(settingsSelection ? { settingsSelection } : {}),
   };

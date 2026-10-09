@@ -10,7 +10,6 @@ import {
   WRITE_STDIN_PARAMETERS,
 } from "nanocodex-tools/execution-contract";
 
-import { serverHandID } from "./hand-hosts";
 import { isPrivateEgressHeader } from "./managed-egress";
 import type { Sandbox } from "./sandbox-runtime";
 
@@ -22,7 +21,6 @@ const LOCAL_PEER_SOURCE_ROOT = "/run/nanocodex/peer-sources";
 // hand workspaces are read-only. Flush every FUSE mount before reporting
 // completion so acknowledged writes become visible.
 const WORKSPACE_FLUSH_COMMAND = "sync";
-const DEFAULT_MAX_OUTPUT_TOKENS = 10_000;
 const APPROXIMATE_BYTES_PER_TOKEN = 4;
 const OUTPUT_CURSOR_PREFIX = "sandbox-output-cursor:";
 const WORKSPACE_MOUNT_PROBE_TIMEOUT_MS = 10_000;
@@ -152,7 +150,6 @@ export function cloudflareSandboxTools(
   namespaceMounts?: () => readonly CloudflareSandboxNamespaceMount[],
   brainWorkspace?: CloudflareBrainWorkspace,
   accountSubject?: string,
-  desktop?: { owner: string; name: string },
   connectGrantId?: string,
 ): ToolMap {
   return createCloudflareSandboxTools(
@@ -169,7 +166,6 @@ export function cloudflareSandboxTools(
           namespaceMounts(),
           brainWorkspace,
         ));
-      if (desktop) await configureDesktop(namespace, sessionId, desktop);
       return sandbox;
     },
     publicOrigin === undefined || previewSecret === undefined
@@ -215,7 +211,6 @@ async function prepareMeasuredCloudflareSandboxHand(
   localBucket = false,
   brainWorkspace?: CloudflareBrainWorkspace,
   accountSubject?: string,
-  desktop?: { owner: string; name: string },
   connectGrantId?: string,
 ): Promise<void> {
   if (accountSubject !== undefined) await performanceStage("sandbox.bind_egress", () => sandboxHandle(namespace, resourceId).bindAccountEgress(accountSubject, connectGrantId));
@@ -231,14 +226,6 @@ async function prepareMeasuredCloudflareSandboxHand(
     normalized,
     brain,
   );
-  if (desktop) await performanceStage("sandbox.desktop", () => configureDesktop(namespace, resourceId, desktop));
-}
-
-async function configureDesktop(namespace: DurableObjectNamespace<Sandbox>, resourceId: string, desktop: { owner: string; name: string }) {
-  await sandboxHandle(namespace, resourceId).configureRemoteDesktop({
-    owner: desktop.owner, id: await serverHandID(desktop.owner, `cloudflare:${resourceId}`),
-    machineId: `cf:${resourceId}`, name: desktop.name,
-  });
 }
 
 export async function destroyCloudflareSandbox(
@@ -1364,10 +1351,7 @@ function requestedOutputBytes(value: unknown): number {
   if (value !== undefined && (!Number.isSafeInteger(value) || Number(value) < 0)) {
     throw new Error("max_output_tokens must be a non-negative safe integer");
   }
-  return Math.min(
-    Number.MAX_SAFE_INTEGER,
-    Number(value ?? DEFAULT_MAX_OUTPUT_TOKENS) * APPROXIMATE_BYTES_PER_TOKEN,
-  );
+  return value === undefined ? Infinity : Number(value) * APPROXIMATE_BYTES_PER_TOKEN;
 }
 
 function memoryOutputCursorStorage(): SandboxOutputCursorStorage {

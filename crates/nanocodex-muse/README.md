@@ -23,7 +23,8 @@ agent.shutdown().await?;
 Defaults: `muse-spark-1.3`, low reasoning, `https://api.meta.ai/v1`, and
 client-owned history (`store: false`). `.model(MuseModel::Contributor)` selects
 `muse-spark-1.3-contributor`, which permits Meta training. Neither model supports
-`Thinking::None`; Contributor also excludes `Thinking::Max`.
+`Thinking::None`; Contributor also excludes `Thinking::Max`. Tools use mandatory
+Code Mode, matching the reference harness.
 
 ## Authentication
 
@@ -53,7 +54,8 @@ retrieve updated credentials. Storage belongs to the caller.
 User images, MCP screenshots and image tool results retain typed image content.
 
 Image generation is disabled by default. On native targets,
-`Tools::builder().image_generation(true)` exposes `image_gen__imagegen`, calling
+`Tools::builder().image_generation(true)` enables `tools.image_gen__imagegen`
+inside `exec`, calling
 `muse-image-1.0` through Responses for generation and reference-image edits.
 Results return as image content to Spark and are saved in the chosen workspace.
 Transparency is unsupported; account access and quota determine availability.

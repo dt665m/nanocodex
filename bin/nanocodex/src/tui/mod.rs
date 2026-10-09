@@ -15,7 +15,6 @@ mod notification;
 mod resume_picker;
 mod scheduler;
 mod selection;
-mod simplify;
 mod slash_commands;
 mod split;
 mod startup;
@@ -793,12 +792,13 @@ pub(crate) async fn run(
     reason = "the ordered terminal, agent, worker, and render event loop is intentionally cohesive"
 )]
 pub(crate) async fn run_observed(
-    config: AgentArgs,
+    mut config: AgentArgs,
     vm: crate::vm::VmArgs,
     initial_prompt: Option<InitialPrompt>,
     resume: Option<DurableSession>,
     observability: Option<crate::observability::ObservabilityArgs>,
 ) -> Result<()> {
+    config.prefer_codex_for_vm(&vm);
     let can_replace_backend = resume.is_none() && config.claude_resume.is_none();
     let mut backend_config = config.clone();
     let backend_vm = vm.clone();
@@ -4164,17 +4164,6 @@ fn classify_submission(input: impl Into<SubmittedPrompt>) -> Submission {
     if trimmed == "/trace" {
         return Submission::Trace;
     }
-    if trimmed == "/simplify" || trimmed.starts_with("/simplify ") {
-        let display = trimmed.to_owned();
-        let focus = trimmed
-            .strip_prefix("/simplify")
-            .map(str::trim)
-            .filter(|focus| !focus.is_empty());
-        let instruction = simplify::prompt(focus);
-        input.set_display(display);
-        input.set_instruction(instruction);
-        return Submission::Prompt(input);
-    }
     if trimmed == "/benchmark" || trimmed.starts_with("/benchmark ") {
         let display = trimmed.to_owned();
         let argument = trimmed
@@ -4417,6 +4406,7 @@ mod tests {
 
     fn scoped_agent_update(root_session_id: &str, update: AgentUpdate) -> ScopedAgentUpdate {
         ScopedAgentUpdate {
+            detach: false,
             root_session_id: root_session_id.to_owned(),
             update,
         }
@@ -4689,10 +4679,6 @@ mod tests {
             Submission::Prompt("/collapsible".into())
         );
         assert_eq!(
-            classify_submission("/simplify-this"),
-            Submission::Prompt("/simplify-this".into())
-        );
-        assert_eq!(
             classify_submission("/trace-this".to_owned()),
             Submission::Prompt("/trace-this".into())
         );
@@ -4909,23 +4895,6 @@ mod tests {
             app.btw.as_ref().unwrap().conversation.status,
             "Collapse unavailable"
         );
-    }
-
-    #[test]
-    fn simplify_command_submits_the_private_workflow_with_optional_focus() {
-        let Submission::Prompt(prompt) =
-            classify_submission(" /simplify focus on memory efficiency ")
-        else {
-            panic!("simplify should submit a model prompt");
-        };
-
-        assert_eq!(prompt.display(), "/simplify focus on memory efficiency");
-        assert!(matches!(
-            prompt.into_prompt().instruction,
-            PromptInput::Text(text)
-                if text.starts_with("Additional review focus: focus on memory efficiency")
-                    && text.contains("call `simplify_review` exactly once")
-        ));
     }
 
     #[test]

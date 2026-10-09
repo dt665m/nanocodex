@@ -16,43 +16,106 @@ inputs:
 runs:
   using: composite
   steps:
-    - name: Skip superseded push
-      id: current-release
-      shell: bash
-      run: node scripts/cloudflare/current-production-release.mjs
-    - name: Select Workers changed since their successful deployments
-      id: plan
-      if: steps.current-release.outputs.active == 'true'
+    # Plan (freshness check, fingerprints, ledger lookups) in the background
+    # while Node and the cached dependencies restore; both take ~5-10s.
+    - name: Start the release plan in the background
       shell: bash
       env:
         RELEASE_ONLY: ${{ inputs.component }}
-      run: node scripts/cloudflare/release-plan.mjs plan
+      run: |
+        plan="$RUNNER_TEMP/release-plan"; mkdir -p "$plan"
+        nohup bash -c '
+          set -o pipefail
+          GITHUB_OUTPUT="$0/guard.out" node scripts/cloudflare/current-production-release.mjs
+          code=$?
+          if [ $code -eq 0 ] && grep -qx "active=true" "$0/guard.out"; then
+            GITHUB_OUTPUT="$0/plan.out" node scripts/cloudflare/release-plan.mjs plan
+            code=$?
+          fi
+          echo $code > "$0/exit"
+        ' "$plan" > "$plan/log" 2>&1 &
+    - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      with:
+        node-version: 24
+        # The pnpm store is only needed when installed modules miss.
+        cache: ''
+    # Restore installed dependencies for every deployable Worker in one entry.
+    # A hit skips pnpm install (~22s plus the store restore) entirely.
+    - name: Restore deployment dependencies
+      id: modules
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        path: |
+          node_modules
+          js/*/node_modules
+          examples/*/node_modules
+        key: deploy-modules-v1-${{ runner.os }}-node24-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml', '.npmrc', 'patches/**', 'examples/astra-mpp-trial/package-lock.json', 'scripts/cloudflare/worker-inputs.mjs') }}
+    - name: Select Workers changed since their successful deployments
+      id: plan
+      shell: bash
+      run: |
+        plan="$RUNNER_TEMP/release-plan"
+        for _ in $(seq 1 1200); do [ -f "$plan/exit" ] && break; sleep 0.1; done
+        cat "$plan/log"
+        [ -f "$plan/exit" ] || { echo '::error::Release plan timed out'; exit 1; }
+        code=$(cat "$plan/exit")
+        [ "$code" -eq 0 ] || exit "$code"
+        if [ -f "$plan/plan.out" ]; then cat "$plan/plan.out" >> "$GITHUB_OUTPUT"; fi
     - name: Reuse unchanged WASM outputs
       id: wasm
       if: steps.plan.outputs.wasm == 'true'
       uses: ./.github/actions/wasm-outputs
+    # Start the WASM compilation now, overlapping Node setup, dependency install
+    # and the early Worker phases. The later build-js-package.sh cargo call waits
+    # on Cargo's target-dir lock and then finds everything fresh. Starting the
+    # sccache server here (not under Turbo's filtered env) keeps the GHA backend.
+    - name: Start WASM compilation in the background
+      if: steps.plan.outputs.wasm == 'true' && steps.wasm.outputs.hit != 'true'
+      shell: bash
+      run: |
+        sccache --start-server
+        nohup cargo +1.97 build --locked -p nanocodex-wasm --target wasm32-unknown-unknown --profile wasm \
+          > "$RUNNER_TEMP/wasm-cargo.log" 2>&1 &
     - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
       if: steps.plan.outputs.workspace == 'true'
-    - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-      if: steps.plan.outputs.any == 'true'
-      with:
-        node-version: 24
-        cache: pnpm
-        cache-dependency-path: pnpm-lock.yaml
-    - name: Install only selected application dependencies
-      if: steps.plan.outputs.any == 'true'
+    - name: Install every deployable Worker's dependencies
+      if: steps.plan.outputs.any == 'true' && steps.modules.outputs.cache-hit != 'true'
       shell: bash
-      run: node scripts/cloudflare/release-plan.mjs install --defer-astra
+      run: |
+        node scripts/cloudflare/release-plan.mjs install --all
+        npm ci --prefer-offline --no-audit --no-fund --prefix examples/astra-mpp-trial
+    - name: Save deployment dependencies
+      if: steps.plan.outputs.any == 'true' && steps.modules.outputs.cache-hit != 'true' && github.ref == 'refs/heads/master'
+      continue-on-error: true
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        path: |
+          node_modules
+          js/*/node_modules
+          examples/*/node_modules
+        key: ${{ steps.modules.outputs.cache-primary-key }}
+    - uses: ./.github/actions/turbo-cache
+      if: steps.plan.outputs.any == 'true'
     - name: Deploy selected Workers and record successful releases
       id: release
       if: steps.plan.outputs.any == 'true'
       shell: bash
       env:
+        WRANGLER_SEND_METRICS: "false"
+        # The cached node_modules is authoritative. Nested `pnpm run` calls (the
+        # WASM package build) otherwise re-install the whole workspace and check
+        # the lockfile against the registry first (~17s).
+        npm_config_verify_deps_before_run: "false"
+        pnpm_config_verify_deps_before_run: "false"
         RELEASE_ONLY: ${{ inputs.component }}
         ASTRA_MANAGED_API_KEY: ${{ inputs.astra-api-key }}
         ASTRA_MPP_SECRET: ${{ inputs.astra-mpp-secret }}
         TEMPO_API_KEY: ${{ inputs.tempo-api-key }}
       run: node scripts/cloudflare/release-workers.mjs
+    - uses: ./.github/actions/turbo-cache
+      if: ${{ !cancelled() && steps.plan.outputs.any == 'true' }}
+      with:
+        save: "true"
     - name: Retain verified WASM outputs
       if: ${{ !cancelled() && steps.release.outputs.wasm-built == 'true' && github.ref == 'refs/heads/master' }}
       uses: ./.github/actions/save-wasm-outputs

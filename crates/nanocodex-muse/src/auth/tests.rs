@@ -102,7 +102,7 @@ async fn agent(auth: &MuseAuth, origin: &str, model: Model) -> Nanocodex {
         .unwrap();
     let tools = Tools::builder()
         .without_defaults()
-        .exposure(ToolExposure::DirectOnly)
+        .exposure(ToolExposure::CodeModeOnly)
         .build()
         .unwrap();
     Nanocodex::builder(provider).tools(tools).build().unwrap().0

@@ -36,9 +36,12 @@ export function createBrowserHost(options = {}) {
   }
   const socketObservations = createSocketObservations(options.onSocketEvent);
   const preservation = createBeforeCompaction(options.beforeCompaction);
-  const toolMode = options.toolMode ?? "code";
-  if (toolMode !== "code" && toolMode !== "code-only" && toolMode !== "direct") {
-    throw new TypeError("toolMode must be code, code-only or direct");
+  const toolMode = options.toolMode ?? "code-only";
+  if (toolMode !== "code-only") {
+    throw new TypeError("toolMode must be code-only");
+  }
+  if (options.codeEvaluator !== undefined && typeof options.codeEvaluator !== "function") {
+    throw new TypeError("codeEvaluator must be a function");
   }
   const toolsRouter = options.tools?.[toolRouterBrand]
     ? options.tools[toolRouterRuntime]
@@ -49,9 +52,6 @@ export function createBrowserHost(options = {}) {
   }
   if (toolsMcp && options.mcp) {
     throw new TypeError("MCP is already configured in Tools");
-  }
-  if ((toolsMcp || options.mcp) && toolMode === "direct") {
-    throw new TypeError("remote MCP requires Code Mode");
   }
   const toolsLifecycle = options.tools?.[toolRuntimeLifecycle];
   toolsLifecycle?.available();
@@ -676,6 +676,7 @@ export function createBrowserHost(options = {}) {
       return options.subagentRouting.bind(request);
     },
     bindSubagentSession: code.bindSubagentSession,
+    subagentStatus: code.subagentStatus,
     cancelCode: code.cancel,
     readWorkspaceFile: async (path) => {
       if (!options.filesystem) throw new Error("browser workspace is unavailable");
@@ -702,7 +703,7 @@ export function createBrowserHost(options = {}) {
     },
     toolMode: () => toolMode,
     toolDefinitions: code.toolDefinitions,
-    releaseSession: (sessionId) => { effectIdentity.release(sessionId); socketObservations?.release(sessionId); return code.releaseSession(sessionId); },
+    releaseSession: (sessionId, options) => { effectIdentity.release(sessionId); socketObservations?.release(sessionId); return code.releaseSession(sessionId, options); },
     emitEvent: (event, ...args) => { code.observeEvent(event); effectIdentity.observe(event); socketObservations?.runtime(event); return onEvent(event, ...args); },
     reset: () => { effectIdentity.reset(); return code.reset(); },
     dispose,

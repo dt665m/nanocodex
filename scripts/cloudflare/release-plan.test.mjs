@@ -3,7 +3,7 @@ import test from 'node:test';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { selectRelease, readPlan, planPath, installSelected, buildSelected, scopedRelease } from './release-plan.mjs';
+import { selectRelease, readPlan, planPath, installSelected, buildSelected, scopedRelease, startBuilds } from './release-plan.mjs';
 import { workerSpecs } from './worker-inputs.mjs';
 const fingerprints = Object.fromEntries(Object.keys(workerSpecs).map(name => [name, 'a'.repeat(64)]));
 
@@ -36,10 +36,14 @@ test('release phases reuse successfully completed targets and never cache failed
   for (const selected of [['egress'], ['managed'], ['account']]) {
     buildSelected({ selected }, (command, args) => calls.push([command, args]), completed);
   }
-  const filters = calls.filter(([command]) => command === 'pnpm')
+  const filters = calls.filter(([command]) => command === 'node_modules/.bin/turbo')
     .flatMap(([, args]) => args.filter((_, i) => args[i - 1] === '--filter'));
   assert.equal(new Set(filters).size, filters.length);
-  assert.ok(filters.indexOf('nanocodex') < filters.indexOf('nanocodex-web'));
+  // Leaf apps bundle with their own vite binary after the library tiers.
+  const wasmTier = calls.findIndex(([, args]) => args.includes('nanocodex'));
+  const web = calls.findIndex(([command, args]) => command === 'js/account/node_modules/.bin/vite' && args.join(' ') === 'build js/account');
+  assert.ok(wasmTier >= 0 && wasmTier < web);
+  assert.ok(!calls.some(([command]) => command === 'pnpm'), 'builds never go through pnpm');
   assert.deepEqual(calls.filter(([, args]) => args[0]?.startsWith('js/managed/scripts/')), [
     [process.execPath, ['js/managed/scripts/prepare-code-evaluator.mjs']],
     [process.execPath, ['js/managed/scripts/prepare-just-bash-lazy.mjs']],
@@ -62,4 +66,54 @@ test('managed-only scope includes its private media dependency before managed', 
   assert.throws(() => scopedRelease(selected, 'media'));
   assert.deepEqual(commands(installSelected, ['media'])[0][1].slice(-2), ['--filter', 'nanocodex-media-service...']);
   assert.deepEqual(commands(buildSelected, ['media'])[0][1].slice(-2), ['--filter', 'nanocodex-tools']);
+});
+
+test('background builds let early phases deploy while leaf apps bundle, and surface failures', async () => {
+  const { EventEmitter } = await import('node:events');
+  const started = [], pending = [];
+  const launch = (command, args) => {
+    const child = new EventEmitter(); child.kill = () => {};
+    started.push(args.join(' ')); pending.push({ args: args.join(' '), child });
+    return child;
+  };
+  const finish = async (match, code = 0) => {
+    await new Promise(resolve => setImmediate(resolve));
+    const index = pending.findIndex(row => row.args.includes(match));
+    assert.ok(index >= 0, `no running step matching ${match}: ${started.join(' | ')}`);
+    pending.splice(index, 1)[0].child.emit('close', code);
+    await new Promise(resolve => setImmediate(resolve));
+  };
+  const completed = new Set();
+  const builds = startBuilds({ selected: ['managed', 'account'] }, { launch, env: {}, completedTargets: completed });
+  let managed = false; const managedReady = builds.ready(['managed']).then(() => { managed = true; });
+  const account = builds.ready(['account']); account.catch(() => {});
+  await finish('nanocodex-tools');
+  await finish('prepare-code-evaluator');
+  await finish('prepare-just-bash-lazy');
+  await managedReady;
+  assert.ok(managed, 'managed is ready before second-tier and leaf builds finish');
+  assert.ok(completed.has('nanocodex') && !completed.has('nanocodex-web'));
+  await finish('nanocodex-connect-ui');
+  // Leaf apps only bundle: no typecheck or turbo build script.
+  assert.ok(started.some(args => args === 'build js/account'));
+  await finish('js/account', 1);
+  await assert.rejects(account, /Build step failed/);
+  assert.ok(!completed.has('nanocodex-web'));
+});
+
+test('unchanged topology deploys every selected Worker in one parallel phase', async () => {
+  const topology = 'c'.repeat(64);
+  const ledgerWith = topologies => ({ async lastSuccessful(name) {
+    return { fingerprint: name === 'managed' || name === 'account' ? 'b'.repeat(64) : fingerprints[name], topology: name in topologies ? topologies[name] : topology };
+  } });
+  const same = await selectRelease(fingerprints, { ledger: ledgerWith({}), revision: 'r', topology });
+  assert.deepEqual(same.selected, ['managed', 'account']);
+  assert.equal(same.parallel, true);
+  // A selected Worker last released under another topology keeps ordered phases.
+  assert.equal((await selectRelease(fingerprints, { ledger: ledgerWith({ account: 'd'.repeat(64) }), revision: 'r', topology })).parallel, false);
+  // Records from before topology tracking are ordered too.
+  assert.equal((await selectRelease(fingerprints, { ledger: ledgerWith({ managed: null }), revision: 'r', topology })).parallel, false);
+  // An unselected Worker's older topology does not matter.
+  assert.equal((await selectRelease(fingerprints, { ledger: ledgerWith({ x: 'd'.repeat(64) }), revision: 'r', topology })).parallel, true);
+  assert.equal((await selectRelease(fingerprints, { ledger: ledgerWith({}), force: true, topology })).parallel, false);
 });

@@ -9,7 +9,6 @@ import { cachedAccountMetadata, validDiscoveryOptions } from "./metadata-cache";
 import { consumeRpcData } from "nanocodex/cloudflare/rpc";
 import { annotateActiveSpan, tracing } from "nanocodex/cloudflare/tracing";
 import type { CloudflareAccountCatalogResult, CloudflareAccountVaultResult, CloudflareAccountDiscoveryResult } from "nanocodex/cloudflare/egress";
-import { durablePlacementOptions, ingressColo, TRUSTED_INGRESS_HEADER, type IngressPlacement } from "nanocodex/cloudflare/durable-placement";
 import { LINK_PATH } from "./connectors/link";
 import { chatGptFailoverSocket, chatGptLimitReset } from "./chatgpt-failover";
 import { WorkerEntrypoint } from "cloudflare:workers";
@@ -17,7 +16,8 @@ import {
   AgentSubjectDirectory,
   type BrokerEnv,
   UserCredentialBroker,
-  type UserCredentialSnapshot,
+  type ClaudeCredentialValue as ClaudeSubscriptionCredential,
+  type ModelCredentialValue,
   type VaultEntry,
   type VaultKind,
   validChatGptCredentialImport,
@@ -229,22 +229,13 @@ const CONNECTOR_OPERATIONS: readonly ConnectorOperation[] = [
   },
 ];
 
-export interface EgressEnv extends BrokerEnv, ConnectorBrokerEnv, IngressPlacement, GmailPushIngressEnv, PhoneServiceEnv {
-  trustedPlacementRegion?: DurableObjectLocationHint;
+export interface EgressEnv extends BrokerEnv, ConnectorBrokerEnv, GmailPushIngressEnv, PhoneServiceEnv {
   USER_CREDENTIALS: DurableObjectNamespace<UserCredentialBroker>;
   USER_CONNECTORS: DurableObjectNamespace<UserConnectorBroker>;
   AGENT_SUBJECTS: DurableObjectNamespace<AgentSubjectDirectory>;
   MANAGED_AGENT_OWNERSHIP?: Fetcher;
   MCP_CONNECTIONS: DurableObjectNamespace<McpConnectionDirectory>;
   CHATGPT_EGRESS?: DurableObjectNamespace;
-  // Optional during phased account/egress rollout; absent bindings use legacy.
-  CHATGPT_EGRESS_WNAM?: DurableObjectNamespace;
-  CHATGPT_EGRESS_ENAM?: DurableObjectNamespace;
-  CHATGPT_EGRESS_WEUR?: DurableObjectNamespace;
-  CHATGPT_EGRESS_EEUR?: DurableObjectNamespace;
-  CHATGPT_EGRESS_APAC?: DurableObjectNamespace;
-  CHATGPT_EGRESS_SAM?: DurableObjectNamespace;
-  CHATGPT_EGRESS_OC?: DurableObjectNamespace;
   CHATGPT_VOICE_RELAY_RPC?: string;
   CODEX_RELAY_URL?: string;
   ALLOW_INSECURE_LOOPBACK_RELAY?: string;
@@ -290,9 +281,7 @@ export function handleManagedRealtimeCall(
   // organization, team, epoch, and deletion/export state for either retained
   // subject strategy. Legacy calls need no directory rebind/readback. Only this
   // private entrypoint may carry the result past generic agent egress.
-  const region = validatedRelayRegion(request.headers.get("x-nanocodex-voice-region"));
-  const placed = region ? { ...env, trustedPlacementRegion: region } : env;
-  return handleEgressWithOwner(request, placed, ctx, fetch, undefined, undefined, { subject, userId });
+  return handleEgressWithOwner(request, env, ctx, fetch, undefined, undefined, { subject, userId });
 }
 
 /** The same live ownership admission as calls, without a second Session hop.
@@ -336,13 +325,7 @@ export class ChiefOfStaffEgress extends WorkerEntrypoint<EgressEnv> {
 }
 
 const SESSION_MODEL_OWNER_HEADER = "x-nanocodex-session-model-owner";
-const SESSION_MODEL_REGION_HEADER = "x-nanocodex-model-region";
-type SessionModelAuthority = Readonly<{ subject: string; owner: string; region?: DurableObjectLocationHint }>;
-
-function validatedRelayRegion(value: string | null | undefined): DurableObjectLocationHint | undefined {
-  return value && ["wnam", "enam", "sam", "weur", "eeur", "apac", "oc"].includes(value)
-    ? value as DurableObjectLocationHint : undefined;
-}
+type SessionModelAuthority = Readonly<{ subject: string; owner: string }>;
 
 const SESSION_MODEL_TRANSPORT_URLS: ReadonlySet<string> = new Set([
   "https://nanocodex.internal/v1/responses", "https://nanocodex.internal/v1/messages",
@@ -377,13 +360,11 @@ export class SessionModelEgress extends WorkerEntrypoint<EgressEnv> {
     }
     const forwarded = new Request(request);
     forwarded.headers.delete(SESSION_MODEL_OWNER_HEADER);
-    // Only the private Session wrapper may assert placement; generic egress
-    // never derives a region from this header. Nothing private goes upstream.
-    // Placement applies to the model transport only, never to tool calls.
-    const region = transport ? validatedRelayRegion(forwarded.headers.get(SESSION_MODEL_REGION_HEADER)) : undefined;
-    forwarded.headers.delete(SESSION_MODEL_REGION_HEADER);
-    return handleEgress(forwarded, this.env, this.ctx, fetch, undefined, { subject, owner, ...(region ? { region } : {}) });
+    // Managed sessions may still send their former placement header; it carries nothing.
+    forwarded.headers.delete("x-nanocodex-model-region");
+    return handleEgress(forwarded, this.env, this.ctx, fetch, undefined, { subject, owner });
   }
+
 }
 
 const SESSION_TOOL_OWNER_HEADER = "x-nanocodex-session-tool-owner";
@@ -573,11 +554,12 @@ async function handleMeasuredEgressWithOwner(
       return jsonError(403, "invalid_session_tool_authority");
     }
   }
-  if (sessionModelAuthority?.region) env = { ...env, trustedPlacementRegion: sessionModelAuthority.region };
   const started = Date.now();
   // Headers on the general broker are never an ownership assertion. Only the
   // dedicated Worker entrypoint may supply already-validated Session authority.
-  if (request.headers.has(SESSION_MODEL_OWNER_HEADER)) return jsonError(403, "invalid_session_model_authority");
+  if (request.headers.has(SESSION_MODEL_OWNER_HEADER)) {
+    return jsonError(403, "invalid_session_model_authority");
+  }
   let url: URL;
   try { url = new URL(request.url); } catch { return jsonError(400, "invalid_url"); }
   if (url.username || url.password || url.hash) return jsonError(403, "destination_denied");
@@ -819,9 +801,7 @@ async function handleMeasuredEgressWithOwner(
         operation,
         buildUpstreamRequest(request, env, operation, credential, body),
         upstreamFetch,
-        request.headers.get("x-nanocodex-voice-region"),
         egressRequestId,
-        sessionModelAuthority?.region,
       );
       let recovered = false;
       if (upstream.status === 401 && credential.kind === "chatgpt") {
@@ -847,9 +827,7 @@ async function handleMeasuredEgressWithOwner(
           operation,
           buildUpstreamRequest(request, env, operation, credential, body),
           upstreamFetch,
-          request.headers.get("x-nanocodex-voice-region"),
           egressRequestId,
-          sessionModelAuthority?.region,
         );
         recovered = true;
       }
@@ -876,7 +854,7 @@ async function handleMeasuredEgressWithOwner(
         rejectionBody = undefined;
         upstream = await fetchUpstream(env, userId, credential, operation,
           buildUpstreamRequest(request, env, operation, credential, body), upstreamFetch,
-          request.headers.get("x-nanocodex-voice-region"), egressRequestId, sessionModelAuthority?.region);
+          egressRequestId);
         recovered = true;
       }
       if (REDIRECT_STATUS.has(upstream.status)) {
@@ -932,9 +910,6 @@ async function handleMeasuredEgressWithOwner(
         user_id: userId,
         deployment_sha: env.DEPLOYMENT_SHA, egress_request_id: egressRequestId,
         credential_kind: credential.kind,
-        ...(operation.id === "responses" && credential.kind === "chatgpt" && env.CHATGPT_EGRESS
-          && !env.CODEX_RELAY_URL && sessionModelAuthority?.region
-          ? { relay_region: sessionModelAuthority.region } : {}),
         subject_ms: subjectResolvedAt - started,
         credential_ms: credentialResolvedAt - subjectResolvedAt,
         credential_broker_ms: credentialBrokerMs,
@@ -2250,7 +2225,10 @@ function closeSponsoredSocket(socket: WebSocket, code: number, reason: string): 
 
 async function handleControl(request: Request, url: URL, env: EgressEnv): Promise<Response> {
   // This control API is service-binding only; public model egress never enters it.
-  env = { ...env, trustedClientIngressColo: ingressColo(request.headers.get(TRUSTED_INGRESS_HEADER)) };
+  // Any credential mutation drops this isolate's cached reads for that user.
+  const mutatedUser = request.method !== "GET" && request.method !== "HEAD"
+    ? /^\/users\/([A-Za-z0-9][A-Za-z0-9._:-]{0,127})\/credentials(?:\/|$)/.exec(url.pathname)?.[1] : undefined;
+  if (mutatedUser) forgetCachedCredentials(env, mutatedUser);
   const gmailPush = /^\/users\/([A-Za-z0-9][A-Za-z0-9._:-]{0,127})\/gmail-push\/([A-Za-z0-9][A-Za-z0-9._:-]{0,127})$/.exec(url.pathname);
   if (gmailPush) {
     if (!env.GMAIL_PUSH_MAILBOXES) return jsonError(503, "gmail_push_unavailable");
@@ -2617,7 +2595,7 @@ async function handleControl(request: Request, url: URL, env: EgressEnv): Promis
 
   if (operation === "claude/models") {
     if (request.method !== "GET" || request.body !== null) return jsonError(405, "method_not_allowed");
-    return handleClaudeModels(env, userId);
+    return handleClaudeModels(env, userId, request.headers.get(CLAUDE_MODELS_CACHE_HEADER) === "allow");
   }
   if (operation?.startsWith("claude")) {
     const method = operation === "claude" ? "DELETE" : operation === "claude/login/status" ? "GET" : "POST";
@@ -2742,9 +2720,21 @@ async function hasRequestPayload(request: Request): Promise<boolean> {
  * OAuth catalog support is a separate rollout gate from Messages inference;
  * unsupported/rejected catalog access remains unavailable, never guessed.
  */
-async function handleClaudeModels(env: EgressEnv, userId: string): Promise<Response> {
+// Agent creation checks the live Claude catalog; Anthropic's /v1/models adds
+// ~1s per create. Creation may opt in to the last successful listing within
+// the credential cache window; public catalog reads stay live and refresh it.
+const CLAUDE_MODELS_CACHE_HEADER = "x-nanocodex-catalog-cache";
+async function handleClaudeModels(env: EgressEnv, userId: string, allowCached: boolean): Promise<Response> {
+  if (allowCached) {
+    const cached = cacheGet(caches(env).claudeModels, userId)
+      ?? await userBroker(env, userId).readClaudeModels().catch(() => null) ?? undefined;
+    if (cached) {
+      cachePut(caches(env).claudeModels, userId, cached, CREDENTIAL_CACHE_MS);
+      return json({ models: cached, has_more: false }, 200);
+    }
+  }
   try {
-    let result = consumeRpcData(await userBroker(env, userId).resolveClaudeCredential());
+    let result = await resolvePlainClaudeCredential(env, userId);
     if (result.status !== 200 || !result.credential) return jsonError(409, "claude_login_required");
     let credential = result.credential;
     const secrets = [credential.headers.authorization?.replace(/^Bearer /, "") ?? ""];
@@ -2770,6 +2760,7 @@ async function handleClaudeModels(env: EgressEnv, userId: string): Promise<Respo
         await cancelResponseBody(response);
         refreshed = true;
         result = consumeRpcData(await userBroker(env, userId).resolveClaudeCredential(true, credential.revision));
+        if (result.status === 200 && result.credential) cachePut(caches(env).claude, userId, result, CREDENTIAL_CACHE_MS); else caches(env).claude.delete(userId);
         if (result.status !== 200 || !result.credential) return jsonError(409, "claude_login_required");
         credential = result.credential;
         secrets.push(credential.headers.authorization?.replace(/^Bearer /, "") ?? "");
@@ -2794,6 +2785,8 @@ async function handleClaudeModels(env: EgressEnv, userId: string): Promise<Respo
           if (secrets.some(secret => secret && model.id.includes(secret))) throw new Error("invalid Claude catalog");
           if (secrets.some(secret => secret && model.display_name.includes(secret))) model.display_name = model.id;
         }
+        cachePut(caches(env).claudeModels, userId, rows, CREDENTIAL_CACHE_MS);
+        await userBroker(env, userId).storeClaudeModels(rows, CREDENTIAL_CACHE_MS).catch(() => undefined);
         return json({ models: rows, has_more: false }, 200);
       }
       const last = value.data[value.data.length - 1];
@@ -2827,15 +2820,18 @@ async function handleClaudeMessages(
   if (version !== null && version !== "2023-06-01") return jsonError(403, "provider_header_forbidden");
   const beta = request.headers.get("anthropic-beta");
   if (beta !== null && (beta.length > 1024 || !/^[a-z0-9,-]+$/.test(beta))) return jsonError(403, "provider_header_forbidden");
+  const claudeStartedAt = Date.now();
   let body: string;
   try { body = await readBoundedText(request, MAX_MODEL_BODY_BYTES); }
   catch { return jsonError(413, "model_request_too_large"); }
+  const bodyReadAt = Date.now();
   const egressRequestId = crypto.randomUUID();
   let phase = "credential_resolution";
   let dispatches = 0;
   let rejected = false;
   try {
-    let result = consumeRpcData(await userBroker(env, authority.owner).resolveClaudeCredential());
+    let result = await resolvePlainClaudeCredential(env, authority.owner);
+    const credentialAt = Date.now();
     if (result.status !== 200 || !result.credential) return jsonError(409, "claude_login_required");
     let credential = result.credential;
     const secrets = [credential.headers.authorization?.replace(/^Bearer /, "") ?? ""];
@@ -2868,6 +2864,7 @@ async function handleClaudeMessages(
       return upstreamFetch(upstreamRequest);
     };
     let response = await dispatch();
+    const upstreamHeadersAt = Date.now();
     // A definitive unauthorized response is the only replay permission. Never
     // retry transport failures, redirects, overloads, or uncertain Messages POSTs.
     if (response.status === 401) {
@@ -2876,6 +2873,7 @@ async function handleClaudeMessages(
       await cancelResponseBody(response);
       phase = "credential_refresh";
       result = consumeRpcData(await userBroker(env, authority.owner).resolveClaudeCredential(true, credential.revision));
+      if (result.status === 200 && result.credential) cachePut(caches(env).claude, authority.owner, result, CREDENTIAL_CACHE_MS); else caches(env).claude.delete(authority.owner);
       if (result.status !== 200 || !result.credential) return jsonError(409, "claude_login_required");
       credential = result.credential;
       secrets.push(credential.headers.authorization?.replace(/^Bearer /, "") ?? "");
@@ -2893,6 +2891,11 @@ async function handleClaudeMessages(
       return Response.json({ error: { type: "api_error", message: `Claude request rejected (HTTP ${response.status}).` } },
         { status: REDIRECT_STATUS.has(response.status) ? 502 : response.status, headers });
     }
+    console.info({ type: "egress.claude.timing", egress_request_id: egressRequestId,
+      body_bytes: body.length, body_read_ms: bodyReadAt - claudeStartedAt,
+      credential_ms: credentialAt - bodyReadAt, upstream_headers_ms: upstreamHeadersAt - credentialAt,
+      total_to_headers_ms: Date.now() - claudeStartedAt, attempts: dispatches, status: response.status,
+      ...(typeof request.cf?.colo === "string" ? { colo: request.cf.colo } : {}) });
     return new Response(privateClaudeStream(response.body, secrets), { status: response.status, headers });
   } catch (error) {
     const status = request.signal.aborted ? 499 : 502;
@@ -3009,7 +3012,7 @@ function buildUpstreamRequest(
   original: Request,
   env: EgressEnv,
   operation: ModelOperation,
-  credential: UserCredentialSnapshot,
+  credential: ModelCredentialValue,
   body: Uint8Array | null,
 ): Request {
   const headers = new Headers();
@@ -3073,7 +3076,7 @@ function buildUpstreamRequest(
 function upstreamUrl(
   env: EgressEnv,
   operation: ModelOperation,
-  kind: UserCredentialSnapshot["kind"],
+  kind: ModelCredentialValue["kind"],
 ): URL {
   if (kind === "openai") return new URL(operation.openai);
   const configured = env.CODEX_RELAY_URL?.trim();
@@ -3109,44 +3112,20 @@ function realtimeRelayRpc(env: EgressEnv, request: Request): boolean {
 async function fetchUpstream(
   env: EgressEnv,
   userId: string,
-  credential: UserCredentialSnapshot,
+  credential: ModelCredentialValue,
   operation: ModelOperation,
   request: Request,
   upstreamFetch: typeof fetch,
-  voiceRegion: string | null,
   egressRequestId: string | undefined,
-  textRegion: DurableObjectLocationHint | undefined,
 ): Promise<Response> {
   if (credential.kind !== "chatgpt" || env.CODEX_RELAY_URL || operation.directChatGpt) {
     return upstreamFetch(request);
   }
-  const region = operation.id === "realtime-call" ? validatedRelayRegion(voiceRegion)
-    : operation.id === "responses" ? validatedRelayRegion(textRegion) : undefined;
-  // DO hints place the controller; the selected application's constraints place
-  // its container. Validated text and voice regions share regional pools while
-  // keeping separate identities and transport state.
-  const regionalRelays: Partial<Record<DurableObjectLocationHint, DurableObjectNamespace | undefined>> = {
-    wnam: env.CHATGPT_EGRESS_WNAM,
-    enam: env.CHATGPT_EGRESS_ENAM,
-    weur: env.CHATGPT_EGRESS_WEUR,
-    eeur: env.CHATGPT_EGRESS_EEUR,
-    apac: env.CHATGPT_EGRESS_APAC,
-    sam: env.CHATGPT_EGRESS_SAM,
-    oc: env.CHATGPT_EGRESS_OC,
-  };
-  const relayNamespace = (region ? regionalRelays[region] : undefined)
-    ?? env.CHATGPT_EGRESS;
+  const relayNamespace = env.CHATGPT_EGRESS;
   if (relayNamespace) {
     const target = new URL(request.url);
     const internal = new URL(`${target.pathname}${target.search}`, "https://chatgpt-egress.internal");
-    // Hints apply only to initial allocation and are best effort. New text
-    // identities avoid legacy relay anchors; existing DOs never move. Keep
-    // voice separate because call-creation placement also affects media.
-    const relayName = region
-      ? `${operation.id === "realtime-call" ? "voice" : "text"}-v1:${region}:${userId}`
-      : `user-v1:${userId}`;
-    const id = relayNamespace.idFromName(relayName);
-    const relay = relayNamespace.get(id, region ? { locationHint: region } : undefined);
+    const relay = relayNamespace.getByName(`user-v1:${userId}`);
     if (operation.id === "realtime-call" && realtimeRelayRpc(env, request)) {
       const rpc = relay as typeof relay & {
         createRealtimeCall(body: string, headers: Record<string, string>, search: string): Promise<{
@@ -3273,11 +3252,12 @@ async function subjectUser(response: Response): Promise<string> {
 async function reportChatGptLimit(
   env: EgressEnv,
   userId: string,
-  credential: UserCredentialSnapshot,
+  credential: ModelCredentialValue,
   resetAt: number,
   select = true,
   egressRequestId?: string,
 ): Promise<boolean> {
+  forgetCachedCredentials(env, userId); // the broker's account selection is changing
   const controller = new AbortController();
   const started = Date.now();
   const failed = (outcome: "timeout" | "error") => console.warn({
@@ -3328,7 +3308,7 @@ async function resolveCredential(
   return { ...await resolveSponsoredChatGptCredential(env, recover, revision), source: "sponsored" };
 }
 
-type ResolvedModelCredential = UserCredentialSnapshot & Readonly<{
+type ResolvedModelCredential = ModelCredentialValue & Readonly<{
   source: "sponsored" | "user";
   broker_ms?: number;
   broker_activation_ms?: number;
@@ -3340,7 +3320,7 @@ async function resolveSponsoredChatGptCredential(
   env: EgressEnv,
   recover: boolean,
   revision?: number,
-): Promise<UserCredentialSnapshot> {
+): Promise<ModelCredentialValue> {
   const sponsorUserId = env.NANOCODEX_SPONSORED_CHATGPT_USER_ID?.trim();
   if (!sponsorUserId || !USER_ID.test(sponsorUserId)) {
     throw new EgressFailure(409, "sponsored_chatgpt_unavailable");
@@ -3371,7 +3351,7 @@ export function isLegacyLocalBootstrapCredential(
     "ALLOW_LOCAL_CREDENTIAL_CLAIM" | "ENVIRONMENT" | "LOCAL_CHATGPT_BOOTSTRAP"
     | "NANOCODEX_SPONSORED_CHATGPT_USER_ID">,
   userId: string,
-  credential: UserCredentialSnapshot,
+  credential: ModelCredentialValue,
 ): boolean {
   if (!localClaimEnabled(env) || credential.kind !== "chatgpt" || credential.provenance
     || userId === env.NANOCODEX_SPONSORED_CHATGPT_USER_ID?.trim()) {
@@ -3389,14 +3369,63 @@ export function isLegacyLocalBootstrapCredential(
   }
 }
 
+/**
+ * Isolate-local cache of plain credential reads. Cloudflare runs this Worker
+ * next to the caller, so a hit avoids a round trip to the user's broker on
+ * every model call. Bounded by CREDENTIAL_CACHE_MS (a revoked or switched
+ * credential can keep working this long) and by provider expiry. Recovery,
+ * revision fences and account pins always read the broker, and a recovery
+ * result replaces the cached entry.
+ */
+const CREDENTIAL_CACHE_MS = 10 * 60_000;
+const CREDENTIAL_CACHE_EARLY_MS = 5 * 60_000;
+const CREDENTIAL_CACHE_MAX = 1024;
+type CachedClaude = { status: number; credential: ClaudeSubscriptionCredential | null };
+type ClaudeModelRows = Array<{ id: string; display_name: string }>;
+type CredentialCaches = { model: Map<string, { value: CanonicalResolve; until: number }>; claude: Map<string, { value: CachedClaude; until: number }>; claudeModels: Map<string, { value: ClaudeModelRows; until: number }> };
+// Scoped to the broker binding, so distinct deployments/tests never share entries.
+const credentialCaches = new WeakMap<object, CredentialCaches>();
+function caches(env: EgressEnv): CredentialCaches {
+  let entry = credentialCaches.get(env.USER_CREDENTIALS);
+  if (!entry) credentialCaches.set(env.USER_CREDENTIALS, entry = { model: new Map(), claude: new Map(), claudeModels: new Map() });
+  return entry;
+}
+function cacheGet<T>(cache: Map<string, { value: T; until: number }>, key: string): T | undefined {
+  const entry = cache.get(key);
+  if (!entry) return undefined;
+  if (entry.until > Date.now()) return entry.value;
+  cache.delete(key);
+  return undefined;
+}
+function cachePut<T>(cache: Map<string, { value: T; until: number }>, key: string, value: T, ttl: number): void {
+  if (!(ttl > 0)) { cache.delete(key); return; }
+  if (cache.size >= CREDENTIAL_CACHE_MAX) cache.delete(cache.keys().next().value!);
+  cache.set(key, { value, until: Date.now() + ttl });
+}
+/** Drop cached reads for a user after any credential mutation in this isolate. */
+export function forgetCachedCredentials(env: EgressEnv, userId: string): void {
+  caches(env).model.delete(userId);
+  caches(env).claude.delete(userId);
+  caches(env).claudeModels.delete(userId);
+}
+
 async function resolveUserCredential(
   env: EgressEnv,
   userId: string,
   recover: boolean,
   revision?: number,
   accountId?: string,
-): Promise<UserCredentialSnapshot & Pick<ResolvedModelCredential, "broker_ms" | "broker_activation_ms" | "broker_age_ms" | "broker_resolve_id">> {
-  const result = consumeRpcData(await userBroker(env, userId).resolveModelCredential(recover, revision, accountId));
+): Promise<ModelCredentialValue & Pick<ResolvedModelCredential, "broker_ms" | "broker_activation_ms" | "broker_age_ms" | "broker_resolve_id">> {
+  const plain = !recover && revision === undefined && accountId === undefined;
+  let result = plain ? cacheGet(caches(env).model, userId) : undefined;
+  if (!result) {
+    result = consumeRpcData(await userBroker(env, userId).resolveModelCredential(recover, revision, accountId)) as CanonicalResolve;
+    if (result.status >= 200 && result.status < 300 && result.credential && (plain || recover)) {
+      const expiresAt = result.credential.expiresAt;
+      cachePut(caches(env).model, userId, { ...result, resolve_ms: 0 },
+        Math.min(CREDENTIAL_CACHE_MS, expiresAt === undefined ? CREDENTIAL_CACHE_MS : expiresAt - CREDENTIAL_CACHE_EARLY_MS - Date.now()));
+    } else if (plain || recover) caches(env).model.delete(userId);
+  }
   if (result.status < 200 || result.status >= 300) {
     if (result.status === 429) throw new EgressFailure(429, accountId ? "chatgpt_account_exhausted" : "chatgpt_accounts_exhausted");
     throw new EgressFailure(result.status === 404 ? 409 : 503, accountId ? "chatgpt_account_unavailable" : "user_credential_unavailable");
@@ -3406,15 +3435,29 @@ async function resolveUserCredential(
     || !Number.isSafeInteger(value.revision)) {
     throw new EgressFailure(503, "invalid_credential_response");
   }
-  return { ...value, ...(Number.isFinite(result.resolve_ms) && result.resolve_ms >= 0
+  return { ...value, ...(typeof result.resolve_ms === "number" && Number.isFinite(result.resolve_ms) && result.resolve_ms >= 0
     ? { broker_ms: result.resolve_ms } : {}),
-    ...(Number.isFinite(result.activation_ms) && result.activation_ms >= 0
+    ...(typeof result.activation_ms === "number" && Number.isFinite(result.activation_ms) && result.activation_ms >= 0
       ? { broker_activation_ms: result.activation_ms } : {}),
-    ...(Number.isFinite(result.activation_age_ms) && result.activation_age_ms >= 0
+    ...(typeof result.activation_age_ms === "number" && Number.isFinite(result.activation_age_ms) && result.activation_age_ms >= 0
       ? { broker_age_ms: result.activation_age_ms } : {}),
     ...(typeof result.resolve_id === "string" && /^[0-9a-f-]{36}$/.test(result.resolve_id)
       ? { broker_resolve_id: result.resolve_id } : {}),
   };
+}
+
+type CanonicalResolve = Readonly<{ status: number; credential: ModelCredentialValue | null;
+  resolve_ms?: number; activation_ms?: number; activation_age_ms?: number; resolve_id?: string }>;
+
+async function resolvePlainClaudeCredential(env: EgressEnv, userId: string): Promise<{
+  status: number; credential: ClaudeSubscriptionCredential | null;
+}> {
+  const cached = cacheGet(caches(env).claude, userId);
+  if (cached) return cached;
+  const result = consumeRpcData(await userBroker(env, userId).resolveClaudeCredential()) as { status: number; credential: ClaudeSubscriptionCredential | null };
+  if (result.status === 200 && result.credential) cachePut(caches(env).claude, userId, result, CREDENTIAL_CACHE_MS);
+  else caches(env).claude.delete(userId);
+  return result;
 }
 
 async function resolveSshIdentity(
@@ -3484,11 +3527,10 @@ function subjectDirectory(
   return env.AGENT_SUBJECTS.getByName(`${SUBJECT_DIRECTORY_PREFIX}${subject}`);
 }
 function userBroker(env: EgressEnv, userId: string): DurableObjectStub<UserCredentialBroker> {
-  return env.USER_CREDENTIALS.getByName(userId, env.trustedPlacementRegion
-    ? { locationHint: env.trustedPlacementRegion } : durablePlacementOptions(env.trustedClientIngressColo));
+  return env.USER_CREDENTIALS.getByName(userId);
 }
 function connectorBroker(env: EgressEnv, userId: string): DurableObjectStub<UserConnectorBroker> {
-  return env.USER_CONNECTORS.getByName(userId, durablePlacementOptions(env.trustedClientIngressColo));
+  return env.USER_CONNECTORS.getByName(userId);
 }
 async function cancelResponseBody(response: Response): Promise<void> {
   try { await response.body?.cancel(); } catch { /* Response disposal is best-effort. */ }
@@ -3653,8 +3695,6 @@ function audit(
     || rule === "cloudflare" || rule === "slack" || rule === "x" || rule === "spotify" || rule === "soundcloud" || rule === "link" || rule === "whatsapp" || rule === "mcp";
   const log = action === "error" ? console.error : action === "deny" ? console.warn : console.info;
   const safeDetail = {
-    ...(rule === "responses" && typeof detail.relay_region === "string" && validatedRelayRegion(detail.relay_region)
-      ? { relay_region: detail.relay_region } : {}),
     ...(typeof detail.egress_request_id === "string"
       && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(detail.egress_request_id)
       ? { egress_request_id: detail.egress_request_id } : {}),

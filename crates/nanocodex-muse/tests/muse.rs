@@ -115,6 +115,18 @@ async fn turn(agent: &Nanocodex, prompt: &str) -> Result<String> {
 
 #[tokio::test]
 async fn malformed_custom_tool_wrappers_fail_without_panicking_the_agent() -> Result<()> {
+    for exposure in [ToolExposure::DirectOnly, ToolExposure::DirectAndCodeMode] {
+        let provider = Muse::builder("synthetic-test-key").build()?;
+        let tools = Tools::builder()
+            .without_defaults()
+            .exposure(exposure)
+            .build()?;
+        assert!(matches!(
+            Nanocodex::builder(provider).tools(tools).build(),
+            Err(nanocodex_muse::NanocodexError::InvalidRequest(message))
+                if message.contains("CodeModeOnly")
+        ));
+    }
     for arguments in ["[]", "1", "true", "\"text\"", "{}", "{\"input\":42}"] {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let endpoint = format!("http://{}/v1", listener.local_addr()?);
@@ -190,21 +202,15 @@ async fn file_edit_compaction_journey(model: Model) -> Result<()> {
         assert!(!headers.contains("x-codex-turn-state:"));
         assert_eq!(first["model"], model.as_str());
         assert_eq!(first["reasoning"]["effort"], "low");
-        let patch_tool = first["tools"]
+        let exec_tool = first["tools"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|tool| {
-                tool["name"]
-                    .as_str()
-                    .is_some_and(|name| name.ends_with("apply_patch"))
-            })
-            .ok_or_else(|| eyre!("apply_patch missing"))?;
-        let name = patch_tool["name"].as_str().unwrap();
-        assert_eq!(patch_tool["type"], "function");
-        let arguments =
-            json!({"input":"*** Begin Patch\n*** Add File: hello.txt\n+hello Muse\n*** End Patch"})
-                .to_string();
+            .find(|tool| tool["name"] == "exec")
+            .ok_or_else(|| eyre!("exec missing"))?;
+        let name = exec_tool["name"].as_str().unwrap();
+        assert_eq!(exec_tool["type"], "function");
+        let arguments = json!({"input": r#"text(await tools.apply_patch("*** Begin Patch\n*** Add File: hello.txt\n+hello Muse\n*** End Patch"));"#}).to_string();
         respond_with_turn_state(stream, "resp-tool", vec![json!({"type":"reasoning", "id":"rs_original", "summary":[{"type":"summary_text","text":"Retained reasoning summary"}], "encrypted_content":"opaque-original"}),
             json!({"type":"function_call", "call_id":"patch1", "name":name, "arguments":arguments})], 9_000, Some("turn-a")).await?;
         let (stream, compact, headers) = request_with_headers(&listener).await?;
@@ -252,7 +258,10 @@ async fn file_edit_compaction_journey(model: Model) -> Result<()> {
             .iter()
             .find(|i| i["type"] == "function_call_output" && i["call_id"] == "patch1")
             .unwrap();
-        assert!(receipt.to_string().contains("hello.txt"));
+        assert!(
+            receipt["output"].to_string().contains("Script completed"),
+            "{receipt}"
+        );
         respond(stream, "resp-answer", vec![answer("Created hello.txt")], 12).await?;
         let (stream, manual) = request(&listener).await?;
         assert_eq!(manual["model"], model.as_str());
@@ -284,7 +293,7 @@ async fn file_edit_compaction_journey(model: Model) -> Result<()> {
         .context_window_tokens(40_000)
         .build()?;
     let tools = Tools::builder()
-        .exposure(ToolExposure::DirectOnly)
+        .exposure(ToolExposure::CodeModeOnly)
         .build()?;
     let (agent, mut events) = Nanocodex::builder(provider)
         .service_tier(ServiceTier::Ultrafast)
@@ -381,7 +390,7 @@ async fn invalid_summary_leaves_history_available_for_retry() -> Result<()> {
         .build()?;
     let tools = Tools::builder()
         .without_defaults()
-        .exposure(ToolExposure::DirectOnly)
+        .exposure(ToolExposure::CodeModeOnly)
         .build()?;
     let (agent, _events) = Nanocodex::builder(provider).tools(tools).build()?;
     turn(&agent, "Remember 42").await?;
@@ -406,33 +415,34 @@ async fn muse_discovers_and_dispatches_upstream_mcp_tools() -> Result<()> {
     let endpoint = format!("http://{}/v1", listener.local_addr()?);
     let server = tokio::spawn(async move {
         let (stream, catalog) = request(&listener).await?;
-        assert!(
+        assert_eq!(
             catalog["tools"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|t| t["name"] == "tool_search" && t["type"] == "function")
+                .map(|tool| tool["name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["exec", "wait"]
         );
-        respond(stream, "resp-search", vec![json!({"type":"function_call", "call_id":"search1", "name":"tool_search", "arguments":"{\"query\":\"echo deterministic message\",\"limit\":1}"})], 12).await?;
+        let search = json!({"input": "text(await tools.tool_search({query: 'echo deterministic message', limit: 1}));"});
+        respond(stream, "resp-search", vec![json!({"type":"function_call", "call_id":"search1", "name":"exec", "arguments":search.to_string()})], 12).await?;
         let (stream, discovered) = request(&listener).await?;
-        let tool = discovered["tools"]
+        let output = discovered["input"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|t| {
-                t["name"]
-                    .as_str()
-                    .is_some_and(|name| name.starts_with("mcp__fixture") && name.ends_with("echo"))
-            })
-            .ok_or_else(|| eyre!("MCP discovery omitted echo"))?;
+            .find(|item| item["type"] == "function_call_output" && item["call_id"] == "search1")
+            .ok_or_else(|| eyre!("missing discovery receipt"))?;
+        assert!(output.to_string().contains("mcp__fixture__"), "{output}");
         assert!(
-            discovered["input"]
+            discovered["tools"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|i| i["type"] == "function_call_output" && i["call_id"] == "search1")
+                .all(|tool| tool["name"] == "exec" || tool["name"] == "wait")
         );
-        respond(stream, "resp-echo", vec![json!({"type":"function_call", "call_id":"echo1", "name":tool["name"], "arguments":"{\"message\":\"hello\"}"})], 12).await?;
+        let echo = json!({"input": "text(await tools.mcp__fixture__echo({message: 'hello'}));"});
+        respond(stream, "resp-echo", vec![json!({"type":"function_call", "call_id":"echo1", "name":"exec", "arguments":echo.to_string()})], 12).await?;
         let (stream, executed) = request(&listener).await?;
         assert!(
             executed["input"]
@@ -455,7 +465,7 @@ async fn muse_discovers_and_dispatches_upstream_mcp_tools() -> Result<()> {
         )
         .build()?;
     let tools = Tools::builder()
-        .exposure(ToolExposure::DirectAndCodeMode)
+        .exposure(ToolExposure::CodeModeOnly)
         .provider(mcp)
         .build()?;
     let provider = Muse::builder("synthetic-test-key")
@@ -488,7 +498,7 @@ async fn muse_cancels_an_inflight_http_response_and_accepts_a_new_turn() -> Resu
         .build()?;
     let tools = Tools::builder()
         .without_defaults()
-        .exposure(ToolExposure::DirectOnly)
+        .exposure(ToolExposure::CodeModeOnly)
         .build()?;
     let (agent, _events) = Nanocodex::builder(provider).tools(tools).build()?;
     let active = agent.prompt("Wait for a response").await?;

@@ -31,7 +31,7 @@ use crate::login::load_managed_mcp_credential;
 use crate::managed_memory::{ConfiguredManagedMemory, MEMORY_INSTRUCTIONS};
 use crate::mcp::{ConfiguredMcp, McpArgs};
 use crate::mpp::{MppAdapter, MppArgs};
-use crate::subagents::{self, ChildAgents, DEFAULT_MAX_SUBAGENTS, SubagentToolSet};
+use crate::subagents::{self, ChildAgents, DEFAULT_MAX_SUBAGENTS};
 use crate::vm::{ConfiguredVm, VmArgs};
 
 mod claude;
@@ -245,6 +245,19 @@ pub(crate) struct AgentArgs {
     )]
     image_generation: Option<bool>,
 
+    /// Whether the local command, patch, plan, and file tools are exposed.
+    ///
+    /// Set false when every workspace effect must go through MCP tools, for
+    /// example when a remote sandbox is the workspace. Local computer-use
+    /// tools are disabled with them.
+    #[arg(
+        long,
+        env = "NANOCODEX_WORKSPACE_TOOLS",
+        default_value_t = true,
+        action = ArgAction::Set
+    )]
+    workspace_tools: bool,
+
     /// Whether clean, reusable Tact-style subagents are exposed in Code Mode.
     #[arg(
         long,
@@ -388,7 +401,71 @@ impl AgentArgs {
                 Err(eyre!("--claude conflicts with --harness {family}"))
             }
             (true, _) | (false, Some("claude")) => Ok(HarnessFamily::Claude),
-            _ => Ok(HarnessFamily::Codex),
+            (false, Some(_)) => Ok(HarnessFamily::Codex),
+            (false, None) => Ok(self.default_harness()),
+        }
+    }
+
+    /// Claude Opus 5.5 (medium) is the preferred default. An explicit model or
+    /// Responses-only configuration keeps its family, and Codex remains the
+    /// fallback when no local Claude credential is configured.
+    fn default_harness(&self) -> HarnessFamily {
+        let explicit_model = self
+            .model
+            .as_deref()
+            .and_then(|value| value.parse::<HarnessModel>().ok());
+        if let Some(model) = explicit_model {
+            return model.family();
+        }
+        if self.model.is_some() || std::env::var_os("OPENAI_MODEL").is_some() {
+            return HarnessFamily::Codex;
+        }
+        if std::env::var_os("ANTHROPIC_MODEL").is_some() {
+            return HarnessFamily::Claude;
+        }
+        let responses_only = self.memory
+            || self.mpp.is_enabled()
+            || self.model_id_prefix.is_some()
+            || self.websocket_url.is_some()
+            || self.api_base_url.is_some()
+            || self.responses_transport.is_some()
+            || self.store_responses.is_some()
+            || self.reasoning_mode != ReasoningMode::Standard;
+        if responses_only {
+            return HarnessFamily::Codex;
+        }
+        if self.claude_api_key.is_some() || self.claude_auth.has_saved_credentials() {
+            HarnessFamily::Claude
+        } else {
+            HarnessFamily::Codex
+        }
+    }
+
+    /// Whether a harness family was chosen with --claude, --harness or a model.
+    pub(crate) fn has_explicit_harness(&self) -> bool {
+        self.claude
+            || self.harness.is_some()
+            || self.model.is_some()
+            || std::env::var_os("OPENAI_MODEL").is_some()
+            || std::env::var_os("ANTHROPIC_MODEL").is_some()
+    }
+
+    /// The workspace requested with `--cwd`, if any.
+    pub(crate) fn requested_workspace(&self) -> Option<&std::path::Path> {
+        self.cwd.as_deref()
+    }
+
+    /// Resume uses the store owning the thread unless the family was chosen explicitly.
+    pub(crate) fn resume_with_harness(&mut self, family: HarnessFamily) {
+        if !self.has_explicit_harness() {
+            self.harness = Some(family.to_string());
+        }
+    }
+
+    /// The local Claude harness has no VM support; keep a defaulted session on Codex.
+    pub(crate) fn prefer_codex_for_vm(&mut self, vm: &VmArgs) {
+        if vm.is_enabled() && !self.claude && self.harness.is_none() && self.model.is_none() {
+            self.harness = Some(HarnessFamily::Codex.to_string());
         }
     }
 
@@ -519,12 +596,13 @@ impl AgentArgs {
     }
 
     async fn build_inner(
-        self,
+        mut self,
         durable: Option<DurableSession>,
         vm: VmArgs,
         tui: bool,
         local_durability: Option<LocalDurability>,
     ) -> Result<ConfiguredAgent> {
+        self.prefer_codex_for_vm(&vm);
         let harness = self.selected_harness()?;
         if self.claude_workflows && (harness != HarnessFamily::Claude || !self.subagents) {
             return Err(eyre!(
@@ -627,8 +705,9 @@ impl AgentArgs {
         let configured_vm = vm.start(vm_egress).await?;
         let mut tools = match configured_vm.as_ref() {
             Some(vm) => vm.tools_builder().await?,
-            None => Tools::builder(),
+            None => Tools::builder().workspace(self.workspace_tools),
         }
+        .exposure(nanocodex::tools::ToolExposure::CodeModeOnly)
         .web_search(web_search)
         .image_generation(self.image_generation.unwrap_or(true));
         let managed_mcp = if self.mcp.loads_managed() {
@@ -650,7 +729,7 @@ impl AgentArgs {
             }
             tools = tools.remote_http_client(mpp_adapter.tool_http_client()?);
         }
-        if configured_vm.is_none() {
+        if configured_vm.is_none() && self.workspace_tools {
             let _timing = crate::startup_timing::Stage::new("computer_discovery");
             if let Some(computer) = crate::computer::connect_for_startup()
                 .await
@@ -666,8 +745,7 @@ impl AgentArgs {
         }
         let tools = tools.build()?;
         let generic_subagents = self.subagents;
-        let subagent_tools = selected_subagent_tools(generic_subagents, tui);
-        let subagent_runtime = subagent_tools.map(|_| subagents::channel(self.max_subagents));
+        let subagent_runtime = generic_subagents.then(|| subagents::channel(self.max_subagents));
         let claude_tools = tools
             .clone()
             .into_builder()
@@ -746,11 +824,10 @@ impl AgentArgs {
                                     nanocodex::tools::runtime::ToolsBuildError::HostInitialization,
                                 )?;
                             if let Some(registry) = &registry {
-                                subagents::install_tools(
+                                nanocodex_subagents::install_tools(
                                     tools.clone(),
                                     parent,
                                     Arc::clone(registry),
-                                    subagent_tools.unwrap_or(SubagentToolSet::Generic),
                                 )
                             } else {
                                 Ok(tools.clone())
@@ -813,8 +890,8 @@ impl AgentArgs {
             workspaces
                 .seed(agent.session_id(), root_workspace.clone())
                 .map_err(nanocodex::tools::runtime::ToolsBuildError::HostInitialization)?;
-            if let (Some(registry), Some(subagent_tools)) = (&root_registry, subagent_tools) {
-                subagents::install_tools(tools.clone(), agent, Arc::clone(registry), subagent_tools)
+            if let Some(registry) = &root_registry {
+                nanocodex_subagents::install_tools(tools.clone(), agent, Arc::clone(registry))
             } else {
                 Ok(tools.clone())
             }
@@ -891,18 +968,6 @@ impl AgentArgs {
 pub(crate) struct LocalDurability {
     pub(crate) path: PathBuf,
     pub(crate) state_id: String,
-}
-
-const fn selected_subagent_tools(
-    generic_subagents: bool,
-    simplify_workflow: bool,
-) -> Option<SubagentToolSet> {
-    match (generic_subagents, simplify_workflow) {
-        (true, true) => Some(SubagentToolSet::GenericAndSimplify),
-        (true, false) => Some(SubagentToolSet::Generic),
-        (false, true) => Some(SubagentToolSet::Simplify),
-        (false, false) => None,
-    }
 }
 
 const SUBAGENT_INSTRUCTIONS: &str = concat!(

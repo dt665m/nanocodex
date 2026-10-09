@@ -29,7 +29,7 @@ use std::{
 use tokio::sync::oneshot;
 
 const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
-const MAX_WAIT_TIMEOUT: Duration = Duration::from_secs(300);
+const MAX_WAIT_TIMEOUT: Duration = Duration::from_secs(3600);
 const SPAWN_AGENT_TOOL: &str = "spawn_agent";
 const SUBMIT_RESULT_TOOL: &str = "submit_result";
 const SEND_AGENT_MESSAGE_TOOL: &str = "send_agent_message";
@@ -264,6 +264,7 @@ pub async fn start_agents_observed(
     observe_session: impl Fn(&str) + Send + Sync + 'static,
 ) -> AgentToolResult<Vec<AgentStartReport>> {
     registry.register_handle(parent.clone());
+    registry.await_restored(session_id).await?;
     let prepared = prepare_batch(tasks)?;
     let mut startup = registry.batch_startup();
     let capacities = registry.reserve_turns(prepared.len())?;
@@ -485,6 +486,7 @@ async fn start_child(
         return Err("child caller identity must match its native parent handle".into());
     }
     registry.register_handle(parent.clone());
+    registry.await_restored(session_id).await?;
     let AgentTask {
         role,
         task,
@@ -586,7 +588,7 @@ impl Tool for SpawnAgent {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition::function(
             SPAWN_AGENT_TOOL,
-            "Starts an ephemeral, reusable clean-room subagent without inherited conversation history and immediately returns its ID. Children and in-memory idle snapshots are dropped when the parent runtime restarts; historical IDs do not identify recovered agents.",
+            "Starts a reusable clean-room subagent without inherited conversation history and immediately returns its ID. When the root agent is durable, the task tree survives runtime restarts with the same IDs and interrupted children resume from their latest committed checkpoint; otherwise children are dropped when the parent runtime restarts.",
             spawn_agent_parameters(),
         )
         .with_strict_parameters()
@@ -810,7 +812,7 @@ impl Tool for SendAgentMessage {
                         "type": "string",
                         "minLength": 1,
                         "maxLength": MAX_MESSAGE_BYTES,
-                        "description": "The focused message body. The runtime enforces a 2048-byte UTF-8 limit."
+                        "description": "The focused message body. The runtime enforces a 64 KiB UTF-8 limit."
                     },
                     "priority": {
                         "type": "string",
@@ -892,14 +894,14 @@ impl Tool for ListAgents {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition::function(
             LIST_AGENTS_TOOL,
-            "Lists a compact directory of agents in the same task tree. Active recipients are returned by default; completed agents can be included when a follow-up message is needed.",
+            "Lists a compact directory of agents in the same task tree. Pending, running, and recoverable interrupted agents are returned by default; other retained agents can be included when a follow-up message is needed.",
             json!({
                 "type": "object",
                 "properties": {
                     "include_completed": {
                         "type": "boolean",
                         "default": false,
-                        "description": "Includes completed, interrupted, failed, and closed agents."
+                        "description": "Also includes completed, failed, closed, and nonrecoverable interrupted agents."
                     },
                     "include_self": {
                         "type": "boolean",
@@ -924,7 +926,7 @@ impl Tool for ListAgents {
         json_output(&AgentDirectory {
             agents: registry
                 .directory(context.session_id(), include_completed, include_self)
-                .await,
+                .await?,
         })
     }
 }
@@ -951,7 +953,7 @@ impl Tool for WaitAgent {
                     "timeout_ms": {
                         "type": "integer",
                         "minimum": 1,
-                        "maximum": 300000,
+                        "maximum": 3600000,
                         "description": "Bounded wait in milliseconds. Defaults to 30000."
                     }
                 },

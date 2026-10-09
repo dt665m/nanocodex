@@ -1,6 +1,8 @@
 import { memo } from "react";
 import { generatedOutputUrl, type GeneratedOutput } from "nanocodex-react/agent";
-import { Streamdown } from "streamdown";
+import { RichMarkdown } from "./RichMarkdown.js";
+import { HtmlPreview } from "./HtmlPreview.js";
+import { inlineHtmlFromDataUrl } from "./htmlDocument.js";
 
 /** User-facing code output, independent of the activity disclosure's state. */
 export const GeneratedOutputView = memo(function GeneratedOutputView({ items }: {
@@ -10,10 +12,9 @@ export const GeneratedOutputView = memo(function GeneratedOutputView({ items }: 
   return <div className="agent-generated-output" aria-label="Generated output">
     {items.map((item, index) => item.kind === "text" ? (
       <div className="agent-generated-text" key={`text:${item.text}`}>
-        <Streamdown mode="static" skipHtml linkSafety={{ enabled: true }}
-          controls={{ code: { copy: true, download: false }, table: false, mermaid: false }}>
+        <RichMarkdown>
           {item.text}
-        </Streamdown>
+        </RichMarkdown>
       </div>
     ) : (
       <GeneratedMedia key={`${item.kind}:${item.url}`} item={item} index={index} />
@@ -28,6 +29,8 @@ const GeneratedMedia = memo(function GeneratedMedia({ item, index }: {
   const url = generatedOutputUrl(item.url, item.kind);
   const name = item.name || defaultName(item, index);
   if (!url) return <p className="agent-generated-unavailable">{name} — preview unavailable</p>;
+  const html = item.kind === "file" && url.startsWith("data:") ? inlineHtmlFromDataUrl(url) : undefined;
+  if (html !== undefined) return <HtmlPreview html={html} name={name} />;
   return <figure className={`agent-generated-media is-${item.kind}`}>
     {item.kind === "image" ? <img src={url} alt={name} loading="lazy" decoding="async" referrerPolicy="no-referrer" /> : null}
     {item.kind === "audio" ? <audio src={url} controls preload="none" aria-label={name} /> : null}

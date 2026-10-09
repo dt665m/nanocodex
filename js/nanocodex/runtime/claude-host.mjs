@@ -1,3 +1,4 @@
+import { createWorkerEvaluator } from './worker-evaluator.mjs';
 import { freezeJson } from '../internal.mjs';
 import { createCodeRuntime, toolResult } from './code-runtime.mjs';
 import { createCodeEffectIdentity } from './code-effect-identity.mjs';
@@ -6,7 +7,7 @@ const TOOL_RESULT = Symbol.for('nanocodex.toolResult');
 const MEDIA = new Set(['input_text', 'input_image', 'input_audio', 'encrypted_content']);
 // These are Codex runtime contracts, not Claude capabilities. Never reinterpret
 // a namedTool() from the existing default catalog as a native Claude definition.
-const TOOL_KEYS = new Set(['name', 'description', 'handler', 'inputSchema', 'parameters', 'strict', 'deferLoading', 'defer_loading']);
+const TOOL_KEYS = new Set(['name', 'description', 'handler', 'inputSchema', 'parameters', 'strict', 'deferLoading', 'defer_loading', 'supportsParallelToolCalls']);
 const CODEX_TOOL_NAMES = new Set([
   'exec', 'wait', 'tool_search', 'exec_command', 'write_stdin', 'apply_patch',
   'view_image', 'update_plan', 'web__run', 'image_gen__imagegen',
@@ -22,6 +23,7 @@ const PLATFORM_SUBAGENT_NAMES = new Set([
 export function resolveClaudeTools(tools = []) {
   if (!Array.isArray(tools)) throw new TypeError('Claude tools must be an explicit array');
   const handlers = new Map();
+  const parallelSafe = [];
   const definitions = tools.map((tool) => {
     if (!tool || typeof tool !== 'object'
       || typeof tool.name !== 'string' || !/^[a-zA-Z0-9_-]{1,64}$/.test(tool.name)
@@ -31,7 +33,7 @@ export function resolveClaudeTools(tools = []) {
     if (Object.keys(tool).some(key => !TOOL_KEYS.has(key))) throw new TypeError('unsupported Claude tool field');
     if (tool.inputSchema !== undefined && tool.parameters !== undefined) throw new TypeError('Claude tool schema aliases are mutually exclusive');
     if (tool.deferLoading !== undefined && tool.defer_loading !== undefined) throw new TypeError('Claude tool deferLoading aliases are mutually exclusive');
-    for (const key of ['strict', 'deferLoading', 'defer_loading']) if (tool[key] !== undefined && typeof tool[key] !== 'boolean') throw new TypeError('Claude tool flags must be boolean');
+    for (const key of ['strict', 'deferLoading', 'defer_loading', 'supportsParallelToolCalls']) if (tool[key] !== undefined && typeof tool[key] !== 'boolean') throw new TypeError('Claude tool flags must be boolean');
     if (CODEX_TOOL_NAMES.has(tool.name)) throw new TypeError('Codex tool definitions are not accepted by the Claude catalog');
     if (PLATFORM_SUBAGENT_NAMES.has(tool.name)) throw new TypeError('Nanocodex subagent tools are installed by the shared runtime');
     if (handlers.has(tool.name)) throw new TypeError('duplicate Claude tool name');
@@ -40,12 +42,14 @@ export function resolveClaudeTools(tools = []) {
       throw new TypeError('Claude tool inputSchema must be an object schema');
     }
     handlers.set(tool.name, tool.handler);
+    // Scheduling metadata only; never part of the model-visible definition.
+    if (tool.supportsParallelToolCalls === true) parallelSafe.push(tool.name);
     return { name: tool.name, description: tool.description, input_schema: JSON.parse(JSON.stringify(schema)),
       ...(tool.strict === undefined ? {} : { strict: tool.strict }),
       ...(tool.deferLoading === undefined && tool.defer_loading === undefined ? {} : { defer_loading: tool.deferLoading ?? tool.defer_loading }),
     };
   });
-  return { handlers, definitions: freezeJson(definitions) };
+  return { handlers, definitions: freezeJson(definitions), parallelSafe: Object.freeze(parallelSafe) };
 }
 
 /** Credentials remain in this host closure, never the WASM configuration. */
@@ -73,7 +77,7 @@ function ownMessagesFetch(fetchImpl, endpoint) {
   messagesFetches.set(id, { fetch: fetchImpl, endpoint });
   return { id, release() { messagesFetches.delete(id); } };
 }
-export function createClaudeHost({ auth, tools = [], onEvent = () => {}, fetch, endpoint, subagentSessions, subagentRouting, toolMode = 'direct', codeEvaluator, codeEffectJournal, traceTool }) {
+export function createClaudeHost({ auth, tools = [], onEvent = () => {}, fetch, endpoint, subagentSessions, subagentRouting, toolMode = 'code-only', codeEvaluator, codeEffectJournal, traceTool }) {
   if (!auth || typeof auth !== 'object' || Array.isArray(auth)
     || Object.keys(auth).some((key) => !['apiKey', 'headers'].includes(key))
     || (auth.headers !== undefined && typeof auth.headers !== 'function')
@@ -81,18 +85,19 @@ export function createClaudeHost({ auth, tools = [], onEvent = () => {}, fetch, 
     || (auth.apiKey !== undefined && (typeof auth.apiKey !== 'string' || !auth.apiKey.trim()))) {
     throw new TypeError('Claude auth requires exactly one apiKey or headers callback');
   }
-  if (!['direct', 'code-only'].includes(toolMode)) throw new TypeError('unsupported Claude toolMode');
-  if (toolMode === 'code-only' && typeof codeEvaluator !== 'function') throw new TypeError('Claude Code Mode requires an explicit codeEvaluator');
+  if (toolMode !== 'code-only') throw new TypeError('Claude toolMode must be code-only');
+  if (codeEvaluator === undefined && typeof globalThis.Worker === 'function') codeEvaluator = createWorkerEvaluator();
+  if (typeof codeEvaluator !== 'function') throw new TypeError('Claude Code Mode requires a Worker or explicit codeEvaluator');
   let apiKey = auth.apiKey;
   let headerProvider = auth.headers;
-  const { handlers, definitions } = resolveClaudeTools(tools);
+  const { handlers, definitions, parallelSafe } = resolveClaudeTools(tools);
   const sessions = new Map();
   const children = new Map();
   let disposed = false;
   const codeTurns = new Map();
   const codeTurnOrdinals = new Map();
   const effectIdentity = createCodeEffectIdentity(codeEffectJournal);
-  const code = toolMode === 'code-only' ? createCodeRuntime(Object.fromEntries(definitions.map(definition => [definition.name, {
+  const code = createCodeRuntime(Object.fromEntries(definitions.map(definition => [definition.name, {
     description: definition.description, parameters: definition.input_schema,
     async handler(input, context) {
       if (disposed) throw new Error('Claude tool host is disposed');
@@ -114,12 +119,12 @@ export function createClaudeHost({ auth, tools = [], onEvent = () => {}, fetch, 
         return value;
       } catch (error) {
         if (error?.code === 'host_interrupted') throw error;
-        return toolResult('Claude tool execution failed', null, { success: false });
+        return toolResult(errorText(error), null, { success: false });
       }
     },
   }])), { evaluate: codeEvaluator, effectJournal: codeEffectJournal,
-    effectIdentity: codeEffectJournal ? effectIdentity.resolve : undefined, traceTool }) : undefined;
-  const modelDefinitions = code ? codeDefinitions(definitions) : definitions;
+    effectIdentity: codeEffectJournal ? effectIdentity.resolve : undefined, traceTool });
+  const modelDefinitions = codeDefinitions(definitions);
   function beginCodeTurn(sessionId, turnId) {
     let turns = codeTurns.get(sessionId);
     if (!turns) codeTurns.set(sessionId, turns = new Map());
@@ -162,6 +167,8 @@ export function createClaudeHost({ auth, tools = [], onEvent = () => {}, fetch, 
       } catch { throw new Error('Claude authentication unavailable'); }
     },
     toolDefinitions() { return JSON.stringify(modelDefinitions); },
+    // Code Mode exposes only exec/wait, which keep the serial default.
+    parallelSafeTools() { return code ? [] : [...parallelSafe]; },
     toolMode() { return toolMode; },
     emitEvent(event, ...args) {
       // Claude's native model-call cursor is zero-based. The shared effect
@@ -183,20 +190,23 @@ export function createClaudeHost({ auth, tools = [], onEvent = () => {}, fetch, 
       if (!subagentRouting) throw new Error('subagent routing is not configured');
       return subagentRouting.bind(request);
     },
+    subagentStatus(sessionId, status) {
+      subagentSessions?.status?.(sessionId, status);
+    },
     bindSubagentSession(sessionId, descriptor, hostContextRef) {
       descriptor = subagentSessions?.bindingDescriptor?.(sessionId, descriptor, hostContextRef) ?? descriptor;
       subagentSessions?.bind?.(sessionId, descriptor, hostContextRef);
       children.set(sessionId, { descriptor, hostContextRef });
     },
-    releaseSession(sessionId) {
+    releaseSession(sessionId, options) {
       abort(sessionId);
       sessions.delete(sessionId);
-      code?.releaseSession(sessionId);
+      code?.releaseSession(sessionId, options);
       codeTurns.delete(sessionId);
       codeTurnOrdinals.delete(sessionId);
       effectIdentity.release(sessionId);
       const retained = children.get(sessionId);
-      if (retained) subagentSessions?.release?.(sessionId, retained.hostContextRef);
+      if (retained) subagentSessions?.release?.(sessionId, retained.hostContextRef, options);
       children.delete(sessionId);
     },
     releaseTurn(sessionId, turnId) {
@@ -207,23 +217,21 @@ export function createClaudeHost({ auth, tools = [], onEvent = () => {}, fetch, 
     executeClaudeTool(name, encodedInput, sessionId, callId, model, turnId, localDefinitions, executeLocalTool) {
       const operation = (async () => {
         let value;
-        if (code) {
-          if (disposed) throw new Error('Claude tool host is disposed');
-          if (!sessionId || !turnId || !callId) throw new Error('Claude tools require session, turn and call identities');
-          beginCodeTurn(sessionId, turnId);
-          if (name === 'exec') {
-            const input = JSON.parse(encodedInput);
-            value = JSON.parse(await code.executeCodeObserved(input.code, sessionId, callId, model, turnId, localDefinitions, executeLocalTool));
-          } else if (name === 'wait') value = JSON.parse(await code.waitCodeObserved(encodedInput, sessionId, callId));
-          else value = failed('Claude tool is unavailable in Code Mode');
-        } else value = await host.invokeTool(name, encodedInput, sessionId, callId, model, turnId);
+        if (disposed) throw new Error('Claude tool host is disposed');
+        if (!sessionId || !turnId || !callId) throw new Error('Claude tools require session, turn and call identities');
+        beginCodeTurn(sessionId, turnId);
+        if (name === 'exec') {
+          const input = JSON.parse(encodedInput);
+          value = JSON.parse(await code.executeCodeObserved(input.code, sessionId, callId, model, turnId, localDefinitions, executeLocalTool));
+        } else if (name === 'wait') value = JSON.parse(await code.waitCodeObserved(encodedInput, sessionId, callId));
+        else value = failed('Claude tool is unavailable in Code Mode');
         if (value && typeof value === 'object' && Object.hasOwn(value, 'content')) {
           if (typeof value.content !== 'string' && !Array.isArray(value.content)) throw new TypeError('invalid Claude native tool content');
           if (value.isError !== undefined && typeof value.isError !== 'boolean') throw new TypeError('invalid Claude tool error flag');
           return JSON.stringify({ content: value.content, isError: value.isError ?? false, metadata: value.metadata ?? null, structuredResult: value.structuredResult ?? null });
         }
         const wire = wireOutput(value);
-        if (code && Array.isArray(value?.nested_calls)) {
+        if (Array.isArray(value?.nested_calls)) {
           wire.metadata = { ...wire.metadata, _nanocodex_code: { calls: value.nested_calls,
             origin_call_id: value.cell?.origin_call_id ?? callId } };
         }
@@ -258,9 +266,8 @@ export function createClaudeHost({ auth, tools = [], onEvent = () => {}, fetch, 
           signal: controller(sessionId, turnId).signal,
         }));
         return value;
-      } catch {
-        // Arbitrary thrown host errors may contain credentials; no stack/body crosses this boundary.
-        return failed('Claude tool execution failed');
+      } catch (error) {
+        return failed(errorText(error));
       }
     },
     dispose() {
@@ -269,7 +276,7 @@ export function createClaudeHost({ auth, tools = [], onEvent = () => {}, fetch, 
       apiKey = undefined;
       headerProvider = undefined;
       for (const sessionId of sessions.keys()) abort(sessionId);
-      for (const sessionId of [...children.keys()]) host.releaseSession(sessionId);
+      for (const sessionId of [...children.keys()]) host.releaseSession(sessionId, { detach: true });
       sessions.clear();
       handlers.clear();
       codeTurns.clear();
@@ -279,6 +286,10 @@ export function createClaudeHost({ auth, tools = [], onEvent = () => {}, fetch, 
     },
   };
   return host;
+}
+
+function errorText(error) {
+  return error instanceof Error ? (error.message || error.name) : String(error);
 }
 
 function failed(text) {
@@ -305,7 +316,7 @@ function wireOutput(value) {
 
 function codeDefinitions(definitions) {
   return freezeJson([
-    { name: 'exec', description: 'Run JavaScript in the configured isolated Code Mode evaluator. Call capabilities through tools and inspect ALL_TOOLS for names and schemas. Await tool calls; use text(value), image(value), store(key, value), load(key), and yield_control(). A first-line // @exec: {"yield_time_ms": 10000, "max_output_tokens": 10000} controls observation. If a cell is running, continue it with wait. Native capabilities: ' + JSON.stringify(definitions),
+    { name: 'exec', description: 'Run JavaScript in the configured isolated Code Mode evaluator. Call capabilities through tools and inspect ALL_TOOLS for names and schemas. Await tool calls; use text(value), image(value), store(key, value), load(key), and yield_control(). A first-line // @exec: {"yield_time_ms": 10000, "max_output_tokens": 10000} controls observation. Output has no token budget unless explicitly supplied. If a cell is running, continue it with wait. Native capabilities: ' + JSON.stringify(definitions),
       input_schema: { type: 'object', properties: { code: { type: 'string', description: 'JavaScript source to evaluate.' } }, required: ['code'], additionalProperties: false } },
     { name: 'wait', description: 'Continue a running exec cell. Use only the cell_id returned by exec.',
       input_schema: { type: 'object', properties: { cell_id: { type: 'string' }, yield_time_ms: { type: 'integer', minimum: 0 }, max_tokens: { type: 'integer', minimum: 0 }, terminate: { type: 'boolean' } }, required: ['cell_id'], additionalProperties: false } },

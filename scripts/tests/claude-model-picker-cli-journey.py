@@ -42,6 +42,8 @@ def main():
             request = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
             family = 'claude' if self.path == '/v1/messages' else 'codex'
             try:
+                if self.path == "/v1/messages" and {t["name"] for t in request.get("tools", [])} != {"exec", "wait"}:
+                    raise AssertionError("Claude catalog must expose exactly exec/wait")
                 h.require(self.path in ('/v1/messages', '/v1/responses'), 'unexpected route ' + self.path)
                 if family == 'claude':
                     h.require(self.headers.get('x-api-key') == 'synthetic-claude-key', 'wrong Claude auth')
@@ -142,8 +144,9 @@ def main():
                 h.require(len(requests) == start, 'failed selection dispatched inference')
             send('/model')
             wait(lambda: 'Select Model' in screen.text(), 'model picker absent')
-            for model in ['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-luna', 'claude-opus-5-5', 'claude-sonnet-5-5', 'claude-fable-5-1', 'claude-opus-4-6', 'claude-sonnet-4-6', 'claude-haiku-4-5']:
-                h.require(model in screen.text(), 'picker omitted ' + model)
+            models = ['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-luna', 'claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5', 'claude-fable-5-1', 'claude-opus-4-6', 'claude-sonnet-4-6', 'claude-haiku-4-5']
+            # The slash-command popup can briefly cover the picker's last rows.
+            wait(lambda: all(model in screen.text() for model in models), 'picker omitted a model')
             (out / 'picker.txt').write_text(screen.text())
             if picker:
                 # Default Sol is second; Sonnet is fifth in the public menu.
@@ -161,9 +164,14 @@ def main():
             wait(lambda: f'model-selection-reply-{start+1}' in screen.text(), 'first answer absent')
             h.require(len(requests) == start + 1, 'unexpected first-turn requests')
             h.require(requests[-1]['request']['model'] == expected, 'wrong first-turn wire model')
-            if target == 'haiku':
-                h.require('thinking' not in requests[-1]['request'], 'Haiku retained adaptive thinking')
-                h.require('default' in footer(), 'Haiku effort display is stale')
+            if expected == 'claude-haiku-4-5':
+                h.require('thinking' not in requests[-1]['request'], 'Haiku 4.5 retained adaptive thinking')
+                h.require('default' in footer(), 'Haiku 4.5 effort display is stale')
+            if expected == 'claude-haiku-5-5':
+                wire = requests[-1]['request']
+                effort = wire.get('output_config', {}).get('effort')
+                h.require(wire.get('thinking', {}).get('type') == 'adaptive', 'Haiku 5.5 lost adaptive thinking')
+                h.require(effort is not None and f'· {effort}' in footer(), 'Haiku 5.5 effort display does not match the wire')
             send('/model sol' if expected.startswith('claude') else '/model sonnet')
             wait(lambda: 'only be changed before the first prompt' in screen.text(), 'started thread allowed model change')
             h.require(expected in footer(), 'rejected change altered displayed model')
@@ -191,7 +199,8 @@ def main():
         journey('claude-only-credentials', 'codex', 'sonnet', 'claude-sonnet-5-5', codex_auth=False)
         journey('queued-first-prompt', 'codex', 'sonnet', 'claude-sonnet-5-5', queued=True)
         journey('claude-to-codex', 'claude', 'sol', 'gpt-6.1-sol')
-        journey('haiku-effort', 'claude', 'haiku', 'claude-haiku-4-5')
+        journey('haiku-effort', 'claude', 'haiku', 'claude-haiku-5-5')
+        journey('haiku-45-ordinary', 'claude', 'claude-haiku-4-5', 'claude-haiku-4-5')
         journey('failed-auth-retains-codex', 'codex', 'luna', 'gpt-6-luna', claude_auth=False, fail_first=True)
         journey('queued-failed-auth', 'codex', 'luna', 'gpt-6-luna', claude_auth=False, fail_first=True, queued_failure=True)
         outcome = {'success': True, 'checks': checks, 'provider_requests': len(requests)}

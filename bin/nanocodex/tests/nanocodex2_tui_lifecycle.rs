@@ -31,108 +31,6 @@ const VAULT_ORIGIN: &str = "https://vault-approval.example:8443";
 const SECURE_INPUT_ID: &str = "cbbfa5ef-2e4b-45f7-9c98-3913f8ca87cf";
 const TIMEOUT: Duration = Duration::from_secs(10);
 
-// The Managed2 API is intentionally smaller, but interactive sessions must keep
-// the same terminal presentation and render real streamed replies in that shell.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn managed2_uses_the_existing_tui_for_text_turns() {
-    use axum::{
-        extract::Path as AxumPath,
-        http::{HeaderMap, StatusCode},
-    };
-    let credential = format!("ncx2_{}", "A".repeat(43));
-    let state = Arc::new(Mutex::new((String::new(), false)));
-    let app = Router::new()
-        .route("/v1/agents", post({
-            let state = state.clone();
-            let credential = credential.clone();
-            move |headers: HeaderMap, Json(body): Json<Value>| {
-                let state = state.clone();
-                let credential = credential.clone();
-                async move {
-                    assert_eq!(headers.get("authorization").unwrap().to_str().unwrap(), format!("Bearer {credential}"));
-                    assert_eq!(body["input"], "Managed2 TUI prompt");
-                    let id = headers.get("idempotency-key").unwrap().to_str().unwrap().to_owned();
-                    state.lock().unwrap().0 = id.clone();
-                    (StatusCode::ACCEPTED, Json(json!({"agent_id":id,"turn_id":id,"state":"accepted"})))
-                }
-            }
-        }))
-        .route("/v1/agents/{agent}/turns/{turn}", get({
-            let state = state.clone();
-            move |AxumPath((_agent, turn)): AxumPath<(String, String)>| {
-                let state = state.clone();
-                async move {
-                    let (id, complete) = &*state.lock().unwrap();
-                    assert_eq!(&turn, id);
-                    Json(json!({"turn_id":turn,"state":if *complete {"completed"} else {"accepted"},
-                        "message":if *complete {Some("TUI_MANAGED2_REPLY")} else {None}}))
-                }
-            }
-        }))
-        .route("/v1/agents/{agent}/events", get({
-            let state = state.clone();
-            move |ws: WebSocketUpgrade, Query(query): Query<HashMap<String, String>>, AxumPath(agent): AxumPath<String>| {
-                let state = state.clone();
-                async move {
-                    assert_eq!(query.get("cursor").map(String::as_str), Some("0"));
-                    ws.on_upgrade(move |mut socket| async move {
-                        let id = state.lock().unwrap().0.clone();
-                        assert_eq!(agent, id);
-                        let events = [
-                            json!({"protocol_version":1,"request_id":agent,"seq":1,"type":"input.accepted",
-                                "payload":{"request_id":id,"turn_id":"internal-turn","input":"Managed2 TUI prompt"}}),
-                            json!({"protocol_version":1,"request_id":agent,"seq":2,"type":"assistant.delta",
-                                "payload":{"turn_id":"internal-turn","model_call_index":0,"item_id":"answer","phase":"final_answer","text":"TUI_MANAGED2_REPLY"}}),
-                            json!({"protocol_version":1,"request_id":agent,"seq":3,"type":"run.completed",
-                                "payload":{"turn_id":"internal-turn"}}),
-                        ];
-                        for (index, event) in events.into_iter().enumerate() {
-                            socket.send(Message::Text(json!({"cursor":(index+1).to_string(),"event":event}).to_string().into())).await.unwrap();
-                        }
-                        state.lock().unwrap().1 = true;
-                        while socket.recv().await.is_some() {}
-                    })
-                }
-            }
-        }));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let origin = format!("http://{}", listener.local_addr().unwrap());
-    let service = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let mut terminal = Terminal::start_with_command(&origin, false, None, |command| {
-        command.arg("--managed2");
-        command.env("NANOCODEX_MANAGED2_URL", &origin);
-        command.env("NANOCODEX_MANAGED2_API_KEY", &credential);
-    });
-    terminal.wait_output("\x1b[?1049h").await;
-    // Unsupported commands must be rejected on both submit and queue keys,
-    // keeping this text-only preview alive without creating a review turn.
-    for key in ["\r", "\t"] {
-        terminal.prompt("/review --uncommitted", key);
-        terminal
-            .wait_text("Managed2 accepts text, /id, and /exit only.")
-            .await;
-        terminal.input("\x15");
-        terminal.wait_no_text("/review --uncommitted").await;
-    }
-    terminal.input("Managed2 TUI prompt");
-    terminal.wait_text("Managed2 TUI prompt").await;
-    terminal.input("\r");
-    terminal.wait_text("TUI_MANAGED2_REPLY").await;
-    let snapshot = terminal.screen.lock().unwrap().screen().contents();
-    assert!(snapshot.contains("Managed2 TUI prompt"));
-    assert!(snapshot.contains("TUI_MANAGED2_REPLY"));
-    terminal.prompt(&format!("/secure-input {AGENT} {SECURE_INPUT_ID}"), "\r");
-    terminal
-        .wait_text("Private native sudo approval is unavailable in Managed2")
-        .await;
-    assert!(
-        !String::from_utf8_lossy(&terminal.output.lock().unwrap()).contains("Password: ********")
-    );
-    terminal.input("\x03\x03");
-    terminal.wait_output("\x1b[?1049l").await;
-    service.abort();
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn terminal_empty_idle_stops_redrawing_and_still_accepts_input_and_live_updates() {
     let mut fixture = Fixture::start().await;
@@ -2397,6 +2295,8 @@ async fn terminal_preserves_steering_and_queue_across_repeated_connection_drops(
 async fn terminal_preserves_shell_waiting_prompts_and_followups_across_reconnect() {
     for finishes_offline in [false, true] {
         let mut fixture = Fixture::start().await;
+        // This journey inspects tool details; explicitly open them.
+        fixture.terminal.input("\x0f");
         let command = r#"/bin/sh -c 'i=0; while [ ! -e release-shell ] && [ "$i" -lt 500 ]; do sleep 0.02; i=$((i+1)); done; printf "SHELL_%s\n" FINISHED; : > shell-finished'"#;
         fixture.terminal.prompt(&format!("!{command}"), "\r");
         fixture.terminal.wait_text("Shell").await;
@@ -2457,6 +2357,8 @@ async fn terminal_preserves_shell_waiting_prompts_and_followups_across_reconnect
 async fn terminal_interrupts_a_local_shell_and_accepts_the_next_prompt() {
     for disconnected in [false, true] {
         let mut fixture = Fixture::start().await;
+        // This journey inspects tool details; explicitly open them.
+        fixture.terminal.input("\x0f");
         fixture.terminal.prompt("!sleep 30", "\r");
         fixture.terminal.wait_text("Shell").await;
         if disconnected {
@@ -3667,6 +3569,8 @@ async fn terminal_shows_the_durable_answer_when_the_final_stream_message_is_miss
 #[tokio::test]
 async fn terminal_settles_tools_when_only_the_durable_completion_arrives() {
     let mut fixture = Fixture::start().await;
+    // This journey inspects tool details; explicitly open them.
+    fixture.terminal.input("\x0f");
     fixture
         .terminal
         .prompt("finish a tool without its last stream events", "\r");
@@ -3868,6 +3772,8 @@ async fn terminal_preserves_retry_status_when_other_turns_finish() {
 #[tokio::test]
 async fn terminal_keeps_background_commands_connected_across_turns() {
     let mut fixture = Fixture::start().await;
+    // This journey inspects tool details; explicitly open them.
+    fixture.terminal.input("\x0f");
     fixture.terminal.prompt("start a background build", "\r");
     let first = fixture.submission("start a background build").await;
     fixture.nested(&first, "run.started", json!({}));
@@ -3905,7 +3811,10 @@ async fn terminal_keeps_background_commands_connected_across_turns() {
     fixture.terminal.wait_text("Enter send").await;
     let screen = fixture.terminal.screen.lock().unwrap().screen().contents();
     assert_eq!(
-        screen.matches("BACKGROUND_BUILD_COMMAND").count(),
+        screen
+            .lines()
+            .filter(|line| line.contains("Shell") && line.contains("BACKGROUND_BUILD_COMMAND"))
+            .count(),
         1,
         "{screen}"
     );
@@ -3930,6 +3839,8 @@ async fn terminal_live_restore_keeps_an_attached_tool_running() {
         json!({"call_id": "pending-read", "tool": "read_file", "arguments": {"path": "PENDING_ON_ATTACH.txt"}}),
     );
     let mut fixture = Fixture::start_with_history(true, true, history).await;
+    // This journey inspects tool details; explicitly open them.
+    fixture.terminal.input("\x0f");
     fixture.terminal.wait_text("PENDING_ON_ATTACH.txt").await;
     let screen = fixture.terminal.screen.lock().unwrap().screen().contents();
     assert!(
@@ -4134,6 +4045,8 @@ async fn terminal_keeps_local_shell_context_scoped_to_the_session_after_resume()
     const OTHER_AGENT: &str = "019fc927-b280-79a7-8445-1b9996ad2fb1";
     for succeeds in [true, false] {
         let mut fixture = Fixture::start().await;
+        // This journey inspects tool details; explicitly open them.
+        fixture.terminal.input("\x0f");
         fixture
             .terminal
             .prompt("!printf OLD_SESSION_SHELL_OUTPUT", "\r");
@@ -4360,6 +4273,8 @@ async fn terminal_keeps_a_draft_and_completion_received_while_attach_history_is_
 
 async fn assert_terminal_durable_stop(cancelled: bool) {
     let mut fixture = Fixture::start_with_active(true).await;
+    // This journey inspects tool details; explicitly open them.
+    fixture.terminal.input("\x0f");
     fixture.nested(REMOTE_TURN, "run.started", json!({}));
     fixture.nested(REMOTE_TURN, "assistant.delta", json!({"model_call_index": 1, "item_id": "partial", "phase": "final_answer", "text": "PARTIAL_BEFORE_DURABLE_STOP"}));
     fixture.nested(REMOTE_TURN, "tool.call", json!({"call_id": "unfinished-stop-read", "tool": "read_file", "arguments": {"path": "UNFINISHED_STOP_READ.txt"}}));
@@ -4476,6 +4391,83 @@ async fn terminal_retains_a_long_older_response_across_history_page_boundaries()
     fixture.terminal.input("\r");
     let turn = fixture.submission("DRAFT_DURING_OLDER_HISTORY").await;
     fixture.complete(&turn);
+}
+
+#[tokio::test]
+async fn terminal_tool_activity_keeps_wrapper_failures_visible() {
+    let mut fixture = Fixture::start_with_active(true).await;
+    fixture.nested(REMOTE_TURN, "tool.call", json!({"call_id": "wrapper", "tool": "exec", "arguments": "await check(); throw new Error('WRAPPER_FAILURE')"}));
+    fixture.nested(REMOTE_TURN, "tool.call", json!({"call_id": "wrapper/code-0", "tool": "exec_command", "arguments": {"cmd": "CHILD_COMMAND"}}));
+    fixture.nested(REMOTE_TURN, "tool.result", json!({"call_id": "wrapper/code-0", "tool": "exec_command", "status": "completed", "duration_ns": 1, "result": {"output": "child succeeded", "exit_code": 0}}));
+    fixture.nested(REMOTE_TURN, "tool.result", json!({"call_id": "wrapper", "tool": "exec", "status": "failed", "duration_ns": 2, "result": {"error": "WRAPPER_FAILURE"}}));
+    fixture.complete(REMOTE_TURN);
+    fixture.terminal.wait_text("execution failed").await;
+    fixture.terminal.wait_no_text("CHILD_COMMAND").await;
+    eprintln!(
+        "WRAPPER FAILURE\n{}",
+        fixture.terminal.screen.lock().unwrap().screen().contents()
+    );
+}
+
+#[tokio::test]
+async fn terminal_tool_activity_is_compact_live_and_expandable() {
+    let mut fixture = Fixture::start_with_active(true).await;
+    for (id, command) in [
+        ("one", "FIRST_HIDDEN_COMMAND"),
+        ("two", "SECOND_HIDDEN_COMMAND"),
+    ] {
+        fixture.nested(
+            REMOTE_TURN,
+            "tool.call",
+            json!({"call_id": id, "tool": "exec_command", "arguments": {"cmd": command}}),
+        );
+    }
+    fixture.terminal.wait_text("2 running").await;
+    fixture.terminal.wait_no_text("FIRST_HIDDEN_COMMAND").await;
+    fixture.terminal.wait_no_text("SECOND_HIDDEN_COMMAND").await;
+    eprintln!(
+        "RUNNING\n{}",
+        fixture.terminal.screen.lock().unwrap().screen().contents()
+    );
+    fixture.nested(REMOTE_TURN, "tool.result", json!({"call_id": "one", "tool": "exec_command", "status": "completed", "duration_ns": 1000000000, "result": {"output": "FIRST_HIDDEN_OUTPUT", "exit_code": 0}}));
+    fixture.terminal.wait_text("1 running · 1 completed").await;
+    fixture.nested(REMOTE_TURN, "tool.result", json!({"call_id": "two", "tool": "exec_command", "status": "failed", "duration_ns": 2000000000, "result": {"output": "SECOND_HIDDEN_FAILURE", "exit_code": 1}}));
+    fixture.complete(REMOTE_TURN);
+    fixture.terminal.wait_text("Enter send").await;
+    fixture.terminal.wait_text("1 completed · 1 failed").await;
+    fixture.terminal.wait_no_text("FIRST_HIDDEN_OUTPUT").await;
+    fixture.terminal.wait_no_text("SECOND_HIDDEN_FAILURE").await;
+    eprintln!(
+        "SETTLED\n{}",
+        fixture.terminal.screen.lock().unwrap().screen().contents()
+    );
+    fn click(terminal: &mut Terminal, text: &str) {
+        let row = terminal
+            .screen
+            .lock()
+            .unwrap()
+            .screen()
+            .contents()
+            .lines()
+            .position(|line| line.contains(text))
+            .unwrap()
+            + 1;
+        terminal.input(&format!("\x1b[<0;2;{row}M\x1b[<0;2;{row}m"));
+    }
+    click(&mut fixture.terminal, "2 tools");
+    fixture.terminal.wait_text("FIRST_HIDDEN_OUTPUT").await;
+    fixture.terminal.wait_text("SECOND_HIDDEN_COMMAND").await;
+    click(&mut fixture.terminal, "SECOND_HIDDEN_COMMAND");
+    fixture.terminal.wait_text("21 B").await;
+    fixture.terminal.wait_text("SECOND_HIDDEN_FAILURE").await;
+    eprintln!(
+        "EXPANDED\n{}",
+        fixture.terminal.screen.lock().unwrap().screen().contents()
+    );
+    click(&mut fixture.terminal, "FIRST_HIDDEN_COMMAND");
+    fixture.terminal.wait_text("1 completed · 1 failed").await;
+    fixture.terminal.wait_no_text("FIRST_HIDDEN_COMMAND").await;
+    fixture.terminal.wait_no_text("SECOND_HIDDEN_FAILURE").await;
 }
 
 #[tokio::test]

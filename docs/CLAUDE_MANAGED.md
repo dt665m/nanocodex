@@ -2,8 +2,8 @@
 
 The managed platform has an account-scoped Claude subscription connection and a
 native Messages execution path. It does not translate Claude through OpenAI
-Responses or borrow an installed Claude Code login. The OpenAI and Claude tool
-runtimes remain separate.
+Responses or borrow an installed Claude Code login. Both harnesses use shared
+Code Mode orchestration with their native inference transports.
 
 ## Connect privately
 
@@ -60,12 +60,14 @@ streams are not silently replayed.
 
 ## Tools, durability and limits
 
-Managed Claude sessions expose native `Bash`, `Read`, `Write`, `Edit` and supported
-account/Hand capabilities. Discovery uses `ToolSearch`/`ToolExecute` and
-`MCPToolSearch`/`MCPExecute`, not Responses tool-search declarations.
+Managed sessions expose only `exec` and `wait` to the model. Claude's nested
+catalog includes `Bash`, `Read`, `Write`, `Edit` and supported account/Hand
+capabilities. Call them through `tools` inside Code Mode. Discovery uses nested
+`ToolSearch`/`ToolExecute` and `MCPToolSearch`/`MCPExecute` calls.
 
 Default managed Claude sessions expose the canonical `spawn_agent`, `list_agents`,
-`send_agent_message`, `wait_agent`, `interrupt_agent` and `close_agent` tools.
+`send_agent_message`, `wait_agent`, `interrupt_agent`, `close_agent` and
+child-only `submit_result` tools inside Code Mode.
 Account-owned managed sessions can select `harness: "claude"` from a Codex
 parent or `harness: "codex"` from a Claude parent. Each child uses its native
 Messages or Responses transport and the spawning turn's retained authority;
@@ -73,18 +75,31 @@ selecting a child never changes the parent's model. Claude-root Codex children
 currently support the available GPT models; gateway models are rejected at
 admission. Child selection is checked against the account's available model
 catalog before inference. Explicit `multi_agent: { enabled: false }` disables
-delegation, and an explicit tool allowlist does not acquire additional tools. Existing configurations
-that explicitly enable `Task` retain its blocking execution, durable receipts and
-uncertainty after interruption. The session's native prompt describes its actual
-tools rather than instructing Claude to call Codex Code Mode.
+delegation, and an explicit tool allowlist does not acquire additional tools.
+Root and child sessions follow the same Code Mode contract regardless of harness.
 
 Native Messages history, opaque content and completed receipts survive normal
 Durable Object reopen in the shared durability store. Events retain streaming
 assistant text and tool cards. This does **not** make OpenAI snapshots portable
 to Claude. Managed Claude accepts ordered text, HTTPS/base64 images and inline
-PDF or text documents. Uploaded native-client image descriptors are resolved to
-bounded JPEG previews before dispatch. OpenAI image file IDs and raw audio input
-remain unsupported; documents remain unsupported on GPT sessions.
+PDF or UTF-8 plain text documents. JPEG, PNG, GIF and WebP originals uploaded by
+native clients are frozen into the dispatch when they fit the application bounds;
+other image formats and oversized originals use the bounded JPEG preview. Missing,
+invalid or over-limit originals and previews produce an explicit notice. Hand-local
+images require that Hand's image tools. Frozen dispatch and native Messages history
+preserve media across reopen without rereading mutable uploads. Web, Connect and
+native transcripts retain document labels alongside images and captions.
+
+The application bounds are 20 images, 5 MiB per inline image, five documents,
+10 MiB per document and 20 MiB combined inline media per prompt; these are conservative application limits, not a claim
+about the provider's maximum. PDF/text documents use native document blocks,
+including supported tool results. Tool audio and video remain available to clients
+and produce an explicit model-facing notice; they are not native Claude media
+inputs. OpenAI image file IDs and raw audio/video input remain unsupported;
+documents remain unsupported on GPT sessions. See the provider's
+[vision](https://platform.claude.com/docs/en/build-with-claude/vision),
+[PDF](https://platform.claude.com/docs/en/build-with-claude/pdf-support) and
+[document format](https://platform.claude.com/docs/en/build-with-claude/files) contracts.
 
 GPT Realtime can provide the voice frontend for a Claude thread. Completed voice
 transcripts and start/stop markers become bounded, once-consumed session context,

@@ -457,7 +457,7 @@ test("owned host ABI keeps overlapping projected turns separate and rejects wron
   const { createNodeHost } = await import("../node/host.mjs");
   const contexts = [];
   let effects = 0;
-  const host = createNodeHost({ toolMode: "direct", tools: { probe: {
+  const host = createNodeHost({ toolMode: "code-only", tools: { probe: {
     async handler() { effects += 1; return { effect: effects }; },
   } }, codeEffectJournal: {
     async begin(context) { contexts.push(context); return { status: "execute" }; },
@@ -486,7 +486,7 @@ test("owned host routes multiplexed child calls by trusted accepted turn, not pa
   const { createNodeHost } = await import("../node/host.mjs");
   const contexts = [];
   let effects = 0;
-  const host = createNodeHost({ toolMode: "direct", tools: { probe: {
+  const host = createNodeHost({ toolMode: "code-only", tools: { probe: {
     async handler() { effects += 1; return "JOURNAL_CHILD_OK"; },
   } }, codeEffectJournal: {
     async begin(context) { contexts.push(context); return { status: "execute" }; },
@@ -509,7 +509,7 @@ test("owned host routes multiplexed child calls by trusted accepted turn, not pa
 test("owned host rejects conflicting accepted owners and invalid metadata without stale call fallback", async () => {
   const { createNodeHost } = await import("../node/host.mjs");
   let admissions = 0, effects = 0;
-  const host = createNodeHost({ toolMode: "direct", tools: { probe: {
+  const host = createNodeHost({ toolMode: "code-only", tools: { probe: {
     async handler() { effects += 1; return effects; },
   } }, codeEffectJournal: {
     async begin() { admissions += 1; return { status: "execute" }; },
@@ -536,7 +536,7 @@ test("owned host rejects conflicting accepted owners and invalid metadata withou
 test("owned host waits for exact delayed call metadata and never reuses consumed metadata", async () => {
   const { createNodeHost } = await import("../node/host.mjs");
   const contexts = []; let effects = 0;
-  const host = createNodeHost({ toolMode: "direct", tools: { probe: {
+  const host = createNodeHost({ toolMode: "code-only", tools: { probe: {
     async handler() { effects += 1; return "OK"; },
   } }, codeEffectJournal: {
     async begin(context) { contexts.push(context); return { status: "execute" }; },
@@ -566,7 +566,7 @@ test("owned host waits for exact delayed call metadata and never reuses consumed
 test("owned host missing metadata has a bounded deadline and no effect admission", async () => {
   const { createNodeHost } = await import("../node/host.mjs");
   let admissions = 0;
-  const host = createNodeHost({ toolMode: "direct", tools: { probe: { async handler() { throw Error("must not dispatch"); } } },
+  const host = createNodeHost({ toolMode: "code-only", tools: { probe: { async handler() { throw Error("must not dispatch"); } } },
     codeEffectJournal: { async begin() { admissions += 1; return { status: "execute" }; }, async complete() {} } });
   try {
     host.emitEvent(JSON.stringify({ type: "input.accepted", request_id: "deadline", payload: { session_id: "deadline", turn_id: "projected-deadline", kind: "prompt", request_id: "op" } }));
@@ -618,4 +618,18 @@ test("cell completion stops guest timers before a delayed durable store acknowle
   assert.deepEqual(notifications, []);
   const read = JSON.parse(await runtime.executeCode('text(load("value"));', "delayed-store", "read"));
   assert.ok(JSON.stringify(read.output).includes('"text":"1"'));
+});
+
+test("unbudgeted exec and wait preserve large text and mixed media", async () => {
+  const runtime = createCodeRuntime({});
+  const expected = "世界".repeat(40_000);
+  try {
+    const direct = JSON.parse(await runtime.executeCodeObserved(`text(${JSON.stringify(expected)});`, "large", "exec-large"));
+    assert.ok(outputText(direct.output).includes(expected));
+    const first = JSON.parse(await runtime.executeCodeObserved(`yield_control(); await new Promise(resolve => setTimeout(resolve, 20)); text(${JSON.stringify(expected)}); image({ type: "image", data: "AAAA", mimeType: "image/png" });`, "large", "exec-mixed"));
+    const cellId = outputText(first.output).match(/cell ID ([^\s]+)/)[1];
+    const last = JSON.parse(await runtime.waitCodeObserved(JSON.stringify({ cell_id: cellId }), "large", "wait-large"));
+    assert.ok(outputText(last.output).includes(expected));
+    assert.ok(last.output.some(item => item.type === "input_image"));
+  } finally { runtime.reset(); }
 });

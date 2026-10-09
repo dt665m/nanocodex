@@ -60,6 +60,8 @@ pub enum BackendPromptRoute {
     Steered,
 }
 
+pub use nanocodex_agent_reference::backend::{ChildJournal, ChildJournalStore};
+
 /// Embedding-owned construction of clean native children.
 ///
 /// Implementations retain provider recipes and approved host capabilities. The

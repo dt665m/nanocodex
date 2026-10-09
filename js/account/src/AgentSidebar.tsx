@@ -1,11 +1,6 @@
 import {
-  BookOpen,
-  ChevronDown,
   CircleUserRound,
-  Compass,
   Layers,
-  Link2,
-  MessageCircle,
   PanelLeftClose,
   Search,
   SquarePen,
@@ -22,15 +17,12 @@ import { Link, useLocation } from "react-router";
 import { AgentSearchDialog } from "./AgentSearchDialog";
 import type { ManagedConversation } from "./managedAgentRuntime";
 import { useModalBoundary } from "./modalBoundary";
-import {
-  connectDemoUrl,
-  demoNavigation,
-  gitNavigation,
-  pathForSurface,
-  primaryNavigation,
-} from "./navigation";
+import { NanocodexMark } from "./MainNavigation";
+import { accountRouteIntent } from "./accountRoutePreload";
 
 /** Web navigation owns presentation; the managed runtime still owns conversation selection. */
+const SIDEBAR_PAGE = 60;
+
 export function AgentSidebar({
   conversations,
   error,
@@ -75,6 +67,23 @@ export function AgentSidebar({
   const visibleConversations = runningOnly
     ? conversations.filter((conversation) => ["running", "stopping"].includes(conversation.presentation?.status ?? ""))
     : conversations;
+  // Render the list incrementally: thousands of rows (each with prompt
+  // previews) made every sidebar interaction and stream update slow.
+  const [rowLimit, setRowLimit] = useState(SIDEBAR_PAGE);
+  const listEndRef = useRef<HTMLDivElement>(null);
+  const renderedConversations = visibleConversations.length > rowLimit
+    ? visibleConversations.slice(0, rowLimit)
+    : visibleConversations;
+  const hasMoreRows = renderedConversations.length < visibleConversations.length;
+  useEffect(() => {
+    const end = listEndRef.current;
+    if (!end || !hasMoreRows || typeof IntersectionObserver === "undefined") return;
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) setRowLimit((limit) => limit + SIDEBAR_PAGE);
+    }, { root: end.parentElement, rootMargin: "400px" });
+    observer.observe(end);
+    return () => observer.disconnect();
+  }, [hasMoreRows, rowLimit]);
   const panelRef = useRef<HTMLElement>(null);
   const backdropRef = useRef<HTMLDivElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
@@ -132,7 +141,7 @@ export function AgentSidebar({
       >
         <div className="agent-navigation-brand">
           <Link to="/" aria-label="Nanocodex home">
-            <span className="paradigm-mark" aria-hidden="true" />
+            <NanocodexMark />
             <span>Nanocodex</span>
           </Link>
           {!landing ? (
@@ -168,17 +177,13 @@ export function AgentSidebar({
             <SquarePen />
             <span>{landing ? "New chat" : "New agent"}</span>
           </button>
-          <Link to="/" aria-current={landing ? "page" : undefined}>
-            <MessageCircle />
-            <span>Chat</span>
-          </Link>
-          <Link to="/agent" aria-current={!landing ? "page" : undefined}>
+          <Link to="/agents" aria-current={!landing ? "page" : undefined}>
             <Layers aria-hidden="true" />
             <span>Agents</span>
           </Link>
-          <Link to="/connect">
-            <Link2 />
-            <span>Connections</span>
+          <Link to="/account" {...accountRouteIntent}>
+            <CircleUserRound aria-hidden="true" />
+            <span>Account</span>
           </Link>
         </nav>
         <div className="agent-navigation-history">
@@ -191,9 +196,9 @@ export function AgentSidebar({
           </div> : null}
           <div className="agent-navigation-list" aria-busy={pending}>
             {!landing
-              ? visibleConversations.map((conversation, index) => (
+              ? renderedConversations.map((conversation, index) => (
                   <Fragment key={conversation.id}>
-                    {threadGroup(conversation) !== (index ? threadGroup(visibleConversations[index - 1]!) : undefined) ? (
+                    {threadGroup(conversation) !== (index ? threadGroup(renderedConversations[index - 1]!) : undefined) ? (
                       <div className="agent-navigation-group">{threadGroup(conversation)}</div>
                     ) : null}
                     <button
@@ -219,7 +224,7 @@ export function AgentSidebar({
                         {sidebarStatus(conversation)}
                         {conversation.lastUserMessageAt ? <time dateTime={new Date(conversation.lastUserMessageAt).toISOString()}>{threadAge(conversation.lastUserMessageAt)}</time> : null}
                       </span>
-                      {conversation.presentation?.activity && conversation.presentation.activeTurnIds.includes(conversation.presentation.activityTurnId ?? "") ? (
+                      {conversation.presentation?.activity && !/^\s*[{[]/.test(conversation.presentation.activity) && conversation.presentation.activeTurnIds.includes(conversation.presentation.activityTurnId ?? "") ? (
                         <span className="agent-navigation-activity">{conversation.presentation.activity}</span>
                       ) : null}
                       {conversation.presentation?.lastUserPrompt ? (
@@ -232,10 +237,11 @@ export function AgentSidebar({
                   </Fragment>
                 ))
               : null}
+            {!landing && hasMoreRows ? <div ref={listEndRef} className="agent-navigation-more" aria-hidden="true" style={{ height: 1 }} /> : null}
             {landing ? (
               <div className="agent-navigation-empty">
                 <p>Give your work a place to keep going.</p>
-                <Link to="/agent">
+                <Link to="/agents">
                   Open your agents <span aria-hidden="true">↗</span>
                 </Link>
               </div>
@@ -255,38 +261,7 @@ export function AgentSidebar({
           </div>
         </div>
         <div className="agent-navigation-footer">
-          <Link to="/docs">
-            <BookOpen aria-hidden="true" />
-            <span>Documentation</span>
-          </Link>
-          <details className="agent-navigation-explore">
-            <summary>
-              <Compass aria-hidden="true" />
-              <span>Explore</span>
-              <ChevronDown aria-hidden="true" />
-            </summary>
-            <nav aria-label="Explore Nanocodex">
-              {[
-                ...demoNavigation.filter(({ surface }) => surface !== "agent"),
-                ...primaryNavigation.filter(
-                  ({ surface }) => surface !== "docs",
-                ),
-                ...gitNavigation,
-              ].map(({ surface, label }) => (
-                <Link key={surface} to={pathForSurface(surface)}>
-                  {label}
-                </Link>
-              ))}
-              <a
-                href={connectDemoUrl(window.location.origin)}
-                target="_blank"
-                rel="noreferrer"
-              >
-                Connect playground ↗
-              </a>
-            </nav>
-          </details>
-          <Link className="agent-navigation-account" to="/connect">
+          <Link className="agent-navigation-account" to="/account">
             <CircleUserRound aria-hidden="true" />
             <span>
               <strong>{persistent ? "Your account" : "Get started"}</strong>

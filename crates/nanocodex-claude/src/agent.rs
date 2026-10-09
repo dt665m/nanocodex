@@ -61,6 +61,7 @@ type ToolResultFuture =
 #[cfg(target_family = "wasm")]
 type ToolResultFuture = Pin<Box<dyn Future<Output = std::result::Result<ClaudeToolReply, String>>>>;
 type Handler = Arc<dyn Fn(Value, ClaudeToolInvocation) -> ToolResultFuture + Send + Sync>;
+type ToolCleanup = Arc<dyn Fn() -> BackendFuture<()> + Send + Sync>;
 
 /// Stable invocation identities supplied to a host-owned tool.
 #[derive(Clone, Debug)]
@@ -101,8 +102,20 @@ pub struct ClaudeTools {
     tools: Vec<(ToolDefinition, Handler)>,
     dynamic: Vec<DynamicToolsFactory>,
     custom_tool_search: bool,
+    adapter_cleanup: Vec<ToolCleanup>,
 }
 impl ClaudeTools {
+    /// Drains adapter-owned work after each admitted turn, including cancellation.
+    /// Cleanup is awaited before the turn result or cancellation is published.
+    pub fn adapter_cleanup<F, Fut>(mut self, cleanup: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: crate::ToolFuture<Output = ()> + 'static,
+    {
+        self.adapter_cleanup
+            .push(Arc::new(move || Box::pin(cleanup())));
+        self
+    }
     /// Creates an empty native function collection.
     pub fn new() -> Self {
         Self::default()
@@ -118,6 +131,33 @@ impl ClaudeTools {
             .iter()
             .map(|(definition, _)| definition.clone())
             .collect()
+    }
+    /// Resolves the current static and dynamic catalog for a nested runtime.
+    pub fn current_definitions(&self) -> Vec<ToolDefinition> {
+        self.current_tools()
+            .into_iter()
+            .map(|(definition, _)| definition)
+            .collect()
+    }
+    /// Freezes current definitions and callbacks for one nested execution admission.
+    pub fn snapshot(&self) -> Self {
+        Self {
+            tools: self.current_tools(),
+            ..Self::default()
+        }
+    }
+    fn current_tools(&self) -> Vec<(ToolDefinition, Handler)> {
+        let mut tools = self.tools.clone();
+        let mut names = tools
+            .iter()
+            .map(|(d, _)| d.name.clone())
+            .collect::<HashSet<_>>();
+        for factory in &self.dynamic {
+            tools.extend(factory().tools.into_iter().filter(|(d, _)| {
+                !d.name.is_empty() && d.input_schema.is_object() && names.insert(d.name.clone())
+            }));
+        }
+        tools
     }
     /// Dispatches a static callback without exposing it as a top-level model tool.
     /// The embedding must retain the originating invocation identity and revision.
@@ -199,6 +239,7 @@ fn hooked_handler(
             };
             let mut reply = match handler(input.clone(), invocation.clone()).await {
                 Ok(reply) => reply,
+                Err(error) if error == ClaudeTools::HOST_INTERRUPTED => return Err(error),
                 Err(error) => ClaudeToolReply {
                     content: ToolResultContent::Text(error),
                     is_error: true,
@@ -255,6 +296,28 @@ impl BuilderBackend for Claude {
     }
 }
 
+// Messages requires max_tokens. Use the documented standard Messages maxima,
+// not application response-length policy. Unknown/custom models require a caller
+// budget rather than guessing a protocol limit. See:
+// https://platform.claude.com/docs/en/models/overview
+// https://platform.claude.com/docs/en/models/sonnet-4-6/overview
+// https://platform.claude.com/docs/en/models/haiku-4-5/overview
+fn model_max_tokens(model: &str) -> Option<u32> {
+    match model {
+        "claude-opus-5-5" | "claude-fable-5-1" | "claude-sonnet-5-5" | "claude-haiku-5-5"
+        | "claude-opus-5" | "claude-sonnet-5" | "claude-opus-4-6" | "claude-sonnet-4-6" => {
+            Some(128_000)
+        }
+        "claude-haiku-4-5"
+        | "claude-haiku-4-5-20251001"
+        | "claude-sonnet-4-5"
+        | "claude-sonnet-4-5-20250929"
+        | "claude-opus-4-5"
+        | "claude-opus-4-5-20251101" => Some(64_000),
+        _ => None,
+    }
+}
+
 type WorkspaceResolver = Arc<dyn Fn(&str) -> String + Send + Sync>;
 type SubagentTypeResolver = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 type ChildWorkspaceInit = Arc<dyn Fn(&str, &str) -> Result<()> + Send + Sync>;
@@ -266,7 +329,7 @@ pub struct ClaudeBuilder {
     subagent_type_resolver: Option<SubagentTypeResolver>,
     claude: Claude,
     session_id: Option<String>,
-    max_tokens: u32,
+    max_tokens: Option<u32>,
     effort: Option<crate::Effort>,
     automatic_cache: bool,
     cache_one_hour: bool,
@@ -284,12 +347,15 @@ pub struct ClaudeBuilder {
     system_resolver: Option<WorkspaceResolver>,
     tools: Vec<(ToolDefinition, Handler)>,
     tools_factory: Option<ClaudeToolsFactory>,
+    tools_adapter: Option<Arc<dyn Fn(ClaudeTools) -> Result<ClaudeTools> + Send + Sync>>,
     dynamic_tools: Vec<DynamicToolsFactory>,
     tool_hooks: Vec<Arc<dyn crate::ClaudeToolHooks>>,
     spawn_factory: Option<Arc<dyn AgentFactory>>,
+    child_journal: Option<nanocodex_agent::backend::ChildJournal>,
     host_context: Option<Arc<str>>,
     server_tools: Vec<ServerToolDefinition>,
     parallel_tools: bool,
+    parallel_safe_tools: HashSet<String>,
     client_tool_search: bool,
     code_only: bool,
     policy: Option<Arc<dyn ClaudeExecutionPolicy>>,
@@ -300,9 +366,8 @@ pub struct ClaudeBuilder {
 impl ClaudeBuilder {
     fn new(claude: Claude) -> Self {
         let context_window_tokens = match claude.model.as_str() {
-            "claude-opus-5-5" | "claude-fable-5-1" | "claude-sonnet-5-5" | "claude-sonnet-5" => {
-                1_000_000
-            }
+            "claude-opus-5-5" | "claude-fable-5-1" | "claude-sonnet-5-5" | "claude-haiku-5-5"
+            | "claude-sonnet-5" => 1_000_000,
             _ => 200_000, // Conservative fallback; override for other models.
         };
         Self {
@@ -310,7 +375,7 @@ impl ClaudeBuilder {
             subagent_type_resolver: None,
             claude,
             session_id: None,
-            max_tokens: 4096,
+            max_tokens: None,
             effort: None,
             automatic_cache: false,
             cache_one_hour: false,
@@ -328,12 +393,15 @@ impl ClaudeBuilder {
             system_resolver: None,
             tools: Vec::new(),
             tools_factory: None,
+            tools_adapter: None,
             dynamic_tools: Vec::new(),
             tool_hooks: Vec::new(),
             spawn_factory: None,
+            child_journal: None,
             host_context: None,
             server_tools: Vec::new(),
             parallel_tools: false,
+            parallel_safe_tools: HashSet::new(),
             client_tool_search: false,
             code_only: false,
             policy: None,
@@ -342,9 +410,19 @@ impl ClaudeBuilder {
             task_board: None,
         }
     }
+    /// Transforms the complete client catalog after hooks have been attached.
+    /// Nested dispatch through the supplied collection preserves those hooks.
+    pub fn tools_adapter<F>(mut self, adapter: F) -> Self
+    where
+        F: Fn(ClaudeTools) -> Result<ClaudeTools> + Send + Sync + 'static,
+    {
+        self.tools_adapter = Some(Arc::new(adapter));
+        self
+    }
     /// Restricts outbound catalogs to the host's `exec` and `wait` tools.
     /// Recovery reconciles old receipts without dispatching legacy direct calls.
-    /// Disabled by default to preserve direct SDK admission semantics.
+    /// Low-level backend hosts install their adapter before enabling this;
+    /// shipped CLI and JavaScript hosts always enable it.
     pub const fn code_only(mut self, enabled: bool) -> Self {
         self.code_only = enabled;
         self
@@ -366,6 +444,12 @@ impl ClaudeBuilder {
         F: Fn(AgentHandle) -> Result<ClaudeTools> + Send + Sync + 'static,
     {
         self.tools_factory = Some(Arc::new(factory));
+        self
+    }
+    /// Makes this root's subagent task tree durable beside its own state.
+    /// Durability adapters call this; it is never inherited by children.
+    pub fn child_journal(mut self, journal: nanocodex_agent::backend::ChildJournal) -> Self {
+        self.child_journal = Some(journal);
         self
     }
     /// Installs embedding-owned mixed-family child construction.
@@ -433,7 +517,7 @@ impl ClaudeBuilder {
         if stored.version != 1
             || stored.model.parse::<HarnessModel>().ok() != Some(model)
             || !model.supports_thinking(thinking)
-            || stored.max_tokens == 0
+            || stored.max_tokens == Some(0)
             || stored.context_window_tokens == 0
         {
             return Err(unsupported("invalid Claude native checkpoint policy"));
@@ -443,8 +527,11 @@ impl ClaudeBuilder {
         self.max_tokens = stored.max_tokens;
         self.effort = stored.effort;
         self.adaptive_thinking = stored.adaptive_thinking;
-        self.automatic_cache = stored.automatic_cache;
-        self.cache_one_hour = stored.cache_one_hour;
+        // Caching is a host policy that may be newly enabled for an existing
+        // session; a restored checkpoint must not silently disable it. Frozen
+        // cursors keep their admitted wire bytes, so only new steps change.
+        self.automatic_cache |= stored.automatic_cache;
+        self.cache_one_hour |= stored.cache_one_hour;
         self.keep_thinking = stored.keep_thinking;
         self.fast_mode = stored.fast_mode;
         self.message_diagnostics = stored.message_diagnostics;
@@ -464,7 +551,7 @@ impl ClaudeBuilder {
     }
     /// Sets the Messages output-token limit.
     pub const fn max_tokens(mut self, max_tokens: u32) -> Self {
-        self.max_tokens = max_tokens;
+        self.max_tokens = Some(max_tokens);
         self
     }
     /// Sets the model's adaptive-thinking effort using output_config.effort.
@@ -571,6 +658,21 @@ impl ClaudeBuilder {
     /// safe to overlap. Results remain ordered in one user message.
     pub const fn parallel_tools(mut self, enabled: bool) -> Self {
         self.parallel_tools = enabled;
+        self
+    }
+    /// Declare individual client tools whose invocations are independent and
+    /// safe to overlap, as Claude Code does for concurrency-safe tools. When
+    /// `parallel_tools` is off, each maximal run of consecutive calls to these
+    /// tools in one response executes concurrently; every other call runs
+    /// alone, in response order, after the preceding calls finish. Results
+    /// remain ordered in one user message and keep per-call durable receipts.
+    pub fn parallel_safe_tools<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.parallel_safe_tools
+            .extend(names.into_iter().map(Into::into));
         self
     }
     /// Install caller-owned pre/post client-tool hooks. A pre-hook error or
@@ -815,6 +917,7 @@ impl ClaudeBuilder {
     pub fn nested_web_search(mut self, deferred: bool) -> Self {
         let client = self.claude.client.clone();
         let model = self.claude.model.clone();
+        let max_tokens = self.max_tokens;
         let definition = ToolDefinition {
             name: "WebSearch".into(),
             description: "Search public web sources and return attributed results.".into(),
@@ -829,7 +932,7 @@ impl ClaudeBuilder {
         self = self.tool(definition, move |input| {
             let client = client.clone();
             let model = model.clone();
-            async move { nested_web_search(&client, &model, input).await }
+            async move { nested_web_search(&client, &model, max_tokens, input).await }
         });
         self
     }
@@ -852,6 +955,7 @@ impl ClaudeBuilder {
         recipe.session_id = None;
         recipe.restored = None;
         recipe.policy = None;
+        recipe.child_journal = None;
         recipe.subagent_type = Some("general-purpose".into());
         let native_factory = Arc::new(ClaudeNativeFactory {
             recipe,
@@ -867,7 +971,8 @@ impl ClaudeBuilder {
             selected_model,
             native_factory.clone(),
         )
-        .with_native_model_id(self.claude.model.as_str());
+        .with_native_model_id(self.claude.model.as_str())
+        .with_child_journal(self.child_journal.clone());
         if let Some(factory) = &self.spawn_factory {
             handle = handle.with_spawn_factory(factory.clone());
         }
@@ -881,11 +986,16 @@ impl ClaudeBuilder {
         }
 
         if self.claude.model.trim().is_empty()
-            || self.max_tokens == 0
+            || self.max_tokens == Some(0)
             || self.context_window_tokens == 0
             || self.auto_compact_window_tokens == Some(0)
         {
             return Err(unsupported("Claude model and max_tokens must be nonempty"));
+        }
+        if self.max_tokens.is_none() && model_max_tokens(&self.claude.model).is_none() {
+            return Err(unsupported(
+                "Unknown Claude model: configure max_tokens explicitly",
+            ));
         }
         if self.system_blocks.as_ref().is_some_and(|blocks| {
             blocks.is_empty()
@@ -1020,6 +1130,56 @@ impl ClaudeBuilder {
                 *handler = hooked_handler(name.clone(), handler.clone(), hooks.clone());
             }
         }
+        let mut adapter_cleanup = Vec::new();
+        if let Some(adapter) = &self.tools_adapter {
+            if !self.server_tools.is_empty() {
+                return Err(unsupported("client tool adapters cannot wrap server tools"));
+            }
+            let dynamic = std::mem::take(&mut self.dynamic_tools)
+                .into_iter()
+                .map(|factory| {
+                    let hooks = self.tool_hooks.clone();
+                    Arc::new(move || {
+                        let mut catalog = factory();
+                        for (definition, handler) in &mut catalog.tools {
+                            for hook in hooks.iter().rev() {
+                                *handler = hooked_handler(
+                                    definition.name.clone(),
+                                    handler.clone(),
+                                    hook.clone(),
+                                );
+                            }
+                        }
+                        catalog
+                    }) as DynamicToolsFactory
+                })
+                .collect();
+            let catalog = ClaudeTools {
+                tools: definitions
+                    .drain(..)
+                    .map(|d| {
+                        let handler = handlers.remove(&d.name).expect("validated tool handler");
+                        (d, handler)
+                    })
+                    .collect(),
+                dynamic,
+                custom_tool_search: false,
+                adapter_cleanup: Vec::new(),
+            };
+            let adapted = adapter(catalog)?;
+            for (definition, handler) in adapted.tools {
+                if definition.name.is_empty()
+                    || !definition.input_schema.is_object()
+                    || handlers.insert(definition.name.clone(), handler).is_some()
+                {
+                    return Err(unsupported("invalid or duplicate adapted Claude tool"));
+                }
+                definitions.push(definition);
+            }
+            self.dynamic_tools = adapted.dynamic;
+            adapter_cleanup = adapted.adapter_cleanup;
+            self.client_tool_search = false;
+        }
         let mut names = handlers.keys().map(String::as_str).collect::<HashSet<_>>();
         for tool in &self.server_tools {
             if tool.kind.is_empty() || tool.name.is_empty() || !names.insert(&tool.name) {
@@ -1093,6 +1253,7 @@ impl ClaudeBuilder {
             system: self.system,
             system_blocks: self.system_blocks,
             tools: definitions,
+            adapter_cleanup,
             dynamic_tools: self.dynamic_tools,
             tool_hooks: self.tool_hooks,
             server_tools: self.server_tools,
@@ -1101,8 +1262,10 @@ impl ClaudeBuilder {
             client_tool_search: self.client_tool_search,
             code_only: self.code_only,
             parallel_tools: self.parallel_tools,
+            parallel_safe_tools: self.parallel_safe_tools,
             conversation: Mutex::new(restored.conversation),
             dispatch_fork: std::sync::RwLock::new(None),
+            round_boundary: std::sync::RwLock::new(None),
             policy: self.policy,
             admission: Mutex::new(()),
             idle: Notify::new(),
@@ -1137,24 +1300,20 @@ fn host_reply(
                 blocks.push(match item {
                     ToolResultBlock::Text { text } => json!({"type":"text","text":text}),
                     ToolResultBlock::Image { source } => {
-                        let source = match source {
+                        let image_url = match source {
                             ImageSource::Base64 { media_type, data } => {
-                                if !matches!(
-                                    media_type.as_str(),
-                                    "image/png" | "image/jpeg" | "image/gif" | "image/webp"
-                                ) {
-                                    return Err("unsupported Claude image media type".into());
-                                }
-                                json!({"type":"base64","media_type":media_type,"data":data})
+                                format!("data:{media_type};base64,{data}")
                             }
-                            ImageSource::Url { url } => {
-                                if !url.starts_with("https://") {
-                                    return Err("host image URL must be HTTPS".into());
-                                }
-                                json!({"type":"url","url":url})
-                            }
+                            ImageSource::Url { url } => url,
                         };
+                        let (source, _) = crate::prompt::image_source(&image_url)
+                            .map_err(|error| error.to_string())?;
                         json!({"type":"image","source":source})
+                    }
+                    ToolResultBlock::Document { file_data } => {
+                        let (block, _) = crate::prompt::document_block(&file_data, None)
+                            .map_err(|error| error.to_string())?;
+                        serde_json::to_value(block).map_err(|error| error.to_string())?
                     }
                     ToolResultBlock::UnsupportedMedia { media_type } => {
                         return Err(format!(
@@ -1181,6 +1340,7 @@ fn host_reply(
 async fn nested_web_search(
     client: &ClaudeClient,
     model: &str,
+    max_tokens: Option<u32>,
     input: Value,
 ) -> std::result::Result<String, String> {
     const MAX_OUTPUT: usize = 32 * 1024;
@@ -1272,7 +1432,8 @@ async fn nested_web_search(
     // without fabricating client tool_result messages.
     for _ in 0..4 {
         let mut request = MessagesRequest {
-            model: model.into(), max_tokens: 4096, cache_control: None,
+            model: model.into(), max_tokens: max_tokens.or_else(|| model_max_tokens(model))
+                .ok_or("Unknown Claude model: configure max_tokens explicitly")?, cache_control: None,
             output_config: None, speed: None,
             thinking: None, context_management: None, diagnostics: None,
             tool_choice: Some(json!({"type":"auto"})),
@@ -1418,7 +1579,7 @@ async fn web_fetch_with_source<P: nanocodex_claude_tools::web::ApprovedWebFetchS
     // Retrieved content is data, never authorization for actions or credentials.
     let mut request = MessagesRequest {
         model: "claude-haiku-4-5-20251001".into(),
-        max_tokens: 4096,
+        max_tokens: model_max_tokens("claude-haiku-4-5-20251001").expect("known model"),
         cache_control: None,
         output_config: None,
         speed: None,
@@ -1482,7 +1643,9 @@ async fn web_fetch_with_source<P: nanocodex_claude_tools::web::ApprovedWebFetchS
 /// model table at https://platform.claude.com/docs/en/about-claude/models/extended-thinking-models,
 /// `disabled` is a 400 on Opus 5.5, Fable 5.1 and Sonnet 5.5. Sonnet 5.5's lowest
 /// setting is `between_tools` (effort high or below); Opus 5.5 and Fable 5.1 accept
-/// adaptive thinking at low effort.
+/// adaptive thinking at low effort. Haiku 5.5 accepts `disabled` at high effort or
+/// below, so the disabled request omits the session effort and runs at the model
+/// default.
 enum RecoveryThinking {
     Disabled,
     AdaptiveLow,
@@ -1647,6 +1810,24 @@ fn current_server_turn_start(messages: &[Message]) -> Option<usize> {
 // Normalize custom handlers and older retained receipts at the request boundary.
 // The API expands native references into definitions and rejects mixed content.
 // Companions follow all receipts so parallel tool-result ordering stays valid.
+/// Contiguous position ranges executed one batch at a time, in response order.
+/// Calls inside a multi-call batch overlap; `all` admits every call together.
+fn tool_batches<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+    all: bool,
+    parallel_safe: &HashSet<String>,
+) -> Vec<std::ops::Range<usize>> {
+    let mut batches: Vec<(std::ops::Range<usize>, bool)> = Vec::new();
+    for (position, name) in names.into_iter().enumerate() {
+        let safe = all || parallel_safe.contains(name);
+        match batches.last_mut() {
+            Some((range, true)) if safe => range.end = position + 1,
+            _ => batches.push((position..position + 1, safe)),
+        }
+    }
+    batches.into_iter().map(|(range, _)| range).collect()
+}
+
 fn separate_tool_references(messages: &mut [Message]) {
     for message in messages {
         let mut companions = Vec::new();
@@ -1736,7 +1917,7 @@ const fn thinking_effort(thinking: Thinking) -> Option<crate::Effort> {
 struct NativeChildState {
     version: u32,
     model: String,
-    max_tokens: u32,
+    max_tokens: Option<u32>,
     effort: Option<crate::Effort>,
     adaptive_thinking: bool,
     automatic_cache: bool,
@@ -1970,13 +2151,14 @@ struct TurnSteering {
 }
 
 struct State {
+    adapter_cleanup: Vec<ToolCleanup>,
     lifecycle_opened: Mutex<Option<String>>,
     subagent_type: Option<String>,
     subagent_type_resolver: Option<SubagentTypeResolver>,
     session_id: String,
     client: ClaudeClient,
     model: std::sync::RwLock<String>,
-    max_tokens: u32,
+    max_tokens: Option<u32>,
     effort: std::sync::RwLock<Option<crate::Effort>>,
     automatic_cache: bool,
     cache_one_hour: bool,
@@ -2002,9 +2184,16 @@ struct State {
     client_tool_search: bool,
     code_only: bool,
     parallel_tools: bool,
+    // Scheduling only: receipts are keyed by call ID and results by position,
+    // so this set need not be frozen with an admitted cursor.
+    parallel_safe_tools: HashSet<String>,
     conversation: Mutex<Conversation>,
     // Native context before the active tool batch; callbacks must not lock conversation.
     dispatch_fork: std::sync::RwLock<Option<Snapshot>>,
+    // Latest committed boundary of the running turn: its start, then each tool
+    // batch. Residency/durability checkpoints read it while the turn holds
+    // `conversation`, so a child can resume without replaying finished rounds.
+    round_boundary: std::sync::RwLock<Option<Snapshot>>,
     policy: Option<Arc<dyn ClaudeExecutionPolicy>>,
     admission: Mutex<()>,
     idle: Notify,
@@ -2188,6 +2377,30 @@ impl State {
             .is_ok_and(HarnessModel::supports_fast_mode);
         (supported && self.fast_mode.load(Ordering::SeqCst)).then_some(crate::Speed::Fast)
     }
+    /// Hosts that restate prompt-carried context (memory, request origin) need
+    /// to know when a summary replaced earlier history. Usage is omitted: turn
+    /// usage already accounts the summary request.
+    fn emit_compacted(
+        &self,
+        events: &AgentEventPublisher,
+        after_model_call_index: u32,
+        started: Instant,
+    ) {
+        self.emit(
+            events,
+            AgentEventKind::ModelCompactionCompleted,
+            json!({
+                "after_model_call_index": after_model_call_index,
+                "attempt": 1,
+                "connection_generation": 0,
+                "status": "completed",
+                "duration_ns": u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                "time_to_first_event_ns": 0,
+                "time_to_first_output_ns": null,
+                "usage": null,
+            }),
+        );
+    }
     fn emit_run_started(&self, request: &BackendPrompt) -> (&'static str, String) {
         let reasoning_mode = if matches!(
             self.model().as_str(),
@@ -2239,7 +2452,9 @@ impl State {
     fn request_template(&self, speed: Option<crate::Speed>) -> MessagesRequest {
         MessagesRequest {
             model: self.model(),
-            max_tokens: self.max_tokens,
+            max_tokens: self.max_tokens.unwrap_or_else(|| {
+                model_max_tokens(&self.model()).expect("model validated by builder")
+            }),
             cache_control: self.automatic_cache.then(|| crate::CacheControl {
                 kind: crate::CacheType::Ephemeral,
                 ttl: self.cache_one_hour.then_some(crate::CacheTtl::OneHour),
@@ -2277,7 +2492,8 @@ impl State {
         let completed = |response: &crate::MessageResponse,
                          attempt: u32,
                          first_event: u64,
-                         first_output: Option<u64>| {
+                         first_output: Option<u64>,
+                         dispatch: Option<u64>| {
             let Some(events) = events else { return };
             // Shared usage counts all input, including cache reads and writes.
             let input_tokens = response
@@ -2295,6 +2511,7 @@ impl State {
                 "duration_ns": elapsed_ns(),
                 "time_to_first_event_ns": first_event,
                 "time_to_first_output_ns": first_output,
+                "time_to_dispatch_ns": dispatch,
                 "tool_calls": response.content.iter().filter(|block| matches!(block, ContentBlock::ToolUse { .. })).count(),
                 "usage": {
                     "input_tokens": input_tokens,
@@ -2353,7 +2570,7 @@ impl State {
             ),
             Step::Replay(value) => {
                 let response = serde_json::from_value(value).map_err(durable::recovery_error)?;
-                completed(&response, 0, 0, None);
+                completed(&response, 0, 0, None, None);
                 return Ok(ResponseOutcome {
                     message: response,
                     upgrade: None,
@@ -2400,7 +2617,7 @@ impl State {
                     .await?
             {
                 let response = serde_json::from_value(value).map_err(durable::recovery_error)?;
-                completed(&response, 0, 0, None);
+                completed(&response, 0, 0, None, None);
                 return Ok(ResponseOutcome {
                     message: response,
                     upgrade: Some(upgrade.clone()),
@@ -2412,6 +2629,7 @@ impl State {
         // crash or reopen starts with a fresh budget.
         let max_attempts = if context.disable_tools { 3 } else { 5 };
         let mut attempt = 0;
+        let mut dispatched: Option<u64> = None;
         loop {
             if cancel.flag.load(Ordering::SeqCst) {
                 return Err(ResponseFailure {
@@ -2429,6 +2647,9 @@ impl State {
             // only when both identify the same provider message; a null delta ID
             // beside a concrete final ID renders every Claude answer twice.
             let mut message_id: Option<String> = None;
+            // Pre-send work (durable admission, output gate, request build)
+            // is the part of time-to-first-event spent before the provider fetch.
+            dispatched.get_or_insert_with(&elapsed_ns);
             let opened = tokio::select! {
                 result = client.stream(&request) => result,
                 () = cancel.cancelled() => return Err(ResponseFailure {
@@ -2495,6 +2716,7 @@ impl State {
                         attempt,
                         first_event.unwrap_or_default(),
                         first_output,
+                        dispatched,
                     );
                     return Ok(ResponseOutcome {
                         message: response,
@@ -2588,9 +2810,24 @@ impl State {
         let events = &request.events;
         let (reasoning_mode, effort) = self.emit_run_started(&request);
         let notices_before = conversation.recovery_notices.len();
+        // Publish the pre-turn boundary before mutating; a checkpoint taken
+        // during this turn must never wait for the turn to release its lock.
+        if let Ok(boundary) = self.snapshot(&conversation).await {
+            *self.round_boundary.write().expect("round boundary lock") = Some(boundary);
+        }
         let mut result = self
             .run_locked(&mut conversation, &request, speed, &cancel)
             .await;
+        // run_locked has dropped any active exec/wait observation future. Drain
+        // cells even if cancellation arrived while the model request was pending.
+        // Keep the conversation lock until cleanup completes, fencing the next turn.
+        for cleanup in &self.adapter_cleanup {
+            cleanup().await;
+        }
+        self.round_boundary
+            .write()
+            .expect("round boundary lock")
+            .take();
         if result
             .as_ref()
             .err()
@@ -2814,12 +3051,11 @@ impl State {
         let mut template = cursor.template.clone();
         if matches!(mode, CompactionMode::ContextRecovery) {
             // Exhaustion leaves only the earlier prefix available to summarize.
-            // Reserve a bounded text answer independently of the task's output
-            // and thinking budgets; rejection leaves the original state intact.
-            template.max_tokens = template.max_tokens.min(4096);
+            // Preserve the caller's output budget (or model maximum); rejection
+            // leaves the original state intact.
             // Some current models reject `disabled`; keep their lowest
-            // documented thinking setting instead. Older and unknown models
-            // retain the text-only request.
+            // documented thinking setting instead. All other models retain the
+            // text-only request.
             match recovery_thinking(&template.model) {
                 RecoveryThinking::Disabled => {
                     template.thinking = Some(json!({"type":"disabled"}));
@@ -3383,6 +3619,7 @@ impl State {
                     .saturating_add(incoming_tokens)
                     >= cursor.threshold
             {
+                let compaction_started = Instant::now();
                 add_usage(
                     &mut usage,
                     &self
@@ -3395,6 +3632,7 @@ impl State {
                         )
                         .await?,
                 );
+                self.emit_compacted(&request.events, 0, compaction_started);
             }
             pending = conversation.packed_messages();
             pending.extend(prompt);
@@ -3424,6 +3662,7 @@ impl State {
                 // large tool result, not just when the next user turn starts.
                 // Summarize only the prefix before the pending assistant round;
                 // the completed receipts remain lossless and are not reexecuted.
+                let compaction_started = Instant::now();
                 add_usage(
                     &mut usage,
                     &self
@@ -3436,6 +3675,7 @@ impl State {
                         )
                         .await?,
                 );
+                self.emit_compacted(&request.events, index, compaction_started);
                 pending = conversation.packed_messages();
                 previous_message_id = conversation.previous_message_id.clone();
                 cursor.pending = pending.clone();
@@ -3567,6 +3807,14 @@ impl State {
                 }
                 if response.role != Role::Assistant {
                     return Err(provider_error("response role is not assistant"));
+                }
+                // A provider refusal is terminal, even if content includes a
+                // tool call. Classify it before dispatch or continuation; the
+                // ordinary error path also retains evidence of server effects.
+                if response.stop_reason == Some(StopReason::Refusal) {
+                    return Err(provider_error(
+                        "provider refused the request (stop_reason=refusal); turn stopped",
+                    ));
                 }
                 let mut tool_calls = Vec::new();
                 let mut seen_ids = HashSet::new();
@@ -3707,15 +3955,26 @@ impl State {
             // cancelled. Keep *every* assistant tool_use paired with a result:
             // completed results are retained, while interrupted handlers get an
             // explicit unknown-outcome error. Never silently replay their calls.
+            *self.round_boundary.write().expect("round boundary lock") =
+                Some(fork_snapshot.clone());
             *self.dispatch_fork.write().expect("fork boundary lock") = Some(fork_snapshot);
             let fork_boundary = DispatchForkBoundary(&self.dispatch_fork);
             let mut results = vec![None; tool_calls.len()];
             let mut interrupted = false;
+            // Ordered batches: one batch when the embedding declared every tool
+            // independent, otherwise maximal runs of declared parallel-safe
+            // tools, with every other call alone (Claude Code's scheduling).
+            let batches = tool_batches(
+                tool_calls.iter().map(|(_, name, _, _)| name.as_str()),
+                cursor.parallel,
+                &self.parallel_safe_tools,
+            );
             if self.policy.is_some() {
                 // Reconcile every committed receipt before cancelling a recovered batch.
-                if cursor.parallel {
+                for batch in batches {
                     let mut calls = futures_util::stream::FuturesUnordered::new();
-                    for (position, (id, name, input, handler)) in tool_calls.iter().enumerate() {
+                    for position in batch {
+                        let (id, name, input, handler) = &tool_calls[position];
                         let cursor = &cursor;
                         calls.push(async move {
                             (
@@ -3735,74 +3994,57 @@ impl State {
                     while let Some((position, result)) = calls.next().await {
                         results[position] = Some(result?);
                     }
-                } else {
-                    for (position, (id, name, input, handler)) in tool_calls.iter().enumerate() {
-                        results[position] = Some(
-                            self.durable_tool(
-                                (&cursor, cancel),
-                                id,
-                                name,
-                                input,
-                                *handler,
-                                &request.events,
-                            )
-                            .await?,
-                        );
-                    }
                 }
                 interrupted = cancel.flag.load(Ordering::SeqCst);
-            } else if cursor.parallel {
-                let mut calls = futures_util::stream::FuturesUnordered::new();
-                for (position, (id, name, input, handler)) in tool_calls.iter().enumerate() {
-                    let cursor = &cursor;
-                    calls.push(async move {
-                        // A prior completion can cancel before this queued
-                        // future is first polled. Do not start its handler.
-                        let result = if cancel.flag.load(Ordering::SeqCst) {
-                            None
-                        } else {
-                            Some(
-                                self.durable_tool(
-                                    (cursor, cancel),
-                                    id,
-                                    name,
-                                    input,
-                                    *handler,
-                                    &request.events,
-                                )
-                                .await,
-                            )
-                        };
-                        (position, result)
-                    });
-                }
-                let mut remaining = tool_calls.len();
-                while remaining > 0 {
-                    tokio::select! {
-                        biased;
-                        next = calls.next() => {
-                            let Some((position, result)) = next else { break };
-                            interrupted |= result.is_none();
-                            results[position] = result.transpose()?;
-                            remaining -= 1;
-                        }
-                        () = cancel.cancelled() => { interrupted = true; break; }
-                    }
-                }
             } else {
-                for (position, (id, name, input, handler)) in tool_calls.iter().enumerate() {
-                    // Retain a completed receipt even if its handler cancelled
-                    // the turn, but never poll the next sequential handler.
+                for batch in batches {
+                    // Retain completed receipts even if a handler cancelled
+                    // the turn, but never start a later batch.
                     if cancel.flag.load(Ordering::SeqCst) {
                         interrupted = true;
                         break;
                     }
-                    let result = tokio::select! {
-                        biased;
-                        value = self.durable_tool((&cursor, cancel), id, name, input, *handler, &request.events) => value,
-                        () = cancel.cancelled() => { interrupted = true; break; },
-                    };
-                    results[position] = Some(result?);
+                    let mut calls = futures_util::stream::FuturesUnordered::new();
+                    let mut remaining = batch.len();
+                    for position in batch {
+                        let (id, name, input, handler) = &tool_calls[position];
+                        let cursor = &cursor;
+                        calls.push(async move {
+                            // A prior completion can cancel before this queued
+                            // future is first polled. Do not start its handler.
+                            let result = if cancel.flag.load(Ordering::SeqCst) {
+                                None
+                            } else {
+                                Some(
+                                    self.durable_tool(
+                                        (cursor, cancel),
+                                        id,
+                                        name,
+                                        input,
+                                        *handler,
+                                        &request.events,
+                                    )
+                                    .await,
+                                )
+                            };
+                            (position, result)
+                        });
+                    }
+                    while remaining > 0 {
+                        tokio::select! {
+                            biased;
+                            next = calls.next() => {
+                                let Some((position, result)) = next else { break };
+                                interrupted |= result.is_none();
+                                results[position] = result.transpose()?;
+                                remaining -= 1;
+                            }
+                            () = cancel.cancelled() => { interrupted = true; break; }
+                        }
+                    }
+                    if interrupted {
+                        break;
+                    }
                 }
             }
             if self.system_resolver.is_some() {
@@ -3854,6 +4096,11 @@ impl State {
                             .map(|text| estimate_text_tokens(&text))
                             .unwrap_or(0),
                     );
+                // This round is now committed history: expose it to checkpoints
+                // taken while the next provider call holds the conversation.
+                if let Ok(boundary) = self.snapshot(conversation).await {
+                    *self.round_boundary.write().expect("round boundary lock") = Some(boundary);
+                }
                 if interrupted {
                     return Err(NanocodexError::TurnCancelled);
                 }
@@ -3959,6 +4206,7 @@ impl State {
                     return Err(provider_error("context window exhausted after recovery"));
                 }
                 cursor.context_recovery_attempted = true;
+                let compaction_started = Instant::now();
                 add_usage(
                     &mut usage,
                     &self
@@ -3971,6 +4219,7 @@ impl State {
                         )
                         .await?,
                 );
+                self.emit_compacted(&request.events, index, compaction_started);
                 // A user continuation closes the interrupted assistant turn.
                 // Partial text and completed effects remain lossless; only
                 // fully resolved tool boundaries can reach this point.
@@ -4193,19 +4442,62 @@ impl LifecycleBackend for Driver {
     fn runtime_snapshot(&self) -> BackendFuture<Result<ChildSnapshot>> {
         let state = self.state.clone();
         Box::pin(async move {
-            let conversation = state.conversation.lock().await;
-            if state.stopped.load(Ordering::SeqCst) {
-                return Err(NanocodexError::AgentStopped);
-            }
-            let snapshot = state.snapshot(&conversation).await?;
+            // An idle child exposes its complete conversation. A running turn
+            // holds the conversation lock until it settles, so expose its
+            // latest committed round instead of blocking the caller (and the
+            // child's harness loop) for the remainder of the turn.
+            let (snapshot, has_conversation) = match state.conversation.try_lock() {
+                Ok(conversation) => {
+                    if state.stopped.load(Ordering::SeqCst) {
+                        return Err(NanocodexError::AgentStopped);
+                    }
+                    let has_conversation =
+                        !conversation.messages.is_empty() || !conversation.summary.is_empty();
+                    (state.snapshot(&conversation).await?, has_conversation)
+                }
+                Err(_) => {
+                    let boundary = state
+                        .dispatch_fork
+                        .read()
+                        .map_err(|_| unsupported("Claude fork boundary lock poisoned"))?
+                        .clone()
+                        .or_else(|| {
+                            state
+                                .round_boundary
+                                .read()
+                                .ok()
+                                .and_then(|boundary| boundary.clone())
+                        });
+                    if let Some(mut snapshot) = boundary {
+                        if state.stopped.load(Ordering::SeqCst) {
+                            return Err(NanocodexError::AgentStopped);
+                        }
+                        // The boundary ends at completed history; the restored
+                        // child receives a fresh prompt, never a dangling
+                        // continuation of a server-side request.
+                        snapshot.conversation.pending_continuation = false;
+                        snapshot.conversation.previous_message_id = None;
+                        snapshot.conversation.container = None;
+                        let has_conversation = !snapshot.conversation.messages.is_empty()
+                            || !snapshot.conversation.summary.is_empty();
+                        (snapshot, has_conversation)
+                    } else {
+                        let conversation = state.conversation.lock().await;
+                        if state.stopped.load(Ordering::SeqCst) {
+                            return Err(NanocodexError::AgentStopped);
+                        }
+                        let has_conversation =
+                            !conversation.messages.is_empty() || !conversation.summary.is_empty();
+                        (state.snapshot(&conversation).await?, has_conversation)
+                    }
+                }
+            };
             let model = state.model().parse().map_err(unsupported)?;
             let thinking = if state.effort().is_none() {
                 HarnessModel::default_thinking(model)
             } else {
                 state.thinking()
             };
-            let has_conversation =
-                !conversation.messages.is_empty() || !conversation.summary.is_empty();
             Ok(ChildSnapshot::Native {
                 model,
                 session_id: state.session_id.clone(),
@@ -4824,6 +5116,7 @@ mod session_identity_tests {
             "synthetic-test-model",
         );
         let (agent, _events) = Nanocodex::builder(backend.clone())
+            .max_tokens(128_000)
             .session_id("host-session")
             .build()
             .expect("explicit identity");
@@ -4849,5 +5142,27 @@ mod subscription_discovery_tests {
         assert_eq!(found, HashSet::from(["Read", "_custom"]));
         assert!(server_discovered_tools(&blocks, &tools, false).is_empty());
         assert_eq!(serde_json::to_value(&blocks).unwrap(), before);
+    }
+}
+
+#[cfg(test)]
+mod tool_batch_tests {
+    use super::*;
+    #[test]
+    fn parallel_safe_runs_batch_and_unsafe_calls_stay_ordered_alone() {
+        let safe = HashSet::from(["Read".to_owned(), "Bash".to_owned()]);
+        let names = [
+            "Read", "Bash", "Write", "Read", "Read", "Edit", "Edit", "Bash",
+        ];
+        assert_eq!(
+            tool_batches(names, false, &safe),
+            vec![0..2, 2..3, 3..5, 5..6, 6..7, 7..8]
+        );
+        assert_eq!(tool_batches(names, true, &HashSet::new()), vec![0..8]);
+        assert_eq!(
+            tool_batches(names, false, &HashSet::new()),
+            (0..8).map(|i| i..i + 1).collect::<Vec<_>>()
+        );
+        assert!(tool_batches([], false, &safe).is_empty());
     }
 }

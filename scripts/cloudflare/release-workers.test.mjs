@@ -5,7 +5,7 @@ import { existsSync, writeFileSync, readFileSync, statSync, mkdtempSync, rmSync 
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { DeploymentLedgerError } from './deployment-ledger.mjs';
-import { releaseWorkers, releasePhases, prepareReleasePhase, guardedCommand, accountHealth, AccountHealthError } from './release-workers.mjs';
+import { releaseWorkers, releasePhases, prepareReleasePhase, guardedCommand, accountHealth, AccountHealthError, localWrangler } from './release-workers.mjs';
 function fixture(selected, overrides = {}) {
   const events = [], calls = [];
   const plan = { revision: 'b'.repeat(40), selected, fingerprints: Object.fromEntries(selected.map(name => [name, 'a'.repeat(64)])) };
@@ -195,7 +195,7 @@ test('managed uploads before unrelated Astra and account builds without duplicat
     ...options,
     run(command, args) {
       f.events.push(['build', args.join(' ')]);
-      if (command === 'pnpm') targets.push(...args.filter((_, i) => args[i - 1] === '--filter'));
+      if (command === 'node_modules/.bin/turbo') targets.push(...args.filter((_, i) => args[i - 1] === '--filter'));
     },
     managed: async () => f.events.push(['config', 'managed']),
     account: async () => f.events.push(['config', 'account']),
@@ -204,7 +204,7 @@ test('managed uploads before unrelated Astra and account builds without duplicat
   const managed = f.events.findIndex(row => row[0] === 'success' && row[1] === 'managed');
   const astraInstall = f.events.findIndex(row => row[0] === 'build' && row[1].startsWith('ci --prefix examples/astra-mpp-trial'));
   const astra = f.events.findIndex(row => row[0] === 'build' && row[1].includes('build:client'));
-  const account = f.events.findIndex(row => row[0] === 'build' && row[1].includes('nanocodex-web'));
+  const account = f.events.findIndex(row => row[0] === 'build' && row[1] === 'build js/account');
   assert.ok(managed >= 0 && managed < astraInstall && astraInstall < astra && astra < account);
   assert.ok(account < f.events.findIndex(row => row[0] === 'config' && row[1] === 'account'));
   assert.equal(new Set(targets).size, targets.length);
@@ -253,7 +253,7 @@ test('phase builds strip deployment-only secrets and configure images after thei
       for (const key of ['ASTRA_MANAGED_API_KEY', 'ASTRA_MPP_SECRET', 'TEMPO_API_KEY']) assert.ok(!Object.hasOwn(options.env, key));
     },
     managed: async options => { assert.equal(options.requireCurrent, true); configs.push('managed'); },
-    account: async () => { assert.ok(calls.some(([, args]) => args.includes('nanocodex-web'))); configs.push('account'); },
+    account: async () => { assert.ok(calls.some(([, args]) => args.includes('js/account'))); configs.push('account'); },
   });
   assert.deepEqual(configs, ['managed', 'account']);
   assert.equal(env.ASTRA_MANAGED_API_KEY, 'synthetic-api');
@@ -392,4 +392,40 @@ test('health check classifies actual HTTP and stalled body failures', async () =
     await assert.rejects(accountHealth(undefined,{url:origin,timeoutMs:1000}),e=>e.category==='http_status'&&e.httpStatus===502&&!e.message.includes('SECRET'));
     await assert.rejects(accountHealth(undefined,{url:origin+'/stall',timeoutMs:50}),e=>e.category==='timeout');
   }finally{server.closeAllConnections();await new Promise(resolve=>server.close(resolve));}
+});
+
+test('parallel plans upload every selected Worker together with one health check and record topology', async () => {
+  const f = fixture(['media', 'managed', 'egress', 'account']);
+  f.plan.parallel = true; f.plan.topology = 'c'.repeat(64);
+  const topologies = [];
+  const start = f.options.ledger.start;
+  f.options.ledger.start = async (name, fingerprint, options) => { topologies.push(options?.topology); return start(name, fingerprint, options); };
+  await f.release();
+  const starts = f.events.map((row, i) => [row, i]).filter(([row]) => row[0] === 'start').map(([, i]) => i);
+  const firstSuccess = f.events.findIndex(row => row[0] === 'success');
+  assert.equal(starts.length, 4);
+  assert.ok(starts.every(i => i < firstSuccess), 'all uploads start before any receipt');
+  assert.equal(f.events.filter(row => row[0] === 'health').length, 1);
+  assert.deepEqual(topologies, Array(4).fill('c'.repeat(64)));
+});
+
+test('parallel plans skip container comparisons; ordered plans keep immediate rollouts', async () => {
+  const command = (f, name) => f.calls.find(call => call.options.directory === (name === 'account' ? 'js/account' : 'js/managed')).command;
+  const parallel = fixture(['managed', 'account']); parallel.plan.parallel = true; parallel.plan.topology = 'c'.repeat(64);
+  await parallel.release();
+  for (const name of ['managed', 'account']) {
+    const args = command(parallel, name);
+    assert.equal(args[args.indexOf('--containers-rollout') + 1], 'none', name);
+  }
+  const ordered = fixture(['managed', 'account']);
+  await ordered.release();
+  const managed = command(ordered, 'managed');
+  assert.equal(managed[managed.indexOf('--containers-rollout') + 1], 'immediate');
+  assert.ok(!command(ordered, 'account').includes('--containers-rollout'));
+});
+
+test('Wrangler commands use the package binary when installed', () => {
+  assert.deepEqual(localWrangler(['npx', 'wrangler', 'deploy'], '/pkg', () => true), ['node_modules/.bin/wrangler', 'deploy']);
+  assert.deepEqual(localWrangler(['npx', 'wrangler', 'deploy'], '/pkg', () => false), ['npx', 'wrangler', 'deploy']);
+  assert.deepEqual(localWrangler(['node', 'script.mjs'], '/pkg', () => true), ['node', 'script.mjs']);
 });

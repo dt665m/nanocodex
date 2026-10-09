@@ -60,7 +60,7 @@ export default {fetch(){return Response.json({calls,attempts:Object.fromEntries(
 let mf;
 await mkdir(output,{recursive:true});
 try {
-  const aliases = Object.fromEntries(['rpc','managed-auth','managed-live','durable-placement','managed-access'].map(n=>['nanocodex/cloudflare/'+n,fileURLToPath(new URL('../../nanocodex/cloudflare/'+n+'.mjs',import.meta.url))]));
+  const aliases = Object.fromEntries(['rpc','managed-auth','managed-live','managed-access'].map(n=>['nanocodex/cloudflare/'+n,fileURLToPath(new URL('../../nanocodex/cloudflare/'+n+'.mjs',import.meta.url))]));
   const bundled = await build({stdin:{contents:source,resolveDir:managed},bundle:true,write:false,format:'esm',target:'es2022',platform:'browser',external:['cloudflare:workers','node:*'],alias:{...aliases,'node-rsa':join(managed,'node_modules/nanocodex/tools/browser/unsupportedNodeRsa.mjs')}});
   const script=bundled.outputFiles[0].text;
   bundleDigest=createHash('sha256').update(script).digest('hex');
@@ -75,8 +75,8 @@ try {
       assert.ok(subjects.has(request.headers.get('x-nanocodex-subject')),'research subject must be owner-bound');
       const query=await request.json();assert.deepEqual(query.commands,{search_query:[{q:publicQuery}],response_length:'long'});
       assert.deepEqual(query.settings,{allowed_callers:['direct'],external_web_access:true});
-      assert.equal(query.model,'gpt-6-astra');assert.equal(query.max_output_tokens,5000);
-      assert.deepEqual(Object.keys(query).sort(),['commands','id','max_output_tokens','model','settings']);
+      assert.equal(query.model,'gpt-6-astra');assert.equal(query.max_output_tokens,undefined);
+      assert.deepEqual(Object.keys(query).sort(),['commands','id','model','settings']);
       researchTrace.push({query:publicQuery,source:publicSource,method:request.method,path:url.pathname});
       return Response.json({output:'Comparing health plans ('+publicSource+')\n[Retrieved fixture; wordlim 200] Compare premiums, deductibles, provider networks and covered benefits. Public comparison guidance does not establish personalized eligibility or an eligible quote.'});
     }

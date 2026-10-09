@@ -26,6 +26,7 @@ mod hand_recording;
 mod hand_recording_control;
 #[path = "../hand_registry.rs"]
 mod hand_registry;
+mod hand_share;
 #[cfg(any(
     all(target_os = "linux", not(target_env = "musl")),
     all(target_os = "macos", target_arch = "aarch64")
@@ -40,7 +41,6 @@ mod launcher;
 mod linux_hand_install;
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
 mod linux_hand_update;
-mod managed2;
 mod native_hand;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod native_secure_input;
@@ -52,6 +52,7 @@ mod screen_broadcast;
 mod screen_gamepad;
 #[cfg(target_os = "linux")]
 mod screen_helpers;
+mod screen_hls;
 #[cfg(target_os = "linux")]
 mod screen_host;
 mod screen_ice;
@@ -128,9 +129,6 @@ const SYSTEM_HOST_TOKEN_ENV: &str = "NANOCODEX_SYSTEM_HOST_TOKEN";
     about = "Nanocodex terminal client connected to the background machine Hand"
 )]
 struct Cli {
-    /// Opt in to the separate Managed2 API (limited text sessions in the standard TUI).
-    #[arg(long, global = true)]
-    managed2: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -154,6 +152,8 @@ enum Command {
     Vault(vault::Vault),
     /// Manage connected accounts directly.
     Connectors(connectors::Connectors),
+    /// Create, list, revoke, or redeem account Hand sharing links.
+    HandShare(hand_share::HandShare),
     /// Attach a terminal session to an existing managed agent.
     Attach(Attach),
     /// Connect this computer as a Hand; optionally run a VM or Docker Hand.
@@ -237,9 +237,10 @@ enum Command {
 
 #[derive(Args)]
 struct Attach {
-    /// Account-owned agent URL or ID. Choose from a list when omitted.
-    #[arg(value_name = "AGENT_URL_OR_ID", value_parser = parse_agent_reference)]
-    agent: Option<AgentReference>,
+    /// Agent ID, owner URL, or full shared-thread URL. Choose from a list when omitted.
+    // Validate after Clap so errors never echo a bearer URL.
+    #[arg(value_name = "AGENT_URL_OR_ID")]
+    agent: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -687,20 +688,17 @@ async fn run(cli: Cli) -> Result<(), ManagedError> {
             .await
             .map_err(|_| ManagedError::Configuration("local recording control failed".into()));
     }
-    if cli.managed2 {
-        return match cli.command {
-            None => tui::run_managed2(None).await,
-            Some(Command::Attach(Attach { agent: Some(agent) })) if agent.managed_origin.is_none() => {
-                tui::run_managed2(Some(agent.agent_id)).await
+    // Shared links carry their own narrowly scoped authority. Never load an
+    // account credential or start a local Hand for a guest attachment.
+    let attach_reference = match &cli.command {
+        Some(Command::Attach(Attach { agent: Some(value) })) => {
+            if value.contains("/share/") || value.contains("#token=") {
+                return tui::run_shared(value).await;
             }
-            Some(Command::Run(command)) if !command.settings.is_explicit() => {
-                managed2::run(command.agent, Some(command.prompt), command.idempotency_key).await
-            }
-            _ => Err(ManagedError::Configuration(
-                "--managed2 supports interactive sessions, attach ID, and run [--agent ID] PROMPT only; legacy commands/settings are unavailable".into(),
-            )),
-        };
-    }
+            Some(parse_agent_reference(value).map_err(ManagedError::Configuration)?)
+        }
+        _ => None,
+    };
     let command = match cli.command {
         Some(Command::Tui(command)) => {
             return command
@@ -794,10 +792,9 @@ async fn run(cli: Cli) -> Result<(), ManagedError> {
         }
         command => command,
     };
-    let managed_origin = match &command {
-        Some(Command::Attach(Attach { agent: Some(agent) })) => agent.managed_origin.as_deref(),
-        _ => None,
-    };
+    let managed_origin = attach_reference
+        .as_ref()
+        .and_then(|agent| agent.managed_origin.as_deref());
     let client = {
         let _timing = startup_timing::Stage::new("managed_client");
         client_from_environment(managed_origin)?
@@ -821,9 +818,10 @@ async fn run(cli: Cli) -> Result<(), ManagedError> {
         }
         Some(Command::Vault(command)) => command.run(&client).await,
         Some(Command::Connectors(command)) => command.run(&client).await,
+        Some(Command::HandShare(command)) => command.run(&client).await,
         Some(Command::Voice(command)) => voice::run(&client, command).await,
-        Some(Command::Attach(command)) => {
-            attach_tui(&client, command.agent.map(|agent| agent.agent_id)).await
+        Some(Command::Attach(_)) => {
+            attach_tui(&client, attach_reference.map(|agent| agent.agent_id)).await
         }
         Some(Command::ContinueAttach(_)) => unreachable!("handled before managed client setup"),
         Some(Command::Computer(_)) => unreachable!("handled before managed client setup"),
@@ -837,6 +835,11 @@ async fn run(cli: Cli) -> Result<(), ManagedError> {
         #[cfg(any(target_os = "linux", target_os = "macos", test))]
         Some(Command::UpdateHand) => unreachable!("handled before managed client setup"),
         Some(Command::Host(_)) => unreachable!("handled before managed client setup"),
+        Some(Command::New(settings)) if !settings.is_explicit() => {
+            // Omitted settings let the service choose its default (Claude Opus
+            // 5.5 at medium effort, with an OpenAI fallback when unavailable).
+            write_json(&client.create().await?)
+        }
         Some(Command::New(settings)) => {
             let account = settings.chatgpt_account.clone();
             let settings = settings.resolve_validated()?;
@@ -1154,7 +1157,12 @@ fn supported_agent_page_origin(url: &Url) -> bool {
 async fn run_turn(client: &ManagedClient, command: Run) -> Result<(), ManagedError> {
     let created = command.agent.is_none();
     let account = command.settings.chatgpt_account.clone();
-    let settings = command.settings.resolve_validated()?;
+    let settings = if command.settings.is_explicit() || command.agent.is_some() {
+        command.settings.resolve_validated()?
+    } else {
+        // The account catalog default: Claude Opus 5.5 at medium when available.
+        client.default_settings().await?
+    };
     let requested_agent = command.agent;
     let request_id = command
         .idempotency_key
@@ -1480,7 +1488,6 @@ mod tests {
     #[test]
     fn hand_stats_is_a_read_only_standard_managed_command() {
         let cli = Cli::try_parse_from(["nanocodex2", "hand-stats"]).unwrap();
-        assert!(!cli.managed2);
         assert!(matches!(cli.command, Some(Command::HandStats)));
     }
 
@@ -1496,7 +1503,11 @@ mod tests {
             panic!("attach command parsed into the wrong variant");
         };
         assert_eq!(
-            agent,
+            agent
+                .as_deref()
+                .map(parse_agent_reference)
+                .transpose()
+                .unwrap(),
             Some(AgentReference {
                 agent_id: "77777777-7777-4777-8777-777777777777".to_owned(),
                 managed_origin: Some(

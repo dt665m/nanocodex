@@ -2,7 +2,7 @@ import { forwardManagedPreview, previewBridgeEnabled, type PreviewBridgeEnv } fr
 import { consumeRpcData } from "nanocodex/cloudflare/rpc";
 import { apiKeyDigest, apiKeyPrincipal } from "nanocodex/cloudflare/managed-auth";
 import { nativeLiveRequest, liveAgentSettings, liveAgentFailure, liveAgentRequest, newManagedAgentId, nativeRunRequest, nativeRunBody, runAgentRequest } from "nanocodex/cloudflare/managed-live";
-import { durablePlacementOptions, ingressColo, regionalApiKeyAuthorityName, regionalApiKeyAuthorityRegion } from "nanocodex/cloudflare/durable-placement";
+import { ingressColo } from "nanocodex/cloudflare/managed-live";
 
 import { MANAGED_ACCESS_HEADER, MANAGED_ACCESS_TTL_MS, isHandViewerUpgrade, readManagedAccess, handRequestFailure, handBrokerRequest } from "nanocodex/cloudflare/managed-access";
 
@@ -11,16 +11,12 @@ export type ManagedProxyEnv = PreviewBridgeEnv & {
   NANOCODEX_ACCESS_SECRET?: string;
   NANOCODEX_HAND_BROKER?: DurableObjectNamespace;
   NANOCODEX_LIVE_API_KEYS?: {
-    getByName(name: string, options?: ReturnType<typeof durablePlacementOptions>): {
+    getByName(name: string): {
       id?: { toString(): string };
       resolveAuthorizedKey?: () => Promise<unknown>;
-      resolveRegionalAuthorizedKey?: (primaryObjectId: string, region: string) => Promise<unknown>;
     };
-    idFromName?(name: string): { toString(): string };
   };
-  /** "true" lets new ingress-regional lease replicas answer live API-key auth. */
-  NANOCODEX_REGIONAL_API_KEY_AUTHORITY?: string;
-  NANOCODEX_LIVE_SESSIONS?: { getByName(name: string, options?: ReturnType<typeof durablePlacementOptions>): {
+  NANOCODEX_LIVE_SESSIONS?: { getByName(name: string): {
     fetch(request: Request): Promise<Response>;
   } };
 
@@ -39,8 +35,11 @@ const MANAGED_ROUTE = /^(?:\/auth(?:\/.*)?|\/webauthn\/.*|\/sandbox-preview\/[^/
 // Authentication and method-specific policy remain in the managed service.
 const HAND_IDENTITY_ROUTE = /^\/v1\/account\/hands\/[A-Za-z0-9](?:[A-Za-z0-9._:-]|%3[Aa]){0,127}$/;
 
+// Portable HLS: owner link management and token-authorized public playback/upload (tokens never in paths).
+const SCREEN_PLAYBACK_ROUTE = /^\/v1\/(?:account\/hands\/playback-links(?:\/sp_[0-9a-f]{32})?|screen-playback\/sp_[0-9a-f]{32}\/(?:index\.m3u8|s(?:0|[1-9][0-9]{0,9})\.ts|upload\/(?:index\.m3u8|s(?:0|[1-9][0-9]{0,9})\.ts)?))$/;
+
 export function isManagedRoutePath(pathname: string): boolean {
-  return pathname === "/v1/services" || pathname.startsWith("/v1/services/") || pathname === "/v1/account/links" || pathname === "/v1/account/hands/inventory" || pathname === "/v1/account/hands/prune" || HAND_IDENTITY_ROUTE.test(pathname) || pathname === "/v1/account/hand-relays" || pathname === "/v1/account/hand-relays/retire" || /^\/v1\/vault\/(?:request|store|card)$/.test(pathname) || PERMISSION_REQUEST_ROUTE.test(pathname) || GENERATED_APP_ROUTE.test(pathname) || pathname === "/api/router" || pathname === "/v1/agent-runs" || MANAGED_ROUTE.test(pathname) || /^\/v1\/shared\/[0-9a-f-]{36}(?:\/(?:events(?:\/history)?|turns))?$/.test(pathname) || /^\/v1\/phone\/bridge\/(?:health|check|calls(?:\/[0-9a-f-]{36}(?:\/(?:hangup|steer))?)?|status\/[0-9a-f-]{36}|media\/[0-9a-f-]{36}\/|internal\/(?:state|setup))$/.test(pathname);
+  return pathname === "/v1/teams" || pathname.startsWith("/v1/teams/") || SCREEN_PLAYBACK_ROUTE.test(pathname) || /^\/hand-share\/[0-9a-f-]{36}$/.test(pathname) || /^\/v1\/account\/hand-shares(?:\/(?:redeem|[0-9a-f-]{36}))?$/.test(pathname) || pathname === "/v1/services" || pathname.startsWith("/v1/services/") || pathname === "/v1/account/links" || pathname === "/v1/account/hands/inventory" || pathname === "/v1/account/hands/prune" || HAND_IDENTITY_ROUTE.test(pathname) || pathname === "/v1/account/hand-relays" || pathname === "/v1/account/hand-relays/retire" || /^\/v1\/vault\/(?:request|store|card)$/.test(pathname) || PERMISSION_REQUEST_ROUTE.test(pathname) || GENERATED_APP_ROUTE.test(pathname) || pathname === "/api/router" || pathname === "/v1/agent-runs" || MANAGED_ROUTE.test(pathname) || /^\/v1\/shared\/[0-9a-f-]{36}(?:\/(?:events(?:\/history)?|turns))?$/.test(pathname) || /^\/v1\/phone\/bridge\/(?:health|check|calls(?:\/[0-9a-f-]{36}(?:\/(?:hangup|steer))?)?|status\/[0-9a-f-]{36}|media\/[0-9a-f-]{36}\/|internal\/(?:state|setup))$/.test(pathname);
 }
 
 /**
@@ -76,6 +75,7 @@ async function routeMeasuredManaged(
   request: Request,
   env: ManagedProxyEnv,
   url: URL,
+  context?: Pick<ExecutionContext, "waitUntil">,
 ): Promise<Response | undefined> {
   if (!isManagedRoutePath(url.pathname)) return undefined;
   if (/\bnci_/i.test(request.headers.get("authorization") ?? "")
@@ -118,7 +118,7 @@ async function routeMeasuredManaged(
       }
       // Undefined means ineligible/unconfigured before session creation. A failed
       // direct dispatch throws to the 503 boundary; never create a second agent.
-      response = await directLiveAgent(request, env) ?? await directAgentRun(request, env) ?? await env.NANOCODEX_BACKEND.fetch(request);
+      response = await directLiveAgent(request, env, context) ?? await directAgentRun(request, env, context) ?? await env.NANOCODEX_BACKEND.fetch(request);
     }
     if (url.pathname === "/v1/agent-runs" || /^\/v1\/agents(?:\/(?:live|[0-9a-f-]{36}(?:\/(?:routing|settings|done|prepare|ws|events(?:\/history)?|turns(?:\/[A-Za-z0-9_.:-]{1,128}\/cancel)?))?))?$/.test(url.pathname)) {
       // Match the managed receipt without reading a body or changing upgraded
@@ -133,7 +133,8 @@ async function routeMeasuredManaged(
     }
     if (/^\/v1\/account\/hands\/(?:screens|host|view|ice|renew)$/.test(url.pathname)) {
       console.info({ type: "hand.proxy", request_id: response.headers.get("x-nanocodex-request-id"),
-        method: request.method, path: url.pathname, status: response.status, route: local ? "local_access" : "managed",
+        method: request.method, path: url.pathname, status: response.status,
+        route: local ? "local_access" : "managed",
         backend_ms: performance.now() - started, started_at_ms: startedAt, finished_at_ms: Date.now(),
         request_colo: typeof request.cf?.colo === "string" ? request.cf.colo : undefined });
     }
@@ -150,39 +151,17 @@ async function routeMeasuredManaged(
 
 const INELIGIBLE = Symbol("ineligible");
 
-/**
- * Live key authority. With regional authority enabled, ask the ingress
- * region's lease replica; it holds a lease only after the key's primary object
- * checked key, account and grant, and the primary revokes leases before
- * acknowledging a key deletion. A null answer or replica transport failure
- * falls back to the authoritative primary; a replica denial is final.
- */
-async function liveKeyPrincipal(env: ManagedProxyEnv, digest: string, colo: string | null): Promise<ReturnType<typeof apiKeyPrincipal> | typeof INELIGIBLE> {
+/** Live key authority: the key's single ApiKeyRecord object. */
+async function liveKeyPrincipal(env: ManagedProxyEnv, digest: string): Promise<ReturnType<typeof apiKeyPrincipal> | typeof INELIGIBLE> {
   const keys = env.NANOCODEX_LIVE_API_KEYS!;
-  const region = regionalApiKeyAuthorityRegion(colo, env.NANOCODEX_REGIONAL_API_KEY_AUTHORITY);
-  const primaryId = region && typeof keys.idFromName === "function" ? keys.idFromName(digest).toString() : undefined;
-  if (region && primaryId && /^[0-9a-f]{64}$/.test(primaryId)) {
-    const replica = keys.getByName(regionalApiKeyAuthorityName(primaryId, region), { locationHint: region });
-    const resolve = replica.resolveRegionalAuthorizedKey;
-    if (typeof resolve === "function") {
-      let value: { record?: unknown; apiKeyObjectId?: unknown } | undefined | null | typeof INELIGIBLE;
-      // Null means "ask the primary", exactly like a replica transport failure.
-      try { value = consumeRpcData(await Reflect.apply(resolve, replica, [primaryId, region])) as typeof value | null; }
-      catch { value = INELIGIBLE; }
-      if (value === null) value = INELIGIBLE;
-      if (value !== INELIGIBLE) {
-        return value && value.apiKeyObjectId === primaryId ? apiKeyPrincipal(value.record, digest, primaryId) : undefined;
-      }
-    }
-  }
-  const key = keys.getByName(digest, durablePlacementOptions(colo));
+  const key = keys.getByName(digest);
   const resolve = key.resolveAuthorizedKey;
   if (typeof resolve !== "function") return INELIGIBLE;
   return apiKeyPrincipal(consumeRpcData(await Reflect.apply(resolve, key, [])), digest, key.id?.toString());
 }
 
 /** API-key-only entrypoint; authority still comes from the existing live key DO. */
-async function directLiveAgent(request: Request, env: ManagedProxyEnv): Promise<Response | undefined> {
+async function directLiveAgent(request: Request, env: ManagedProxyEnv, context?: Pick<ExecutionContext, "waitUntil">): Promise<Response | undefined> {
   if (!env.NANOCODEX_LIVE_API_KEYS || !env.NANOCODEX_LIVE_SESSIONS || !nativeLiveRequest(request)) return;
   const settings = liveAgentSettings(request);
   if (settings instanceof Response) return settings;
@@ -192,7 +171,7 @@ async function directLiveAgent(request: Request, env: ManagedProxyEnv): Promise<
   const digest = await apiKeyDigest(request);
   if (!digest) return;
   const colo = ingressColo(request.cf?.colo);
-  const resolved = await liveKeyPrincipal(env, digest, colo);
+  const resolved = await liveKeyPrincipal(env, digest);
   // Older/unconfigured bindings keep the full managed route, before any create.
   if (resolved === INELIGIBLE) return;
   const principal = resolved;
@@ -206,7 +185,7 @@ async function directLiveAgent(request: Request, env: ManagedProxyEnv): Promise<
     const internal = liveAgentRequest(request, principal!, settings, agentId, colo);
     let status: number | undefined;
     try {
-      response = await env.NANOCODEX_LIVE_SESSIONS.getByName(agentId, durablePlacementOptions(colo)).fetch(internal);
+      response = await env.NANOCODEX_LIVE_SESSIONS.getByName(agentId).fetch(internal);
       status = response.status;
     } finally {
       try {
@@ -230,7 +209,7 @@ async function directLiveAgent(request: Request, env: ManagedProxyEnv): Promise<
 }
 
 /** Reuse the live key authority and Session boundary without an extra Worker hop. */
-async function directAgentRun(request: Request, env: ManagedProxyEnv): Promise<Response | undefined> {
+async function directAgentRun(request: Request, env: ManagedProxyEnv, context?: Pick<ExecutionContext, "waitUntil">): Promise<Response | undefined> {
   if (!env.NANOCODEX_LIVE_API_KEYS || !env.NANOCODEX_LIVE_SESSIONS || !nativeRunRequest(request)) return;
   const run = await nativeRunBody(request);
   if (!run) return;
@@ -238,7 +217,7 @@ async function directAgentRun(request: Request, env: ManagedProxyEnv): Promise<R
   const digest = await apiKeyDigest(request);
   if (!digest) return;
   const colo = ingressColo(request.cf?.colo);
-  const resolved = await liveKeyPrincipal(env, digest, colo);
+  const resolved = await liveKeyPrincipal(env, digest);
   if (resolved === INELIGIBLE) return;
   const principal = resolved;
   const authFinishedAt = Date.now();
@@ -246,7 +225,7 @@ async function directAgentRun(request: Request, env: ManagedProxyEnv): Promise<R
   if (failure) return failure;
   const internal = await runAgentRequest(request, principal!, run, colo);
   const dispatchAt = Date.now();
-  const response = await env.NANOCODEX_LIVE_SESSIONS.getByName(internal.agentId, durablePlacementOptions(colo)).fetch(internal.request);
+  const response = await env.NANOCODEX_LIVE_SESSIONS.getByName(internal.agentId).fetch(internal.request);
   if (response.ok && (!response.headers.get("content-type")?.startsWith("text/event-stream")
     || response.headers.get("x-nanocodex-agent-id") !== internal.agentId
     || response.headers.get("x-nanocodex-turn-id") !== internal.turnId)) {

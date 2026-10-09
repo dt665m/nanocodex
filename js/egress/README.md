@@ -190,6 +190,9 @@ and durable-state recovery after failures.
 `upstream_ms` includes our
 subscription relay and must not be interpreted as provider-only latency.
 
+Every credential read goes to the user's single `UserCredentialBroker`
+(`getByName(userId)`); Cloudflare places it. There are no regional replicas.
+
 Caught Claude Messages failures emit `egress.claude.failure` with a random
 `egress_request_id`, failure phase, built-in error class and upstream attempt
 count, plus a validated deployment SHA when available. The response includes the same ID in

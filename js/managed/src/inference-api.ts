@@ -1,4 +1,3 @@
-import { durablePlacementOptions } from "nanocodex/cloudflare/durable-placement";
 import { authenticate, requireSameOriginMutation, type AccountAuthEnv, type Principal } from "./account-auth";
 import { authorizeInferenceKey, routeInferenceKeys, type InferenceKeysEnv } from "./inference-keys";
 import { executeStatelessInferenceResponse, inferenceOrigin, INFERENCE_INGRESS_HEADER, type InferenceSessionEnv, type InferenceExecutionContext } from "./inference-session";
@@ -97,8 +96,8 @@ async function routeInferenceApiInternal(request: Request, env: InferenceApiEnv,
   try {
     // Cloudflare-owned metadata only. User-provided geography headers are ignored.
     const origin = inferenceOrigin(request.cf?.colo);
-    const headers = new Headers({ "content-type": "application/json", "x-inference-key-id": key.id,
-      "x-inference-max-output-tokens": String(key.limits.maxOutputTokens) });
+    const headers = new Headers({ "content-type": "application/json", "x-inference-key-id": key.id });
+    if (key.limits.maxOutputTokens !== undefined) headers.set("x-inference-max-output-tokens", String(key.limits.maxOutputTokens));
     if (origin.clientIngressColo) headers.set(INFERENCE_INGRESS_HEADER, origin.clientIngressColo);
     let id: string; let method = request.method; let path = "/session"; let body: Record<string, unknown> | undefined;
     if (suffix === "/sessions") {
@@ -119,7 +118,7 @@ async function routeInferenceApiInternal(request: Request, env: InferenceApiEnv,
     }
     headers.set("x-inference-session-id", id);
     // The caller cannot choose a DO identity, credential, account context, or internal header.
-    return await env.NANOCODEX_INFERENCE_SESSIONS.getByName(id, durablePlacementOptions(origin.clientIngressColo)).fetch(new Request("https://inference.internal" + path,
+    return await env.NANOCODEX_INFERENCE_SESSIONS.getByName(id).fetch(new Request("https://inference.internal" + path,
       { method, headers, ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: request.signal }));
   } catch (error) {
     if (request.signal.aborted) return json({ error: "request_cancelled" }, 499);

@@ -5,13 +5,29 @@ import {readFile,writeFile,mkdir} from 'node:fs/promises';
 import {fileURLToPath} from 'node:url';
 import {createRequire} from 'node:module';
 import path from 'node:path';
+import {nanocodexTools} from '../../nanocodex-vite/tools.mjs';
 const root=fileURLToPath(new URL('../../../',import.meta.url));process.chdir(root);
 const out='output/account-workspace';await mkdir(out,{recursive:true});
 const checkpoint=async text=>writeFile(`${out}/browser-progress.md`,`${new Date().toISOString()}\n${text}\n`);
 await checkpoint('Draft saved; building production bundle.');
 const require=createRequire(path.resolve('js/account/package.json'));
-const {build}=require('esbuild');const {chromium}=require('playwright-core');
-await build({stdin:{contents:`import React from 'react';import {createRoot} from 'react-dom/client';import {QueryClient,QueryClientProvider} from '@tanstack/react-query';import {BrowserRouter} from 'react-router';import {AccountSessionProvider} from './src/AccountSession';import {DeviceConnect} from './src/DeviceConnect';import './src/index.css';createRoot(document.getElementById('root')).render(<QueryClientProvider client={new QueryClient({defaultOptions:{queries:{retry:false}}})}><BrowserRouter><AccountSessionProvider><DeviceConnect/></AccountSessionProvider></BrowserRouter></QueryClientProvider>);`,resolveDir:path.resolve('js/account'),sourcefile:'account-journey.tsx',loader:'tsx'},bundle:true,external:['/paradigm-mark.svg'],format:'esm',jsx:'automatic',outfile:`${out}/journey.js`,loader:{'.woff2':'dataurl','.png':'dataurl','.svg':'dataurl'}});
+const {chromium}=require('playwright-core');
+const {build}=await import('vite');
+const {default:react}=await import('@vitejs/plugin-react');
+// Use the production browser bundler and compatibility plugin. Plain esbuild
+// follows Node-only fallbacks in dependencies imported by the account UI.
+const entry=path.resolve('js/account/account-workspace-journey.tsx');
+await build({configFile:false,root:path.resolve('js/account'),define:{'process.env.NODE_ENV':JSON.stringify('production'),'process.env':'{}'},
+ worker:{format:'es',plugins:()=>[nanocodexTools()]},
+ plugins:[nanocodexTools(),react(),{name:'account-workspace-entry',
+  resolveId(id){if(id===entry)return entry;},
+  load(id){if(id===entry)return `import React from 'react';import {createRoot} from 'react-dom/client';import {QueryClient,QueryClientProvider} from '@tanstack/react-query';import {BrowserRouter} from 'react-router';import {AccountSessionProvider} from './src/AccountSession';import {DeviceConnect} from './src/DeviceConnect';import './src/index.css';import './src/MainNavigation.css';createRoot(document.getElementById('root')).render(<QueryClientProvider client={new QueryClient({defaultOptions:{queries:{retry:false}}})}><BrowserRouter><AccountSessionProvider><DeviceConnect/></AccountSessionProvider></BrowserRouter></QueryClientProvider>);`;},
+ }],
+ build:{outDir:path.resolve(out),emptyOutDir:false,cssCodeSplit:false,
+  lib:{entry,formats:['es'],fileName:()=> 'journey.js',cssFileName:'journey'},
+  rolldownOptions:{external:['/paradigm-mark.svg'],output:{codeSplitting:false}},
+ }});
+
 const requests=[],errors=[],shots=[];let signedOut=false, credentialsFailure=false, pendingChatGpt=false, cloudflareConnected=false, cloudflareLostReply=false;
 const wallet='0x1111111111111111111111111111111111111111';
 const user={id:'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',persistent:true,address:wallet};
@@ -35,6 +51,7 @@ if(url.pathname.startsWith('/v1/')){
  }
  if(url.pathname==='/v1/connectors/cloudflare/connections/'+ 'f'.repeat(43)&&req.method==='DELETE'){cloudflareConnected=false;return reply({disconnected:true});}
  if(req.method!=='GET')return reply({error:'Unexpected fixture mutation'},405);
+ if(url.pathname==='/v1/teams')return reply({teams:[]});
  if(url.pathname==='/v1/me')return reply(signedOut?{error:'unauthorized'}:{user},signedOut?401:200);
  if(url.pathname==='/v1/credentials'){
   if(credentialsFailure)return reply({error:'synthetic outage'},503);
@@ -56,7 +73,8 @@ res.setHeader('content-type','text/html');res.end('<!doctype html><html><head><m
 await new Promise(r=>server.listen(0,'127.0.0.1',r));const origin=`http://127.0.0.1:${server.address().port}`;
 const browser=await chromium.launch({executablePath:process.env.CHROME_PATH||chromium.executablePath(),headless:true});
 const contextFor=async(viewport,theme='light')=>{
- const context=await browser.newContext({viewport,colorScheme:theme});
+ const phone=viewport.width<500;
+ const context=await browser.newContext({viewport,colorScheme:theme,...(phone?{isMobile:true,hasTouch:true,deviceScaleFactor:3}:{})});
  await context.route('**/*',route=>route.request().url().startsWith(origin)?route.continue():route.abort());
  await context.addInitScript(t=>{document.addEventListener('DOMContentLoaded',()=>{document.documentElement.dataset.theme=t;});localStorage.setItem('nanocodex-theme',t);},theme);
  return context;
@@ -65,24 +83,34 @@ const screenshot=async(page,name)=>{
  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true,`${name}: horizontal overflow`);
  await page.screenshot({path:`${out}/${name}.png`,fullPage:true});shots.push(name);
 };
+// Phone ergonomics: no input below 16px (iOS focus zoom), every visible control a 44px target.
+const ergonomics=[];
+const phoneAudit=()=>{
+ const shown=el=>{const r=el.getBoundingClientRect();const s=getComputedStyle(el);return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none'&&!el.closest('[inert]');};
+ const smallText=[],smallTargets=[];
+ for(const el of document.querySelectorAll('input:not([type=file]):not([type=checkbox]):not([type=radio]),textarea,select'))if(shown(el)&&parseFloat(getComputedStyle(el).fontSize)<16)smallText.push(`${el.tagName}.${el.className} ${getComputedStyle(el).fontSize}`);
+ for(const el of document.querySelectorAll('button,a[href],summary,[role=button],select,input[type=checkbox]')){if(!shown(el)||(el.tagName==='A'&&el.closest('p,li,td')))continue;const r=el.getBoundingClientRect();if(r.width<43.5||r.height<43.5)smallTargets.push(`${el.getAttribute('aria-label')||el.innerText.trim().slice(0,30)||el.className} ${Math.round(r.width)}x${Math.round(r.height)}`);}
+ return {smallText,smallTargets};
+};
 const writes=()=>requests.filter(r=>r.method==='POST'&&r.path.startsWith('/v1/credentials/vault/')).length;
 try{
  for(const [device,viewport] of Object.entries({desktop:{width:1280,height:900},mobile:{width:360,height:800}}))for(const theme of ['light','dark']){
   const context=await contextFor(viewport,theme);const page=await context.newPage();page.on('pageerror',e=>errors.push(e.message));
   for(const section of ['connections','vault','wallet','access']){
-   await page.goto(origin+'/connect'+(section==='connections'?'':'/'+section));await page.waitForLoadState('networkidle');
+   await page.goto(origin+'/account'+(section==='connections'?'':'/'+section));await page.waitForLoadState('networkidle');
    await page.getByRole('heading',{level:1,name:section==='access'?'API access':section[0].toUpperCase()+section.slice(1),exact:true}).waitFor();
    assert.equal(await page.locator('[role="alert"]:visible').count(),0,section+' has no error: '+await page.locator('[role="alert"]:visible').allTextContents());
    if(section==='vault')await page.getByText('Example account',{exact:true}).waitFor();
    if(section==='wallet')await page.getByText('Balance: $5.00',{exact:true}).waitFor();
    await screenshot(page,`${device}-${theme}-${section}`);
+   if(device==='mobile'){const audit=await page.evaluate(phoneAudit);assert.deepEqual(audit,{smallText:[],smallTargets:[]},`${section} phone ergonomics ${JSON.stringify(audit)}`);ergonomics.push({section,theme});}
   }
-  await page.goto(origin+'/connect/vault?add=login');await page.getByLabel('Password',{exact:true}).waitFor();await screenshot(page,`${device}-${theme}-add-login`);
+  await page.goto(origin+'/account/vault?add=login');await page.getByLabel('Password',{exact:true}).waitFor();await screenshot(page,`${device}-${theme}-add-login`);
   await context.close();
  }
  const context=await contextFor({width:390,height:844});const page=await context.newPage();page.on('pageerror',e=>errors.push(e.message));
  signedOut=true;
- await page.goto(origin+'/connect/vault?add=login');await page.locator('input[type="tel"]').waitFor();await screenshot(page,'mobile-sign-in');
+ await page.goto(origin+'/account/vault?add=login');await page.locator('input[type="tel"]').waitFor();await screenshot(page,'mobile-sign-in');
  await page.locator('input[type="tel"]').fill('+15555550123');await page.getByRole('button',{name:'Text me a code',exact:true}).click();
  await page.getByLabel('6-digit code',{exact:true}).fill('123456');await page.getByRole('button',{name:'Continue',exact:true}).click();
  await page.getByLabel('Password',{exact:true}).waitFor();assert.equal(new URL(page.url()).search,'?add=login');assert.equal(writes(),0);
@@ -94,13 +122,13 @@ try{
  await page.getByRole('button',{name:'Cancel',exact:true}).click();assert.equal(requests.filter(r=>r.method==='DELETE').length,0);
  await page.getByRole('button',{name:'Delete Journey login',exact:true}).click();await page.getByRole('button',{name:'Delete',exact:true}).click();await page.getByText('No matching items',{exact:true}).waitFor();assert.equal(requests.filter(r=>r.method==='DELETE').length,1);
  await page.getByLabel('Search vault',{exact:true}).fill('');await page.getByRole('button',{name:'Cards',exact:true}).click();await page.getByText('Travel card',{exact:true}).waitFor();assert.equal(await page.locator('.vault-items > li').count(),1);
- await page.goto(origin+'/connect/vault?add=api_key');await page.getByLabel('API key',{exact:true}).fill('synthetic-key');await page.getByRole('button',{name:'Cancel',exact:true}).click();assert.equal(writes(),1);await page.locator('.vault-inline-entry').waitFor({state:'detached'});assert.equal(await page.locator('input[type="password"]').count(),0);
- for(const [path,title] of [['/connect','Connections'],['/connect/wallet','Wallet'],['/connect/access','API access'],['/connect/vault','Vault']]){
+ await page.goto(origin+'/account/vault?add=api_key');await page.getByLabel('API key',{exact:true}).fill('synthetic-key');await page.getByRole('button',{name:'Cancel',exact:true}).click();assert.equal(writes(),1);await page.locator('.vault-inline-entry').waitFor({state:'detached'});assert.equal(await page.locator('input[type="password"]').count(),0);
+ for(const [path,title] of [['/account','Connections'],['/account/wallet','Wallet'],['/account/access','API access'],['/account/vault','Vault']]){
   await page.getByRole('navigation',{name:'Account navigation'}).getByRole('link',{name:title,exact:true}).click();await page.waitForURL(origin+path);assert.equal(new URL(page.url()).pathname,path);await page.reload();await page.getByRole('heading',{level:1,name:title,exact:true}).waitFor();
  }
- await page.goto(origin+'/connect?connect=constructor');await page.getByRole('heading',{level:1,name:'Connections',exact:true}).waitFor();
- await page.goto(origin+'/connect?connect=github');await page.locator('[data-provider="github"] button').first().waitFor();assert.equal(await page.locator('[data-provider="github"] button').first().evaluate(el=>el===document.activeElement),true);
- await page.goto(origin+'/connect?connect=cloudflare');
+ await page.goto(origin+'/account?connect=constructor');await page.getByRole('heading',{level:1,name:'Connections',exact:true}).waitFor();
+ await page.goto(origin+'/account?connect=github');await page.locator('[data-provider="github"] button').first().waitFor();assert.equal(await page.locator('[data-provider="github"] button').first().evaluate(el=>el===document.activeElement),true);
+ await page.goto(origin+'/account?connect=cloudflare');
  const cf=page.locator('[data-provider="cloudflare"]');await cf.getByLabel('Cloudflare Vault API key').waitFor();
  assert.equal(requests.filter(r=>r.method==='POST'&&r.path==='/v1/connectors/cloudflare').length,0);
  assert.equal(await cf.getByRole('button',{name:'Connect Cloudflare',exact:true}).isEnabled(),false);
@@ -113,10 +141,17 @@ try{
  await cf.getByRole('button',{name:'Revoke Synthetic Cloudflare',exact:true}).click();await cf.getByText('Synthetic Cloudflare',{exact:true}).waitFor({state:'detached'});
  assert.equal(requests.filter(r=>r.method==='DELETE'&&r.path==='/v1/connectors/cloudflare/connections/'+'f'.repeat(43)).length,1);
  await page.goto(origin+'/connect?connector=github&connector_result=failed');await page.getByText('GitHub couldn’t be connected. Try again.',{exact:true}).waitFor();
- pendingChatGpt=true;await page.goto(origin+'/connect');await page.getByText('SYNTHETIC',{exact:true}).waitFor();await page.reload();await page.getByText('SYNTHETIC',{exact:true}).waitFor();pendingChatGpt=false;
- credentialsFailure=true;await page.goto(origin+'/connect/vault');await page.getByRole('alert').waitFor();credentialsFailure=false;await page.getByRole('button',{name:'Retry',exact:true}).click();await page.getByText('Example account',{exact:true}).waitFor();
- await page.goto(origin+'/connect/vault?add=login');await page.getByLabel('Password',{exact:true}).fill('discard-on-expiry');signedOut=true;await page.getByLabel('Name',{exact:true}).fill('Expired');await page.getByLabel('Username',{exact:true}).fill('fixture');await page.getByRole('button',{name:'Save',exact:true}).click();await page.locator('input[type="tel"]').waitFor();assert.equal(await page.locator('input[type="password"]').count(),0);
+ pendingChatGpt=true;await page.goto(origin+'/account');await page.getByText('SYNTHETIC',{exact:true}).waitFor();await page.reload();await page.getByText('SYNTHETIC',{exact:true}).waitFor();pendingChatGpt=false;
+ credentialsFailure=true;await page.goto(origin+'/account/vault');await page.getByRole('alert').waitFor();credentialsFailure=false;await page.getByRole('button',{name:'Retry',exact:true}).click();await page.getByText('Example account',{exact:true}).waitFor();
+ await page.goto(origin+'/account/vault?add=login');await page.getByLabel('Password',{exact:true}).fill('discard-on-expiry');signedOut=true;await page.getByLabel('Name',{exact:true}).fill('Expired');await page.getByLabel('Username',{exact:true}).fill('fixture');await page.getByRole('button',{name:'Save',exact:true}).click();await page.locator('input[type="tel"]').waitFor();assert.equal(await page.locator('input[type="password"]').count(),0);
  assert.deepEqual(errors,[]);await context.close();
  await writeFile(`${out}/requests.json`,JSON.stringify({requests,errors,shots},null,2));await checkpoint(`PASS: desktop/mobile light/dark; all routes; sign-in deep link; single save; cancel; search/filter; delete confirmation; callback error; pending login reload; retry; expired session clears secret. ${shots.length} screenshots. No page errors.`);
+ console.log('phone ergonomics checked: '+ergonomics.length+' views');
  console.log('PASS account workspace browser journey ('+shots.length+' screenshots)');
+ }catch(error){
+ const page=browser.contexts().flatMap(context=>context.pages()).at(-1);
+ const visible=page ? await page.locator('body').innerText().catch(()=> '') : '';
+ if(page)await page.screenshot({path:out+'/failure.png',fullPage:true}).catch(()=> {});
+ await writeFile(out+'/failure.json',JSON.stringify({error:String(error),errors,requests,visible},null,2));
+ console.error(JSON.stringify({errors,visible}));throw error;
 }finally{await browser.close();await new Promise(r=>server.close(r));}

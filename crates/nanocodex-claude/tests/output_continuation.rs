@@ -138,6 +138,7 @@ async fn partial_tool_never_executes_and_signed_content_continues() {
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = calls.clone();
         let (agent, _) = Nanocodex::builder(Claude::new(client, "test"))
+            .max_tokens(128_000)
             .tool(
                 ToolDefinition {
                     name: "effect".into(),
@@ -203,6 +204,7 @@ async fn repeated_exhaustion_is_bounded_and_last_partial_is_retained() {
         .collect();
     let (client, log, server) = fixture(responses).await;
     let (agent, _) = Nanocodex::builder(Claude::new(client, "test"))
+        .max_tokens(128_000)
         .build()
         .unwrap();
     let error = agent
@@ -237,6 +239,7 @@ async fn repeated_exhaustion_is_bounded_and_last_partial_is_retained() {
 async fn malformed_terminal_without_token_cutoff_is_still_rejected() {
     let (client, log, server) = fixture(vec![cut_tool(false, "end_turn")]).await;
     let (agent, _) = Nanocodex::builder(Claude::new(client, "test"))
+        .max_tokens(128_000)
         .build()
         .unwrap();
     let error = agent
@@ -270,6 +273,7 @@ async fn automatic_compaction_omits_old_thinking_but_retains_cutoff_and_continua
     ])
     .await;
     let (agent, _) = Nanocodex::builder(Claude::new(client, "test"))
+        .max_tokens(128_000)
         .auto_compact_window_tokens(100_000)
         .build()
         .unwrap();
@@ -379,6 +383,7 @@ async fn interleaved_cutoffs_and_tool_rounds_succeed_beyond_three_total() {
     let calls = Arc::new(AtomicUsize::new(0));
     let counter = calls.clone();
     let (agent, _) = Nanocodex::builder(Claude::new(client, "test"))
+        .max_tokens(128_000)
         .tool(effect_tool(), move |_| {
             counter.fetch_add(1, Ordering::SeqCst);
             async { Ok("receipt committed".to_string()) }
@@ -424,6 +429,7 @@ async fn four_consecutive_cutoffs_after_a_tool_round_still_fail() {
     let calls = Arc::new(AtomicUsize::new(0));
     let counter = calls.clone();
     let (agent, _) = Nanocodex::builder(Claude::new(client, "test"))
+        .max_tokens(128_000)
         .tool(effect_tool(), move |_| {
             counter.fetch_add(1, Ordering::SeqCst);
             async { Ok("receipt committed".to_string()) }
@@ -482,6 +488,7 @@ async fn cutoff_with_complete_tool_call_does_not_reset_budget() {
     let calls = Arc::new(AtomicUsize::new(0));
     let counter = calls.clone();
     let (agent, _) = Nanocodex::builder(Claude::new(client, "test"))
+        .max_tokens(128_000)
         .tool(effect_tool(), move |_| {
             counter.fetch_add(1, Ordering::SeqCst);
             async { Ok("receipt committed".to_string()) }
@@ -551,6 +558,7 @@ async fn stop_hook_continuation_after_normal_finish_resets_budget() {
     ])
     .await;
     let (agent, _) = Nanocodex::builder(Claude::new(client, "test"))
+        .max_tokens(128_000)
         .tool_hooks(Arc::new(StopOnce(Default::default())))
         .build()
         .unwrap();
@@ -590,6 +598,7 @@ async fn steering_after_normal_finish_resets_budget() {
     )
     .await;
     let (agent, _) = Nanocodex::builder(Claude::new(client, "test"))
+        .max_tokens(128_000)
         .build()
         .unwrap();
     let turn = agent.prompt("finish task").await.unwrap();
@@ -725,6 +734,7 @@ impl ClaudeExecutionPolicy for Store {
 fn durable_agent(client: ClaudeClient, store: &Arc<Store>, calls: &Arc<AtomicUsize>) -> Nanocodex {
     let counter = calls.clone();
     Nanocodex::builder(Claude::new(client, "test"))
+        .max_tokens(128_000)
         .tool(effect_tool(), move |_| {
             counter.fetch_add(1, Ordering::SeqCst);
             async { Ok("receipt committed".to_string()) }
@@ -830,4 +840,62 @@ async fn reopen_cannot_refill_consecutive_cutoff_budget() {
     }
     assert_eq!(*store.terminal.lock().unwrap(), ["fail"]);
     server.abort();
+}
+
+/// Provider refusal is an unsuccessful terminal turn, never a continuation.
+#[tokio::test]
+async fn refusal_is_terminal_without_retry_or_client_effects() {
+    for (case, blocks) in [
+        ("empty", vec![]),
+        (
+            "text",
+            vec![json!({"type":"text","text":"I cannot help with that request."})],
+        ),
+        (
+            "tool",
+            vec![
+                json!({"type":"text","text":"I cannot help with that request."}),
+                json!({"type":"tool_use","id":"refused-tool","name":"effect","input":{"value":1}}),
+            ],
+        ),
+    ] {
+        let (client, log, server) = fixture(vec![response(blocks, "refusal")]).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let (agent, _) = Nanocodex::builder(Claude::new(client, "test"))
+            .max_tokens(128_000)
+            .tool(
+                ToolDefinition {
+                    name: "effect".into(),
+                    description: "Synthetic effect".into(),
+                    input_schema: json!({"type":"object"}),
+                    strict: None,
+                    defer_loading: false,
+                },
+                move |_| {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    async { Ok("must not execute".to_string()) }
+                },
+            )
+            .build()
+            .unwrap();
+        let error = agent
+            .prompt("synthetic refusal test")
+            .await
+            .unwrap()
+            .result()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("provider refused the request"),
+            "{case}: {error}"
+        );
+        assert!(error.contains("stop_reason=refusal"), "{case}: {error}");
+        assert!(!error.contains("unsupported"), "{case}: {error}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "{case}");
+        assert_eq!(log.lock().unwrap().len(), 1, "{case}");
+        eprintln!("refusal case={case}: error={error}; provider_requests=1; client_effects=0");
+        server.abort();
+    }
 }

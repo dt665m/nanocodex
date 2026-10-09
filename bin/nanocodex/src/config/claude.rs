@@ -2,6 +2,8 @@ use super::*;
 
 mod agents;
 mod checkpoints;
+mod code_mode;
+mod computer;
 pub(crate) mod frontend;
 mod loop_frontend;
 mod permissions;
@@ -118,6 +120,8 @@ impl WorkspaceRegistry {
         session: &str,
         interaction: &Arc<interaction::Interaction>,
     ) -> std::result::Result<(), String> {
+        // Validate restored rules before publishing a model-visible tool catalog.
+        interaction.resolved_policy(session)?;
         self.policies
             .lock()
             .map_err(|_| "workspace policies poisoned")?
@@ -341,6 +345,17 @@ impl AgentArgs {
             .image_generation(false);
         if let Some(ConfiguredMcp { provider, .. }) = mcp {
             tools = tools.provider(provider);
+        }
+        if self.workspace_tools {
+            let _timing = crate::startup_timing::Stage::new("computer_discovery");
+            if let Some(computer) = crate::computer::connect_for_startup()
+                .await
+                .map_err(eyre::Report::msg)?
+            {
+                for tool in computer.tools() {
+                    tools = tools.add(tool);
+                }
+            }
         }
         let tools = tools.build()?;
         let registry = self
@@ -618,6 +633,7 @@ fn configured_claude_builder(
     );
     let profile_guard = Arc::new(agents::profiles::Guard {
         workspaces: workspaces.clone(),
+        registry: registry.as_ref().map(Arc::downgrade),
     });
     let interaction_tools = interaction.clone();
     let interaction_children = interaction.clone();
@@ -670,7 +686,6 @@ fn configured_claude_builder(
                 ),
             )
         })
-        .max_tokens(16_384)
         .parallel_tools(false)
         .tool_hooks(profile_guard.clone())
         .tool_hooks(interaction)
@@ -696,9 +711,6 @@ fn configured_claude_builder(
                     monitor_ws_origins.clone(),
                 ))
             });
-            let fork = registry
-                .as_ref()
-                .map(|registry| (parent.clone(), registry.clone()));
             let workflow = if workflows_enabled && parent.session_id() == schedule_owner {
                 registry.as_ref().map(|registry| {
                     Arc::new(workflow::Workflow::new(
@@ -711,8 +723,12 @@ fn configured_claude_builder(
                 None
             };
             let tools = if let Some(registry) = &registry {
-                nanocodex_subagents::install_tools(tools.clone(), parent, Arc::clone(registry))
-                    .map_err(|error| nanocodex::NanocodexError::InvalidRequest(error.to_string()))?
+                nanocodex_subagents::install_tools(
+                    tools.clone(),
+                    parent.clone(),
+                    Arc::clone(registry),
+                )
+                .map_err(|error| nanocodex::NanocodexError::InvalidRequest(error.to_string()))?
             } else {
                 tools.clone()
             };
@@ -721,17 +737,21 @@ fn configured_claude_builder(
                 tools,
                 registry.is_some(),
                 mcp_handle.clone(),
-                fork,
                 interaction_tools.clone(),
                 monitor,
                 workflow,
             )?;
+            if let Some(registry) = &registry {
+                native =
+                    nanocodex_subagents::install_claude_tools(native, parent, registry.clone())?;
+            }
             native = interaction::install(native, interaction_tools.clone());
             if let Some(scheduler) = owner_scheduler {
                 native = scheduler::install(native, scheduler);
             }
             Ok(native)
         });
+    builder = builder.code_only(true).tools_adapter(code_mode::wrap);
     if let Some(effort) = claude_effort(thinking) {
         builder = builder.adaptive_thinking().keep_thinking().effort(effort);
     }
@@ -851,10 +871,6 @@ fn native_tools(
     tools: Tools,
     subagents: bool,
     mcp_handle: Option<McpHandle>,
-    fork: Option<(
-        nanocodex::agent::AgentHandle,
-        Arc<nanocodex_subagents::Registry>,
-    )>,
     interaction: Arc<interaction::Interaction>,
     monitor: Option<Arc<monitor::Monitor>>,
     workflow: Option<Arc<workflow::Workflow>>,
@@ -914,12 +930,18 @@ fn native_tools(
         let bash = bash.clone();
         async move { bash.execute(input, invocation.session_id).await }
     });
+    let direct_tools = tools
+        .into_builder()
+        .exposure(nanocodex::tools::runtime::ToolExposure::DirectOnly)
+        .build()
+        .map_err(|error| nanocodex::NanocodexError::InvalidRequest(error.to_string()))?;
     let runtime = Arc::new(RetainedHost(ToolRuntime::new_with_tools(
         workspace.current(),
         None,
         None,
-        &tools,
+        &direct_tools,
     )));
+    native = computer::install(native, runtime.clone());
     if let Some(monitor) = &monitor {
         native = monitor::install(native, monitor.clone());
     }
@@ -931,13 +953,51 @@ fn native_tools(
         runtime,
         shell,
         subagents,
-        fork,
         monitor,
         workspace,
         interaction,
         workflow,
     );
     Ok(native)
+}
+
+/// Converts a host tool-result document (a base64 data URL) into a Claude
+/// `document` block with the same bounds and media checks that
+/// `nanocodex-claude` applies to prompt documents.
+fn document_block(file_data: &str) -> std::result::Result<Value, String> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    const MAX_DOCUMENT_BYTES: usize = 10 * 1024 * 1024;
+    if file_data.len() > MAX_DOCUMENT_BYTES.div_ceil(3) * 4 + 64 {
+        return Err("Claude document exceeds 10 MiB".into());
+    }
+    let (header, data) = file_data
+        .strip_prefix("data:")
+        .and_then(|value| value.split_once(','))
+        .ok_or("Claude documents require a base64 data URL")?;
+    let media_type = header
+        .strip_suffix(";base64")
+        .ok_or("Claude document data URL must use base64")?;
+    let bytes = STANDARD
+        .decode(data)
+        .map_err(|_| "invalid Claude document base64")?;
+    if bytes.is_empty() || bytes.len() > MAX_DOCUMENT_BYTES {
+        return Err("Claude document must contain 1 byte through 10 MiB".into());
+    }
+    let source = match media_type {
+        "application/pdf" if bytes.starts_with(b"%PDF-") => {
+            json!({"type":"base64","media_type":"application/pdf","data":data})
+        }
+        "application/pdf" => {
+            return Err("Claude document media type does not match its bytes".into());
+        }
+        "text/plain" => {
+            let text =
+                String::from_utf8(bytes).map_err(|_| "Claude text document must be UTF-8")?;
+            json!({"type":"text","media_type":"text/plain","data":text})
+        }
+        _ => return Err("Claude documents support application/pdf and text/plain".into()),
+    };
+    Ok(json!({"type":"document","source":source}))
 }
 
 fn output_reply(
@@ -971,6 +1031,7 @@ fn output_reply(
                         };
                         json!({"type":"image","source":source})
                     }
+                    ToolResultBlock::Document { file_data } => document_block(&file_data)?,
                     ToolResultBlock::UnsupportedMedia { media_type } => {
                         return Err(format!(
                             "host returned media unsupported by the Claude adapter: {media_type}"

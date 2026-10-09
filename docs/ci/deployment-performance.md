@@ -37,13 +37,21 @@ manually dispatchable with a standalone build. The success gate requires each
 applicable build/check job; behavioral test steps are currently paused in the
 [CI workflow](../../.github/workflows/ci.yml).
 
-The [Apple workflow](../../.github/workflows/apple-inbox.yml) currently builds the
-iPhone app for a generic simulator; Swift package tests and the simulator journey
-are paused. The retained [package runner](../../scripts/ci/apple-package-tests.sh)
-runs five packages in two bounded lanes with independent build directories and
-per-package transcripts. Each lane finishes its packages even if one fails, and
-any failure fails the runner. The retained simulator journey uses
-`build-for-testing` for its selected device.
+Apple CI (iPhone, iPad, native Mac and Swift app workflows) is removed. Build and
+test Apple targets locally through `scripts/xcodebuild-guard.sh`.
+
+Master only deploys. CI runs on pull requests, the merge queue and manual
+dispatch, never on master pushes or a schedule. Deployment never waits on CI. The production WASM build
+starts in the background as soon as Rust is installed, and its sccache server is
+started outside Turbo so the GitHub Actions cache backend stays enabled.
+
+Every WASM release build on a cache miss (CI, previews, deploys) installs the
+native `wasm-opt` matching the pinned npm `binaryen` release
+(`.github/actions/native-binaryen`). The npm package runs Binaryen compiled to
+JavaScript: its `-Oz` pass took ~100 s locally and ~130 s on CI. The native
+binary emits byte-identical output in ~16 s. `build-js-package.sh` uses
+`NANOCODEX_WASM_OPT` only when its `--version` matches the package; bump the
+action's version and checksum together with the package.
 
 ## Measurement
 

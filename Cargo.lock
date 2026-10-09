@@ -6035,6 +6035,7 @@ dependencies = [
  "nanocodex-claude-tools",
  "nanocodex-oai-api",
  "nanocodex-oai-tools",
+ "nanocodex-subagents",
  "reqwest",
  "rusqlite",
  "rustls",
@@ -6429,6 +6430,7 @@ name = "nanocodex-subagents"
 version = "0.6.7"
 dependencies = [
  "async-trait",
+ "axum",
  "futures-util",
  "js-sys",
  "jsonschema",
@@ -6436,6 +6438,8 @@ dependencies = [
  "nanocodex-claude",
  "nanocodex-oai-api",
  "nanocodex-oai-tools",
+ "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",

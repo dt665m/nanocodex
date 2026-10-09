@@ -1,3 +1,4 @@
+import { TeamSessionChooser } from "./TeamSessionChooser";
 import { ManagedAgentInspector } from "./ManagedAgentInspector";
 import { sessionQueryKey } from "./queryClient";
 import type { BrowserSession } from "./sessionQueries";
@@ -16,7 +17,7 @@ import {
 import type { AgentControllerEvent } from "nanocodex-react/agent";
 import { AccountChooser } from "nanocodex-connect-ui/AccountChooser";
 import { Link, useNavigate } from "react-router";
-import { Moon, PanelLeft, Share2, SquarePen, Sun } from "lucide-react";
+import { Ellipsis, Moon, PanelLeft, ScanSearch, Share2, SquarePen, Sun, Users } from "lucide-react";
 import type { AgentStatus, AgentTerminalMode, AgentTerminalState } from "./agentTerminalTypes";
 import { AgentTerminal, ManagedAgentTerminal } from "./AgentTerminal";
 import { TerminalComposer, TerminalTranscriptSurface } from "nanocodex-terminal";
@@ -66,7 +67,9 @@ export const AgentExperience = memo(function AgentExperience({
 }) {
   const navigate = useNavigate();
   const [inspectorOpen, setInspectorOpen] = useState(false);
+  const [headerMenuOpen, setHeaderMenuOpen] = useState(false);
   const [shareOpen, setShareOpen] = useState(false);
+  const [teamChooserOpen, setTeamChooserOpen] = useState(false);
   const [ephemeralThreadId, setEphemeralThreadId] = useState(() => crypto.randomUUID());
   const account = useAccountSession();
   const capabilityError = useMemo(() => browserAgentCapabilityError(), []);
@@ -100,6 +103,10 @@ export const AgentExperience = memo(function AgentExperience({
     && hasDurableCredential && authStatus?.state === "ready";
   const queryClient = useQueryClient();
   const accountId = account.account?.id;
+  const scopeQuery = useQuery({
+    ...managedConversationQueryOptions(accountId ?? "", managedConversationId ?? ""),
+    enabled: !landing && !!accountId && !!managedConversationId && !managedConversationId.startsWith("pending:"),
+  });
   const conversationsQuery = useQuery({
     ...managedConversationsQueryOptions(accountId ?? ""),
     refetchInterval: 10_000,
@@ -142,6 +149,7 @@ export const AgentExperience = memo(function AgentExperience({
     selectionRef.current = undefined;
     creatingRef.current = undefined;
     setCreatePending(false);
+    setTeamChooserOpen(false);
     setOptimisticConversation(undefined);
     setPendingDraft("");
     setManagedConversationId(undefined);
@@ -167,9 +175,11 @@ export const AgentExperience = memo(function AgentExperience({
     const refresh = refreshManagedList.current;
     refreshManagedList.current = false;
     if (agentId) {
+      // The route is authoritative: open the requested thread immediately
+      // instead of blanking the workspace until the list round-trip resolves.
+      if (selectionRef.current !== agentId) setRuntimeState(undefined);
       selectionRef.current = agentId;
-      setManagedConversationId((current) => current === agentId ? current : undefined);
-      setRuntimeState(undefined);
+      setManagedConversationId(agentId);
     }
     setManagedError(undefined);
     void loadManagedConversationSelection({
@@ -238,13 +248,14 @@ export const AgentExperience = memo(function AgentExperience({
     setRuntimeState(undefined);
     onAgentChange?.(id);
   }, [account.account, onAgentChange, visibleManagedConversationId]);
-  const createConversation = useCallback(() => {
+  const createConversation = useCallback((teamId?: string) => {
+    setTeamChooserOpen(false);
     setShareOpen(false);
     if (creatingRef.current || !canCreateManaged || !account.account) return;
     const accountId = account.account.id;
     const previousId = selectionRef.current;
     const routeAtCreation = routeAgentIdRef.current;
-    const { provisional, receipt } = beginManagedConversationCreation(accountId);
+    const { provisional, receipt } = beginManagedConversationCreation(accountId, teamId);
     ++selectionIntent.current;
     selectionRef.current = provisional.id;
     creatingRef.current = { id: provisional.id, accountId, routeAgentId: routeAtCreation };
@@ -306,12 +317,13 @@ export const AgentExperience = memo(function AgentExperience({
   }, [refreshModelSession]);
 
   const newChat = () => {
+    setTeamChooserOpen(false);
     closeSidebar();
     if (landing) {
       setRuntimeState(undefined);
       setEphemeralThreadId(crypto.randomUUID());
     } else if (canCreateManaged) createConversation();
-    else if (!sessionChecking) void navigate("/connect");
+    else if (!sessionChecking) void navigate("/account");
   };
   const selectedConversation = managedConversations.find(({ id }) => id === visibleManagedConversationId);
   const title = landing ? "New chat" : selectedConversation
@@ -329,16 +341,22 @@ export const AgentExperience = memo(function AgentExperience({
       <div className="conversation-main">
         <header className="agent-chat-header">
           <button ref={sidebarTriggerRef} className="agent-sidebar-toggle chat-icon-button" type="button" onClick={() => { if (window.matchMedia("(min-width: 761px)").matches) toggleDesktopSidebar(); else setRailOpen(true); }} aria-label="Open sidebar" aria-expanded={railOpen} aria-controls="agent-navigation"><PanelLeft aria-hidden="true" /></button>
-          <div className="agent-chat-heading"><strong>{landing ? "Nanocodex" : title}</strong></div>
+          <div className="agent-chat-heading"><strong>{landing ? "Nanocodex" : title}</strong>{!landing && <span className="agent-scope">{scopeQuery.data?.scope?.type === "team" ? `Team session · ${scopeQuery.data.scope.team_id}` : scopeQuery.isError ? "Scope unavailable" : scopeQuery.data ? "Private session" : "Loading scope…"}</span>}</div>
           <div className="agent-chat-header-actions">
             {!landing ? <button className="chat-running-agents" type="button" aria-label="Running agents" title="Show running agents" onClick={() => { setRunningOnly(true); setRailOpen(true); if (window.matchMedia("(min-width: 761px)").matches) setSidebarCollapsed(false); }}><span className="chat-running-dot" aria-hidden="true" />{runningCount}<span className="agent-terminal-sr-only"> running agents</span></button> : null}
-            {!landing && visibleManagedConversationId && !visibleManagedConversationId.startsWith("pending:") ? <button className="chat-icon-button" type="button" aria-label="Share thread" title="Share thread" onClick={() => setShareOpen(true)}><Share2 aria-hidden="true" /></button> : null}
-            {managedConversationId && <button type="button" onClick={() => setInspectorOpen(open => !open)} aria-expanded={inspectorOpen}>Inspect</button>}
+            <div className={`agent-chat-secondary${headerMenuOpen ? " is-open" : ""}`} id="agent-chat-secondary" onClick={event => { if ((event.target as HTMLElement).closest("button")) setHeaderMenuOpen(false); }}>
+              {!landing && canCreateManaged && <button className="chat-icon-button" type="button" disabled={createPending} onClick={() => setTeamChooserOpen(true)} aria-label="New team session" title="New team session"><Users aria-hidden="true" /><span>New team session</span></button>}
+              {!landing && !!visibleManagedConversationId && !visibleManagedConversationId.startsWith("pending:") ? <button className="chat-icon-button" type="button" aria-label="Share thread" title="Share thread" onClick={() => setShareOpen(true)}><Share2 aria-hidden="true" /><span>Share thread</span></button> : null}
+              {managedConversationId && <button className="chat-icon-button" type="button" onClick={() => setInspectorOpen(open => !open)} aria-expanded={inspectorOpen} aria-label="Inspect agent" title="Inspect agent"><ScanSearch aria-hidden="true" /><span>Inspect</span></button>}
+              <button className="chat-icon-button" type="button" onClick={() => onThemeChange(theme === "light" ? "dark" : "light")} aria-label={`Use ${theme === "light" ? "dark" : "light"} appearance`} title={`Use ${theme === "light" ? "dark" : "light"} appearance`}>{theme === "light" ? <Moon aria-hidden="true" /> : <Sun aria-hidden="true" />}<span>{theme === "light" ? "Dark appearance" : "Light appearance"}</span></button>
+            </div>
+            {headerMenuOpen && <div className="agent-chat-menu-backdrop" aria-hidden="true" onClick={() => setHeaderMenuOpen(false)} />}
+            <button className="chat-icon-button agent-chat-more" type="button" aria-label="More actions" aria-expanded={headerMenuOpen} aria-controls="agent-chat-secondary" onClick={() => setHeaderMenuOpen(open => !open)}><Ellipsis aria-hidden="true" /></button>
             {agentStatus === "starting" || agentStatus === "error" ? <span className={`agent-chat-status is-${agentStatus}`} role="status"><i aria-hidden="true" />{agentStatus === "starting" ? "Connecting…" : "Needs attention"}</span> : null}
-            <button className="chat-icon-button" type="button" onClick={() => onThemeChange(theme === "light" ? "dark" : "light")} aria-label={`Use ${theme === "light" ? "dark" : "light"} appearance`} title={`Use ${theme === "light" ? "dark" : "light"} appearance`}>{theme === "light" ? <Moon aria-hidden="true" /> : <Sun aria-hidden="true" />}</button>
             <button className="chat-icon-button" type="button" disabled={createPending || (!landing && sessionChecking)} onClick={newChat} aria-label={landing ? "New chat" : "New agent"} title={landing ? "New chat" : "New agent"}><SquarePen aria-hidden="true" /></button>
           </div>
         </header>
+        {teamChooserOpen && <TeamSessionChooser key={accountId} onCreate={createConversation} onClose={() => setTeamChooserOpen(false)} />}
         {shareOpen && visibleManagedConversationId && !visibleManagedConversationId.startsWith("pending:") ? <ThreadShareDialog key={visibleManagedConversationId} agentId={visibleManagedConversationId} onClose={() => setShareOpen(false)} /> : null}
         {inspectorOpen && managedConversationId && <ManagedAgentInspector key={`${account.account?.id}:${managedConversationId}`} agentId={managedConversationId} onClose={() => setInspectorOpen(false)} />}
         {LOCAL_SPONSORED_TRIAL_RESET && showHomepageTrialReset ? (
@@ -385,7 +403,7 @@ export const AgentExperience = memo(function AgentExperience({
                 : <ReservedTerminal message={inactiveMessage} mode={mode}
                   welcome={sessionChecking ? undefined : "# What should we work on?"}
                   composer={sessionChecking ? <p className="agent-connection-loading" role="status">Opening your workspace…</p>
-                    : !hasDurableCredential ? <div className="agent-connect-prompt"><Link to="/connect">Connect your account</Link><span>Connect a model account to start a durable agent.</span></div> : null}
+                    : !hasDurableCredential ? <div className="agent-connect-prompt"><Link to="/account">Connect your account</Link><span>Connect a model account to start a durable agent.</span></div> : null}
                 />}
         <p className="agent-chat-footnote">{landing ? "Chats here are temporary. Use Agents to keep your work across sessions." : "Your agent keeps working when you leave. Come back anytime."}</p>
       </div>
@@ -440,7 +458,7 @@ function HomepageTrialActions() {
     </div>
     <nav aria-label="Continue after free prompts">
       {funding.checkoutUrl ? <a href={funding.checkoutUrl} target="_blank" rel="noopener noreferrer">Open Stripe checkout</a> : null}
-      <Link to="/connect">Connect</Link>
+      <Link to="/account">Connect</Link>
       <button
         disabled={funding.loading || !funding.available || funding.operation !== null}
         onClick={funding.fund}

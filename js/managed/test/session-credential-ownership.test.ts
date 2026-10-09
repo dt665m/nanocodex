@@ -55,10 +55,8 @@ describe("Session-owned credential authority", () => {
         const scoped = scopedManagedModelEgress(binding, storageId, subject, undefined, pin);
         await scoped.fetch("https://nanocodex.internal/v1/responses", { headers: {
           "x-nanocodex-subject": storageId, "x-nanocodex-chatgpt-account-id": "spoofed",
-          "x-nanocodex-placement-colo": "NRT",
         } });
         expect(received[0]!.headers.get("x-nanocodex-chatgpt-account-id")).toBe(pin ?? null);
-        expect(received[0]!.headers.has("x-nanocodex-placement-colo")).toBe(false);
         expect(received[0]!.headers.get("x-nanocodex-subject")).toBe(subject);
       }
     }
@@ -159,6 +157,8 @@ describe("Session-owned credential authority", () => {
           NANOCODEX_SESSIONS: DurableObjectNamespace<DurableAgentSession>;
         }).NANOCODEX_SESSIONS;
         const stub = sessions.getByName(crypto.randomUUID());
+        // Admission, rather than fresh construction, now creates the schema.
+        await (await stub.fetch(new Request("https://session.internal/__initialize"))).body?.cancel();
         await runInDurableObject(stub, async (_session, state) => {
           state.storage.sql.exec(`INSERT INTO session_state (
             singleton, session_id, owner_id, organization_id, team_id,

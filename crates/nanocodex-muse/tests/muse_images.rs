@@ -216,7 +216,7 @@ async fn muse_image_unauthorized_recovers_once_and_bounds_the_retry() -> Result<
         let endpoint = format!("http://{}/v1", listener.local_addr()?);
         let server = tokio::spawn(async move {
             let (stream, _, _, _) = request(&listener).await?;
-            response(stream, "generation", vec![json!({"type":"function_call","call_id":"auth-gen","name":"image_gen__imagegen","arguments":"{\"prompt\":\"paint a square\"}"})], 12).await?;
+            response(stream, "generation", vec![json!({"type":"function_call","call_id":"auth-gen","name":"exec","arguments":json!({"input":"try { const result = await tools.image_gen__imagegen({prompt:'paint a square'}); generatedImage(result); } catch (error) { text(error); }"}).to_string()})], 12).await?;
             let mut previous = None;
             for key in ["old-synthetic-key", "new-synthetic-key"] {
                 let (stream, path, headers, body) = request(&listener).await?;
@@ -252,7 +252,7 @@ async fn muse_image_unauthorized_recovers_once_and_bounds_the_retry() -> Result<
             assert_eq!(path, "/v1/responses");
             let output = receipt(&body, "auth-gen");
             if rejected_twice {
-                assert!(output.as_str().unwrap().contains("401"));
+                assert!(output.to_string().contains("401"), "{output}");
             } else {
                 assert_eq!(image_part(output)["image_url"], data_url("png", &png));
             }
@@ -261,7 +261,7 @@ async fn muse_image_unauthorized_recovers_once_and_bounds_the_retry() -> Result<
         });
         let (agent, _) = Nanocodex::builder(Muse::builder(auth).api_base_url(endpoint).build()?)
             .workspace(workspace.path())
-            .tools(tools(true, ToolExposure::DirectOnly)?)
+            .tools(tools(true, ToolExposure::CodeModeOnly)?)
             .build()?;
         let result = turn(&agent, "Generate an image.").await;
         agent.shutdown().await?;
@@ -310,7 +310,7 @@ async fn muse_edits_accept_local_remote_and_uploaded_references() -> Result<()> 
         let endpoint = format!("http://{}/v1", listener.local_addr()?);
         let server = tokio::spawn(async move {
             let (stream, _, _, _) = request(&listener).await?;
-            response(stream, "edit", vec![json!({"type":"function_call","call_id":"edit-ref","name":"image_gen__imagegen","arguments":args.to_string()})], 12).await?;
+            response(stream, "edit", vec![json!({"type":"function_call","call_id":"edit-ref","name":"exec","arguments":json!({"input":format!("try {{ const result = await tools.image_gen__imagegen({args}); generatedImage(result); }} catch (error) {{ text(error); }}")}).to_string()})], 12).await?;
             let (stream, path, _, body) = request(&listener).await?;
             assert_eq!(path, "/v1/responses");
             assert_eq!(body, image_request("add a circle", vec![reference]));
@@ -335,7 +335,7 @@ async fn muse_edits_accept_local_remote_and_uploaded_references() -> Result<()> 
                 .build()?,
         )
         .workspace(workspace.path())
-        .tools(tools(true, ToolExposure::DirectOnly)?)
+        .tools(tools(true, ToolExposure::CodeModeOnly)?)
         .build()?;
         let result = turn(&agent, prompt).await;
         agent.shutdown().await?;
@@ -354,7 +354,7 @@ async fn muse_image_failures_return_text_without_creating_artifacts() -> Result<
         let server = tokio::spawn(async move {
             let (stream, _, _, _) = request(&listener).await?;
             let args = json!({"prompt":"paint a square","transparent_background":transparent});
-            response(stream, "generation", vec![json!({"type":"function_call","call_id":"failed-gen","name":"image_gen__imagegen","arguments":args.to_string()})], 12).await?;
+            response(stream, "generation", vec![json!({"type":"function_call","call_id":"failed-gen","name":"exec","arguments":json!({"input":format!("try {{ const result = await tools.image_gen__imagegen({args}); generatedImage(result); }} catch (error) {{ text(error); }}")}).to_string()})], 12).await?;
             if !transparent {
                 let (stream, path, _, _) = request(&listener).await?;
                 assert_eq!(path, "/v1/responses");
@@ -368,8 +368,11 @@ async fn muse_image_failures_return_text_without_creating_artifacts() -> Result<
             }
             let (stream, path, _, body) = request(&listener).await?;
             assert_eq!(path, "/v1/responses");
-            let error = receipt(&body, "failed-gen").as_str().unwrap();
-            assert!(error.contains(if transparent { "opaque" } else { "400" }));
+            let error = receipt(&body, "failed-gen").to_string();
+            assert!(
+                error.contains(if transparent { "opaque" } else { "400" }),
+                "{error}"
+            );
             response(stream, "done", vec![answer("Image unavailable.")], 12).await?;
             Result::<()>::Ok(())
         });
@@ -379,7 +382,7 @@ async fn muse_image_failures_return_text_without_creating_artifacts() -> Result<
                 .build()?,
         )
         .workspace(workspace.path())
-        .tools(tools(true, ToolExposure::DirectOnly)?)
+        .tools(tools(true, ToolExposure::CodeModeOnly)?)
         .build()?;
         let result = turn(&agent, "Generate an image.").await;
         agent.shutdown().await?;
@@ -442,7 +445,7 @@ async fn muse_image_inputs_match_the_documented_responses_payload_and_survive_re
         .build()?;
     let (agent, _) = Nanocodex::builder(provider)
         .workspace(workspace.path())
-        .tools(tools(false, ToolExposure::DirectOnly)?)
+        .tools(tools(false, ToolExposure::CodeModeOnly)?)
         .build()?;
     let prompt = Prompt::content([
         UserInput::Text {
@@ -477,7 +480,7 @@ async fn muse_image_inputs_match_the_documented_responses_payload_and_survive_re
         .build()?;
     let (resumed, _) = Nanocodex::builder(provider)
         .resume(snapshot)
-        .tools(tools(false, ToolExposure::DirectOnly)?)
+        .tools(tools(false, ToolExposure::CodeModeOnly)?)
         .build()?;
     assert_eq!(
         turn(&resumed, "Describe the images again").await?,
@@ -490,12 +493,9 @@ async fn muse_image_inputs_match_the_documented_responses_payload_and_survive_re
 
 #[tokio::test]
 async fn spark_generates_inspects_compacts_and_edits_muse_images() -> Result<()> {
-    for exposure in [ToolExposure::DirectOnly, ToolExposure::CodeModeOnly] {
-        generation_journey(exposure).await?;
-    }
-    Ok(())
+    generation_journey().await
 }
-async fn generation_journey(exposure: ToolExposure) -> Result<()> {
+async fn generation_journey() -> Result<()> {
     let workspace = tempfile::tempdir()?;
     let png = image(ImageFormat::Png);
     let webp = image(ImageFormat::WebP);
@@ -503,7 +503,6 @@ async fn generation_journey(exposure: ToolExposure) -> Result<()> {
     let expected_webp = data_url("webp", &webp);
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = format!("http://{}/v1", listener.local_addr()?);
-    let direct = exposure == ToolExposure::DirectOnly;
     let server = tokio::spawn(async move {
         let (stream, path, _, body) = request(&listener).await?;
         assert_eq!(path, "/v1/responses");
@@ -513,21 +512,13 @@ async fn generation_journey(exposure: ToolExposure) -> Result<()> {
             .unwrap()
             .iter()
             .find(|tool| {
-                tool["name"].as_str().is_some_and(|name| {
-                    if direct {
-                        name.ends_with("imagegen")
-                    } else {
-                        name == "exec" || name.ends_with("__exec")
-                    }
-                })
+                tool["name"]
+                    .as_str()
+                    .is_some_and(|name| name == "exec" || name.ends_with("__exec"))
             })
             .unwrap()["name"]
             .clone();
-        let args = if direct {
-            json!({"prompt":"paint a red and blue square"})
-        } else {
-            json!({"input":"const result = await tools.image_gen__imagegen({prompt: 'paint a red and blue square'}); generatedImage(result);"})
-        };
+        let args = json!({"input":"const result = await tools.image_gen__imagegen({prompt: 'paint a red and blue square'}); generatedImage(result);"});
         response(stream, "call-generation", vec![json!({"type":"function_call","call_id":"gen-fixture","name":name,"arguments":args.to_string()})], 9_000).await?;
         let (stream, path, headers, body) = request(&listener).await?;
         assert_eq!(path, "/v1/responses");
@@ -558,14 +549,10 @@ async fn generation_journey(exposure: ToolExposure) -> Result<()> {
         let generated = receipt(&body, "gen-fixture");
         assert_eq!(image_part(generated)["image_url"], expected_png);
         assert!(body.to_string().contains("muse_context_summary"));
-        let args = if direct {
-            json!({"prompt":"add a white circle","num_last_images_to_include":1})
-        } else {
-            json!({"input":"const result = await tools.image_gen__imagegen({prompt: 'add a white circle', num_last_images_to_include: 1}); generatedImage(result);"})
-        };
+        let args = json!({"input":"const result = await tools.image_gen__imagegen({prompt: 'add a white circle', num_last_images_to_include: 1}); generatedImage(result);"});
         response(stream, "call-edit", vec![json!({"type":"function_call","call_id":"edit-fixture","name":name,"arguments":args.to_string()})], 12).await?;
         let (stream, path, _, body) = request(&listener).await?;
-        assert_eq!(path, "/v1/responses", "direct={direct}");
+        assert_eq!(path, "/v1/responses");
         assert_eq!(
             body,
             image_request(
@@ -602,7 +589,7 @@ async fn generation_journey(exposure: ToolExposure) -> Result<()> {
         .build()?;
     let (agent, _) = Nanocodex::builder(provider)
         .workspace(workspace.path())
-        .tools(tools(true, exposure)?)
+        .tools(tools(true, ToolExposure::CodeModeOnly)?)
         .build()?;
     let result = turn(
         &agent,
@@ -659,23 +646,26 @@ for await (const line of lines) {{
     let endpoint = format!("http://{}/v1", listener.local_addr()?);
     let server = tokio::spawn(async move {
         let (stream, _, _, _) = request(&listener).await?;
-        response(stream, "search", vec![json!({"type":"function_call","call_id":"search-fixture","name":"tool_search","arguments":"{\"query\":\"red blue screenshot\",\"limit\":1}"})], 12).await?;
+        let search = json!({"input":"text(await tools.tool_search({query:'red blue screenshot',limit:1}));"});
+        response(stream, "search", vec![json!({"type":"function_call","call_id":"search-fixture","name":"exec","arguments":search.to_string()})], 12).await?;
         let (stream, _, _, body) = request(&listener).await?;
-        let name = body["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|tool| {
-                tool["name"]
-                    .as_str()
-                    .is_some_and(|name| name.starts_with("mcp__") && name.ends_with("screenshot"))
-            })
-            .unwrap()["name"]
-            .clone();
-        response(stream, "capture", vec![json!({"type":"function_call","call_id":"screenshot-fixture","name":name,"arguments":"{}"})], 12).await?;
+        assert!(
+            receipt(&body, "search-fixture")
+                .to_string()
+                .contains("mcp__screenshot__")
+        );
+        let capture = json!({"input":"const result = await tools.mcp__screenshot__screenshot({}); text(result.content[0].text); image(result.content[1]);"});
+        response(stream, "capture", vec![json!({"type":"function_call","call_id":"screenshot-fixture","name":"exec","arguments":capture.to_string()})], 12).await?;
         let (stream, _, _, body) = request(&listener).await?;
         let parts = receipt(&body, "screenshot-fixture");
-        assert_eq!(parts[0], json!({"type":"input_text","text":"Screenshot:"}));
+        assert!(
+            parts
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|part| part == &json!({"type":"input_text","text":"Screenshot:"})),
+            "{parts}"
+        );
         assert_eq!(
             image_part(parts),
             &json!({"type":"input_image","image_url":data_url("png", &png)})
@@ -692,7 +682,7 @@ for await (const line of lines) {{
     let tools = Tools::builder()
         .without_defaults()
         .provider(mcp)
-        .exposure(ToolExposure::DirectAndCodeMode)
+        .exposure(ToolExposure::CodeModeOnly)
         .build()?;
     let provider = Muse::builder("synthetic-key")
         .api_base_url(endpoint)
