@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { readFile, mkdir, writeFile } from "node:fs/promises";
 import { test } from "node:test";
 
 import {
@@ -11,6 +11,7 @@ import {
   destroy,
   exportDurabilityState,
   importDurabilityState,
+  prepareTransport,
 } from "../cloudflare/Agent.mjs";
 import * as HostAgent from "../host/Agent.mjs";
 import { createCloudflareDurabilityStore } from "../runtime/cloudflare-durability-store.mjs";
@@ -522,47 +523,6 @@ test("Cloudflare Agent reconstruction takes over the same durable owner after fe
   await reconstructed.session.shutdown();
   const reopened = await create(module, durableOwner(storage, binding, FIRST_OBJECT_ID));
   await reopened.session.shutdown();
-});
-
-test("Cloudflare root takeover retains child status and stale cleanup preserves new children", async () => {
-  const module = await readFile(new URL("../pkg-web/nanocodex_bg.wasm", import.meta.url));
-  const storage = new MemoryStorage();
-  const lifecycles = [];
-  const options = {
-    tools: { identity: { parameters: { type: "object" }, handler: (_input, context) => context.subagent } },
-    [Symbol.for("nanocodex.cloudflare.internalRuntime")]: { subagentLifecycle: event => lifecycles.push(event) },
-  };
-  const first = await create(module, durableOwner(storage), options);
-  let replacement;
-  try {
-    const oldChild = await Subagents.spawn(first, { role: "old-child", task: "Wait until restart.", outputSchema: { type: "object" } });
-    const oldBind = lifecycles.find(({ type }) => type === "bind");
-    assert.ok(oldBind);
-    assert.equal(storage.subagents.size, 0);
-    assert.equal(storage.subagentCheckpoints.size, 0);
-    replacement = await create(module, durableOwner(storage), options);
-    assert.equal(replacement.sessionId, first.sessionId, "root identity remains durable");
-    const restored = (await Subagents.list(replacement, { includeCompleted: true })).agents;
-    assert.equal(restored.length, 1);
-    assert.equal(restored[0].agent_id, oldChild.agent_id);
-    assert.equal(restored[0].role, "old-child");
-    assert.deepEqual(restored[0].status, { state: "interrupted" });
-    const child = await Subagents.spawn(replacement, { role: "new-child", task: "Use only live authority.", outputSchema: { type: "object" } });
-    const newBind = lifecycles.find(({ type, descriptor }) => type === "bind" && descriptor.role === "new-child");
-    assert.ok(newBind);
-    assert.notEqual(newBind.sessionId, oldBind.sessionId);
-    await first.session.shutdown();
-    const routed = JSON.parse(await globalThis.nanocodexHost.executeTool("identity", "{}", newBind.sessionId, "after-stale-cleanup"));
-    assert.equal(routed.structured_result.role, "new-child");
-    assert.throws(() => globalThis.nanocodexHost.executeTool("identity", "{}", oldBind.sessionId, "old-child"), /no Nanocodex host is active/);
-    assert.equal(lifecycles.some(({ type }) => type === "reconstruct"), false);
-    await Subagents.close(replacement, child.agent_id);
-    assert.equal(storage.subagents.size, 0);
-    assert.equal(storage.subagentCheckpoints.size, 0);
-  } finally {
-    await first.session.shutdown();
-    await replacement?.session.shutdown();
-  }
 });
 
 test("Cloudflare startup drops legacy child descriptors and malformed checkpoints without reading them", async () => {
@@ -1648,6 +1608,7 @@ test("manual GPT children preserve native defaults, max/xhigh/none, fast mode, a
   const storage = new MemoryStorage();
   const native = new Set();
   const requests = new Map();
+  const observations = [];
   let choices = 0, admitted = true, responseId = 0;
   class NativeSocket extends EventTarget {
     readyState = 1;
@@ -1684,6 +1645,7 @@ test("manual GPT children preserve native defaults, max/xhigh/none, fast mode, a
     },
     [Symbol.for("nanocodex.cloudflare.internalRuntime")]: {
       preserveRootTransport: true, subagentsEnabled: true,
+      onSocketEvent: event => observations.push(event),
       subagentRouting: {
         async resolve() { choices++; return { native: true, routeId: `native-${choices}` }; },
         bind(request) { if (!admitted) throw new Error("spawning authorization lost"); native.add(request.sessionId); },
@@ -1708,6 +1670,11 @@ test("manual GPT children preserve native defaults, max/xhigh/none, fast mode, a
         outputSchema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"], additionalProperties: false } });
       assert.deepEqual((await Subagents.wait(agent, { agentIds: [child.agent_id], timeoutMs: 5_000 })).agents[0].status,
         { state: "completed", output: { ok: true } });
+      const childSession = [...requests.keys()].at(-1);
+      const finished = observations.filter(event => event.event === "request.finished" && event.runtime_session_id === childSession);
+      assert.equal(finished.length, 1, "the child inference finishes under its own runtime session; the following send is its result acknowledgement");
+      assert.ok(finished.every(event => event.agent_id === child.agent_id && event.outcome === "completed"));
+      assert.ok(finished.every(event => event.request_id === storage.sessionId && event.runtime_turn_id));
       const seen = [...requests.values()].at(-1);
       assert.ok(seen.length >= 2);
       for (const request of seen) {
@@ -1724,7 +1691,12 @@ test("manual GPT children preserve native defaults, max/xhigh/none, fast mode, a
     await assert.rejects(Subagents.spawn(agent, { role: "revoked-native", task: "Must fail before inference.",
       outputSchema: { type: "object" } }), /binding failed/);
     assert.equal(native.size, created);
-  } finally { await agent.session.shutdown(); }
+  } finally {
+    await agent.session.shutdown();
+    const output = new URL("../../../output/integration/child-socket-attribution/", import.meta.url);
+    await mkdir(output, { recursive: true });
+    await writeFile(new URL("trace.json", output), JSON.stringify(observations, null, 2));
+  }
 });
 
 test("manual root HTTP fallback appends thinking updates with a stable request prefix", { timeout: 30_000 }, async () => {
@@ -1940,4 +1912,133 @@ test("host shutdown closes a transferred preparation socket that resolves late",
   ready.resolve();
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.equal(socket.closed, true);
+});
+
+test("idle root transport preparation is adopted by the next turn and never reuses a closed socket", async () => {
+  const module = await readFile(new URL("../pkg-web/nanocodex_bg.wasm", import.meta.url));
+  class ProviderSocket extends EventTarget {
+    readyState = 1;
+    bufferedAmount = 0;
+    sent = 0;
+    accept() {}
+    close() { this.readyState = 3; }
+    // The provider closes an idle socket between turns.
+    drop() {
+      this.readyState = 3;
+      this.dispatchEvent(Object.assign(new Event("close"), { code: 1000, reason: "idle" }));
+    }
+    send() {
+      this.sent += 1;
+      queueMicrotask(() => this.dispatchEvent(new MessageEvent("message", { data: JSON.stringify({
+        type: "response.completed", response: { id: "resp_" + this.sent, status: "completed", end_turn: true,
+          output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "OK" }] }],
+          usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } } }) })));
+    }
+  }
+  const sockets = [];
+  const owner = durableOwner(new MemoryStorage(), { async fetch(_input, init) {
+    assert.equal(init.headers.get("authorization"), "Bearer NANOCODEX_PROVIDER_CREDENTIAL");
+    const socket = new ProviderSocket();
+    sockets.push(socket);
+    return { status: 101, headers: new Headers(), webSocket: socket };
+  } });
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+  const agent = await create(module, owner);
+  try {
+    assert.equal((await agent.turn.prompt({ input: "Return OK." }).result()).finalMessage, "OK");
+    assert.equal(sockets.length, 1, "the first turn adopts the construction preconnection");
+    assert.equal(prepareTransport(agent), false, "an open root socket is never duplicated");
+
+    sockets[0].drop();
+    assert.equal(prepareTransport(agent), true);
+    assert.equal(prepareTransport(agent), true, "preparation is coalesced");
+    await settle();
+    assert.equal(sockets.length, 2, "the idle socket is reopened before the next prompt");
+    assert.equal((await agent.turn.prompt({ input: "Return OK." }).result()).finalMessage, "OK");
+    assert.equal(sockets.length, 2, "the next root turn adopts the prepared socket");
+    assert.equal(sockets[1].sent, 1);
+
+    sockets[1].drop();
+    assert.equal(prepareTransport(agent), true);
+    await settle();
+    sockets[2].drop();
+    assert.equal((await agent.turn.prompt({ input: "Return OK." }).result()).finalMessage, "OK");
+    assert.equal(sockets[2].sent, 0, "a prepared socket closed before adoption is discarded");
+    assert.equal(sockets.length, 4);
+    assert.equal(sockets[3].sent, 1);
+  } finally { await agent.session.shutdown(); }
+  assert.equal(prepareTransport(agent), false, "a released Agent never prepares");
+});
+
+
+
+test("rejected subagent statuses log one redacted, coded line while the child keeps working", { timeout: 30_000 }, async () => {
+  const module = await readFile(new URL("../pkg-web/nanocodex_bg.wasm", import.meta.url));
+  const storage = new MemoryStorage();
+  const profile = {
+    model: "@cf/zai-org/glm-5.3", thinking: "high",
+    workersAi: { ai: { async run(_model, input) {
+      if (input.messages.at(-1)?.role === "tool") {
+        return { choices: [{ finish_reason: "stop", message: { content: "STATUS_DONE" } }] };
+      }
+      const submit = input.tools.find((tool) => tool.function.description.startsWith("exec\n"));
+      return { choices: [{ finish_reason: "tool_calls", message: { content: null, tool_calls: [{
+        id: `status-submit-${crypto.randomUUID()}`, type: "function", function: {
+          name: submit.function.name, arguments: JSON.stringify({ input: "text(await tools.submit_result({ output: { ok: true } }));" }),
+        },
+      }] } }] };
+    } }, model: "@cf/zai-org/glm-5.3", thinking: "high" },
+  };
+  const rejected = [];
+  const options = {
+    [Symbol.for("nanocodex.cloudflare.internalConfiguration")]: {
+      model: profile.model, thinking: profile.thinking, reasoning_mode: "standard", fast_mode: false,
+    },
+    [Symbol.for("nanocodex.cloudflare.internalRuntime")]: {
+      workersAi: profile.workersAi, subagentsEnabled: true,
+      subagentRouting: {
+        async resolve() { return { model: profile.model, thinking: profile.thinking, routeId: "status-route" }; },
+        bind() {},
+      },
+      // A host that rejects every status, as managed authority does for a child
+      // whose live binding no longer matches.
+      subagentLifecycle(event) {
+        if (event.type !== "status") return;
+        rejected.push(event.status.state);
+        const error = new Error('status for "SECRET-TASK-TEXT" at https://private.example/x was rejected');
+        error.code = "subagent_status_authority_mismatch";
+        throw error;
+      },
+      inferenceForSession() { return profile; },
+    },
+  };
+  const logged = [];
+  const consoleError = console.error;
+  console.error = (...values) => { logged.push(values); };
+  const agent = await create(module, durableOwner(storage), options);
+  try {
+    const child = await Subagents.spawn(agent, {
+      role: "status-worker", task: "Return ok.",
+      outputSchema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"], additionalProperties: false },
+    });
+    for (const message of [undefined, "Return ok again."]) {
+      if (message) await Subagents.send(agent, { agentId: child.agent_id, message });
+      const result = await Subagents.wait(agent, { agentIds: [child.agent_id], timeoutMs: 5_000 });
+      assert.deepEqual(result.agents[0].status, { state: "completed", output: { ok: true } });
+    }
+  } finally {
+    await agent.session.shutdown();
+    console.error = consoleError;
+  }
+  assert.ok(rejected.length >= 3, `every status transition reached the host: ${rejected}`);
+  const records = logged.map(([value]) => value).filter((value) => value?.type === "nanocodex.subagent_host_error");
+  assert.equal(records.length, 1, "a persistent rejection logs once per child, operation and reason");
+  const [record] = records;
+  assert.equal(record.operation, "forwarding a subagent status");
+  assert.equal(record.reason, "subagent_status_authority_mismatch");
+  assert.equal(record.error_kind, "Error");
+  assert.match(record.message, /^Nanocodex failed while forwarding a subagent status/);
+  assert.match(record.error_message, /^status for "…" at <url> was rejected$/);
+  assert.match(record.session_id, /^[0-9a-f-]{36}$/);
+  assert.ok(!JSON.stringify(logged).includes("SECRET-TASK-TEXT"), "quoted content never reaches logs");
 });

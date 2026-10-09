@@ -24,6 +24,7 @@ use ratatui::{
 use serde::Deserialize;
 use serde_json::Value;
 
+use super::ToolCalls;
 use super::composer::ComposerLayout;
 use super::selection::{
     ScreenSelection, SelectionClick, SelectionScrollDirection, SelectionScrollRequest,
@@ -577,7 +578,10 @@ impl Conversation {
         self.materialize_code_parent(&payload.call_id);
         let arguments = summarize_tool_arguments(&payload.tool, &payload.arguments);
         let name = present_tool_name(&payload.tool, &payload.arguments);
-        self.status = format!("Running {name}");
+        // A detached Code Mode cell can start nested calls after its turn ended.
+        if self.running {
+            self.status = format!("Running {name}");
+        }
         let call_id = payload.call_id;
         let status = ToolStatus::Running;
         if self.transcript.has_tool_parent(&call_id) {
@@ -621,6 +625,19 @@ impl Conversation {
                     Some("exec_command" | "write_stdin")
                 ) || self.hidden_terminal_calls.contains_key(&payload.call_id))
                     && shell_result_failed(&payload.structured_result) =>
+            {
+                ToolStatus::Failed
+            }
+            "completed"
+                if payload
+                    .tool
+                    .as_deref()
+                    .is_some_and(|name| name.starts_with("mcp__cua_repl__"))
+                    && payload
+                        .structured_result
+                        .get("isError")
+                        .and_then(Value::as_bool)
+                        == Some(true) =>
             {
                 ToolStatus::Failed
             }
@@ -706,7 +723,12 @@ impl Conversation {
                 status,
             });
         }
-        let result = if shell_tool {
+        let result = if shell_tool
+            || payload
+                .tool
+                .as_deref()
+                .is_some_and(|name| name.starts_with("mcp__cua_repl__"))
+        {
             Some(&payload.structured_result)
         } else {
             payload.result.as_ref()
@@ -725,8 +747,17 @@ impl Conversation {
             self.transcript
                 .set_tool_result(&payload.call_id, status, payload.duration_ns, result)
         };
+        if payload.tool.as_deref() == Some("exec") {
+            self.transcript
+                .set_raw_tool_result(&payload.call_id, payload.result.clone());
+        }
         self.note_unseen_output();
-        "Working".clone_into(&mut self.status);
+        // Late results from a detached Code Mode cell arrive after the turn ended.
+        self.status = if self.running {
+            "Working".to_owned()
+        } else {
+            "Ready".to_owned()
+        };
         true
     }
 
@@ -834,7 +865,10 @@ impl Conversation {
             });
         }
         continued.result = Value::String(combined.clone());
-        self.finish_continued_tool(continued, status, Some(combined))
+        let changed = self.finish_continued_tool(continued, status, Some(combined));
+        self.transcript
+            .set_raw_tool_result(&continued.call_id, result.cloned());
+        changed
     }
 
     fn finish_continued_tool(
@@ -1201,6 +1235,8 @@ fn smooth_scroll_drain(pending_rows: usize) -> usize {
 pub(super) struct BtwPane {
     pub(super) id: u64,
     pub(super) request_id: Option<Arc<str>>,
+    /// Whether another process can read or resume this fork from a rollout.
+    pub(super) resumable: bool,
     collapsing: bool,
     splitting: bool,
     pub(super) conversation: Conversation,
@@ -1359,7 +1395,7 @@ pub(super) struct App {
     cancel_confirmation: Option<CancelConfirmation>,
     screen_selection: ScreenSelection,
     pending_link_destination: Option<String>,
-    tool_details_expanded: bool,
+    tool_calls: ToolCalls,
     fast_mode: bool,
     model: HarnessModel,
     has_rejected_start_input: bool,
@@ -1459,7 +1495,7 @@ impl App {
             cancel_confirmation: None,
             screen_selection: ScreenSelection::default(),
             pending_link_destination: None,
-            tool_details_expanded: true,
+            tool_calls: ToolCalls::Expanded,
             fast_mode: false,
             model: HarnessModel::default(),
             has_rejected_start_input: false,
@@ -2366,39 +2402,37 @@ impl App {
         self.btw = Some(BtwPane {
             id,
             request_id: None,
+            resumable: false,
             collapsing: false,
             splitting: false,
             conversation,
         });
-        if !self.tool_details_expanded
-            && let Some(btw) = &mut self.btw
-        {
-            btw.conversation.transcript.set_tool_details_expanded(false);
+        if let Some(btw) = &mut self.btw {
+            btw.conversation.transcript.set_tool_calls(self.tool_calls);
         }
         self.focus = PaneId::Btw(id);
         id
     }
 
-    pub(super) fn toggle_tool_details(&mut self) -> bool {
-        self.tool_details_expanded = !self.tool_details_expanded;
-        let expanded = self.tool_details_expanded;
-        self.main.transcript.set_tool_details_expanded(expanded);
-        for branch in &mut self.main_branches {
-            branch
-                .conversation
-                .transcript
-                .set_tool_details_expanded(expanded);
-        }
-        if let Some(btw) = &mut self.btw {
-            btw.conversation
-                .transcript
-                .set_tool_details_expanded(expanded);
-        }
-        expanded
+    /// Switches every transcript to the next tool-call mode and returns it.
+    pub(super) fn cycle_tool_calls(&mut self) -> ToolCalls {
+        self.set_tool_calls(self.tool_calls.next());
+        self.tool_calls
     }
 
-    pub(super) const fn tool_details_expanded(&self) -> bool {
-        self.tool_details_expanded
+    pub(super) fn set_tool_calls(&mut self, mode: ToolCalls) {
+        self.tool_calls = mode;
+        self.main.transcript.set_tool_calls(mode);
+        for branch in &mut self.main_branches {
+            branch.conversation.transcript.set_tool_calls(mode);
+        }
+        if let Some(btw) = &mut self.btw {
+            btw.conversation.transcript.set_tool_calls(mode);
+        }
+    }
+
+    pub(super) const fn tool_calls(&self) -> ToolCalls {
+        self.tool_calls
     }
 
     pub(super) fn btw_id(&self) -> Option<u64> {
@@ -2566,9 +2600,10 @@ impl App {
         }
     }
 
-    pub(super) fn btw_opened(&mut self, id: u64, request_id: Arc<str>) {
+    pub(super) fn btw_opened(&mut self, id: u64, request_id: Arc<str>, resumable: bool) {
         if let Some(btw) = self.btw.as_mut().filter(|btw| btw.id == id) {
             btw.request_id = Some(request_id);
+            btw.resumable = resumable;
             btw.conversation.status = if btw.conversation.pending_turns == 0 {
                 "Ready".to_owned()
             } else {
@@ -3513,6 +3548,9 @@ pub(super) enum PlanStepStatus {
 }
 
 fn summarize_tool_arguments(tool: &str, arguments: &Value) -> String {
+    if tool.starts_with("mcp__cua_repl__") {
+        return arguments.to_string();
+    }
     if tool == "exec"
         && let Some(source) = arguments.as_str()
     {
@@ -3587,6 +3625,9 @@ fn summarize_tool_arguments(tool: &str, arguments: &Value) -> String {
 }
 
 fn present_tool_name(tool: &str, arguments: &Value) -> String {
+    if tool.starts_with("mcp__cua_repl__") {
+        return tool.to_owned();
+    }
     if tool == "write_stdin" {
         return "Process".to_owned();
     }
@@ -3837,6 +3878,9 @@ fn running_cell_id(result: &Value) -> Option<String> {
 }
 
 fn summarize_tool_result(tool: Option<&str>, result: &Value, status: ToolStatus) -> String {
+    if tool.is_some_and(|name| name.starts_with("mcp__cua_repl__")) {
+        return normalize_tool_result(result.clone()).to_string();
+    }
     if matches!(tool, Some("exec_command" | "write_stdin")) {
         let decoded = result
             .as_str()
@@ -3890,7 +3934,7 @@ fn summarize_tool_result(tool: Option<&str>, result: &Value, status: ToolStatus)
     String::new()
 }
 
-fn display_tool_output(value: &Value, depth: usize) -> String {
+pub(super) fn display_tool_output(value: &Value, depth: usize) -> String {
     if depth > 10 {
         return "…".to_owned();
     }
@@ -4487,7 +4531,7 @@ mod tests {
         assert!(!app.begin_btw_split(id));
         assert!(!app.btw_splitting(id));
 
-        app.btw_opened(id, Arc::from("btw-thread"));
+        app.btw_opened(id, Arc::from("btw-thread"), true);
         assert!(app.begin_btw_split(id));
         assert!(app.btw_busy());
         app.btw_split_failed(id, "no terminal".to_owned(), false);
@@ -4501,7 +4545,7 @@ mod tests {
         assert_eq!(app.main.status, "BTW moved to the right tmux pane");
 
         let id = app.begin_btw();
-        app.btw_opened(id, Arc::from("second-btw-thread"));
+        app.btw_opened(id, Arc::from("second-btw-thread"), true);
         assert!(app.begin_btw_split(id));
         app.btw_split_failed(id, "launch failed; resume manually".to_owned(), true);
         assert!(app.btw.is_none());

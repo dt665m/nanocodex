@@ -558,6 +558,27 @@ impl EmbeddedToolRuntimeControl {
         }
     }
 
+    /// Asks the embedding host to relay nested updates of cells the completed
+    /// turn left running. Hosts without a relay leave them for the next wait.
+    pub async fn detach_turn_with_updates(
+        &self,
+        observer: &mut (dyn FnMut(&str) -> Box<dyn CodeModeObserver> + Send),
+    ) {
+        if let (Some(host), Some(session_id)) = (&self.host, &self.session_id) {
+            host.detach_turn(session_id, observer);
+        }
+    }
+
+    /// Cancels the current logical turn and reports nested calls its cells
+    /// leave unfinished when the host supports it.
+    pub async fn cancel_turn_with_updates(&self, observer: &mut dyn CodeModeObserver) {
+        if let (Some(host), Some(session_id)) = (&self.host, &self.session_id)
+            && let Err(error) = host.cancel_turn_with_updates(session_id, observer).await
+        {
+            tracing::warn!(target: "nanocodex_oai_tools", %error, "embedded Code Mode turn cancellation failed");
+        }
+    }
+
     /// Cancels active work.
     pub async fn cancel(&self) {
         if let (Some(host), Some(session_id)) = (&self.host, &self.session_id)

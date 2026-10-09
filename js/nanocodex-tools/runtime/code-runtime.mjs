@@ -43,6 +43,10 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
   const traceTool = extras.traceTool;
   const activeExecutions = new Set();
   const codeObservations = new Map();
+  // Relays of cells a completed turn left running, keyed like observations.
+  const codeRelays = new Map();
+  // Unique per relay: a cell can be relayed again after a wait ends its relay.
+  let nextRelayId = 1;
   const cells = new Map();
   const turns = new Map();
   const cellGeneration = globalThis.crypto.randomUUID();
@@ -447,7 +451,7 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
               success: receipt.success, metadata: receipt.metadata });
             if (receipt.thrown) throw restoreEffectFailure(receipt.failure);
             const value = receipt.valueUndefined ? undefined : receipt.value;
-            if (!receipt.success) throw value;
+            if (!receipt.success) throw toolFailureError(value, receipt.output);
             return value;
           }
           if (decision?.status !== "execute") interrupt(effectUnknown(new Error("invalid nested effect admission")));
@@ -536,16 +540,17 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
         await retain(receipt, valueRef, outputJsonRef);
         complete({ output: receipt.output, structured_result: receipt.structured_result,
               success: receipt.success, metadata: receipt.metadata });
-        if (!success) throw toolValue(result);
+        if (!success) throw toolFailureError(toolValue(result), output);
         return toolValue(result);
       }
     }
     const tools = createCodeTools(Object.keys(declaredTools), (name, input) => declaredTools[name](input));
     const EXIT = Symbol("exit");
 
-    function text(value) {
+    // Same as the sandboxed evaluators: text("label:", value) keeps every value.
+    function text(...values) {
       controller.signal.throwIfAborted();
-      content.push({ type: "input_text", text: stringify(value) });
+      content.push({ type: "input_text", text: values.length > 1 ? values.map(stringify).join(" ") : stringify(values[0]) });
     }
     function image(value, detail) {
       controller.signal.throwIfAborted();
@@ -710,7 +715,7 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
       const cell = {
         id: `${cellGeneration}:${nextCellId++}`, sessionId, parentCallId, controller: new AbortController(),
         startedAt: performance.now(), content: [], updates: [], completedCalls: [], notifications: [], turn: turns.get(sessionId) ?? 0,
-        budget: options.max_output_tokens, result: undefined, observing: false,
+        budget: options.max_output_tokens, result: undefined, observing: false, relay: undefined,
       };
       cells.set(cell.id, cell);
       if (extras.effectJournal?.observations) {
@@ -734,6 +739,7 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
         // until the nested call finishes. Original call IDs survive every wait.
         const encoded = JSON.stringify(update);
         if (cell.observation) cell.observation.push(encoded);
+        else if (cell.relay) cell.relay.observation.push(encoded);
         else cell.updates.push(encoded);
         if (update.type === "nested_call_completed") cell.completedCalls.push(update.call);
       }, cell, turnId, localDefinitions, executeLocalTool).then(async (result) => {
@@ -756,11 +762,13 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
           }), false);
         }
         cell.result = { success: completed.success };
+        closeRelay(cell);
         cell.wake?.();
       }).catch((error) => {
         if (error?.code === "host_interrupted") cell.interruption = error;
         cell.content.push({ type: "input_text", text: errorMessage(error) });
         cell.result = { success: false };
+        closeRelay(cell);
         cell.wake?.();
       });
       return observeCell(cell, observation, options.yield_time_ms ?? 10_000, cell.budget);
@@ -843,6 +851,8 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
 
   async function observeCell(cell, observation, yieldTime, budget) {
     const startedAt = performance.now();
+    // A relay drains what it already took; this observer receives the rest.
+    closeRelay(cell);
     cell.observing = true;
     cell.observation = observation;
     for (const update of cell.updates.splice(0)) observation.push(update);
@@ -899,13 +909,80 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
 
   async function nextCodeUpdate(sessionId, parentCallId) {
     const key = codeObservationKey(sessionId, parentCallId);
-    const observation = codeObservations.get(key);
+    const observations = codeObservations.has(key) ? codeObservations : codeRelays;
+    const observation = observations.get(key);
     if (!observation) throw new Error(`unknown Code Mode observation: ${parentCallId}`);
     const update = await observation.next();
-    if (update === null && codeObservations.get(key) === observation) {
-      codeObservations.delete(key);
+    if (update === null && observations.get(key) === observation) {
+      observations.delete(key);
     }
     return update;
+  }
+
+  // At normal turn completion, give every unobserved cell of the session a
+  // relay so nested work the model never waited for still reports its start
+  // and terminal result. Buffered updates move to the relay in order. The
+  // relay ends after the cell settles (including aborted nested calls) or
+  // when a later wait attaches, so each update is delivered exactly once.
+  function detachTurn(sessionId) {
+    const relays = [];
+    for (const cell of cells.values()) {
+      if (cell.sessionId !== sessionId || cell.observing || cell.relay) continue;
+      if (cell.result && cell.updates.length === 0) continue;
+      const id = `relay:${cell.id}:${nextRelayId++}`;
+      const observation = createCodeObservation(sessionId, cell.turn);
+      cell.relay = { id, observation };
+      codeRelays.set(codeObservationKey(sessionId, id), observation);
+      for (const update of cell.updates.splice(0)) observation.push(update);
+      if (cell.result) closeRelay(cell);
+      relays.push({ relay_id: id, origin_call_id: cell.parentCallId });
+    }
+    return JSON.stringify(relays);
+  }
+
+  function closeRelay(cell) {
+    if (!cell.relay) return;
+    clearTimeout(cell.relay.bound);
+    cell.relay.observation.close();
+    cell.relay = undefined;
+  }
+
+  // Cancels the current logical turn's cells like cancelTurn, and returns a
+  // relay per cancelled cell carrying every nested update no observer has
+  // received: updates a just-dropped exec/wait observer never read, buffered
+  // updates, then the aborted calls' terminal results. Each relay ends once
+  // its cell settles, or after a bound so a cancelled turn can always commit.
+  // Earlier turns' cells (including detached ones) are untouched.
+  function cancelTurnWithUpdates(sessionId) {
+    const turn = turns.get(sessionId) ?? 0;
+    const relays = [];
+    for (const cell of cells.values()) {
+      if (cell.sessionId !== sessionId || cell.turn !== turn) continue;
+      if (!cell.relay) {
+        const id = `relay:${cell.id}:${nextRelayId++}`;
+        cell.relay = { id, observation: createCodeObservation(sessionId, cell.turn) };
+        codeRelays.set(codeObservationKey(sessionId, id), cell.relay.observation);
+      }
+      const { observation } = cell.relay;
+      if (cell.observation) {
+        for (const update of cell.observation.take()) observation.push(update);
+        cell.observation = undefined;
+      }
+      for (const update of cell.updates.splice(0)) observation.push(update);
+      relays.push({ relay_id: cell.relay.id, origin_call_id: cell.parentCallId });
+      if (cell.result) closeRelay(cell);
+      else cell.relay.bound = setTimeout(() => closeRelay(cell), CANCELLED_RELAY_BOUND_MS);
+    }
+    cancel(sessionId, turn);
+    return JSON.stringify(relays);
+  }
+
+  function closeCodeRelays(sessionId) {
+    for (const [key, observation] of codeRelays) {
+      if (sessionId !== undefined && observation.sessionId !== sessionId) continue;
+      codeRelays.delete(key);
+      observation.close();
+    }
   }
 
   // Preempt only a foreground observation, never the evaluator or nested
@@ -970,6 +1047,7 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
     subagentBindingsBySession.delete(sessionId);
     router.releaseSession(sessionId);
     closeCodeObservations(sessionId);
+    closeCodeRelays(sessionId);
   }
 
   function reset() {
@@ -983,6 +1061,7 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
     stores.clear();
     subagentBindingsBySession.clear();
     closeCodeObservations();
+    closeCodeRelays();
     return ownsRouter ? router.reset() : undefined;
   }
 
@@ -1017,6 +1096,9 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
     executeCodeObserved,
     waitCodeObserved,
     executeTool,
+    subagentStatus(sessionId, status) {
+      subagentSessions?.status?.(sessionId, status);
+    },
     bindSubagentSession(sessionId, context, hostContextRef) {
       if (hostContextRef !== undefined
         && (typeof hostContextRef !== "string" || hostContextRef.length === 0)) {
@@ -1039,6 +1121,8 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
       }));
     },
     nextCodeUpdate,
+    detachTurn,
+    cancelTurnWithUpdates,
     preempt,
     preemptTurn,
     beginTurn(sessionId) { turns.set(sessionId, (turns.get(sessionId) ?? 0) + 1); },
@@ -1177,6 +1261,27 @@ function deepFreeze(value) {
   return Object.freeze(value);
 }
 
+// A failed tool result rejects with a real Error so guest catch blocks can
+// read error.message/error.code. Fields of a structured failure value remain
+// available as own properties; replay rebuilds the same shape from its receipt.
+function toolFailureError(value, output) {
+  if (value instanceof Error) return value;
+  const record = value !== null && typeof value === "object" && !Array.isArray(value) ? value : undefined;
+  const message = typeof value === "string" ? value
+    : typeof record?.message === "string" ? record.message
+    : typeof record?.error === "string" ? record.error
+    : typeof record?.error?.message === "string" ? record.error.message
+    : typeof output === "string" ? output
+    : value === undefined || value === null ? "tool call failed" : stringify(value);
+  const error = new Error(message || "tool call failed");
+  if (record) {
+    for (const [key, field] of Object.entries(record)) {
+      if (key !== "message" && key !== "stack" && key !== "name") error[key] = field;
+    }
+  } else if (value !== undefined && typeof value !== "string") error.value = value;
+  return error;
+}
+
 function errorMessage(error) {
   if (error && (error.stack || error.message)) return error.stack || error.message;
   return String(error);
@@ -1211,6 +1316,12 @@ function abortableEvaluation(evaluation, signal) {
     );
   });
 }
+
+// Abort rejects the evaluation independently of guest and host promises, and
+// the executor then gives every pending nested call an unknown-outcome terminal
+// (closePendingCalls) before durable finalization. The bound only covers that
+// finalization, so it never closes a relay ahead of a started call's terminal.
+const CANCELLED_RELAY_BOUND_MS = 10_000;
 
 function codeObservationKey(sessionId, callId) {
   return JSON.stringify([sessionId, callId]);
@@ -1248,6 +1359,12 @@ function createCodeObservation(sessionId, turn) {
       closed = true;
       preemptWake = undefined;
       while (waiters.length) waiters.shift()(null);
+    },
+    /** Closes the observation and returns updates its reader never took. */
+    take() {
+      const remaining = queued.splice(0);
+      this.close();
+      return remaining;
     },
     next() {
       if (queued.length) return Promise.resolve(queued.shift());

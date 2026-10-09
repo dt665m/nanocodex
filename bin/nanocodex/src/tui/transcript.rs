@@ -4,7 +4,7 @@ use std::{
     mem,
     sync::{
         Arc, Mutex, PoisonError,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
 };
 
@@ -19,6 +19,7 @@ use ratatui::{
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+use super::ToolCalls;
 use super::app::PlanStepStatus;
 use super::composer::ComposerLayout;
 use super::diff::{PatchPresentation, present_apply_patch};
@@ -63,11 +64,49 @@ pub(super) enum ToolStatus {
     Failed,
 }
 
+/// The tool-call mode shared by one transcript, its entries, and its branches.
+#[derive(Default)]
+pub(super) struct SharedToolCalls(AtomicU8, AtomicBool);
+
+impl SharedToolCalls {
+    const fn encode(mode: ToolCalls) -> u8 {
+        match mode {
+            ToolCalls::Expanded => 0,
+            ToolCalls::Folded => 1,
+            ToolCalls::Hidden => 2,
+        }
+    }
+
+    const fn decode(value: u8) -> ToolCalls {
+        match value {
+            1 => ToolCalls::Folded,
+            2 => ToolCalls::Hidden,
+            _ => ToolCalls::Expanded,
+        }
+    }
+
+    fn get(&self) -> ToolCalls {
+        Self::decode(self.0.load(Ordering::Relaxed))
+    }
+
+    /// Stores `mode` and returns the previous mode.
+    fn swap(&self, mode: ToolCalls) -> ToolCalls {
+        let previous = Self::decode(self.0.swap(Self::encode(mode), Ordering::Relaxed));
+        // Initial Expanded keeps computer calls compact. Cycling back from Hidden
+        // explicitly discloses their raw transcript, while ordinary tools retain
+        // the standard Expanded/Folded/Hidden behavior.
+        if mode != previous {
+            self.1.store(mode == ToolCalls::Expanded, Ordering::Relaxed);
+        }
+        previous
+    }
+}
+
 pub(super) struct Transcript {
     entries: Vec<Arc<TranscriptEntry>>,
     editable_users: Vec<usize>,
     cached_total_height: AtomicU64,
-    tool_details_expanded: Arc<AtomicBool>,
+    tool_calls: Arc<SharedToolCalls>,
     math_renderer: Option<Ratatex>,
 }
 
@@ -77,7 +116,7 @@ impl Default for Transcript {
             entries: Vec::new(),
             editable_users: Vec::new(),
             cached_total_height: AtomicU64::new(0),
-            tool_details_expanded: Arc::new(AtomicBool::new(true)),
+            tool_calls: Arc::default(),
             math_renderer: None,
         }
     }
@@ -89,7 +128,7 @@ impl Clone for Transcript {
             entries: self.entries.clone(),
             editable_users: self.editable_users.clone(),
             cached_total_height: AtomicU64::new(self.cached_total_height.load(Ordering::Relaxed)),
-            tool_details_expanded: Arc::clone(&self.tool_details_expanded),
+            tool_calls: Arc::clone(&self.tool_calls),
             math_renderer: self.math_renderer.clone(),
         }
     }
@@ -122,6 +161,20 @@ impl Transcript {
         self.entries.len()
     }
 
+    /// User prompts and assistant answers in display order; `true` marks a user prompt.
+    pub(super) fn exchange_messages(&self) -> Vec<(bool, &str)> {
+        self.entries
+            .iter()
+            .filter_map(|entry| match (&entry.kind, &entry.content) {
+                (EntryKind::User, _) => entry.user_message().map(|text| (true, text)),
+                (EntryKind::Assistant, EntryContent::Markdown(markdown)) => {
+                    Some((false, markdown.source.as_str()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     pub(super) fn push(&mut self, item: TranscriptItem) {
         if matches!(&item, TranscriptItem::Reasoning(_))
             && let Some(entry) = self.entries.last_mut()
@@ -130,7 +183,7 @@ impl Transcript {
         }
         self.entries.push(Arc::new(TranscriptEntry::new(
             item,
-            Arc::clone(&self.tool_details_expanded),
+            Arc::clone(&self.tool_calls),
             self.math_renderer.clone(),
         )));
         self.invalidate_total_height();
@@ -155,9 +208,18 @@ impl Transcript {
         self.invalidate_total_height();
     }
 
-    pub(super) fn set_tool_details_expanded(&mut self, expanded: bool) {
-        if self.tool_details_expanded.swap(expanded, Ordering::Relaxed) == expanded {
+    pub(super) fn set_tool_calls(&mut self, mode: ToolCalls) {
+        if self.tool_calls.swap(mode) == mode {
             return;
+        }
+        for entry in &self.entries {
+            entry.cached_height.store(0, Ordering::Relaxed);
+            if let EntryContent::Tool(tool) = &entry.content {
+                *tool
+                    .cached_layout
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = None;
+            }
         }
         self.invalidate_total_height();
     }
@@ -197,7 +259,7 @@ impl Transcript {
     pub(super) fn push_editable_user(&mut self, message: String, prompt_id: u64) {
         let mut entry = TranscriptEntry::new(
             TranscriptItem::User(message),
-            Arc::clone(&self.tool_details_expanded),
+            Arc::clone(&self.tool_calls),
             self.math_renderer.clone(),
         );
         entry.prompt_id = Some(prompt_id);
@@ -430,8 +492,36 @@ impl Transcript {
                 [..self.editable_users.partition_point(|i| *i < end)]
                 .to_vec(),
             cached_total_height: AtomicU64::new(0),
-            tool_details_expanded: Arc::clone(&self.tool_details_expanded),
+            tool_calls: Arc::clone(&self.tool_calls),
             math_renderer: self.math_renderer.clone(),
+        }
+    }
+
+    pub(super) fn set_raw_tool_result(&mut self, call_id: &str, result: Option<serde_json::Value>) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| matches!(&entry.kind, EntryKind::Tool { call_id: id } if id == call_id))
+        {
+            let entry = Arc::make_mut(entry);
+            if let EntryContent::Tool(tool) = &mut entry.content {
+                if let Some(result) = result {
+                    tool.raw_result = Some(match tool.raw_result.take() {
+                        Some(serde_json::Value::Array(mut receipts)) => {
+                            receipts.push(result);
+                            serde_json::Value::Array(receipts)
+                        }
+                        Some(previous) => serde_json::Value::Array(vec![previous, result]),
+                        None => result,
+                    });
+                }
+                *tool
+                    .cached_layout
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = None;
+                entry.cached_height.store(0, Ordering::Relaxed);
+            }
+            self.invalidate_total_height();
         }
     }
 
@@ -921,11 +1011,12 @@ struct ToolActivity {
     started_after_ns: Option<u64>,
     duration_ns: Option<u64>,
     result: Option<String>,
+    raw_result: Option<serde_json::Value>,
     children: Vec<Self>,
     patch: Option<PatchPresentation>,
     plain_detail: Option<StreamingText>,
     cached_layout: Mutex<Option<Box<CachedToolLayout>>>,
-    details_expanded: Arc<AtomicBool>,
+    tool_calls: Arc<SharedToolCalls>,
 }
 
 struct MarkdownContent {
@@ -1023,6 +1114,7 @@ impl Clone for ToolActivity {
             started_after_ns: self.started_after_ns,
             duration_ns: self.duration_ns,
             result: self.result.clone(),
+            raw_result: self.raw_result.clone(),
             children: self.children.clone(),
             patch: self.patch.clone(),
             plain_detail: self.plain_detail.clone(),
@@ -1032,7 +1124,7 @@ impl Clone for ToolActivity {
                     .unwrap_or_else(PoisonError::into_inner)
                     .clone(),
             ),
-            details_expanded: Arc::clone(&self.details_expanded),
+            tool_calls: Arc::clone(&self.tool_calls),
         }
     }
 }
@@ -1083,7 +1175,7 @@ impl Clone for TranscriptEntry {
 impl TranscriptEntry {
     fn new(
         item: TranscriptItem,
-        tool_details_expanded: Arc<AtomicBool>,
+        tool_calls: Arc<SharedToolCalls>,
         math_renderer: Option<Ratatex>,
     ) -> Self {
         let (kind, user_message, content) = match item {
@@ -1118,11 +1210,7 @@ impl TranscriptEntry {
                 },
                 None,
                 EntryContent::Tool(ToolActivity::new(
-                    call_id,
-                    name,
-                    arguments,
-                    status,
-                    tool_details_expanded,
+                    call_id, name, arguments, status, tool_calls,
                 )),
             ),
             TranscriptItem::Plan { explanation, steps } => (
@@ -1193,6 +1281,11 @@ impl TranscriptEntry {
         }
     }
 
+    /// Tool rows take no space while tool calls are hidden.
+    fn is_hidden(&self) -> bool {
+        matches!(&self.content, EntryContent::Tool(tool) if tool.tool_calls.get() == ToolCalls::Hidden)
+    }
+
     fn invalidate_math_layout(&self) {
         if let EntryContent::Markdown(markdown) = &self.content {
             markdown.invalidate_math_layout();
@@ -1203,9 +1296,12 @@ impl TranscriptEntry {
         const HEIGHT_MASK: u64 = (1_u64 << 47) - 1;
         const TOOL_EXPANDED: u64 = 1_u64 << 47;
 
+        if self.is_hidden() {
+            return 0;
+        }
         let cached = self.cached_height.load(Ordering::Relaxed);
         let tool_expanded = match &self.content {
-            EntryContent::Tool(tool) => Some(tool.details_expanded.load(Ordering::Relaxed)),
+            EntryContent::Tool(tool) => Some(tool.layout_expanded()),
             _ => None,
         };
         let cache_entry_height = !matches!(self.content, EntryContent::Markdown(_));
@@ -1245,6 +1341,9 @@ impl TranscriptEntry {
         selected: bool,
         math_fallback: bool,
     ) {
+        if self.is_hidden() {
+            return;
+        }
         match &self.content {
             EntryContent::Static(text) => {
                 let mut paragraph = Paragraph::new(text.clone()).wrap(Wrap { trim: false });
@@ -1339,7 +1438,7 @@ impl TranscriptEntry {
             name,
             arguments,
             status,
-            Arc::clone(&tool.details_expanded),
+            Arc::clone(&tool.tool_calls),
         ));
         self.cached_height.store(0, Ordering::Relaxed);
     }
@@ -1386,12 +1485,24 @@ impl TranscriptEntry {
 }
 
 impl ToolActivity {
+    fn is_computer(&self) -> bool {
+        self.name.starts_with("mcp__cua_repl__")
+    }
+
+    fn layout_expanded(&self) -> bool {
+        if self.is_computer() || self.children.iter().any(Self::is_computer) {
+            self.tool_calls.1.load(Ordering::Relaxed)
+        } else {
+            self.details_expanded()
+        }
+    }
+
     fn new(
         call_id: String,
         name: String,
         arguments: String,
         status: ToolStatus,
-        details_expanded: Arc<AtomicBool>,
+        tool_calls: Arc<SharedToolCalls>,
     ) -> Self {
         let patch = (name == "apply_patch")
             .then(|| present_apply_patch(&arguments))
@@ -1406,11 +1517,12 @@ impl ToolActivity {
             started_after_ns: None,
             duration_ns: None,
             result: None,
+            raw_result: None,
             children: Vec::new(),
             patch,
             plain_detail,
             cached_layout: Mutex::new(None),
-            details_expanded,
+            tool_calls,
         }
     }
 
@@ -1434,8 +1546,12 @@ impl ToolActivity {
         });
     }
 
+    fn details_expanded(&self) -> bool {
+        self.tool_calls.get() == ToolCalls::Expanded
+    }
+
     fn uses_plain_detail(&self) -> bool {
-        self.details_expanded.load(Ordering::Relaxed) && self.plain_detail.is_some()
+        self.layout_expanded() && self.plain_detail.is_some()
     }
 
     fn height(&self, width: u16) -> usize {
@@ -1507,7 +1623,7 @@ impl ToolActivity {
     }
 
     fn with_rendered<R>(&self, width: u16, read: impl FnOnce(&RenderedText) -> R) -> R {
-        let expanded = self.details_expanded.load(Ordering::Relaxed);
+        let expanded = self.layout_expanded();
         let mut cached = self
             .cached_layout
             .lock()
@@ -1557,8 +1673,32 @@ impl ToolActivity {
         details
     }
 
+    fn compact_result(&self) -> Option<String> {
+        let raw = self.raw_result.as_ref()?;
+        if self.layout_expanded() || !self.children.iter().any(Self::is_computer) {
+            return None;
+        }
+        let results = self
+            .children
+            .iter()
+            .filter(|child| child.is_computer())
+            .filter_map(|child| {
+                serde_json::from_str::<serde_json::Value>(child.result.as_deref()?).ok()
+            })
+            .collect::<Vec<_>>();
+        Some(super::app::display_tool_output(
+            &without_computer_echoes(raw, &results),
+            0,
+        ))
+    }
+
     fn text(&self, width: u16) -> Text<'static> {
-        let details_expanded = self.details_expanded.load(Ordering::Relaxed);
+        let compact_result = self.compact_result();
+        let visible_result = compact_result.as_deref().or(self.result.as_deref());
+        let details_expanded = self.details_expanded();
+        if self.is_computer() && !self.layout_expanded() {
+            return Text::from(computer_lines(&[self], width));
+        }
         if details_expanded
             && self.children.is_empty()
             && let Some(patch) = &self.patch
@@ -1597,12 +1737,12 @@ impl ToolActivity {
             details.push(format_duration(duration_ns));
         }
         if !self.children.is_empty()
-            && let Some(result) = self.result.as_deref().filter(|result| !result.is_empty())
+            && let Some(result) = visible_result.filter(|result| !result.is_empty())
         {
             details.push(result.lines().next().unwrap_or_default().to_owned());
         }
 
-        if !details_expanded {
+        if !details_expanded && !self.children.iter().any(Self::is_computer) {
             return self.collapsed_text(icon, color, display_name, details);
         }
 
@@ -1614,7 +1754,7 @@ impl ToolActivity {
             } else {
                 self.arguments.clone()
             };
-            if let Some(result) = self.result.as_deref().filter(|result| !result.is_empty()) {
+            if let Some(result) = visible_result.filter(|result| !result.is_empty()) {
                 push_detail(&mut activity_detail, result);
             }
             if !activity_detail.is_empty() {
@@ -1626,26 +1766,54 @@ impl ToolActivity {
         }
         if !self.children.is_empty() {
             let groups = child_activity_groups(&self.children);
-            for (group_index, group) in groups.iter().enumerate() {
-                let group_is_last = group_index + 1 == groups.len();
-                let group_len = group.end - group.start;
-                for (child_index, child) in self.children[group.clone()].iter().enumerate() {
-                    let child_is_last = child_index + 1 == group_len;
-                    let (connector, continuation) = activity_connector(
-                        group_is_last,
-                        group_len > 1,
-                        child_index,
-                        child_is_last,
-                    );
-                    lines.extend(child_lines(child, connector, continuation, width));
+            let mut index = 0;
+            while index < self.children.len() {
+                if self.children[index].is_computer() && !self.layout_expanded() {
+                    let end = self.children[index..]
+                        .iter()
+                        .position(|child| !child.is_computer())
+                        .map_or(self.children.len(), |offset| index + offset);
+                    lines.extend(computer_lines(
+                        &self.children[index..end].iter().collect::<Vec<_>>(),
+                        width,
+                    ));
+                    index = end;
+                    continue;
                 }
+                let group_index = groups
+                    .iter()
+                    .position(|group| group.contains(&index))
+                    .unwrap_or(0);
+                let group = &groups[group_index];
+                let (connector, continuation) = activity_connector(
+                    group_index + 1 == groups.len(),
+                    group.len() > 1,
+                    index - group.start,
+                    index + 1 == group.end,
+                );
+                if details_expanded {
+                    lines.extend(child_lines(
+                        &self.children[index],
+                        connector,
+                        continuation,
+                        width,
+                    ));
+                } else {
+                    let child = &self.children[index];
+                    let (icon, color) = tool_style(child.status);
+                    lines.push(tool_header_line(
+                        icon,
+                        color,
+                        &child.name,
+                        &child.summary_details(),
+                    ));
+                }
+                index += 1;
             }
         }
+
         if !self.children.is_empty()
-            && let Some(result) = self
-                .result
-                .as_deref()
-                .filter(|result| result.contains('\n'))
+            && let Some(result) = visible_result.filter(|result| result.contains('\n'))
         {
             lines.extend(
                 result.lines().skip(1).map(|line| {
@@ -1678,6 +1846,188 @@ impl ToolActivity {
             Line::raw(""),
         ])
     }
+}
+
+// Only exact provider-object echoes are removed. Text that happens to mention an
+// action/result, and independently labeled objects, stay in the ordinary output.
+fn without_computer_echoes(
+    value: &serde_json::Value,
+    results: &[serde_json::Value],
+) -> serde_json::Value {
+    use serde_json::Value;
+    let decoded = value
+        .as_str()
+        .and_then(|text| serde_json::from_str::<Value>(text).ok());
+    let candidate = decoded.as_ref().unwrap_or(value);
+    if results.iter().any(|result| {
+        candidate == result
+            || (candidate.get("content") == result.get("content")
+                && candidate.get("content").is_some()
+                && candidate.as_object().is_some_and(|fields| {
+                    fields.keys().all(|key| {
+                        matches!(key.as_str(), "content" | "isError" | "structuredContent")
+                    })
+                })
+                && candidate
+                    .get("structuredContent")
+                    .is_some_and(|structured| structured == result))
+    }) {
+        return Value::Null;
+    }
+    match value {
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| without_computer_echoes(item, results))
+                .filter(|item| !item.is_null())
+                .collect(),
+        ),
+        Value::Object(fields) => {
+            // Code Mode emissions use text blocks. Do not recurse into arbitrary
+            // user objects: a labeled independent emission must remain intact.
+            if fields.get("type").and_then(Value::as_str) == Some("text") {
+                if fields
+                    .get("text")
+                    .is_some_and(|text| without_computer_echoes(text, results).is_null())
+                {
+                    return Value::Null;
+                }
+                return value.clone();
+            }
+            let mut output = fields.clone();
+            for key in ["content_blocks", "content"] {
+                if let Some(blocks) = output.get_mut(key) {
+                    *blocks = without_computer_echoes(blocks, results);
+                }
+            }
+            Value::Object(output)
+        }
+        _ => value.clone(),
+    }
+}
+
+fn computer_lines(calls: &[&ToolActivity], width: u16) -> Vec<Line<'static>> {
+    let active = calls
+        .iter()
+        .rposition(|call| call.status == ToolStatus::Running);
+    let failed =
+        |call: &ToolActivity| matches!(call.status, ToolStatus::Failed | ToolStatus::Cancelled);
+    let screenshot = |call: &ToolActivity| {
+        call.result.as_deref().is_some_and(|result| {
+            serde_json::from_str::<serde_json::Value>(result)
+                .ok()
+                .and_then(|value| value.get("content").cloned())
+                .and_then(|content| {
+                    content
+                        .as_array()
+                        .map(|blocks| blocks.iter().any(|block| block["type"] == "image"))
+                })
+                .unwrap_or(false)
+        })
+    };
+    let failures = calls.iter().filter(|call| failed(call)).count();
+    let count = calls.len();
+    let mut details = vec![format!(
+        "{count} action{}",
+        if count == 1 { "" } else { "s" }
+    )];
+    if failures > 0 {
+        details.push(format!("{failures} failed"));
+    }
+    let mut lines = vec![tool_header_line(
+        "•",
+        Color::DarkGray,
+        if active.is_some() {
+            "Using computer"
+        } else {
+            "Used computer"
+        },
+        &details,
+    )];
+    let mut selected = if let Some(index) = active {
+        vec![index]
+    } else {
+        let mut indices = (0..count).collect::<Vec<_>>();
+        indices.sort_by_key(|&index| {
+            std::cmp::Reverse((failed(calls[index]), screenshot(calls[index]), index))
+        });
+        indices.truncate(if count > 3 { 2 } else { 3 });
+        indices
+    };
+    selected.sort_unstable();
+    let hidden = count - selected.len();
+    for index in selected {
+        let call = calls[index];
+        let arguments =
+            serde_json::from_str::<serde_json::Value>(&call.arguments).unwrap_or_default();
+        let title = arguments
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .filter(|title| !title.trim().is_empty())
+            .unwrap_or("Computer action");
+        let summary = if failed(call) {
+            let result = call.result.as_deref().unwrap_or_default();
+            let value = serde_json::from_str::<serde_json::Value>(result).unwrap_or_default();
+            let error = value
+                .get("content")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|blocks| {
+                    blocks
+                        .iter()
+                        .filter_map(|block| block.get("text").and_then(serde_json::Value::as_str))
+                        .find(|text| text.starts_with("Script error:"))
+                        .or_else(|| {
+                            blocks.iter().find_map(|block| {
+                                block.get("text").and_then(serde_json::Value::as_str)
+                            })
+                        })
+                })
+                .unwrap_or(result);
+            let error = error
+                .strip_prefix("Script error:")
+                .unwrap_or(error)
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .unwrap_or("Computer action failed");
+            if width < 60 {
+                format!("Failed: {error}")
+            } else {
+                format!("Failed: {title} — {error}")
+            }
+        } else if screenshot(call) {
+            format!("Captured screenshot · {title}")
+        } else {
+            title.to_owned()
+        };
+        let normalized = summary.split_whitespace().collect::<Vec<_>>().join(" ");
+        let budget = usize::from(width.saturating_sub(4));
+        let mut preview = String::new();
+        for grapheme in normalized.graphemes(true) {
+            if preview.width() + grapheme.width() > budget.saturating_sub(1) {
+                break;
+            }
+            preview.push_str(grapheme);
+        }
+        if preview.len() < normalized.len() && budget > 0 {
+            preview.push('…');
+        }
+        lines.push(Line::styled(
+            format!("  └ {preview}"),
+            Style::default().fg(if failed(call) {
+                Color::Red
+            } else {
+                Color::DarkGray
+            }),
+        ));
+    }
+    if hidden > 0 && active.is_none() {
+        lines.push(Line::styled(
+            format!("  └ {hidden} more · Ctrl+O"),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    lines
 }
 
 fn tool_header_line(
@@ -3058,7 +3408,7 @@ fn saturating_u16(value: usize) -> u16 {
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::{Arc, atomic::AtomicBool, mpsc},
+        sync::{Arc, mpsc},
         time::Duration,
     };
 
@@ -3074,8 +3424,9 @@ mod tests {
     };
 
     use super::{
-        EntryContent, InlineEdit, MarkdownContent, StreamingLine, ToolActivity, ToolStatus,
-        Transcript, TranscriptItem, child_lines, render_agent_markdown, saturating_u16, tool_style,
+        EntryContent, InlineEdit, MarkdownContent, SharedToolCalls, StreamingLine, ToolActivity,
+        ToolCalls, ToolStatus, Transcript, TranscriptItem, child_lines, render_agent_markdown,
+        saturating_u16, tool_style,
     };
 
     const ASYNC_RENDER_TIMEOUT: Duration = Duration::from_secs(10);
@@ -3621,20 +3972,20 @@ R_{\mu\nu}-\frac12R\,g_{\mu\nu}+\Lambda g_{\mu\nu}
 
     #[test]
     fn long_nested_tool_result_cache_matches_full_paragraph_scrolling() {
-        let details_expanded = Arc::new(AtomicBool::new(true));
+        let tool_calls = Arc::new(SharedToolCalls::default());
         let mut tool = ToolActivity::new(
             "code-mode-1".to_owned(),
             "exec".to_owned(),
             "text(await tools.exec_command({ cmd: 'render report' }));".to_owned(),
             ToolStatus::Completed,
-            Arc::clone(&details_expanded),
+            Arc::clone(&tool_calls),
         );
         let mut child = ToolActivity::new(
             "code-mode-1/code-1".to_owned(),
             "exec_command".to_owned(),
             "render report".to_owned(),
             ToolStatus::Completed,
-            details_expanded,
+            tool_calls,
         );
         child.duration_ns = Some(1_000_000);
         child.result = Some("styled λ output ".repeat(20_000));
@@ -3919,7 +4270,7 @@ R_{\mu\nu}-\frac12R\,g_{\mu\nu}+\Lambda g_{\mu\nu}
             "*** Begin Patch\n*** Update File: src/main.rs\n@@\n-old();\n+new();\n*** End Patch"
                 .to_owned(),
             ToolStatus::Completed,
-            Arc::new(AtomicBool::new(true)),
+            Arc::new(SharedToolCalls::default()),
         );
 
         let lines = child_lines(&child, "  └──", "      ", 80);
@@ -3955,7 +4306,7 @@ R_{\mu\nu}-\frac12R\,g_{\mu\nu}+\Lambda g_{\mu\nu}
                 .contains("second detail line")
         );
 
-        transcript.set_tool_details_expanded(false);
+        transcript.set_tool_calls(ToolCalls::Folded);
         let mut folded = Terminal::new(TestBackend::new(80, 8)).unwrap();
         folded
             .draw(|frame| {
@@ -3969,6 +4320,42 @@ R_{\mu\nu}-\frac12R\,g_{\mu\nu}+\Lambda g_{\mu\nu}
     }
 
     #[test]
+    fn hidden_tool_calls_leave_only_the_conversation() {
+        let mut transcript = Transcript::default();
+        transcript.push(TranscriptItem::User("check the build".to_owned()));
+        transcript.push(TranscriptItem::Tool {
+            call_id: "call-hidden".to_owned(),
+            name: "exec_command".to_owned(),
+            arguments: "cargo build --workspace".to_owned(),
+            status: ToolStatus::Completed,
+        });
+        transcript.push(TranscriptItem::Assistant("The build passes.".to_owned()));
+        let draw = |transcript: &Transcript| {
+            let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+            terminal
+                .draw(|frame| {
+                    frame.render_widget(transcript.widget(0, None, None, "empty"), frame.area());
+                })
+                .unwrap();
+            terminal.backend().to_string()
+        };
+        let shown_height = transcript.total_height(80);
+
+        transcript.set_tool_calls(ToolCalls::Hidden);
+        let hidden = draw(&transcript);
+        assert!(hidden.contains("check the build"));
+        assert!(hidden.contains("The build passes."));
+        assert!(!hidden.contains("exec_command"));
+        assert!(!hidden.contains("cargo build"));
+        assert_eq!(transcript.height_at(1, 80), Some(0));
+        assert!(transcript.total_height(80) < shown_height);
+
+        transcript.set_tool_calls(ToolCalls::Expanded);
+        assert!(draw(&transcript).contains("cargo build --workspace"));
+        assert_eq!(transcript.total_height(80), shown_height);
+    }
+
+    #[test]
     fn folding_does_not_copy_branch_shared_tool_entries() {
         let mut transcript = Transcript::default();
         transcript.push(TranscriptItem::Tool {
@@ -3979,7 +4366,7 @@ R_{\mu\nu}-\frac12R\,g_{\mu\nu}+\Lambda g_{\mu\nu}
         });
         let shared = transcript.clone();
 
-        transcript.set_tool_details_expanded(false);
+        transcript.set_tool_calls(ToolCalls::Folded);
 
         assert!(Arc::ptr_eq(&transcript.entries[0], &shared.entries[0]));
     }

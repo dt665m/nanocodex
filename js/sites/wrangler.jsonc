@@ -1,0 +1,18 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "nanocodex-sites",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-29",
+  "preview_urls": false,
+  // With an empty SITES_DOMAIN, sites are served by path on workers.dev:
+  // https://nanocodex-sites.<subdomain>.workers.dev/<label>/. Private views
+  // need the owner's session; public links are sandboxed (docs/SITES.md).
+  // To give every site its own origin instead, attach a dedicated registrable
+  // zone with a wildcard route, set SITES_DOMAIN to it, and set managed's
+  // NANOCODEX_SITES_ORIGIN to https://*.<zone>:
+  //   "routes": [{ "pattern": "*.<zone>/*", "zone_name": "<zone>" }]
+  "workers_dev": true,
+  "vars": { "SITES_DOMAIN": "" },
+  "r2_buckets": [{ "binding": "SITES", "bucket_name": "nanocodex-sites" }],
+  "observability": { "enabled": true }
+}

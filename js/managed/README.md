@@ -11,15 +11,37 @@ through `tools.*` inside Code Mode. Tool allowlists and sessions without attache
 providers retain this policy. Recreated sessions select the same policy from
 backend code. Evaluation uses the lazy Workers-compatible QuickJS evaluator.
 
-Claude retains its native `Bash`, `BashOutput`, `Read`, `Write`, and `Edit`
-handlers behind Code Mode. Memories, session recall, canonical subagents,
+Claude uses the shared `exec_command` and `write_stdin` schemas and handlers
+behind Code Mode, alongside its native `Read`, `Write`, and `Edit` handlers. Memories, session recall, canonical subagents,
 connectors, Hands, CUA, and Vault retain their owned handlers and authorization.
 All harnesses use the canonical `spawn_agent`, `list_agents`, `send_agent_message`,
 `wait_agent`, `interrupt_agent`, `close_agent`, and `submit_result` lifecycle.
 Legacy Claude agent `Task`, `TaskOutput`, and `TaskStop` are unavailable. A
 configuration requesting them fails before inference with an explicit removed
 capability error; legacy IDs are never aliased to canonical children.
-`BashOutput` continues to poll retained native shell sessions.
+`write_stdin` polls retained native shell sessions. Legacy `Bash` and
+`BashOutput` capabilities are unavailable.
+
+When a direct subagent completes after its parent turn has ended, the hosted
+thread automatically starts a continuation to inspect and integrate its result.
+This works across harnesses and uses the child's captured permissions. Completion
+while the parent is active (including in `wait_agent`) does not add another turn;
+failed or cancelled parent work is not automatically restarted.
+
+With thinking enabled, Claude Opus 5.5, Sonnet 5.5, and Fable 5.1 request
+`display: "updates"` and its required beta header. Nonempty provider progress
+updates stream as `reasoning.summary.delta` into the existing Thinking rows;
+empty thinking blocks, signatures, and redacted blocks never become display
+text. Signed blocks remain intact in the provider conversation. Other Claude
+models keep their existing thinking display. Progress is model-generated and
+may be skipped, especially at higher effort. Managed Claude instructions also
+ask for concise initial and periodic updates during multi-step work.
+See [Claude thinking display](https://platform.claude.com/docs/en/build-with-claude/thinking#controlling-thinking-display).
+
+`pnpm --filter nanocodex-managed-service run test:claude-managed` covers the
+public curl SSE and history path. The native terminal journey is
+`python3 scripts/tests/claude-progress-cli-journey.py --binary target/debug/nanocodex`.
+Both retain synthetic transcripts under ignored `output/`.
 
 Claude steering accepts identified corrections with the same durable receipt,
 deduplication, and pending-withdrawal contract as Codex. Consumption emits
@@ -78,6 +100,54 @@ Run the provider-mocked real Code Mode/SQLite and Workers SQLite/R2 journeys wit
 `pnpm --dir js/managed test:images`. The first journey also runs standalone with
 `pnpm --dir js/managed test:images:node`; it reopens real disk SQLite but does not
 claim to emulate Cloudflare or R2.
+
+## Session control tool
+
+`session_control` lets a direct account root agent inspect and drive another
+session owned by the same account through the public `/v1/agents` routes and
+the production managed turn lifecycle. No CLI or Hand is involved.
+
+- `list` pages owned sessions, newest first, with titles, status and active
+  turn IDs (`limit`, `cursor`).
+- `status` reads one session's active turns, turn counts and latest event cursor.
+- `submit` admits a turn with a caller-chosen stable `turn_id` and text `input`.
+  It returns once accepted (`created: false` on an identical replay) and never
+  waits for completion. A different input under an existing ID is a conflict.
+- `turn` reads a turn's state and terminal result, or a steering receipt when
+  `message_id` is supplied.
+- `steer` adds text to an active turn under a stable `message_id`; identical
+  replays are idempotent.
+- `events` pages event history with `after`/`before` cursors; oversized events
+  are truncated to a bounded preview.
+
+```js
+const turn_id = crypto.randomUUID();
+text(await tools.session_control({ operation: "submit", session_id: "SESSION_UUID", turn_id, input: "Restart the design subagents." }));
+text(await tools.session_control({ operation: "turn", session_id: "SESSION_UUID", turn_id }));
+```
+
+Reads require `agents:read` and `tools:use`; `submit` and `steer` also require
+`agents:write`. The call forwards only the current root turn's capabilities as
+an owner principal for this session's organization, team and authorization
+epoch; each target session revalidates them, so another context returns 404.
+Connect grants, shared guests, subagents and multiplayer rooms cannot use it.
+Submitting to or steering the current session is rejected to avoid queuing
+behind itself. Transport failures and 5xx responses report an unknown outcome:
+inspect with `turn` and reuse the identical IDs and input, never a new ID.
+Results redact share bearer tokens and are untrusted session content.
+
+Run `pnpm --filter nanocodex-managed-service run test:session-control`; it
+writes its HTTP/WebSocket trace under `output/session-control-journey/`.
+
+## Static sites
+
+`publish_site` publishes a thread directory or file as an immutable static site
+version, and `site_sharing` creates and revokes public links to a version. The
+owner HTTP routes are `/v1/agents/:id/sites/...`, and links are served by the
+separate `nanocodex-sites` Worker. See [Static sites](../../docs/SITES.md) for
+sources, limits, isolation, and operations. Run
+`pnpm --filter nanocodex-managed-service run test:sites`; it writes its HTTP and
+curl trace to `output/sites-journey.json`.
 
 ## Thread sharing tool
 
@@ -290,6 +360,11 @@ Hosted WebSocket diagnostics are always enabled in Workers Logs. The
 `transport.socket.opened`, `transport.request.sent`,
 `transport.request.first_message`, `transport.request.first_output`, and
 `transport.request.finished` describe each socket/request lifecycle.
+The managed `session_id`, `thread_id`, and `turn_id` retain owner correlation;
+`runtime_session_id`, `runtime_turn_id`, and child `agent_id` distinguish concurrent
+agent operations. Group `model_call_index` by runtime session and turn.
+Completion uses an observed response ID when available, otherwise a uniquely
+attributable operation; oversized provider envelopes are never parsed just for diagnostics.
 `first_message` and `first_output` include an allowlisted `provider_event_type`;
 `first_output` also identifies its `output_kind`. This historical output marker
 includes empty item announcements, so it is not a first-token measurement.
@@ -756,11 +831,79 @@ still occurs at dispatch.
 Run `node js/managed/benchmark/curl-ttft.mjs --mode=stream --family=codex` from
 the repository root to measure the normal account proxy, Managed API, Session
 and Egress path with curl against local workerd and a synthetic external provider.
+The default `--ingress=direct` exercises direct namespaces; use
+`--ingress=managed` to measure the managed fallback. These are local fixture
+clock measurements of the selected source checkout, distinct from live latency.
 Use `--mode=combined` for the existing JSON-then-events path, `--mode=legacy`
 for separate create/submit/events, and `--root=/path/to/checkout` for a baseline.
 The harness records first assistant text, durable completion, source hashes and
 raw traces under ignored `output/managed-api-ttft/`; it does not measure live
 inference, network geography or production cold activation.
+
+For live API latency and a bounded disconnect/retry journey, export
+`NANOCODEX_ORIGIN` and `NANOCODEX_API_KEY`, then run:
+
+```sh
+NANOCODEX_LATENCY_SAMPLES=3 \
+  corepack pnpm --filter nanocodex-managed-service benchmark:api:live
+# Alternatively load an existing authorized env file explicitly from the repo root:
+node --env-file=/path/to/authorized.env js/managed/scripts/curl-api-latency.mjs
+```
+
+This creates fresh synthetic sessions and uses live inference. It never reads
+an env file implicitly and supplies the bearer to curl through stdin. Set
+`NANOCODEX_TEST_MODEL` (default `gpt-6.1-sol`),
+`NANOCODEX_LATENCY_SAMPLES` (1–100, default 3), and
+`NANOCODEX_LATENCY_OUTPUT` (default repository `output/managed-api-latency`).
+Each run has a unique evidence directory with source metadata, UTC intervals,
+request identities, headers including server timing/request IDs, raw responses,
+and frame timestamps. It checks exact current-turn text, absence of tool calls,
+same-identity retry after disconnect, changed-input conflict, subsequent work,
+and paginated history. Admission, first text, and EOF timings include client and
+network overhead; a fresh session does not establish a cold Worker. On failure,
+reconcile the saved request identity before retrying; the harness does not
+silently retry uncertain writes. Sessions are retained for inspection.
+
+Durability changes use curl-backed public HTTP journeys:
+
+```sh
+corepack pnpm --filter nanocodex-managed-service test:durability:curl
+NANOCODEX_ORIGIN=https://your-managed-origin.example \
+  corepack pnpm --filter nanocodex-managed-service test:durability:curl:live
+```
+
+The live journey requires `NANOCODEX_API_KEY` in the environment. It creates fresh
+synthetic agents and files in their `/brain`, uses live inference, and retains
+the agents for inspection. It disconnects after admission, retries the same
+idempotency key, verifies SSE cursor replay and expected rejections, and reuses
+an existing child and grandchild after real idle teardown. It also restarts a
+test agent during an effect, verifies no duplicate file append, delegates new
+work to the same child, cancels a later turn, and verifies another turn succeeds.
+`NANOCODEX_JOURNEY_SCENARIO=idle`, `restart`, or `interruption` selects one journey.
+`restart` checks explicit restart and nested recall without the idle wait.
+`NANOCODEX_JOURNEY_RESUME=/previous/evidence/directory` replays that run's exact
+saved admission body and key, preserving its existing children. Idle is
+measured after the last admission replay, which renews the preparation lease
+without changing `last_active`.
+
+The owner-only `POST /v1/agents/:id/restart` drill requires `agents:write` and
+returns `202 {"restarting":true}`. Eviction and recovery happen asynchronously;
+the acknowledgement is owned by the managed Worker before the Session aborts.
+An interrupted tool's outcome can remain unknown after recovery.
+
+The local journey uses real workerd, SQLite, HTTP, curl, and a synthetic Hand
+publisher, with fixtures for account identity and model inference. It forces
+process loss and same-isolate Durable Object restart, checks bounded root and
+child recovery, and exercises Hand receipt reconciliation, missing proof,
+dispatch deadlines, and publisher replacement. It never restarts personal Hands.
+Requests, response headers, JSON/SSE bodies, assertions, and runtime traces live
+under ignored `output/managed-curl-*`. The live runner accepts
+`NANOCODEX_JOURNEY_OUTPUT` for another evidence directory and sends its bearer to
+curl through stdin rather than recording it in command arguments.
+Set `NANOCODEX_TEST_MODEL`, and optionally both `NANOCODEX_TEST_CHILD_HARNESS`
+and `NANOCODEX_TEST_CHILD_MODEL`, to exercise another available model or a mixed
+harness tree. CI runs the local curl journeys and uploads their request/response
+evidence as `managed-curl-durability`.
 
 - SMS OTP/account and API-key routes establish the account identity that owns
   agents, organizations, connectors, memory, and history.
@@ -1003,6 +1146,7 @@ protocol. `/health` is the service health endpoint.
 | `NANOCODEX_HISTORY`, `HISTORY_AI_SEARCH` | R2 history archive and production history retrieval. |
 | `NANOCODEX_WORKSPACES`, `NANOCODEX_WORKSPACES_*`, `NANOCODEX_BRAIN` | Retained per-hand workspaces, read-only peer aliases, and the durable agent's shared writable `/brain` scratch. |
 | `BROWSER`, `LOADER` | Browser Run and the sandboxed Worker loader used by the official Agents browser runtime. |
+| `NANOCODEX_SITES`, `NANOCODEX_SITES_ORIGIN` | Published static site versions and link host records, and the link origin pattern (`https://*.<zone>`). See [Static sites](../../docs/SITES.md). |
 
 ### Persistent prompt apps
 

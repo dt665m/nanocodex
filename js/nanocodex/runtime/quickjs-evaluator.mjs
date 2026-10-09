@@ -195,6 +195,9 @@ const __nanocodex_decode = (encoded) => {
       if (typeof failure.stack === "string") error.stack = failure.stack;
       if (Object.hasOwn(failure, "code")) error.code = failure.code;
       if (Object.hasOwn(failure, "details")) error.details = failure.details;
+      for (const key of Object.keys(failure)) {
+        if (!["message", "stack", "name", "code", "details"].includes(key)) error[key] = failure[key];
+      }
     }
     throw error;
   }
@@ -205,7 +208,11 @@ const tools = (${createCodeTools.toString()})(
   (name, input) => __nanocodex_call_tool(name, JSON.stringify(input ?? null)).then(__nanocodex_decode),
 );
 const ALL_TOOLS = Object.freeze(typeof __nanocodex_catalog === "undefined" ? undefined : JSON.parse(__nanocodex_catalog));
-const text = (value) => __nanocodex_emit("text", JSON.stringify(__nanocodex_stringify(value)));
+// Models often label values as text("label:", value); keep every argument
+// visible instead of silently dropping all but the first.
+const text = (...values) => __nanocodex_emit("text", JSON.stringify(values.length > 1
+  ? values.map(__nanocodex_stringify).join(" ")
+  : __nanocodex_stringify(values[0])));
 const image = (value, detail) => {
   const item = normalizeImage(value, detail);
   __nanocodex_emit("image", JSON.stringify({ value: item, detail: item.detail }));
@@ -267,6 +274,9 @@ function serializeToolError(error) {
       ...(typeof error.stack === "string" ? { stack: error.stack } : {}),
       ...(Object.hasOwn(error, "code") ? { code: error.code } : {}),
       ...(Object.hasOwn(error, "details") ? { details: error.details } : {}),
+      // Structured tool failures carry their fields as own properties.
+      ...Object.fromEntries(Object.entries(error).filter(([key, value]) =>
+        !["message", "stack", "name", "cause"].includes(key) && typeof value !== "function")),
     };
   }
   return String(error);

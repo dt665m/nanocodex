@@ -56,6 +56,12 @@ pub(super) struct ChildSession {
     pub(super) last_output: Option<Value>,
     pub(super) last_used: u64,
     pub(super) evicted: bool,
+    /// Automatic restart resumes since this child last finished a turn.
+    pub(super) resume_attempts: u32,
+    /// Bounded tool calls observed during the current or interrupted turn.
+    pub(super) in_flight_calls: Vec<durable::InFlightCall>,
+    /// Observed calls dropped by the retention bound this turn.
+    pub(super) in_flight_omitted: u32,
     /// Journal-restored children need a fresh host binding before execution.
     announce: bool,
 }
@@ -113,10 +119,18 @@ pub struct Registry {
     /// Per-root restoration outcome. Pending and failed roots must never be saved.
     restored: std::sync::Mutex<HashMap<String, RestorationOutcome>>,
     journal_writer: std::sync::atomic::AtomicBool,
-    checkpoints: std::sync::Mutex<HashMap<(String, AgentId), ChildSnapshot>>,
+    /// Orders background snapshots and the final pre-teardown journal flush.
+    journal_write_lock: tokio::sync::Mutex<()>,
+    checkpoints: std::sync::Mutex<HashMap<(String, AgentId), durable::JournalCheckpoint>>,
+    /// Terminal checkpoints registered before their completed status is visible.
+    pending_checkpoints: std::sync::Mutex<HashMap<String, usize>>,
     /// In-flight mid-turn checkpoint captures; `true` requests one more pass.
     progress_captures: std::sync::Mutex<HashMap<(String, AgentId), bool>>,
     pending_resume: std::sync::Mutex<HashMap<String, Vec<AgentId>>>,
+    /// Terminal results each caller session already received from `wait`.
+    wait_reported: std::sync::Mutex<HashMap<(String, AgentId), u64>>,
+    /// Consecutive waits per caller with nothing new and nothing left active.
+    idle_waits: std::sync::Mutex<HashMap<String, (Vec<AgentId>, u32)>>,
 }
 
 #[derive(Default)]
@@ -132,6 +146,42 @@ struct AgentScope {
     sessions: HashMap<AgentId, ChildSession>,
     messages: MessageThreads,
     closing: bool,
+    /// Shutdown saved the durable pre-teardown tree; later Closing/Closed
+    /// transitions are live-only and must never reach the journal.
+    journal_frozen: bool,
+}
+
+/// One root journal value and the checkpoint records (key, JSON) it newly references.
+struct JournalWrite {
+    payload: String,
+    records: Vec<(Arc<str>, Arc<str>)>,
+}
+
+impl AgentScope {
+    /// Encodes this root's journal and the checkpoint records it newly references.
+    fn journal_payload(
+        &self,
+        root_session_id: &str,
+        checkpoints: &HashMap<(String, AgentId), durable::JournalCheckpoint>,
+    ) -> std::io::Result<JournalWrite> {
+        let mut ids = self.sessions.keys().copied().collect::<Vec<_>>();
+        ids.sort_unstable();
+        let mut records = Vec::new();
+        let mut agents = Vec::with_capacity(ids.len());
+        for id in ids {
+            let Some(session) = self.sessions.get(&id) else {
+                continue;
+            };
+            let checkpoint = checkpoints.get(&(root_session_id.to_owned(), id));
+            agents.push(durable::persist_agent(session, checkpoint, &mut records)?);
+        }
+        let payload = serde_json::to_string(&durable::PersistedScope {
+            version: durable::JOURNAL_VERSION,
+            agents,
+        })
+        .map_err(std::io::Error::other)?;
+        Ok(JournalWrite { payload, records })
+    }
 }
 
 pub(super) struct AgentReservation {
@@ -282,25 +332,15 @@ impl RegistryState {
 
     fn journal(
         &self,
-        checkpoints: &HashMap<(String, AgentId), ChildSnapshot>,
-    ) -> Vec<(String, String)> {
+        checkpoints: &HashMap<(String, AgentId), durable::JournalCheckpoint>,
+    ) -> Vec<(String, JournalWrite)> {
         let mut payloads = Vec::with_capacity(self.scopes.len());
-        for (root_session_id, scope) in &self.scopes {
-            let mut ids = scope.sessions.keys().copied().collect::<Vec<_>>();
-            ids.sort_unstable();
-            let agents = ids
-                .into_iter()
-                .filter_map(|id| {
-                    let session = scope.sessions.get(&id)?;
-                    let checkpoint = checkpoints.get(&(root_session_id.clone(), id));
-                    Some(durable::persist_agent(session, checkpoint))
-                })
-                .collect();
-            let journal = durable::PersistedScope {
-                version: durable::JOURNAL_VERSION,
-                agents,
-            };
-            match serde_json::to_string(&journal) {
+        for (root_session_id, scope) in self
+            .scopes
+            .iter()
+            .filter(|(_, scope)| !scope.journal_frozen)
+        {
+            match scope.journal_payload(root_session_id, checkpoints) {
                 Ok(payload) => payloads.push((root_session_id.clone(), payload)),
                 Err(error) => tracing::warn!(%error, "could not encode subagent journal"),
             }
@@ -745,6 +785,30 @@ impl RegistryState {
         self.summaries_in_scope(root_session_id, ids)
     }
 
+    /// Summaries plus each child's instruction revision, so a resumed child's
+    /// next terminal result is distinguishable from one already reported.
+    fn wait_snapshot(
+        &self,
+        session_id: &str,
+        ids: &[AgentId],
+    ) -> std::io::Result<Vec<(AgentSummary, u64)>> {
+        let summaries = self.summaries(session_id, ids)?;
+        let sessions = &self
+            .scopes
+            .get(self.root_session_id(session_id))
+            .ok_or_else(|| std::io::Error::other("subagent scope disappeared"))?
+            .sessions;
+        Ok(summaries
+            .into_iter()
+            .map(|summary| {
+                let revision = sessions
+                    .get(&summary.agent_id)
+                    .map_or(0, |session| session.next_instruction_revision);
+                (summary, revision)
+            })
+            .collect())
+    }
+
     fn summaries_in_scope(
         &self,
         root_session_id: &str,
@@ -977,6 +1041,25 @@ impl RegistryState {
 }
 
 const AGENT_STOP_TIMEOUT: Duration = Duration::from_secs(30);
+/// Identical waits allowed to re-read already-reported terminal agents.
+const IDLE_WAIT_LIMIT: u32 = 2;
+
+fn lock_unpoisoned<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Identifies one terminal result of one child turn.
+fn wait_mark(status: &AgentStatus, revision: u64) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    revision.hash(&mut hasher);
+    serde_json::to_string(status)
+        .unwrap_or_default()
+        .hash(&mut hasher);
+    hasher.finish()
+}
 
 impl Registry {
     pub(super) fn new(
@@ -999,9 +1082,13 @@ impl Registry {
             journals: std::sync::RwLock::new(HashMap::new()),
             restored: std::sync::Mutex::new(HashMap::new()),
             journal_writer: std::sync::atomic::AtomicBool::new(false),
+            journal_write_lock: tokio::sync::Mutex::new(()),
             checkpoints: std::sync::Mutex::new(HashMap::new()),
+            pending_checkpoints: std::sync::Mutex::new(HashMap::new()),
             progress_captures: std::sync::Mutex::new(HashMap::new()),
             pending_resume: std::sync::Mutex::new(HashMap::new()),
+            wait_reported: std::sync::Mutex::new(HashMap::new()),
+            idle_waits: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -1132,19 +1219,29 @@ impl Registry {
                 let Some(live) = registry.upgrade() else {
                     return;
                 };
+                // Capture under the same lock as the final flush: an older
+                // background payload must never overwrite shutdown's snapshot.
+                let write_guard = live.journal_write_lock.lock().await;
                 let payloads = live.journal_payloads().await;
                 let stores = payloads
                     .iter()
                     .map(|(root, _)| live.store_for(root))
                     .collect::<Vec<_>>();
-                drop(live);
-                for ((root_session_id, payload), store) in payloads.into_iter().zip(stores) {
+                for ((root_session_id, write), store) in payloads.into_iter().zip(stores) {
                     let Some(store) = store else { continue };
+                    let JournalWrite { payload, records } = write;
                     if saved.get(&root_session_id) == Some(&payload) {
+                        // The saved journal already references these records.
+                        live.acknowledge(&root_session_id, &records);
                         continue;
                     }
-                    match store.save(&root_session_id, payload.clone()).await {
+                    let contents = records.iter().map(|(_, json)| Arc::clone(json)).collect();
+                    match store
+                        .save(&root_session_id, payload.clone(), contents)
+                        .await
+                    {
                         Ok(()) => {
+                            live.acknowledge(&root_session_id, &records);
                             saved.insert(root_session_id, payload);
                         }
                         Err(error) => {
@@ -1152,6 +1249,8 @@ impl Registry {
                         }
                     }
                 }
+                drop(write_guard);
+                drop(live);
                 if revision.changed().await.is_err() {
                     return;
                 }
@@ -1159,7 +1258,7 @@ impl Registry {
         }));
     }
 
-    async fn journal_payloads(&self) -> Vec<(String, String)> {
+    async fn journal_payloads(&self) -> Vec<(String, JournalWrite)> {
         let state = self.state.lock().await;
         let checkpoints = self
             .checkpoints
@@ -1181,10 +1280,42 @@ impl Registry {
     }
 
     fn record_checkpoint(&self, root_session_id: &str, id: AgentId, snapshot: ChildSnapshot) {
+        // Encode once, outside the lock; journal writes only reference it.
+        match durable::JournalCheckpoint::encode(&snapshot) {
+            Ok(checkpoint) => self.insert_checkpoint(root_session_id, id, checkpoint),
+            Err(error) => tracing::warn!(%error, "could not encode subagent checkpoint"),
+        }
+    }
+
+    fn insert_checkpoint(
+        &self,
+        root_session_id: &str,
+        id: AgentId,
+        checkpoint: durable::JournalCheckpoint,
+    ) {
         self.checkpoints
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert((root_session_id.to_owned(), id), snapshot);
+            .insert((root_session_id.to_owned(), id), checkpoint);
+    }
+
+    /// Releases encoded checkpoints once a saved journal references their records.
+    fn acknowledge(&self, root_session_id: &str, records: &[(Arc<str>, Arc<str>)]) {
+        if records.is_empty() {
+            return;
+        }
+        let mut checkpoints = self
+            .checkpoints
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for ((root, _), checkpoint) in checkpoints.iter_mut() {
+            if root == root_session_id
+                && checkpoint.pending.is_some()
+                && records.iter().any(|(key, _)| *key == checkpoint.key)
+            {
+                checkpoint.pending = None;
+            }
+        }
     }
 
     /// Captures a child's latest committed boundary for the durable journal.
@@ -1197,12 +1328,30 @@ impl Registry {
         if self.store_for(&root_session_id).is_none() {
             return;
         }
+        *self
+            .pending_checkpoints
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(root_session_id.clone())
+            .or_default() += 1;
         let registry = Arc::clone(self);
         drop(platform::spawn(async move {
             if let Ok(snapshot) = harness.snapshot().await {
                 registry.record_checkpoint(&root_session_id, id, snapshot);
-                registry.changed();
             }
+            {
+                let mut pending = registry
+                    .pending_checkpoints
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(count) = pending.get_mut(&root_session_id) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        pending.remove(&root_session_id);
+                    }
+                }
+            }
+            registry.changed();
         }));
     }
 
@@ -1253,6 +1402,68 @@ impl Registry {
         }));
     }
 
+    /// Journals bounded tool calls observed during a child's turn until the
+    /// turn settles, so a restart can name the calls it must reconcile.
+    async fn track_in_flight(
+        &self,
+        root_session_id: &str,
+        id: AgentId,
+        kind: &AgentEventKind,
+        payload: &Option<Arc<serde_json::value::RawValue>>,
+    ) {
+        #[derive(serde::Deserialize)]
+        struct Call {
+            call_id: String,
+            #[serde(default)]
+            tool: String,
+            #[serde(default)]
+            arguments: Option<Value>,
+        }
+        let Some(call) = payload
+            .as_ref()
+            .and_then(|payload| serde_json::from_str::<Call>(payload.get()).ok())
+        else {
+            return;
+        };
+        {
+            let mut state = self.state.lock().await;
+            let Some(session) = state
+                .scopes
+                .get_mut(root_session_id)
+                .and_then(|scope| scope.sessions.get_mut(&id))
+            else {
+                return;
+            };
+            match kind {
+                AgentEventKind::ToolCall => {
+                    let evicted = durable::retain_call(
+                        &mut session.in_flight_calls,
+                        durable::InFlightCall::new(
+                            &call.call_id,
+                            &call.tool,
+                            call.arguments.as_ref(),
+                        ),
+                    );
+                    session.in_flight_omitted = session.in_flight_omitted.saturating_add(evicted);
+                }
+                // Kept, not removed: a result reaches the restored history only
+                // once a later checkpoint commits it.
+                AgentEventKind::ToolResult => {
+                    let Some(existing) = session
+                        .in_flight_calls
+                        .iter_mut()
+                        .find(|existing| existing.call_id == call.call_id)
+                    else {
+                        return;
+                    };
+                    existing.result_recorded = true;
+                }
+                _ => return,
+            }
+        }
+        self.changed();
+    }
+
     async fn running_harness(&self, root_session_id: &str, id: AgentId) -> Option<HarnessHandle> {
         self.state
             .lock()
@@ -1281,7 +1492,11 @@ impl Registry {
         };
         let journal: durable::PersistedScope = serde_json::from_str(&payload)
             .map_err(|error| std::io::Error::other(format!("invalid subagent journal: {error}")))?;
-        if journal.version != durable::JOURNAL_VERSION {
+        // Embedded (version 1) journals carry whole child conversations.
+        drop(payload);
+        if journal.version != durable::JOURNAL_VERSION
+            && journal.version != durable::EMBEDDED_JOURNAL_VERSION
+        {
             return Err(std::io::Error::other(format!(
                 "unsupported subagent journal version {}",
                 journal.version
@@ -1289,6 +1504,13 @@ impl Registry {
         }
         let mut agents = journal.agents;
         agents.sort_by_key(|agent| agent.descriptor.id);
+        // Load referenced conversations one at a time, before taking the state lock.
+        let mut stored = HashMap::new();
+        for agent in &mut agents {
+            if let Some(checkpoint) = agent.hydrate(store.as_ref(), root_session_id).await? {
+                stored.insert(agent.descriptor.id, checkpoint);
+            }
+        }
         let mut report = RestoreReport::default();
         let mut state = self.state.lock().await;
         if state
@@ -1302,12 +1524,20 @@ impl Registry {
         }
         for agent in agents {
             let id = agent.descriptor.id;
-            let checkpoint = agent.snapshot()?;
             let (session, resume, lost) = durable::restored_session(agent)?;
-            state.insert_restored(root_session_id, session)?;
-            if let Some(checkpoint) = checkpoint {
-                self.record_checkpoint(root_session_id, id, checkpoint);
+            match (stored.remove(&id), &session.stored_runtime) {
+                (Some(checkpoint), _) => self.insert_checkpoint(root_session_id, id, checkpoint),
+                // An embedded checkpoint becomes a record on the next save.
+                (None, Some(snapshot)) => {
+                    self.insert_checkpoint(
+                        root_session_id,
+                        id,
+                        durable::JournalCheckpoint::encode(snapshot)?,
+                    );
+                }
+                (None, None) => {}
             }
+            state.insert_restored(root_session_id, session)?;
             report.restored += 1;
             if resume {
                 report.interrupted.push(id);
@@ -1317,12 +1547,62 @@ impl Registry {
             }
         }
         drop(state);
+        // Persist each resume attempt before admitting it: a runtime lost during
+        // every resume must still exhaust its bounded recovery budget.
+        if !report.interrupted.is_empty() {
+            self.save_scope(root_session_id, store.as_ref())
+                .await
+                .map_err(|error| {
+                    std::io::Error::new(
+                        error.kind(),
+                        format!("could not record subagent resume attempts: {error}"),
+                    )
+                })?;
+        }
         self.pending_resume
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(root_session_id.to_owned(), report.interrupted.clone());
         self.changed();
         Ok(report)
+    }
+
+    /// Synchronously saves one root's current journal, ordered with the writer.
+    async fn save_scope(
+        &self,
+        root_session_id: &str,
+        store: &dyn SubagentStore,
+    ) -> std::io::Result<()> {
+        let _write_guard = self.journal_write_lock.lock().await;
+        let payload = {
+            let state = self.state.lock().await;
+            let checkpoints = self
+                .checkpoints
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state
+                .scopes
+                .get(root_session_id)
+                .map(|scope| scope.journal_payload(root_session_id, &checkpoints))
+                .transpose()?
+        };
+        match payload {
+            Some(write) => self.save_write(root_session_id, store, write).await,
+            None => Ok(()),
+        }
+    }
+
+    async fn save_write(
+        &self,
+        root_session_id: &str,
+        store: &dyn SubagentStore,
+        write: JournalWrite,
+    ) -> std::io::Result<()> {
+        let JournalWrite { payload, records } = write;
+        let contents = records.iter().map(|(_, json)| Arc::clone(json)).collect();
+        store.save(root_session_id, payload, contents).await?;
+        self.acknowledge(root_session_id, &records);
+        Ok(())
     }
 
     /// Continues every child whose turn was interrupted by the restart.
@@ -1340,18 +1620,30 @@ impl Registry {
         for id in ids {
             // Restate the binding task: a resumed child must finish it, not
             // summarize partial progress as its result.
-            let task = self
+            let (task, evidence) = self
                 .state
                 .lock()
                 .await
                 .scopes
                 .get(root_session_id)
                 .and_then(|scope| scope.sessions.get(&id))
-                .map(|session| session.binding_task.clone());
-            let message = match task {
-                Some(task) => format!("{}\n\nDelegated task:\n{task}", durable::RESUME_MESSAGE),
-                None => durable::RESUME_MESSAGE.to_owned(),
-            };
+                .map(|session| {
+                    (
+                        Some(session.binding_task.clone()),
+                        durable::in_flight_evidence(
+                            &session.in_flight_calls,
+                            session.in_flight_omitted,
+                        ),
+                    )
+                })
+                .unwrap_or_default();
+            let mut message = durable::RESUME_MESSAGE.to_owned();
+            if let Some(evidence) = evidence {
+                message = format!("{message}\n\n{evidence}");
+            }
+            if let Some(task) = task {
+                message = format!("{message}\n\nDelegated task:\n{task}");
+            }
             let result = self
                 .send_message(
                     root_session_id,
@@ -1565,6 +1857,9 @@ impl Registry {
                 last_output: None,
                 last_used: 0,
                 evicted: false,
+                resume_attempts: 0,
+                in_flight_calls: Vec::new(),
+                in_flight_omitted: 0,
                 announce: false,
             },
         )?;
@@ -1604,6 +1899,12 @@ impl Registry {
                 None
             } else {
                 let revision = session.next_instruction_revision.checked_add(1)?;
+                // Only the automatic resume continues the interrupted turn and
+                // its unknown calls; any other new turn starts without them.
+                if !matches!(session.status, AgentStatus::Interrupted) {
+                    session.in_flight_calls.clear();
+                    session.in_flight_omitted = 0;
+                }
                 session.next_instruction_revision = revision;
                 session.active_instruction_revision = Some(revision);
                 session.active = true;
@@ -1676,6 +1977,10 @@ impl Registry {
             session.active = false;
             session.active_instruction_revision = None;
             session.steering = false;
+            // The turn settled in this runtime, so restart recovery made progress.
+            session.resume_attempts = 0;
+            session.in_flight_calls.clear();
+            session.in_flight_omitted = 0;
             let submitted_output = session.submitted_output.take();
             // Acceptance belongs to this turn even if cancellation/close wins settlement.
             // Keep its evidence, without claiming the interrupted execution completed.
@@ -1694,12 +1999,13 @@ impl Registry {
                 }
             }
             .clone_into(&mut session.status);
-            (session.status.clone(), session.harness.clone())
+            // Register capture while state is still locked: shutdown must not
+            // observe Completed before its final checkpoint is pending.
+            if let Some(harness) = session.harness.clone() {
+                self.capture_checkpoint(root_session_id.to_owned(), id, harness);
+            }
+            session.status.clone()
         };
-        let (status, harness) = status;
-        if let Some(harness) = harness {
-            self.capture_checkpoint(root_session_id.to_owned(), id, harness);
-        }
         self.send(root_session_id, AgentUpdate::Status { id, status });
         self.changed();
         let registry = Arc::clone(self);
@@ -2163,13 +2469,55 @@ impl Registry {
         let mut revision = self.revision.subscribe();
         let deadline = Instant::now() + duration;
         loop {
-            let summaries = self.state.lock().await.summaries(session_id, ids)?;
-            if summaries
+            let snapshot = self.state.lock().await.wait_snapshot(session_id, ids)?;
+            let terminal = snapshot
                 .iter()
-                .any(|summary| summary.status.is_wait_terminal())
-            {
+                .filter(|(summary, _)| summary.status.is_wait_terminal())
+                .map(|(summary, revision)| {
+                    (summary.agent_id, wait_mark(&summary.status, *revision))
+                })
+                .collect::<Vec<_>>();
+            let all_terminal = terminal.len() == snapshot.len();
+            let summaries = snapshot.into_iter().map(|(summary, _)| summary).collect();
+            // Only results this caller has not seen end a wait. Re-reporting
+            // seen results instantly turned code-mode wait loops into spins.
+            let fresh = {
+                let mut reported = lock_unpoisoned(&self.wait_reported);
+                terminal.iter().fold(false, |fresh, &(id, mark)| {
+                    reported.insert((session_id.to_owned(), id), mark) != Some(mark) || fresh
+                })
+            };
+            if fresh {
+                lock_unpoisoned(&self.idle_waits).remove(session_id);
                 return Ok((summaries, false));
             }
+            if all_terminal {
+                // Nothing new can arrive: return the snapshot so a re-read
+                // works, but reject a loop that keeps asking.
+                let mut key = ids.to_vec();
+                key.sort_unstable();
+                key.dedup();
+                let mut idle = lock_unpoisoned(&self.idle_waits);
+                let entry = idle
+                    .entry(session_id.to_owned())
+                    .or_insert_with(|| (key.clone(), 0));
+                if entry.0 != key {
+                    *entry = (key, 0);
+                }
+                entry.1 += 1;
+                if entry.1 > IDLE_WAIT_LIMIT {
+                    let ids = entry.0.iter().map(ToString::to_string).collect::<Vec<_>>();
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "agent_ids [{}] are all terminal and every result was already returned by an earlier wait_agent call; nothing is left to wait for. Stop waiting: read each agents[i].status.state from that result, or call list_agents({{include_completed:true}}).",
+                            ids.join(", ")
+                        ),
+                    ));
+                }
+                return Ok((summaries, false));
+            }
+            lock_unpoisoned(&self.idle_waits).remove(session_id);
             if timeout_at(deadline, revision.changed()).await.is_err() {
                 let summaries = self.state.lock().await.summaries(session_id, ids)?;
                 return Ok((summaries, true));
@@ -2227,15 +2575,75 @@ impl Registry {
     async fn close_all(&self, session_id: &str) -> std::io::Result<Vec<AgentSummary>> {
         self.await_restored(session_id).await?;
         let _message_guard = self.message_lock.lock().await;
+        let write_guard = self.journal_write_lock.lock().await;
+        let mut revision = self.revision.subscribe();
+        let capture_deadline = Instant::now() + AGENT_STOP_TIMEOUT;
+        let (request, final_journal) = loop {
+            let mut state = self.state.lock().await;
+            let root = state.root_session_id(session_id).to_owned();
+            let captures_pending = self
+                .pending_checkpoints
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&root);
+            if captures_pending {
+                drop(state);
+                // A wedged harness must not block teardown forever; freeze the
+                // newest checkpoint already recorded once the deadline passes.
+                match timeout_at(capture_deadline, revision.changed()).await {
+                    Ok(Ok(())) => continue,
+                    Ok(Err(_)) => {
+                        return Err(std::io::Error::other("subagent runtime is closed"));
+                    }
+                    Err(_) => {
+                        tracing::warn!(%root, "subagent checkpoint capture timed out during shutdown");
+                        self.pending_checkpoints
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .remove(&root);
+                        continue;
+                    }
+                }
+            }
+            // A repeated shutdown (for example a retry after a failed first
+            // flush) must not replace the pre-teardown journal with its
+            // live Closing/Closed statuses.
+            let frozen = state
+                .scopes
+                .get(&root)
+                .is_some_and(|scope| scope.journal_frozen);
+            let final_journal = match self.store_for(&root) {
+                Some(store) if !frozen => {
+                    let checkpoints = self
+                        .checkpoints
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let scope = state.scope_mut(&root);
+                    let payload = scope.journal_payload(&root, &checkpoints)?;
+                    scope.journal_frozen = true;
+                    Some((store, payload))
+                }
+                _ => None,
+            };
+            // Freeze and transition under one state lock. Explicit closes that
+            // won message_lock are already reflected in this durable snapshot.
+            break (state.request_close_all(session_id)?, final_journal);
+        };
         let CloseRequest {
             root_session_id,
             ids,
             harnesses,
             status_updates,
-        } = {
-            let mut state = self.state.lock().await;
-            state.request_close_all(session_id)?
+        } = request;
+        let journal_result = if let Some((store, write)) = final_journal {
+            self.save_write(&root_session_id, store.as_ref(), write)
+                .await
+        } else {
+            Ok(())
         };
+        drop(write_guard);
+        // Even if persistence failed, join the live subtree; report the error
+        // after cleanup rather than leaving children running during shutdown.
         for (id, status) in status_updates {
             self.send(&root_session_id, AgentUpdate::Status { id, status });
         }
@@ -2253,7 +2661,9 @@ impl Registry {
                 .expect("session handles poisoned")
                 .remove(&root);
         }
-        result
+        let summaries = result?;
+        journal_result?;
+        Ok(summaries)
     }
 
     async fn stop_and_close(
@@ -2557,6 +2967,9 @@ impl ChildSession {
             last_output,
             last_used: 0,
             evicted: true,
+            resume_attempts: 0,
+            in_flight_calls: Vec::new(),
+            in_flight_omitted: 0,
             announce: true,
         }
     }
@@ -2626,6 +3039,9 @@ pub(super) fn forward_events(
                 event.kind,
                 AgentEventKind::ModelCallStarted | AgentEventKind::ToolCall
             );
+            let kind = event.kind;
+            let payload = matches!(kind, AgentEventKind::ToolCall | AgentEventKind::ToolResult)
+                .then(|| event.payload.clone());
             if !send_update(
                 &updates,
                 &root_session_id,
@@ -2634,8 +3050,13 @@ pub(super) fn forward_events(
             ) {
                 return;
             }
-            if progress && let Some(registry) = registry.upgrade() {
-                registry.capture_progress(&root_session_id, id);
+            if let Some(registry) = registry.upgrade() {
+                registry
+                    .track_in_flight(&root_session_id, id, &kind, &payload)
+                    .await;
+                if progress {
+                    registry.capture_progress(&root_session_id, id);
+                }
             }
         }
         if let Some(registry) = registry.upgrade() {
@@ -3239,6 +3660,9 @@ mod tests {
             last_output: None,
             last_used: 0,
             evicted: false,
+            resume_attempts: 0,
+            in_flight_calls: Vec::new(),
+            in_flight_omitted: 0,
             announce: false,
         }
     }
@@ -3283,7 +3707,7 @@ mod tests {
             loop {
                 if let Some(payload) = crate::SubagentStore::load(&store, "root").await.unwrap()
                     && payload.contains("\"turn_in_flight\":true")
-                    && payload.contains("\"checkpoint\"")
+                    && payload.contains("\"checkpoint_ref\"")
                 {
                     break;
                 }
@@ -3430,9 +3854,14 @@ mod tests {
                 .unwrap()
                 .status = AgentStatus::Running;
         }
-        let payload = source.journal_payloads().await.pop().unwrap().1;
+        let write = source.journal_payloads().await.pop().unwrap().1;
         let store = crate::MemorySubagentStore::new();
-        crate::SubagentStore::save(&store, root_id, payload)
+        let records = write
+            .records
+            .iter()
+            .map(|(_, json)| Arc::clone(json))
+            .collect();
+        crate::SubagentStore::save(&store, root_id, write.payload, records)
             .await
             .unwrap();
         registry.set_store(Arc::new(store));
@@ -3549,8 +3978,10 @@ mod tests {
         let mut session = test_session(AgentId::new(1), "child", None);
         let original = session.descriptor.task.clone();
         session.descriptor.task = "delegated replacement".to_owned();
-        let encoded =
-            serde_json::to_string(&crate::durable::persist_agent(&session, None)).unwrap();
+        let encoded = serde_json::to_string(
+            &crate::durable::persist_agent(&session, None, &mut Vec::new()).unwrap(),
+        )
+        .unwrap();
         let decoded = serde_json::from_str(&encoded).unwrap();
         let (restored, _, _) = crate::durable::restored_session(decoded).unwrap();
         assert_eq!(restored.descriptor.task, "delegated replacement");
@@ -3590,10 +4021,14 @@ mod tests {
                 .unwrap();
             let encoded = {
                 let state = registry.state.lock().await;
-                serde_json::to_string(&crate::durable::persist_agent(
-                    &state.scopes["main"].sessions[&child],
-                    None,
-                ))
+                serde_json::to_string(
+                    &crate::durable::persist_agent(
+                        &state.scopes["main"].sessions[&child],
+                        None,
+                        &mut Vec::new(),
+                    )
+                    .unwrap(),
+                )
                 .unwrap()
             };
             let (restored, _, _) =
@@ -3601,7 +4036,7 @@ mod tests {
             assert_eq!(restored.descriptor.task, task);
             assert_eq!(restored.binding_task, original);
             // A second checkpoint after restoration must retain both identities.
-            let next = crate::durable::persist_agent(&restored, None);
+            let next = crate::durable::persist_agent(&restored, None, &mut Vec::new()).unwrap();
             let (again, _, _) = crate::durable::restored_session(next).unwrap();
             assert_eq!(again.descriptor.task, task);
             assert_eq!(again.binding_task, original);
@@ -3644,7 +4079,13 @@ mod tests {
         assert_eq!(journal.len(), 1);
 
         let store = crate::MemorySubagentStore::new();
-        crate::SubagentStore::save(&store, "root", journal[0].1.clone())
+        let write = &journal[0].1;
+        let records = write
+            .records
+            .iter()
+            .map(|(_, json)| Arc::clone(json))
+            .collect();
+        crate::SubagentStore::save(&store, "root", write.payload.clone(), records)
             .await
             .unwrap();
         let (registry, _control, _updates) = super::channel(4);
