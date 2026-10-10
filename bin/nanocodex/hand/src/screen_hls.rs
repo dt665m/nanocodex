@@ -403,10 +403,11 @@ fn local_entries(text: &str) -> Vec<(u64, f64)> {
     }
     entries
 }
-/// Owner-private scratch directory; removed on drop, including task abort.
+/// Owner-private scratch directory, named for the owning process. A stream
+/// removes it before reporting a terminal status; drop covers task abort.
 fn scratch() -> std::io::Result<tempfile::TempDir> {
     let dir = tempfile::Builder::new()
-        .prefix("nanocodex-hls-")
+        .prefix(&format!("nanocodex-hls-{}-", std::process::id()))
         .tempdir()?;
     #[cfg(unix)]
     {
@@ -414,6 +415,22 @@ fn scratch() -> std::io::Result<tempfile::TempDir> {
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;
     }
     Ok(dir)
+}
+/// Windows refuses to delete a file that a just-terminated FFmpeg or a file
+/// scanner still holds open, and `TempDir`'s drop ignores that error; retry
+/// briefly so a terminal status does not leave captured segments behind.
+async fn remove_scratch(dir: tempfile::TempDir) {
+    let path = dir.path().to_owned();
+    if dir.close().is_ok() {
+        return;
+    }
+    for _ in 0..10 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        match std::fs::remove_dir_all(&path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {}
+            _ => return,
+        }
+    }
 }
 /// One playback stream: FFmpeg -> local segments -> authenticated uploads.
 /// Status transitions are published on `events`; nothing here is logged.
@@ -505,23 +522,19 @@ pub(crate) async fn run(
             }
         }
     };
-    match outcome {
-        None => {
-            tokio::time::timeout(Duration::from_secs(2), uploader.finish())
-                .await
-                .ok();
-            emit("stopped", None);
-        }
-        Some(error) => {
-            if !matches!(error, "upload_rejected" | "expired") {
-                tokio::time::timeout(Duration::from_secs(2), uploader.finish())
-                    .await
-                    .ok();
-            }
-            emit("failed", Some(error));
-        }
+    // Rejected or expired credentials are never used again.
+    if !matches!(outcome, Some("upload_rejected" | "expired")) {
+        tokio::time::timeout(Duration::from_secs(2), uploader.finish())
+            .await
+            .ok();
     }
-    drop(dir);
+    // Every encoder was killed and reaped above; a terminal status means the
+    // local segments are gone.
+    remove_scratch(dir).await;
+    match outcome {
+        None => emit("stopped", None),
+        Some(error) => emit("failed", Some(error)),
+    }
 }
 
 #[cfg(test)]
@@ -749,7 +762,10 @@ mod tests {
             "stream_id":STREAM,"preset":"720p","upload":{"url":origin.join(&format!("/v1/screen-playback/{STREAM}/upload/")).unwrap().as_str(),
             "token":TOKEN,"expires_at":now_ms() + expires_in_ms}})
     }
+    /// This process's stream scratch directories. Test runners share the temp
+    /// directory across concurrent processes; `SERIAL` orders streams within one.
     fn scratch_dirs() -> Vec<PathBuf> {
+        let prefix = format!("nanocodex-hls-{}-", std::process::id());
         std::fs::read_dir(std::env::temp_dir())
             .unwrap()
             .flatten()
@@ -758,9 +774,22 @@ mod tests {
                 p.file_name()
                     .unwrap()
                     .to_string_lossy()
-                    .starts_with("nanocodex-hls-")
+                    .starts_with(&prefix)
             })
             .collect()
+    }
+    /// These journeys encode, upload and decode real HLS. Without the tools
+    /// every encoder start fails, which would surface only as capture_failed.
+    fn require_ffmpeg() {
+        for tool in ["ffmpeg", "ffprobe"] {
+            let found = Command::new(tool)
+                .arg("-version")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success());
+            assert!(found, "{tool} must be on PATH for the real HLS journeys");
+        }
     }
     /// Wait for a terminal or matching status; every observed result is checked for secrets.
     async fn wait(
@@ -818,6 +847,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn ffmpeg_hls_upload_decodes_recovers_and_stops_by_stream_id() {
         let _serial = SERIAL.lock().await;
+        require_ffmpeg();
         let state: Shared = Default::default();
         let origin = serve(state.clone()).await;
         let before = scratch_dirs();
@@ -1014,6 +1044,7 @@ mod tests {
         revoke_after_live: bool,
     ) -> (Vec<Value>, Shared) {
         let _serial = SERIAL.lock().await;
+        require_ffmpeg();
         let state: Shared = Default::default();
         configure(&mut state.lock().unwrap());
         let origin = serve(state.clone()).await;
@@ -1029,8 +1060,7 @@ mod tests {
         }
         let last = wait(&mut events, &mut seen, "never", 40).await;
         assert_eq!(last["status"], "failed");
-        // The slot is released: the task ended and no scratch directory remains.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // The terminal status is reported only after the scratch directory is gone.
         assert!(scratch_dirs().iter().all(|d| before.contains(d)));
         assert_eq!(
             broadcast
