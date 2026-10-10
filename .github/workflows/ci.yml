@@ -265,7 +265,7 @@ jobs:
             [Management.Automation.Language.Parser]::ParseFile($script.FullName, [ref]$tokens, [ref]$parseErrors) | Out-Null
             if ($parseErrors.Count -gt 0) { throw "Invalid PowerShell in $($script.Name): $parseErrors" }
           }
-      - name: Verify CUA bootstrap copies without Store installation
+      - name: Verify Windows CUA provisioning refuses before installation
         if: needs.changes.outputs.tests == 'true'
         shell: powershell
         run: powershell.exe -NoLogo -NoProfile -NonInteractive -File ./windows/hand/test-cua-provision.ps1
@@ -510,6 +510,8 @@ jobs:
         if: needs.changes.outputs.tests == 'true'
         run: |
           cargo test --locked -p nanocodex-vm --test docker_live -- --ignored --nocapture
+          # The CLI launches the separate Hand daemon installed beside it.
+          cargo build --locked -p nanocodex-hand-daemon --bin nanocodex-hand
           cargo test --locked -p nanocodex-bin --test nanocodex2_managed docker_hand_live -- --ignored --nocapture
         env:
           NANOCODEX_DOCKER_TEST_IMAGE: nanocodex-hand:ci
@@ -712,6 +714,7 @@ jobs:
         if: needs.changes.outputs.tests == 'true'
         run: |
           pnpm exec turbo run test --only \
+            --filter nanocodex-tools \
             --filter nanocodex-react \
             --filter nanocodex-vite \
             --filter nanocodex-terminal \
@@ -865,6 +868,52 @@ jobs:
       - uses: ./.github/actions/turbo-cache
         with:
           save: true
+
+  managed:
+    name: managed service journeys (${{ matrix.shard }}/4)
+    needs: [changes, wasm-build]
+    # Every step of js/managed's "npm test" chain, split across shards by
+    # scripts/ci/managed-shard.mjs.
+    if: needs.changes.outputs.tests == 'true' && needs.changes.outputs.bindings == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+      - uses: ./.github/actions/js-dependency-cache
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: nanocodex-wasm
+          path: js/nanocodex
+      - uses: ./.github/actions/turbo-cache
+      - name: Install managed service dependencies
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm exec turbo run build --only --filter nanocodex-tools
+          pnpm exec turbo run build --filter nanocodex-connect-protocol
+      - name: Run js/managed test shard
+        run: node scripts/ci/managed-shard.mjs ${{ matrix.shard }}/4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: managed-journeys-${{ matrix.shard }}
+          path: |
+            output/**
+            !output/**/node_modules/**
+          if-no-files-found: ignore
+          retention-days: 7
 
   python:
     needs: changes
@@ -1101,7 +1150,7 @@ jobs:
     # Report failed prerequisites, but do not keep a cancelled workflow holding
     # its concurrency slot while this final job waits for a runner.
     if: always() && !cancelled()
-    needs: [changes, test, shared-hands, voice-native, windows-hand, clippy, rust-extra, vm-guest, policy, wasm-build, wasm-quality, bindings, python, apps, js-preview, codeql]
+    needs: [changes, test, shared-hands, voice-native, windows-hand, clippy, rust-extra, vm-guest, policy, wasm-build, wasm-quality, bindings, managed, python, apps, js-preview, codeql]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
