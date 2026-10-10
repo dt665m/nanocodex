@@ -4718,7 +4718,13 @@ async fn terminal_resumes_by_generated_title() {
         "Resume title search (query=cobalt):\n{}",
         fixture.terminal.screen.lock().unwrap().screen().contents()
     );
+    // Hold the switch until its status is on screen. Otherwise a lagging PTY
+    // screen can lack "Resuming session" while the switch is still running,
+    // and the prompt typed into the non-interactive composer is dropped.
+    let pause = fixture.resume_gate.clone().acquire_owned().await.unwrap();
     fixture.terminal.input("\r");
+    fixture.terminal.wait_text("Resuming session").await;
+    drop(pause);
     fixture.replacement_connection().await;
     fixture.terminal.wait_no_text("Resuming session").await;
     fixture
