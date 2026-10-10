@@ -872,8 +872,8 @@ jobs:
   managed:
     name: managed service journeys (${{ matrix.shard }}/4)
     needs: [changes, wasm-build]
-    # Every step of js/managed's "npm test" chain, split across shards by
-    # scripts/ci/managed-shard.mjs.
+    # Every step of js/managed's "npm test" chain not already run by bindings,
+    # split across shards by scripts/ci/managed-shard.mjs.
     if: needs.changes.outputs.tests == 'true' && needs.changes.outputs.bindings == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -884,10 +884,10 @@ jobs:
       matrix:
         shard: [1, 2, 3, 4]
     steps:
+      # Journeys record only HEAD; no history is needed.
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
-          fetch-depth: 0
       - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
