@@ -23,7 +23,10 @@ beforeAll(async () => {
   vi.resetModules();
   ({ routeManagedRealtimeTransport } = await import("../src/managed-realtime-transport"));
   ({ routeBrowserModel } = await import("../src/browser-model"));
-});
+  // A cold re-import of the realtime routes transforms most of the Worker's
+  // module graph; on a loaded CI runner that exceeded the 10 s default hook
+  // timeout (run 38029632144, shard 2/4).
+}, 60_000);
 
 const agentId = "018f25e8-7b51-7a32-8c4d-0123456789ab";
 const voiceId = "018f25e8-7b51-7a32-8c4d-0123456789ac";
