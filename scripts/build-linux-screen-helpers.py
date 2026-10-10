@@ -250,18 +250,25 @@ def main():
     for name in ['bin', 'lib', 'licenses']:
         (bundle / name).mkdir(parents=True, exist_ok=True)
     shutil.copyfile(waymote / 'zig-out/bin/waymote-streamd', bundle / 'bin/waymote-streamd')
+    # Zig names generated-source directories after build-cache hashes that differ
+    # between otherwise identical builds, and its DWARF line table records those
+    # paths. Ship code and symbols without DWARF so identical sources produce an
+    # identical payload, and therefore an identical Hand identity.
+    run(['objcopy', '--strip-debug', bundle / 'bin/waymote-streamd'])
     shutil.copyfile(build / 'grim', bundle / 'bin/grim')
     for binary in (bundle / 'bin').iterdir():
         binary.chmod(0o755)
     libraries = package_runtime(bundle, sysroot, architecture)
     for name, source, license_name in [('waymote', waymote, 'LICENSE'), ('grim', grim, 'LICENSE'), ('wayland-protocols', protocols, 'COPYING')]:
         shutil.copyfile(source / license_name, bundle / 'licenses' / f'{name}.txt')
-    upstream = {'waymote':{'url':WAYMOTE_URL, 'revision':WAYMOTE_REV, 'build_patch':'streamd-only install step; no runtime source modifications'},
+    upstream = {'waymote':{'url':WAYMOTE_URL, 'revision':WAYMOTE_REV, 'build_patch':'streamd-only install step; no runtime source modifications',
+                            'post_link':'objcopy --strip-debug (DWARF holds build-cache paths)'},
                 'grim':{'url':GRIM_URL, 'tag':GRIM_TAG, 'revision':GRIM_REV},
                 'wayland_protocols':{'url':PROTOCOLS_URL, 'revision':PROTOCOLS_REV},
                 'zig':{'version':ZIG_VERSION, 'archive_sha256':target['zig_sha256']}, 'cpu':architecture + ' baseline',
                 'runtime_libraries':libraries,
                 'build_tools':{'meson':capture(shlex.split(args.meson) + ['--version']).strip(),
+                               'objcopy':capture(['objcopy', '--version']).splitlines()[0],
                                'ninja':capture([args.ninja, '--version']).strip(),
                                'cc':capture(['cc', '--version']).splitlines()[0]},
                 'ffmpeg':'not included; Hand system FFmpeg bridge'}
