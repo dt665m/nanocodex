@@ -80,6 +80,9 @@ jobs:
           tool: cargo-nextest
       - name: Install FFmpeg for the real HLS capture journeys
         run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends ffmpeg
+      # CLI journeys launch the separate Hand daemon installed beside the CLI;
+      # nextest builds only test targets, not this package's binary.
+      - run: cargo build --locked -p nanocodex-hand-daemon --bin nanocodex-hand
       - run: cargo nextest run --workspace --locked --profile ci
       - name: Test public library harness journeys
         run: |
