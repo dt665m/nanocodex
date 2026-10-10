@@ -85,8 +85,10 @@ else: print('{}')
         ("ReadMcpResourceTool", {"server": "http", "uri": "fixture://http"}, False, "HTTP resource body"),
         ("ReadMcpResourceTool", {"server": "http", "uri": "fixture://missing"}, True, "Synthetic missing resource"),
         ("ReadMcpResourceTool", {"server": "unknown", "uri": "file:///etc/passwd"}, True, "unavailable"),
-        ("ToolSearch", {"query": "inspect", "max_results": 0}, True, "between 1 and 32"),
+        ("ToolSearch", {"query": "inspect", "max_results": 0}, True, "max_results must be at least 1"),
         ("ToolSearch", {"query": "inspect", "authorization": "model-supplied-token"}, True, "unknown field"),
+        # No upper bound: a limit above the former cap of 32 is accepted.
+        ("ToolSearch", {"query": "mcp", "max_results": 33}, False, '"name":"mcp__stdio__echo"'),
     ]
 
     class Server(BaseHTTPRequestHandler):
