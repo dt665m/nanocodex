@@ -168,7 +168,8 @@ def main():
             if not claude_auth:
                 # Claude models are offered only once Claude is signed in.
                 models = [model for model in models if not model.startswith('claude-')]
-            wait(lambda: all(model in screen.text() for model in models), 'picker omitted a model')
+            # Unauthenticated, also wait for the footer that bounds the picker box.
+            wait(lambda: all(model in screen.text() for model in models) and (claude_auth or 'esc cancel' in screen.text()), 'picker omitted a model or its footer')
             if not claude_auth:
                 # Read only the picker box: the workspace path on the composer
                 # border below it (claude-model-picker-cli/...) contains "claude-".

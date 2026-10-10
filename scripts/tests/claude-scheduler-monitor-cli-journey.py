@@ -23,6 +23,9 @@ class TerminalScreen:
   self.rows,self.columns=rows,columns;self.x=self.y=0
   self.cells=[[' ']*columns for _ in range(rows)]
   self.decoder=codecs.getincrementaldecoder('utf-8')();self.pending=''
+  # The TUI wraps each frame in synchronized output (DEC mode 2026). Like a
+  # supporting terminal, show the last complete frame while one is drawn.
+  self.frame=None
  def feed(self,data):
   self.pending+=self.decoder.decode(data)
   while self.pending:
@@ -32,6 +35,7 @@ class TerminalScreen:
     match=re.match(r'\x1b\[([0-?]*)([ -/]*)([@-~])',self.pending)
     if match is None:return
     params,intermediate,command=match.groups();self.pending=self.pending[match.end():]
+    if params=='?2026' and command in 'hl':self.frame=[row[:] for row in self.cells] if command=='h' else None
     require(not intermediate,'unsupported terminal intermediate')
     values=[int(v) if v else 0 for v in params.lstrip('?><=').split(';')]
     first=values[0] or 1
@@ -65,7 +69,7 @@ class TerminalScreen:
    self.cells[self.y][self.x]=char
    if width==2 and self.x+1<self.columns:self.cells[self.y][self.x+1]=''
    self.x+=width
- def text(self):return '\n'.join(''.join(row) for row in self.cells)
+ def text(self):return '\n'.join(''.join(row) for row in (self.cells if self.frame is None else self.frame))
 
 def main():
  p=argparse.ArgumentParser(description=__doc__);p.add_argument('--binary',type=Path,required=True);p.add_argument('--output',type=Path,default=Path('output/claude-scheduler-monitor-cli')/uuid4().hex);a=p.parse_args()
