@@ -80,9 +80,9 @@ jobs:
           tool: cargo-nextest
       - name: Install FFmpeg for the real HLS capture journeys
         run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends ffmpeg
-      # CLI journeys launch the separate Hand daemon installed beside the CLI;
-      # nextest builds only test targets, not this package's binary.
-      - run: cargo build --locked -p nanocodex-hand-daemon --bin nanocodex-hand
+      # CLI journeys need the separate Hand binary. Build it with the test
+      # targets so dependency features match nextest and libraries compile once.
+      - run: cargo build --locked --workspace --tests --bin nanocodex-hand
       - run: cargo nextest run --workspace --locked --profile ci
       - name: Test public library harness journeys
         run: |
@@ -167,6 +167,34 @@ jobs:
           # The default workspace members are the CLI and the Hand daemon.
           cargo build --locked --bins
           cp target/debug/nanocodex-hand target/debug/nanocodex2
+      - name: Exercise curl bootstrap recovery
+        if: runner.os == 'Linux'
+        timeout-minutes: 8
+        run: |
+          git fetch --no-tags --depth=1 origin refs/tags/v0.6.7:refs/tags/v0.6.7
+          python3 bin/nanocodex/tests/curl_bootstrap_e2e.py output/installer-curl
+      - name: Exercise verified CLI and Hand installation
+        if: runner.os == 'Linux'
+        timeout-minutes: 5
+        run: >-
+          python3 bin/nanocodex/tests/install_network_e2e.py
+          target/debug/nanocodex target/debug/nanocodex-hand output/installer-bundle
+      - name: Exercise release metadata recovery
+        if: runner.os == 'Linux'
+        timeout-minutes: 5
+        run: >-
+          python3 bin/nanocodex/tests/update_metadata_recovery_e2e.py
+          target/debug/nanocodex --hand target/debug/nanocodex-hand
+          --output output/installer-metadata
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always() && runner.os == 'Linux'
+        with:
+          name: installer-recovery-journeys
+          path: |
+            output/installer-curl/*.json
+            output/installer-bundle/*.json
+            output/installer-metadata/*.json
+          if-no-files-found: warn
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
