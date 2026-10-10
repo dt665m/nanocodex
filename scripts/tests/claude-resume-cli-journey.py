@@ -238,7 +238,13 @@ def main():
         """Run the CLI in a real tmux terminal; frames are the rendered screen."""
         record(name, command, env)
         session = f"claude-resume-{name}-{uuid4().hex[:8]}"
-        shell = "env -i " + " ".join(shlex.quote(f"{k}={v}") for k, v in env.items()) + " " + shlex.join(command)
+        # The pane's shell records the CLI's exit status itself. tmux 3.4 can
+        # mark a pane dead without ever rendering "Pane is dead" (CI run
+        # 38022367862: pane_dead=1, empty status, CLI left <defunct>).
+        exit_path = artifact / f"{name}.exit"
+        exit_path.unlink(missing_ok=True)
+        shell = ("env -i " + " ".join(shlex.quote(f"{k}={v}") for k, v in env.items()) + " " + shlex.join(command)
+                 + "; echo $? > " + shlex.quote(str(exit_path)))
         tmux("new-session", "-d", "-x", "170", "-y", "80", "-s", session, "-c", str(launch), shell,
              ";", "set-option", "-t", session, "remain-on-exit", "on")
         return session
@@ -277,12 +283,14 @@ def main():
         tmux("send-keys", "-t", session + ":0.0", "C-c")
         time.sleep(0.3)
         tmux("send-keys", "-t", session + ":0.0", "C-c")
-        # remain-on-exit reports the CLI's own exit status once its pane dies.
+        # The pane's shell writes the CLI's own exit status once it returns.
+        exit_path = artifact / f"{name}.exit"
         began = time.monotonic()
-        screen = screen_until(name, session, lambda screen: "Pane is dead" in screen, 60)
+        screen = screen_until(name, session, lambda screen: exit_path.exists() and exit_path.read_text().strip() != "", 60)
         checks.append(f"{name}: exited {time.monotonic() - began:.1f}s after Ctrl+C")
         tmux("kill-session", "-t", session)
-        require("Pane is dead (status 0," in screen, f"{name} did not exit cleanly: {screen.strip()[-200:]}")
+        status = exit_path.read_text().strip()
+        require(status == "0", f"{name} did not exit cleanly (status {status}): {screen.strip()[-200:]}")
 
     def run_pty(name, command, env, picker=False, session_id=None):
         session = start(name, command, env)
