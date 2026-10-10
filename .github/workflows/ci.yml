@@ -711,14 +711,12 @@ jobs:
         if: needs.changes.outputs.tests == 'true'
         run: |
           pnpm exec turbo run test --only \
+            --filter nanocodex-tools \
             --filter nanocodex-react \
             --filter nanocodex-vite \
             --filter nanocodex-terminal \
             --filter nanocodex-node-example \
             --filter nanocodex-react-vite-example
-          # Its test script rebuilds dist (clean + tsc), which the consumers
-          # above import, so it must not run concurrently with them.
-          pnpm --filter nanocodex-tools test
           node --test examples/browser-cdn/*.test.mjs
           npm test --prefix examples/privy
           npm test --prefix examples/better-auth
@@ -906,6 +904,13 @@ jobs:
           # egress broker's WhatsApp protocol bundle.
           pnpm --filter nanocodex-managed-service run prepare:code-evaluator
           pnpm --filter nanocodex-egress-service run prepare:whatsapp
+      - name: Install ffmpeg for the screen playback journey
+        run: |
+          # Only the shard that runs test:screen-playback decodes real video.
+          if node scripts/ci/managed-shard.mjs --list 4 | grep "^${{ matrix.shard }}:" | grep -q 'test:screen-playback'; then
+            sudo apt-get update -q
+            sudo apt-get install -y -q --no-install-recommends ffmpeg
+          fi
       - name: Run js/managed test shard
         run: node scripts/ci/managed-shard.mjs ${{ matrix.shard }}/4
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
