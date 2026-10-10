@@ -3910,10 +3910,7 @@ async fn terminal_recovers_local_activity_and_controls_after_a_fatal_disconnect(
     fixture
         .terminal
         .prompt("FOLLOWUP_AFTER_LOCAL_RECOVERY", "\t");
-    fixture
-        .terminal
-        .wait_text("FOLLOWUP_AFTER_LOCAL_RECOVERY")
-        .await;
+    wait_queued(&fixture.terminal, "FOLLOWUP_AFTER_LOCAL_RECOVERY").await;
     fixture.break_stream();
     fixture.replacement_connection().await;
     fixture.terminal.wait_text("Reconnected").await;
@@ -3964,7 +3961,7 @@ async fn terminal_can_edit_its_draft_and_retry_a_failed_reconnection() {
 async fn terminal_stops_repeated_fatal_reconnects_until_the_user_retries() {
     let mut fixture = Fixture::start_with_active(true).await;
     fixture.terminal.prompt("AFTER_REPEATED_FAILURE", "\t");
-    fixture.terminal.wait_text("AFTER_REPEATED_FAILURE").await;
+    wait_queued(&fixture.terminal, "AFTER_REPEATED_FAILURE").await;
     fixture.break_stream();
     fixture.replacement_connection().await;
     fixture.terminal.wait_text("Reconnected").await;
@@ -4051,7 +4048,7 @@ async fn terminal_keeps_an_unacknowledged_prompt_available_after_reconnecting() 
         .unwrap()
         .unwrap();
     fixture.terminal.prompt("KNOWN_UNSENT_FOLLOWUP", "\t");
-    fixture.terminal.wait_text("KNOWN_UNSENT_FOLLOWUP").await;
+    wait_queued(&fixture.terminal, "KNOWN_UNSENT_FOLLOWUP").await;
     fixture.break_stream();
     fixture.replacement_connection().await;
     fixture.terminal.wait_text("Reconnected").await;
