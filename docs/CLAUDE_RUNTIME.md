@@ -4,7 +4,7 @@
 
 ## Native CLI instructions and project context
 
-The shipped CLI (`nanocodex --claude` or `--harness claude`) composes original
+The shipped CLI (`ncl --claude` or `--harness claude`) composes original
 coding instructions for its installed tools. The model calls `exec` and `wait`;
 inside Code Mode, file tools retain their native names while shell and agent
 tools use the shared Codex names, schemas and handlers. Optional capabilities must follow the actual catalog.

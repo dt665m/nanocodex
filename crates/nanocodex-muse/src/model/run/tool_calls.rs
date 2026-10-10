@@ -137,6 +137,110 @@ impl CodeModeObserver for NestedToolEventObserver<'_> {
     }
 }
 
+/// Owned nested-tool event emitter for a cell left running after its turn
+/// completed. It emits the same events an exec/wait observer would.
+pub(super) struct DetachedNestedToolEvents {
+    events: EventSink,
+    tool_call_indices: HashMap<Box<str>, u32>,
+    progress: Mutex<ActiveToolProgress>,
+    parent_call_id: String,
+}
+
+impl DetachedNestedToolEvents {
+    pub(super) fn new(
+        events: EventSink,
+        tool_call_indices: HashMap<Box<str>, u32>,
+        parent_call_id: &str,
+    ) -> Self {
+        Self {
+            events,
+            tool_call_indices,
+            progress: Mutex::default(),
+            parent_call_id: parent_call_id.to_owned(),
+        }
+    }
+}
+
+impl CodeModeObserver for DetachedNestedToolEvents {
+    fn update(&mut self, update: CodeModeUpdate<'_>) {
+        let fallback_call_index = self
+            .tool_call_indices
+            .get(self.parent_call_id.as_str())
+            .copied()
+            .unwrap_or_default();
+        let mut observer = NestedToolEventObserver {
+            events: &self.events,
+            tool_call_indices: &self.tool_call_indices,
+            progress: &self.progress,
+            fallback_call_index,
+            parent_call_id: &self.parent_call_id,
+            error: None,
+        };
+        observer.update(update);
+        if let Some(error) = observer.error {
+            tracing::debug!(%error, "detached Code Mode update was not emitted");
+        }
+    }
+}
+
+/// Nested-tool emitter for cells a cancelled or failed turn terminates. Their
+/// remaining receipts would otherwise be discarded with the cell, leaving
+/// starts that an earlier exec/wait observer already emitted without a terminal
+/// result. Nested calls still tracked by an active call are skipped: committing
+/// the interrupted turn reports those as cancelled.
+pub(super) struct TurnTeardownEvents<'a> {
+    events: &'a EventSink,
+    tool_call_indices: &'a HashMap<Box<str>, u32>,
+    active: Vec<Arc<Mutex<ActiveToolProgress>>>,
+    progress: Mutex<ActiveToolProgress>,
+}
+
+impl<'a> TurnTeardownEvents<'a> {
+    pub(super) fn new(
+        events: &'a EventSink,
+        tool_call_indices: &'a HashMap<Box<str>, u32>,
+        active: &[ActiveToolCall],
+    ) -> Self {
+        Self {
+            events,
+            tool_call_indices,
+            active: active.iter().map(|call| call.progress.clone()).collect(),
+            progress: Mutex::default(),
+        }
+    }
+}
+
+impl CodeModeObserver for TurnTeardownEvents<'_> {
+    fn update(&mut self, update: CodeModeUpdate<'_>) {
+        let mut observer = NestedToolEventObserver {
+            events: self.events,
+            tool_call_indices: self.tool_call_indices,
+            progress: &self.progress,
+            fallback_call_index: 0,
+            parent_call_id: "",
+            error: None,
+        };
+        if let CodeModeUpdate::NestedCallCompleted(call) = &update {
+            let (call_id, _) = observer.event_context(&call.call_id);
+            let owned_by_active_call = self.active.iter().any(|progress| {
+                progress
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .active_nested_tool_calls
+                    .iter()
+                    .any(|active| active.call_id == call_id)
+            });
+            if owned_by_active_call {
+                return;
+            }
+        }
+        observer.update(update);
+        if let Some(error) = observer.error {
+            tracing::debug!(%error, "terminated Code Mode update was not emitted");
+        }
+    }
+}
+
 impl NestedToolEventObserver<'_> {
     fn event_context(&self, nested_call_id: &str) -> (String, u32) {
         let embedded_parent = nested_call_id

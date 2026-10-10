@@ -7,7 +7,7 @@
     "node": ">=22.13.0"
   },
   "scripts": {
-    "build": "rm -rf dist && wrangler deploy --dry-run --outdir dist --config wrangler.jsonc",
+    "build": "rm -rf dist && wrangler deploy --dry-run --containers-rollout=none --outdir dist --config wrangler.jsonc",
     "check": "npm run typecheck && npm test && npm run build",
     "predeploy": "npm run prepare:code-evaluator",
     "deploy": "node ../../scripts/cloudflare/managed-crm.mjs deploy",
@@ -48,7 +48,7 @@
     "fixture:meetings": "node scripts/meeting-library-fixture.mjs",
     "test:images:node": "node --experimental-transform-types --import ./test-fixtures/node-types-loader.mjs --test test/managed-images-node.test.mjs",
     "test:images": "npm run test:images:node && vitest run --config vitest.images.config.ts",
-    "test:durability:curl": "node ../egress/scripts/prepare-whatsapp.mjs && node scripts/prepare-code-evaluator.mjs && node scripts/prepare-just-bash-lazy.mjs && node --test --test-concurrency=1 test/managed-curl-recovery.test.mjs test/managed-curl-hand-recovery.test.mjs",
+    "test:durability:curl": "node ../egress/scripts/prepare-whatsapp.mjs && node scripts/prepare-code-evaluator.mjs && node scripts/prepare-just-bash-lazy.mjs && node --test --test-concurrency=1 test/managed-curl-recovery.test.mjs test/managed-curl-claude-yield-recovery.test.mjs test/managed-curl-hand-recovery.test.mjs test/managed-curl-hand-reset-recovery.test.mjs",
     "test:durability:curl:live": "node scripts/curl-durable-journey.mjs",
     "test:recovery": "node --test test/managed-crash-recovery-journey.test.mjs && npm run test:durability:curl && npm run test:code-observations && npm run test:code-observations:workerd",
     "test:code-observations": "node --experimental-transform-types --import ./test-fixtures/node-types-loader.mjs --test test/code-observation-recovery-node.test.mjs",
