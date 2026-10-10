@@ -230,7 +230,7 @@ const gate = {
   "windows-hand": o => o.windows,
   clippy: o => o.rust,
   "rust-extra": o => o.rust_extra,
-  "vm-guest": o => o.vm,
+  "vm-guest": o => o.vm || (o.tests && o.hands),
   policy: o => o.policy,
   "wasm-build": o => o.wasm,
   "js-preview": o => o.preview,
@@ -276,7 +276,7 @@ export function main(env = process.env) {
   // The reusable publisher only runs in the upstream repository. Reflect that
   // restriction in the required-job gate instead of accepting unexpected skips.
   if (env.GITHUB_REPOSITORY && env.GITHUB_REPOSITORY !== "gakonst/nanocodex") result.jobs.preview = false;
-  // Owner switch for the paused test steps; independent of path selection.
+  // Owner switch for the behavioral test steps; independent of path selection.
   const tests = env.NANOCODEX_CI_TESTS === "on";
   const outputs = [...Object.entries(result.jobs), ["tests", tests], ["packages", result.packages], ["heavy", result.heavy]]
     .map(([key, value]) => `${key}=${value}`).join("\n") + "\n";
