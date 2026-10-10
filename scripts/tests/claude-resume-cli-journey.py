@@ -238,7 +238,13 @@ def main():
         """Run the CLI in a real tmux terminal; frames are the rendered screen."""
         record(name, command, env)
         session = f"claude-resume-{name}-{uuid4().hex[:8]}"
-        shell = "env -i " + " ".join(shlex.quote(f"{k}={v}") for k, v in env.items()) + " " + shlex.join(command)
+        # The pane's shell records the CLI's exit status itself. tmux 3.4 can
+        # mark a pane dead without ever rendering "Pane is dead" (CI run
+        # 38022367862: pane_dead=1, empty status, CLI left <defunct>).
+        exit_path = artifact / f"{name}.exit"
+        exit_path.unlink(missing_ok=True)
+        shell = ("env -i " + " ".join(shlex.quote(f"{k}={v}") for k, v in env.items()) + " " + shlex.join(command)
+                 + "; echo $? > " + shlex.quote(str(exit_path)))
         tmux("new-session", "-d", "-x", "170", "-y", "80", "-s", session, "-c", str(launch), shell,
              ";", "set-option", "-t", session, "remain-on-exit", "on")
         return session
@@ -254,20 +260,37 @@ def main():
             if predicate(screen):
                 return screen
             if time.monotonic() > deadline:
-                raise AssertionError(f"{name}: timed out; see {name}.frames.txt")
+                raise AssertionError(f"{name}: timed out; see {name}.frames.txt\n" + timeout_evidence(session, screen))
             time.sleep(0.4)
+
+    def timeout_evidence(session, screen):
+        """Inline diagnostics: CI does not upload output/claude-resume-cli."""
+        parts = ["--- last frame ---", "\n".join(line.rstrip() for line in screen.splitlines() if line.strip())[-4000:]]
+        panes = tmux("list-panes", "-t", session, "-F", "#{pane_pid} dead=#{pane_dead} status=#{pane_dead_status}")
+        parts += ["--- pane ---", (panes.stdout + panes.stderr).strip()]
+        pid = panes.stdout.split(" ", 1)[0].strip()
+        if pid.isdigit():
+            tree = subprocess.run(["ps", "-o", "pid,ppid,stat,wchan:24,etime,args", "--forest", "-s", pid], capture_output=True, text=True)
+            parts += ["--- processes ---", tree.stdout.strip()]
+        logs = sorted((home / ".local/state/nanocodex/logs").glob("tui-*.log"), key=lambda path: path.stat().st_mtime)
+        if logs:
+            text = re.sub(r"\x1b\[[0-9;]*m", "", logs[-1].read_text(errors="replace"))
+            parts += [f"--- {logs[-1].name} (tail) ---", "\n".join(line[:400] for line in text.splitlines()[-40:])]
+        return "\n".join(parts)
 
     def close(name, session):
         # Ctrl+C asks for confirmation; a second Ctrl+C quits.
         tmux("send-keys", "-t", session + ":0.0", "C-c")
         time.sleep(0.3)
         tmux("send-keys", "-t", session + ":0.0", "C-c")
-        # remain-on-exit reports the CLI's own exit status once its pane dies.
+        # The pane's shell writes the CLI's own exit status once it returns.
+        exit_path = artifact / f"{name}.exit"
         began = time.monotonic()
-        screen = screen_until(name, session, lambda screen: "Pane is dead" in screen, 60)
+        screen = screen_until(name, session, lambda screen: exit_path.exists() and exit_path.read_text().strip() != "", 60)
         checks.append(f"{name}: exited {time.monotonic() - began:.1f}s after Ctrl+C")
         tmux("kill-session", "-t", session)
-        require("Pane is dead (status 0," in screen, f"{name} did not exit cleanly: {screen.strip()[-200:]}")
+        status = exit_path.read_text().strip()
+        require(status == "0", f"{name} did not exit cleanly (status {status}): {screen.strip()[-200:]}")
 
     def run_pty(name, command, env, picker=False, session_id=None):
         session = start(name, command, env)
