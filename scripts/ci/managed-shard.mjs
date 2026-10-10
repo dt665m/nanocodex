@@ -25,7 +25,7 @@ export function steps(script = pkg.scripts.test) {
 // Whole scripts that ci.yml's bindings job already runs with dedicated
 // artifacts ("Exercise ..." and "Test managed Claude ..." steps).
 export const coveredByBindings = new Set([
-  "test:sites", "test:session-control", "test:startup", "test:claude-managed", "test:provider-vault",
+  "test:sites", "test:session-control", "test:startup", "test:claude-managed",
   "test:hand-preparation", "test:cua-routing", "test:hand-paths", "test:hand-reconnect-agent",
 ]);
 
