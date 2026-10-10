@@ -12,6 +12,7 @@ import { build } from 'esbuild';
 import { builtinModules } from 'node:module';
 import { Miniflare } from 'miniflare';
 import { claudeProvider } from '../../egress/test/claude-provider.fixture.mjs';
+import { fetch } from "./support/miniflare-fetch.mjs";
 const repo = fileURLToPath(new URL('../../../', import.meta.url));
 const evidence = resolve(repo, process.env.NANOCODEX_COMPANY_CONTEXT_EVIDENCE_DIR ?? 'output/company-context-journey/'+Date.now()+'-'+process.pid);
 const identity = '11111111-1111-4111-8111-111111111133';

@@ -8,6 +8,7 @@ import { build } from "esbuild";
 import { Miniflare } from "miniflare";
 import { createTools } from "../../nanocodex/tools/Tools.mjs";
 import { createNodeProcessTools } from "../../nanocodex-tools/tools/nodeProcess.mjs";
+import { fetch } from "./support/miniflare-fetch.mjs";
 
 // The actual managed Session/account Durable Objects, WASM, Code Mode, SQLite,
 // reverse Hand WebSocket publisher and native shell run here. The fixture seeds

@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { mkdir, writeFile } from "node:fs/promises";
 import { build } from "esbuild";
 import { Miniflare } from "miniflare";
+import { fetch } from "./support/miniflare-fetch.mjs";
 
 test("WhatsApp public HTTP authorization and bounded requests", {timeout:90000}, async () => {
   const bundle = await build({entryPoints:[fileURLToPath(new URL("fixtures/whatsapp-public-worker.ts", import.meta.url))],
