@@ -7170,7 +7170,9 @@ async fn terminal_review_branch_picker_navigates_filters_and_refreshes() {
     fixture.terminal.input("\x1b");
     fixture.terminal.wait_text("Uncommitted").await;
     fixture.terminal.input("\x1b");
-    fixture.terminal.wait_no_text("Search branches").await;
+    // "Search branches" is already gone after the first Esc; wait for the scope
+    // menu itself to close so the next paste cannot race the second Esc.
+    fixture.terminal.wait_no_text("Base branch").await;
     review_journey_normal_turn(&mut fixture, "AFTER_BRANCH_NO_MATCH_ENTER").await;
 
     review_journey_branches(&mut fixture).await;
