@@ -308,7 +308,7 @@ def main():
         offline = ['/']
 
         # Help and typos are answered locally after fetching only the public script.
-        for name, flags, code, text in (('help', '--help', 0, '--nightly'), ('unknown-option', '--nigthly', 2, "unknown option '--nigthly'")):
+        for name, flags, code, text in (('help', '--help', 0, '--nightly'), ('unknown-option', '--not-an-option', 2, "unknown option '--not-an-option'")):
             obs = run_case(name, flags=flags)
             f = []
             r = obs['results'][0]
