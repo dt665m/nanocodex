@@ -2828,13 +2828,6 @@ async fn prompt_images_and_documents_become_native_claude_blocks() {
             ),
             "filename",
         ),
-        (
-            Prompt::content((0..6).map(|_| UserInput::File {
-                file_data: format!("data:application/pdf;base64,{pdf}"),
-                filename: None,
-            })),
-            "5 documents",
-        ),
     ] {
         let error = match agent.prompt(prompt).await {
             Err(error) => error.to_string(),
@@ -2854,6 +2847,30 @@ async fn prompt_images_and_documents_become_native_claude_blocks() {
         5,
         "invalid media never reaches the provider"
     );
+    // More documents than the former five-document cap reach the provider;
+    // only the combined media size bounds a prompt.
+    let many = agent
+        .prompt(Prompt::content((0..8).map(|_| UserInput::File {
+            file_data: format!("data:application/pdf;base64,{pdf}"),
+            filename: None,
+        })))
+        .await
+        .unwrap()
+        .result()
+        .await
+        .unwrap();
+    assert_eq!(many.final_message(), "Read both.");
+    {
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 6);
+        let content = requests[5]["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|block| block["type"] == "document")
+            .count();
+        assert_eq!(content, 8);
+    }
     let artifact = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../output/claude-host-integration");
     std::fs::create_dir_all(&artifact).unwrap();
