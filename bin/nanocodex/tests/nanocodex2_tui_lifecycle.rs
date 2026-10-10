@@ -7251,7 +7251,8 @@ async fn terminal_review_branch_picker_empty_and_nonrepo_recover_without_submitt
     fixture.terminal.input("\x1b");
     fixture.terminal.wait_text("Uncommitted").await;
     fixture.terminal.input("\x1b");
-    fixture.terminal.wait_no_text("Search branches").await;
+    // As above: wait for the scope menu, not the already-closed branch search.
+    fixture.terminal.wait_no_text("Base branch").await;
     review_journey_normal_turn(&mut fixture, "AFTER_BRANCH_EMPTY_REPO").await;
 
     review_journey_commit(&fixture);
