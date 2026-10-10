@@ -3,16 +3,17 @@ name: Linux Hand image
 on:
   pull_request:
     paths:
-      - 'hands/remote/image/Dockerfile'
-      - 'hands/remote/image/smoke.sh'
+      # Every path the Dockerfile COPYs, plus the smoke test.
+      - 'hands/remote/image/**'
+      - 'scripts/build-linux-screen-helpers.sh'
+      - 'scripts/build-linux-screen-helpers.py'
+      - 'scripts/tests/linux-screen-helpers-bundle.py'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'bin/**'
       - 'crates/**'
       - 'examples/**'
-      - 'js/nanocodex/Cargo.toml'
-      - 'js/nanocodex/build.rs'
-      - 'js/nanocodex/src/**'
+      - 'js/nanocodex/**'
       - 'py/bindings/**'
       - 'third_party/**'
       - '.github/workflows/hand-image.yml'
