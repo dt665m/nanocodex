@@ -1,6 +1,7 @@
 import { gitProvider } from "../test-fixtures/git-provider.mjs";
 import { cloudflareTest, readD1Migrations } from "@cloudflare/vitest-pool-workers";
 import { defineConfig } from "vitest/config";
+import { workersPoolDiagnostics } from "./test/workers-pool-diagnostics.ts";
 
 export default defineConfig(async () => ({
   plugins: [cloudflareTest({
@@ -9,7 +10,7 @@ export default defineConfig(async () => ({
       const response = await gitProvider(request);
       return response ?? new Response("Unexpected test network request", { status: 502 });
     } },
-  })],
+  }), workersPoolDiagnostics()],
   test: {
     include: ["test/**/*.test.ts"],
     setupFiles: ["./test/durable-object-settle.ts"],
