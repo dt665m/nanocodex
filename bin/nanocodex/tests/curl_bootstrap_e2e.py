@@ -13,6 +13,8 @@ install_network_e2e.py. Every case uses its own synthetic HOME and NANOCODEX_DIR
 --installer runs the same journeys against another script, such as the
 previous release, and records which expectations it misses.
 Requires Linux, Python 3, OpenSSL, curl, gzip, dash and bash.
+The v0.6.7 tag is a required compatibility fixture. In a shallow checkout run:
+  git fetch --no-tags --depth=1 origin refs/tags/v0.6.7:refs/tags/v0.6.7
 """
 import argparse
 import gzip
@@ -203,6 +205,13 @@ def main():
     installer = args.installer.resolve().read_bytes()
     summary = {'command': ['python3', __file__, '--installer', str(args.installer.resolve()), str(output)],
                'installer_sha256': hashlib.sha256(installer).hexdigest(), 'cases': []}
+    stable = subprocess.run(['git', '-C', str(REPO), 'show', 'v0.6.7:install'],
+                            capture_output=True, check=False)
+    if stable.returncode != 0 or not stable.stdout:
+        raise SystemExit('Missing required v0.6.7 installer fixture; run '
+                         'git fetch --no-tags --depth=1 origin '
+                         'refs/tags/v0.6.7:refs/tags/v0.6.7')
+    stable_tagged = stable.stdout
     transcript = []
     server = None
     with tempfile.TemporaryDirectory(prefix='curl-bootstrap-') as temporary:
@@ -217,8 +226,6 @@ def main():
         proxy = 'http://127.0.0.1:' + str(server.server_port)
         bootstrap = gzip.compress(BOOTSTRAP.encode(), mtime=0)
         digest = hashlib.sha256(bootstrap).hexdigest()
-        stable_tagged = subprocess.run(['git', '-C', str(REPO), 'show', 'v0.6.7:install'],
-                                       capture_output=True, check=False).stdout
 
         def files(tagged=installer, manifest_digest=digest, public=installer, payload=bootstrap):
             result = {'/gakonst/nanocodex/master/install': public,
@@ -339,14 +346,13 @@ def main():
         evaluate(obs, f)
 
         # The new first stage still drives the published v0.6.7 second stage.
-        if stable_tagged:
-            obs = run_case('stage1-with-v0.6.7-stage2', flags='--no-setup --no-modify-path',
-                           files_override=files(tagged=stable_tagged))
-            f = []
-            check(obs['results'][0]['exit'] == 0, 'v0.6.7 stage 2 failed: ' + obs['results'][0]['stderr'][-400:], f)
-            check([(l['args'], l['tag']) for l in obs['launches']] == [('install --no-setup --no-modify-path', STABLE)],
-                  f'bootstrap launches {obs["launches"]}', f)
-            evaluate(obs, f)
+        obs = run_case('stage1-with-v0.6.7-stage2', flags='--no-setup --no-modify-path',
+                       files_override=files(tagged=stable_tagged))
+        f = []
+        check(obs['results'][0]['exit'] == 0, 'v0.6.7 stage 2 failed: ' + obs['results'][0]['stderr'][-400:], f)
+        check([(l['args'], l['tag']) for l in obs['launches']] == [('install --no-setup --no-modify-path', STABLE)],
+              f'bootstrap launches {obs["launches"]}', f)
+        evaluate(obs, f)
 
         # One transient failure on every hop: 503, 502, a dropped manifest and a truncated asset.
         faults = {latest: [('status', 503), ('status', 429)], tagged: [('status', 502)], sums: [('truncate', 10)],
