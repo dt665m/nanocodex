@@ -32,7 +32,7 @@ export const coveredByBindings = new Set([
 // Weighted greedy assignment keeps shards balanced as journeys are added.
 // Weights are approximate CI seconds; unknown steps count as 60.
 const weights = {
-  "vitest run": 240, "test:recovery": 300, "test:routing": 180, "test:services": 150,
+  "test:recovery": 300, "test:routing": 180, "test:services": 150,
   "test:provider-vault": 120, "test:agent-runs": 120, "test:connect-signin": 90, "test:crm-search": 90,
   "test:user-data": 90, "test:hosted-tools": 90, "test:apps": 90,
 };
@@ -49,14 +49,26 @@ export function assign(list, total) {
   return shards;
 }
 
+// The bare workerd "vitest run" step is the longest by far, so every shard runs
+// its own slice of it (vitest --shard); the other steps are assigned whole.
+export function plan(total) {
+  const all = steps().filter(step => !coveredByBindings.has(step.name));
+  const whole = all.filter(step => step.name !== "vitest run");
+  const split = all.some(step => step.name === "vitest run");
+  return assign(whole, total).map((shard, i) => [
+    ...(split ? [{ name: "vitest run --shard=" + (i + 1) + "/" + total, command: "pnpm exec vitest run --shard=" + (i + 1) + "/" + total }] : []),
+    ...shard.steps,
+  ]);
+}
+
 function main(argv) {
   if (argv[0] === "--list") {
-    for (const [i, shard] of assign(steps().filter(step => !coveredByBindings.has(step.name)), Number(argv[1])).entries()) console.log(i + 1 + ": " + shard.steps.map(s => s.name).join(", "));
+    for (const [i, shard] of plan(Number(argv[1])).entries()) console.log(i + 1 + ": " + shard.map(s => s.name).join(", "));
     return;
   }
   const [index, total] = (argv[0] ?? "").split("/").map(Number);
   if (!Number.isInteger(index) || !Number.isInteger(total) || index < 1 || index > total) throw new Error("usage: managed-shard.mjs INDEX/TOTAL");
-  const mine = assign(steps().filter(step => !coveredByBindings.has(step.name)), total)[index - 1].steps;
+  const mine = plan(total)[index - 1];
   const results = [];
   for (const step of mine) {
     console.log("::group::" + step.name);
