@@ -84,6 +84,11 @@ jobs:
           # sccache still keeps progress from a failed run: it uploads each
           # compiled object under its own content key as soon as it is built.
           cache-on-failure: false
+          # Only master publications seed target archives (~4.6GB for Linux, macOS
+          # and Windows together). PR-artifact and branch dispatches still restore
+          # master's entry and keep using sccache, but no longer write
+          # branch-scoped copies that nothing else can read.
+          save-if: ${{ inputs.pr == '' && github.ref == 'refs/heads/master' }}
       # rust-cache restores third-party dependencies but always rebuilds
       # workspace crates. sccache reuses unchanged workspace libraries across
       # runs; binaries and changed crates still compile from source.
@@ -233,6 +238,18 @@ jobs:
           path: ${{ runner.temp }}/update-local-e2e
           if-no-files-found: ignore
           retention-days: 7
+      # The identity report and the exact Linux helper payload (~2.5MB) let a
+      # later run diff an unexpectedly changed Hand identity member by member.
+      - name: Retain Hand identity evidence
+        if: always() && matrix.component == 'cli'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: nightly-hand-identity-${{ matrix.target }}
+          path: |
+            ${{ runner.temp }}/hand-identity-inputs.json
+            ${{ runner.temp }}/linux-screen-helpers.tar.gz
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Retain Cargo build timings
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -350,6 +367,11 @@ jobs:
           # sccache still keeps progress from a failed run: it uploads each
           # compiled object under its own content key as soon as it is built.
           cache-on-failure: false
+          # Only master publications seed target archives (~4.6GB for Linux, macOS
+          # and Windows together). PR-artifact and branch dispatches still restore
+          # master's entry and keep using sccache, but no longer write
+          # branch-scoped copies that nothing else can read.
+          save-if: ${{ inputs.pr == '' && github.ref == 'refs/heads/master' }}
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba
         with:
           version: v0.16.0

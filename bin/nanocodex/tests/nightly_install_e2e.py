@@ -979,6 +979,20 @@ def step_b4():
                             "back_out": back["out"], "back_err": back["err"]}; save()
 
 
+def prior_hand_identity(p, new_key, label):
+    """NEW's Hand Identity: its hand-identity sidecar or, when a pre-identity updater
+    activated NEW (legacy layout, no sidecar), the identity its own Hand reports."""
+    sidecar = p["store"] / "versions" / new_key / "hand-identity"
+    if sidecar.is_file():
+        return sidecar.read_text().strip(), "hand-identity"
+    r = run("prior-hand-version", [str(p["store"] / "versions" / new_key / "nanocodex2"), "--version"], base_env(p), timeout=30)
+    found = re.findall(r"Hand Identity: (\S+)", r["out"] + r["err"])
+    ok = r["exit"] == 0 and len(found) == 1 and re.fullmatch(r"[0-9a-f]{64}", found[0])
+    check(f"{label}: NEW without a hand-identity sidecar: its Hand --version reports exactly one 64-hex Hand Identity",
+          ok, exit=r["exit"], identity=found, record=r["record"])
+    return (found[0] if ok else None), "--version"
+
+
 def final_upgrade(name, label):
     require("--final-sha is set", bool(FINAL))
     p = prefix_paths(name)
@@ -993,16 +1007,31 @@ def final_upgrade(name, label):
     check(f"{label}: FINAL immutable key active", active_key(snap) == key, current=snap["current"])
     unchanged_files(before, snap, versions_of(before), f"{label}: earlier versions retained")
     ident = identity_layout(p, snap, f"{label}: FINAL", FINAL)
-    prior = (p["store"] / "versions" / new_key / "hand-identity")
-    prior_ident = prior.read_text().strip() if prior.is_file() else None
+    prior_ident, prior_source = prior_hand_identity(p, new_key, label)
     pub_new, pub_final = published_identity(NEW), published_identity(FINAL)
     check(f"{label}: published NEW and FINAL reuse keys derive from the stored Hand Identities",
           bool(prior_ident and ident) and reuse_key(prior_ident) == pub_new and reuse_key(ident) == pub_final,
-          stored=[prior_ident, ident], published=[pub_new, pub_final])
+          stored=[prior_ident, ident], prior_source=prior_source, published=[pub_new, pub_final])
+    legacy_hand = f"versions/{new_key}/nanocodex2"
+    if prior_source == "--version":
+        # A pre-identity updater stored NEW's Hand as a regular file in its version.
+        check(f"{label}: sidecar-less NEW Hand is an unchanged regular file equal to the published NEW Hand",
+              before["files"].get(legacy_hand, {}).get("type") == "file"
+              and before["files"][legacy_hand].get("sha256") == verify_release(NEW)["assets"][HAND_ASSET]["raw_sha256"]
+              and snap["files"].get(legacy_hand) == before["files"].get(legacy_hand),
+              before=before["files"].get(legacy_hand), after=snap["files"].get(legacy_hand))
     branch = "reused" if pub_new == pub_final else "new-identity"
     state.setdefault("identity_branch", {})[label] = {"branch": branch, "new": pub_new, "final": pub_final}; save()
     log(f"  {label}: published Hand identity NEW {pub_new} FINAL {pub_final} => branch {branch}")
-    if branch == "reused":
+    if branch == "reused" and f"hand-versions/{ident}/nanocodex2" not in before["files"]:
+        # Legacy NEW had no canonical Hand: FINAL adopts the canonical file exactly once.
+        stored = snap["files"].get(f"hand-versions/{ident}/nanocodex2", {})
+        check(f"{label}: unchanged Hand identity first stores the canonical Hand once beside the legacy NEW Hand",
+              prior_source == "--version" and prior_ident == ident and stored.get("type") == "file"
+              and stored.get("sha256") == verify_release(FINAL)["assets"][HAND_ASSET]["raw_sha256"]
+              and set(hand_entries(snap)) == set(hand_entries(before)) | {ident},
+              identity=ident, prior_identity=prior_ident, stored=stored, hand_versions=hand_entries(snap))
+    elif branch == "reused":
         canonical = f"hand-versions/{ident}/nanocodex2"
         check(f"{label}: unchanged Hand identity reuses the canonical Hand file (same inode, bytes)",
               snap["files"].get(canonical) == before["files"].get(canonical) and hand_entries(snap) == hand_entries(before),
@@ -1019,7 +1048,8 @@ def final_upgrade(name, label):
     check_entrypoints(p, probes, FINAL, f"{label}: FINAL")
     no_service_side_effects(p, snap, f"{label}: FINAL")
     state["steps"]["c1" if name == "a" else "c2"] = {"snapshot": snap, "out": r["out"], "err": r["err"], "probes": probes,
-                                                     "identity": ident, "prior_identity": prior_ident}; save()
+                                                     "identity": ident, "prior_identity": prior_ident,
+                                                     "prior_identity_source": prior_source}; save()
 
 
 def candidate_sha():
