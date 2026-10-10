@@ -1539,14 +1539,44 @@ impl Terminal {
         let screen = Arc::new(Mutex::new(vt100::Parser::new(32, 160, 0)));
         let parsed = screen.clone();
         std::thread::spawn(move || {
+            // The TUI wraps each frame in synchronized output (DEC mode 2026).
+            // Publish whole frames only, as a supporting terminal displays
+            // them, so screen waits never observe a partially redrawn frame.
+            const BEGIN: &[u8] = b"\x1b[?2026h";
+            const END: &[u8] = b"\x1b[?2026l";
             let mut bytes = [0; 8192];
+            let mut pending = Vec::new();
+            let mut synchronized = false;
             while let Ok(count) = reader.read(&mut bytes) {
                 if count == 0 {
                     break;
                 }
                 captured.lock().unwrap().extend_from_slice(&bytes[..count]);
-                parsed.lock().unwrap().process(&bytes[..count]);
+                pending.extend_from_slice(&bytes[..count]);
+                loop {
+                    let marker = if synchronized { END } else { BEGIN };
+                    if let Some(index) = pending
+                        .windows(marker.len())
+                        .position(|window| window == marker)
+                    {
+                        let ready: Vec<u8> = pending.drain(..index + marker.len()).collect();
+                        parsed.lock().unwrap().process(&ready);
+                        synchronized = !synchronized;
+                        continue;
+                    }
+                    if !synchronized {
+                        // Hold back only a possible partial frame marker.
+                        let keep = (1..BEGIN.len())
+                            .rev()
+                            .find(|&len| pending.ends_with(&BEGIN[..len]))
+                            .unwrap_or(0);
+                        let ready: Vec<u8> = pending.drain(..pending.len() - keep).collect();
+                        parsed.lock().unwrap().process(&ready);
+                    }
+                    break;
+                }
             }
+            parsed.lock().unwrap().process(&pending);
         });
         Self {
             child,
