@@ -3910,10 +3910,7 @@ async fn terminal_recovers_local_activity_and_controls_after_a_fatal_disconnect(
     fixture
         .terminal
         .prompt("FOLLOWUP_AFTER_LOCAL_RECOVERY", "\t");
-    fixture
-        .terminal
-        .wait_text("FOLLOWUP_AFTER_LOCAL_RECOVERY")
-        .await;
+    wait_queued(&fixture.terminal, "FOLLOWUP_AFTER_LOCAL_RECOVERY").await;
     fixture.break_stream();
     fixture.replacement_connection().await;
     fixture.terminal.wait_text("Reconnected").await;
@@ -3964,7 +3961,7 @@ async fn terminal_can_edit_its_draft_and_retry_a_failed_reconnection() {
 async fn terminal_stops_repeated_fatal_reconnects_until_the_user_retries() {
     let mut fixture = Fixture::start_with_active(true).await;
     fixture.terminal.prompt("AFTER_REPEATED_FAILURE", "\t");
-    fixture.terminal.wait_text("AFTER_REPEATED_FAILURE").await;
+    wait_queued(&fixture.terminal, "AFTER_REPEATED_FAILURE").await;
     fixture.break_stream();
     fixture.replacement_connection().await;
     fixture.terminal.wait_text("Reconnected").await;
@@ -4051,7 +4048,7 @@ async fn terminal_keeps_an_unacknowledged_prompt_available_after_reconnecting() 
         .unwrap()
         .unwrap();
     fixture.terminal.prompt("KNOWN_UNSENT_FOLLOWUP", "\t");
-    fixture.terminal.wait_text("KNOWN_UNSENT_FOLLOWUP").await;
+    wait_queued(&fixture.terminal, "KNOWN_UNSENT_FOLLOWUP").await;
     fixture.break_stream();
     fixture.replacement_connection().await;
     fixture.terminal.wait_text("Reconnected").await;
@@ -4073,12 +4070,13 @@ async fn terminal_keeps_uncertain_steering_ordered_across_a_replacement_connecti
         .unwrap()
         .unwrap();
     fixture.terminal.prompt("BEFORE_FAILURE", "\r");
-    fixture.terminal.wait_text("BEFORE_FAILURE").await;
+    // The pasted draft is visible before Enter is handled; break the stream only once it is queued.
+    wait_queued(&fixture.terminal, "BEFORE_FAILURE").await;
     fixture.break_stream();
     fixture.replacement_connection().await;
     fixture.terminal.wait_text("Reconnected").await;
     fixture.terminal.prompt("AFTER_RECOVERY", "\r");
-    fixture.terminal.wait_text("AFTER_RECOVERY").await;
+    wait_queued(&fixture.terminal, "AFTER_RECOVERY").await;
     assert!(
         tokio::time::timeout(Duration::from_millis(200), fixture.steers.recv())
             .await
@@ -4432,6 +4430,32 @@ async fn terminal_marks_receiptless_tools_unknown_and_accepts_their_late_result(
     wait_line(&fixture.terminal, &["×", "ACTUALLY_FAILED_READ.txt"]).await;
     fixture.complete(&turn);
     fixture.terminal.wait_text("Enter send").await;
+}
+
+/// Waits until the text has left the composer draft and is shown above it (in the queue), so
+/// its Enter has been handled. A pasted draft is visible before the TUI reads the Enter.
+async fn wait_queued(terminal: &Terminal, text: &str) {
+    let queued = tokio::time::timeout(TIMEOUT, async {
+        loop {
+            let screen = terminal.screen.lock().unwrap().screen().contents();
+            let lines: Vec<&str> = screen.lines().collect();
+            // The composer is the last box whose top border carries the context gauge.
+            if let Some(top) = lines
+                .iter()
+                .rposition(|line| line.starts_with("╭─") && line.contains("%/"))
+                && lines[..top].iter().any(|line| line.contains(text))
+                && !lines[top..].iter().any(|line| line.contains(text))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    if queued.is_err() {
+        let screen = terminal.screen.lock().unwrap().screen().contents();
+        panic!("{text:?} never left the composer for the queue:\n{screen}");
+    }
 }
 
 /// Waits until one rendered row contains every needle.
@@ -4923,6 +4947,11 @@ async fn terminal_keeps_local_shell_context_scoped_to_the_session_after_resume()
         fixture.terminal.input("\r");
         if succeeds {
             fixture.replacement_connection().await;
+            // The picker overlay truncates the old shell output, so wait for
+            // it to close first. Its closing frame also shows the resume
+            // status; the old output then disappears only when the restored
+            // session (which accepts input) replaces the transcript.
+            fixture.terminal.wait_no_text("Recent threads").await;
             fixture
                 .terminal
                 .wait_no_text("OLD_SESSION_SHELL_OUTPUT")
@@ -5318,6 +5347,11 @@ async fn terminal_computer_activity_keeps_observations_in_disclosed_details() {
         .terminal
         .wait_text("Used computer · 4 actions · 1 failed")
         .await;
+    // The summary already renders while the turn is still active. Completion
+    // then adds the "done" row and moves the transcript up two rows, so a click
+    // row computed before that render lands on the wrong item. The turn was
+    // active since start ("Enter steer"), so "Enter send" marks completion.
+    fixture.terminal.wait_text("Enter send").await;
     fixture.terminal.wait_text("CONTROL_DISAPPEARED").await;
     fixture.terminal.wait_text("Captured screenshot").await;
     fixture.terminal.wait_no_text("SNAPSHOT_CONTROL").await;
@@ -8834,6 +8868,23 @@ async fn wait_bytes(terminal: &Terminal, needle: &[u8]) {
     });
 }
 
+/// Terminal output once it holds `count` Kitty PNG uploads, or at the deadline.
+/// Formulas render on background workers and each upload is written with the
+/// next frame, which may change nothing visible.
+async fn wait_kitty_pngs(terminal: &Terminal, count: usize) -> Vec<u8> {
+    let _ = tokio::time::timeout(TIMEOUT, async {
+        loop {
+            let output = terminal.output.lock().unwrap().clone();
+            if kitty_pngs(&output).len() >= count {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    terminal.output.lock().unwrap().clone()
+}
+
 /// PNG payloads of Kitty graphics uploads: APC "ESC _ G keys ; base64 ESC \",
 /// chunked while a chunk carries m=1.
 fn kitty_pngs(output: &[u8]) -> Vec<Vec<u8>> {
@@ -8891,13 +8942,12 @@ async fn terminal_math_renders_kitty_images_and_falls_back_to_source() {
     kitty.terminal.wait_no_text("frac").await;
     // Inline formulas that need more than one row keep their source in line.
     kitty.terminal.wait_text("beside text.").await;
-    let output = kitty.terminal.output.lock().unwrap().clone();
+    // That inline formula still renders and uploads, but its source looks the
+    // same before and after, so no screen state proves its upload was written.
+    let output = wait_kitty_pngs(&kitty.terminal, 3).await;
     let pngs = kitty_pngs(&output);
-    assert!(
-        pngs.len() >= 3,
-        "expected three formula uploads, got {}",
-        pngs.len()
-    );
+    // Keep the raw stream and screen, and log each upload's pixel size, even
+    // when the count assertion fails.
     renderer_evidence("math-kitty.raw", &output);
     renderer_evidence(
         "math-kitty.screen.txt",
@@ -8909,6 +8959,21 @@ async fn terminal_math_renders_kitty_images_and_falls_back_to_source() {
             .screen()
             .contents()
             .as_bytes(),
+    );
+    let sizes = pngs
+        .iter()
+        .filter_map(|png| png.get(16..24))
+        .map(|ihdr| {
+            let width = u32::from_be_bytes([ihdr[0], ihdr[1], ihdr[2], ihdr[3]]);
+            let height = u32::from_be_bytes([ihdr[4], ihdr[5], ihdr[6], ihdr[7]]);
+            format!("{width}x{height}")
+        })
+        .collect::<Vec<_>>();
+    eprintln!("MATH kitty uploads in order: {sizes:?}");
+    assert!(
+        pngs.len() >= 3,
+        "expected three formula uploads, got {}",
+        pngs.len()
     );
     for (index, png) in pngs.iter().enumerate() {
         renderer_evidence(&format!("math-kitty-formula-{index}.png"), png);
