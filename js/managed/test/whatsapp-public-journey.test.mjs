@@ -246,7 +246,8 @@ test("agent starts native WhatsApp linking over HTTP with private code isolation
     }
     assert.equal((await upstream("stats")).pairingRequests,1);
     assert.equal((await tool("same ID different phone conflicts",{...connect,phone:"+15550000002"})).status,"conflict");
-    assert.equal((await tool("new ID cannot replace active attempt",{...connect,operation_id:op2})).status,"conflict");
+    // A new operation ID replaces an unpaired attempt (#859); it may not
+    // replace a linked account (checked after pairing below).
     for (const mode of ["lost","timeout","malformed","unavailable","wrong-operation","unsafe-phase","unsafe-expiry"]) {
       const before=brokerRequests.length;
       fault=mode; hint(await tool(mode+" preserves unknown operation",connect),"unknown"); fault=undefined;
@@ -276,6 +277,7 @@ test("agent starts native WhatsApp linking over HTTP with private code isolation
     hint(await tool("paired receipt remains same operation",{...connect,operation_id:op2}),"paired",op2);
     assert.equal((await tool("list verifies completed linking",{operation:"list"})).connectors.whatsapp.connected,true);
     assert.equal((await tool("other owner never sees linked account",{operation:"list"},{token:foreign.token})).connectors.whatsapp.connected,false);
+    assert.equal((await tool("new ID cannot replace a linked account",{...connect,operation_id:crypto.randomUUID()})).status,"conflict");
   } finally {
     await mf.dispose();
     const output=new URL("../../../output/whatsapp-public/",import.meta.url);
