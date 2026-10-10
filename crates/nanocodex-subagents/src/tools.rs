@@ -28,8 +28,9 @@ use std::{
 };
 use tokio::sync::oneshot;
 
+/// Wait used when the caller omits timeout_ms. An explicit timeout is honored
+/// as requested, without a ceiling.
 const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
-const MAX_WAIT_TIMEOUT: Duration = Duration::from_secs(3600);
 const SPAWN_AGENT_TOOL: &str = "spawn_agent";
 const SUBMIT_RESULT_TOOL: &str = "submit_result";
 const SEND_AGENT_MESSAGE_TOOL: &str = "send_agent_message";
@@ -953,8 +954,7 @@ impl Tool for WaitAgent {
                     "timeout_ms": {
                         "type": "integer",
                         "minimum": 1,
-                        "maximum": 3600000,
-                        "description": "Bounded wait in milliseconds. Defaults to 30000."
+                        "description": "Wait in milliseconds. Defaults to 30000."
                     }
                 },
                 "required": ["agent_ids"],
@@ -975,8 +975,7 @@ impl Tool for WaitAgent {
             .ok_or_else(|| std::io::Error::other("subagent runtime is closed"))?;
         let duration = timeout_ms
             .map(Duration::from_millis)
-            .unwrap_or(DEFAULT_WAIT_TIMEOUT)
-            .min(MAX_WAIT_TIMEOUT);
+            .unwrap_or(DEFAULT_WAIT_TIMEOUT);
         let (agents, timed_out) = registry
             .wait(context.session_id(), &agent_ids, duration)
             .await?;

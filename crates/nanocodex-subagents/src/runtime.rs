@@ -2609,7 +2609,9 @@ impl Registry {
             return Err(std::io::Error::other("agent_ids must not be empty"));
         }
         let mut revision = self.revision.subscribe();
-        let deadline = Instant::now() + duration;
+        // A caller timeout beyond the clock's range waits until an agent
+        // becomes terminal instead of overflowing the deadline.
+        let deadline = Instant::now().checked_add(duration);
         loop {
             let (snapshot, root) = {
                 let state = self.state.lock().await;
@@ -2678,7 +2680,14 @@ impl Registry {
                 return Ok((summaries, false));
             }
             lock_unpoisoned(&self.idle_waits).remove(session_id);
-            if timeout_at(deadline, revision.changed()).await.is_err() {
+            let timed_out = match deadline {
+                Some(deadline) => timeout_at(deadline, revision.changed()).await.is_err(),
+                None => {
+                    let _ = revision.changed().await;
+                    false
+                }
+            };
+            if timed_out {
                 let summaries = self.state.lock().await.summaries(session_id, ids)?;
                 return Ok((summaries, true));
             }
@@ -3050,9 +3059,7 @@ fn validate_submitted_output(
     if validator.is_valid(&output) {
         return Ok((output, false));
     }
-    const MAX_ENCODED_OUTPUT_BYTES: usize = 1_048_576;
     if let Value::String(text) = &output
-        && text.len() <= MAX_ENCODED_OUTPUT_BYTES
         && let Ok(decoded) = serde_json::from_str::<Value>(text)
         && matches!(decoded, Value::Object(_) | Value::Array(_))
         && validator.is_valid(&decoded)
@@ -4384,7 +4391,6 @@ mod tests {
             json!("not JSON"),
             json!("42"),
             json!("\"{\\\"answer\\\":42}\""),
-            json!(format!("{}{{\"answer\":42}}", " ".repeat(1_048_576))),
         ] {
             let error = super::validate_submitted_output(&object, invalid).unwrap_err();
             assert_eq!(error.code, super::CompletionErrorCode::SchemaValidation);
@@ -4393,6 +4399,15 @@ mod tests {
             assert!(!error.to_string().contains("42"));
             assert!(!error.to_string().contains("not JSON"));
         }
+        // Encoded results larger than the former 1 MiB decode cap are decoded too.
+        assert_eq!(
+            super::validate_submitted_output(
+                &object,
+                json!(format!("{}{{\"answer\":42}}", " ".repeat(2 * 1_048_576)))
+            )
+            .unwrap(),
+            (json!({ "answer": 42 }), true)
+        );
         let array = jsonschema::validator_for(&json!({"type":"array", "items":{"type":"integer"}}))
             .unwrap();
         assert_eq!(
@@ -4898,7 +4913,22 @@ mod tests {
                 .all(|summary| summary.status == AgentStatus::Running)
         );
 
-        let interrupted = registry.interrupt("main", parent.id).await.unwrap();
+        // An explicit timeout far beyond the former one-hour ceiling (here the
+        // clock's entire range) waits for the agent instead of being clamped
+        // or overflowing its deadline.
+        let parent_ids = [parent.id];
+        let (waited, interrupted) = timeout(Duration::from_secs(5), async {
+            tokio::join!(registry.wait("main", &parent_ids, Duration::MAX), async {
+                tokio::task::yield_now().await;
+                registry.interrupt("main", parent.id).await
+            })
+        })
+        .await
+        .unwrap();
+        let (waited, timed_out) = waited.unwrap();
+        assert!(!timed_out);
+        assert_eq!(waited[0].status, AgentStatus::Interrupted);
+        let interrupted = interrupted.unwrap();
         assert_eq!(
             interrupted
                 .iter()
