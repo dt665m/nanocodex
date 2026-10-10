@@ -1385,6 +1385,7 @@ impl ClaudeBuilder {
             policy: self.policy,
             admission: Mutex::new(()),
             idle: Notify::new(),
+            attempts: std::sync::atomic::AtomicUsize::new(0),
             compaction_cancel: Mutex::new(None),
             #[cfg(all(feature = "tools", not(target_family = "wasm")))]
             task_board: self.task_board,
@@ -2598,6 +2599,9 @@ struct State {
     policy: Option<Arc<dyn ClaudeExecutionPolicy>>,
     admission: Mutex<()>,
     idle: Notify,
+    /// Turns of this process whose durable attempt began and has not retired.
+    /// An automatic admission blocked only by such a turn waits for it.
+    attempts: std::sync::atomic::AtomicUsize,
     compaction_cancel: Mutex<Option<Arc<Cancellation>>>,
     #[cfg(all(feature = "tools", not(target_family = "wasm")))]
     task_board: Option<Arc<nanocodex_claude_tools::tasks::ClaudeTasks>>,
@@ -5339,10 +5343,11 @@ impl LifecycleBackend for Driver {
             let (accepted, receipt) = oneshot::channel();
             let task = async move {
                 let result = async move {
-                    let _admission = state.admission.lock().await;
+                    let mut _admission = Some(state.admission.lock().await);
                     if state.stopped.load(Ordering::SeqCst) {
                         return Err(NanocodexError::AgentStopped);
                     }
+                    let mut attempt_begun = false;
                     let mut resolution = crate::prompt::ImageResolution::of(&state.model());
                     if let Some(policy) = &state.policy {
                         let automatic = request.request_id.is_none();
@@ -5365,22 +5370,51 @@ impl LifecycleBackend for Driver {
                             Admission::Cancelled => Some(Err(NanocodexError::TurnCancelled)),
                             Admission::Execute | Admission::Resume => None,
                         };
-                        if terminal.is_none()
-                            && let Err(error) = policy.begin_attempt(id.clone()).await
-                        {
+                        while terminal.is_none() {
+                            // Register for a turn's retirement before re-checking,
+                            // so a turn that settles between the check and the
+                            // wait still wakes this admission.
+                            let mut retired = std::pin::pin!(state.idle.notified());
+                            retired.as_mut().enable();
+                            let Err(error) = policy.begin_attempt(id.clone()).await else {
+                                attempt_begun = true;
+                                state.attempts.fetch_add(1, Ordering::SeqCst);
+                                break;
+                            };
+                            let blocked = error.execution_policy_disposition()
+                                == Some(nanocodex_agent::ExecutionPolicyDisposition::Retry);
                             // A queued turn admitted behind an unfinished earlier
                             // operation cannot start until that one settles. Its
                             // cancellation must not wait for it: no attempt began,
                             // so the durable state can retire it without a checkpoint.
-                            let cancelled = request.cancel_on_admission
-                                && error.execution_policy_disposition()
-                                    == Some(nanocodex_agent::ExecutionPolicyDisposition::Retry)
-                                && policy.cancel_unstarted(id.clone()).await.unwrap_or(false);
-                            if !cancelled {
-                                let _ = policy.release(id).await;
-                                return Err(error);
+                            if blocked
+                                && request.cancel_on_admission
+                                && policy.cancel_unstarted(id.clone()).await.unwrap_or(false)
+                            {
+                                terminal = Some(Err(NanocodexError::TurnCancelled));
+                                break;
                             }
-                            terminal = Some(Err(NanocodexError::TurnCancelled));
+                            // An automatic identity is never returned on failure, so
+                            // no caller could retry or cancel this admitted operation
+                            // (#968). While a turn of this process is still settling,
+                            // wait for it without holding admission, then begin the
+                            // same operation. Foreign or stuck blockers still fail.
+                            if blocked
+                                && automatic
+                                && state.attempts.load(Ordering::SeqCst) > 0
+                                && !state.stopped.load(Ordering::SeqCst)
+                            {
+                                _admission = None;
+                                retired.await;
+                                _admission = Some(state.admission.lock().await);
+                                if state.stopped.load(Ordering::SeqCst) {
+                                    let _ = policy.release(id).await;
+                                    return Err(NanocodexError::AgentStopped);
+                                }
+                                continue;
+                            }
+                            let _ = policy.release(id).await;
+                            return Err(error);
                         }
                         if let Some(result) = terminal {
                             state.accepted_turns.fetch_add(1, Ordering::SeqCst);
@@ -5415,6 +5449,10 @@ impl LifecycleBackend for Driver {
                             Ok(admitted) => admitted,
                             Err(error) => {
                                 let _ = policy.release(id).await;
+                                if attempt_begun {
+                                    state.attempts.fetch_sub(1, Ordering::SeqCst);
+                                    state.idle.notify_waiters();
+                                }
                                 return Err(error);
                             }
                         };
@@ -5476,6 +5514,9 @@ impl LifecycleBackend for Driver {
                             .await;
                         running.steering.lock().await.remove(&key);
                         running.cancellations.lock().await.remove(&key);
+                        if attempt_begun {
+                            running.attempts.fetch_sub(1, Ordering::SeqCst);
+                        }
                         running.idle.notify_waiters();
                         let _ = sender.send(
                             result.unwrap_or_else(|panic| std::panic::resume_unwind(panic)),

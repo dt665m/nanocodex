@@ -147,6 +147,11 @@ def main():
    time.sleep(.03)
   raise AssertionError(label)
  def visible(label,text):return text in screens[label].text()
+ def settled(label,marker):
+  # "Turn completed" renders from the committed run terminal record, after the
+  # streamed answer, lifecycle hooks and the durable settle. Exiting before it
+  # abandons the turn and the reopened CLI must refuse to overlap it (#969).
+  text=screens[label].text();index=text.rfind(marker);return index>=0 and 'Turn completed' in text[index:]
  def finish(proc,fd,drain):os.write(fd,b'\x03\x03');wait(lambda:proc.poll() is not None,drain,'CLI did not exit after Ctrl-C',10);drain();os.close(fd)
  outcome={'success':False}
  try:
@@ -162,7 +167,7 @@ def main():
   wait(lambda:fired('cron-once-marker') and fired('dynamic-real-clock-marker'),drain,'normal idle firings absent',20)
   require(not fired('deleted-must-not-fire'),'deleted schedule fired');checks.append('ID-derived recurring half-interval/hourly cap jitter and :30 early/non-boundary exact one-shot receipts persisted');checks.append('real 60-second wakeup and cron fire only after composer cleared; deletion suppresses fire')
   phase('prepare-reopen',[('ScheduleWakeup',{'delaySeconds':60,'prompt':'discard-on-reopen','reason':'restart policy','noop':False},False,None)])
-  os.write(fd,b'Prepare restart\r');wait(lambda:visible('initial','prepare-reopen-complete'),drain,'restart setup missing');finish(proc,fd,drain)
+  os.write(fd,b'Prepare restart\r');wait(lambda:visible('initial','prepare-reopen-complete'),drain,'restart setup missing');wait(lambda:settled('initial','prepare-reopen-complete'),drain,'restart turn never reached its terminal record');finish(proc,fd,drain)
   manifests=list((codex_home/'claude/sessions').glob('*.json'));require(len(manifests)==1,'session manifest missing');session=json.loads(manifests[0].read_text())['id']
   # Simulate an offline gap through persisted records, never a production clock
   # override. The actual reopen must discard expired/elapsed work and skip backlog.

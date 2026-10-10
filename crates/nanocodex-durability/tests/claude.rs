@@ -3506,6 +3506,109 @@ async fn native_claude_journal_adoption_directory_evidence() {
 }
 
 #[tokio::test]
+async fn automatic_turn_admitted_behind_a_running_turn_starts_under_its_identity() {
+    // #968: a local prompt (automatic operation identity) submitted while an
+    // earlier turn of this process was still settling was durably admitted,
+    // its attempt was refused as blocked, and the identity it had been given
+    // was never returned. Nothing could retry or cancel it: it stayed pending
+    // with no model call and blocked every later prompt. It must instead begin
+    // under that same identity once the earlier turn settles.
+    use std::time::Duration;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.sqlite");
+    let (client, requests, server) = server(|index, _| match index {
+        1 => sse(signed_round(), "tool_use", 10),
+        2 => sse(text("first turn finished"), "end_turn", 10),
+        _ => sse(text("queued turn finished"), "end_turn", 10),
+    })
+    .await;
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (notify, gate) = (started.clone(), release.clone());
+    let state = reopen(&path).await;
+    let (agent, events) = Nanocodex::builder(Claude::new(client, "test"))
+        .max_tokens(4096)
+        .tool(tool(), move |_| {
+            notify.notify_one();
+            let gate = gate.clone();
+            async move {
+                gate.notified().await;
+                Ok::<_, String>("effect done".to_owned())
+            }
+        })
+        .durability(state.clone())
+        .await
+        .unwrap()
+        .build()
+        .unwrap();
+    let first = agent
+        .prompt(PromptRequest::new("run the long tool").request_id("running-first"))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .unwrap();
+
+    let caller = agent.clone();
+    let queued = tokio::spawn(async move { caller.prompt("queued follow-up").await });
+    let queued_id = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let retained = state.state().await.unwrap();
+            if let Some((id, _)) = retained
+                .pending_operations()
+                .into_iter()
+                .find(|(id, _)| *id != "running-first")
+            {
+                break id.to_owned();
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the queued prompt is admitted while the first turn runs");
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        1,
+        "the queued turn must not reach HTTP before the first settles"
+    );
+
+    release.notify_one();
+    let first = tokio::time::timeout(Duration::from_secs(5), first.result())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.final_message(), "first turn finished");
+    let turn = tokio::time::timeout(Duration::from_secs(5), queued)
+        .await
+        .expect("the queued admission resolves once the first turn settles")
+        .unwrap()
+        .expect("the admitted queued prompt starts instead of failing as blocked");
+    assert_eq!(
+        turn.request_id(),
+        Some(queued_id.as_str()),
+        "the queued turn runs under its admitted identity, never a second admission"
+    );
+    let result = tokio::time::timeout(Duration::from_secs(5), turn.result())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.final_message(), "queued turn finished");
+    assert_eq!(requests.lock().unwrap().len(), 3);
+    let retained = state.state().await.unwrap();
+    assert!(
+        retained.pending_operations().is_empty(),
+        "no admitted turn is left pending"
+    );
+    assert!(matches!(
+        retained.operation(&queued_id).unwrap().status,
+        nanocodex_durability::OperationStatus::Completed { .. }
+    ));
+    agent.shutdown().await.unwrap();
+    drop((agent, events));
+    server.abort();
+}
+
+#[tokio::test]
 async fn cancelling_a_turn_queued_behind_an_unfinished_operation_settles_immediately() {
     // Hosted regression (managed session 01a120ef, 2026-10-09): a prompt
     // dispatched while an earlier turn was still running a long tool was
