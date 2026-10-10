@@ -1182,9 +1182,9 @@ impl ClaudeBuilder {
                             None => 5,
                             Some(value) => value
                                 .as_u64()
-                                .filter(|n| (1..=8).contains(n))
-                                .ok_or("max_results must be 1–8")?
-                                as usize,
+                                .filter(|n| *n >= 1)
+                                .map(|n| usize::try_from(n).unwrap_or(usize::MAX))
+                                .ok_or("max_results must be a positive integer")?,
                         };
                         let selected = query.strip_prefix("select:");
                         let matches = catalog
@@ -1230,7 +1230,7 @@ impl ClaudeBuilder {
             definitions.push(ToolDefinition {
                 name: "ToolSearch".into(),
                 description: "Find deferred tools by name or purpose; use select:ToolName for an exact match.".into(),
-                input_schema: json!({"type":"object","properties":{"query":{"type":"string"},"max_results":{"type":"integer","minimum":1,"maximum":8}},"required":["query"],"additionalProperties":false}),
+                input_schema: json!({"type":"object","properties":{"query":{"type":"string"},"max_results":{"type":"integer","minimum":1}},"required":["query"],"additionalProperties":false}),
                 strict: None, defer_loading: false,
             });
             definitions.push(ToolDefinition {
@@ -1695,40 +1695,25 @@ fn host_reply(
 }
 
 /// A separate, narrow provider request for one client WebSearch call. The
-/// response is converted to bounded, source-attributed text, not inserted as
-/// a server tool result into the main conversation. This intentionally uses
-/// only caller-approved ClaudeClient authentication, never CLI identity.
+/// response is converted to source-attributed text, not inserted as a server
+/// tool result into the main conversation. The complete answer and every
+/// deduplicated source are returned; the per-receipt history bound applies when
+/// the result is recorded. This intentionally uses only caller-approved
+/// ClaudeClient authentication, never CLI identity.
 async fn nested_web_search(
     client: &ClaudeClient,
     model: &str,
     max_tokens: Option<u32>,
     input: Value,
 ) -> std::result::Result<String, String> {
-    const MAX_OUTPUT: usize = 32 * 1024;
-    const MAX_SOURCES: usize = 8 * 1024;
-    fn bounded(text: &str, max: usize) -> &str {
-        let mut end = text.len().min(max);
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        &text[..end]
-    }
     fn add_source(
         sources: &mut String,
         seen: &mut HashSet<String>,
         url: &str,
         title: Option<&str>,
-    ) -> std::result::Result<(), String> {
-        if seen.contains(url) {
-            return Ok(());
-        }
-        // Keep complete URLs, cap optional decoration, and fail explicitly if
-        // citations themselves cannot fit rather than returning unattributed text.
-        let title = title.map(|text| bounded(text, 256));
-        let size =
-            "\nSource: ".len() + url.len() + title.map_or(0, |text| " — ".len() + text.len());
-        if size > MAX_SOURCES.saturating_sub(sources.len()) {
-            return Err("nested search sources exceed 8 KiB output budget".into());
+    ) {
+        if !seen.insert(url.to_owned()) {
+            return;
         }
         sources.push_str("\nSource: ");
         sources.push_str(url);
@@ -1736,8 +1721,6 @@ async fn nested_web_search(
             sources.push_str(" — ");
             sources.push_str(title);
         }
-        seen.insert(url.to_owned());
-        Ok(())
     }
     let fields = input
         .as_object()
@@ -1757,7 +1740,13 @@ async fn nested_web_search(
     if query.trim().len() < 2 || query.len() > 8192 || query.chars().any(char::is_control) {
         return Err("invalid WebSearch query".into());
     }
-    let mut tool = ServerToolDefinition::web_search_basic(3);
+    // No max_uses: the provider's own server-tool loop and pause_turn decide
+    // how many searches one query needs.
+    let mut tool = ServerToolDefinition {
+        kind: "web_search_20250305".into(),
+        name: "web_search".into(),
+        options: std::collections::BTreeMap::new(),
+    };
     for key in ["allowed_domains", "blocked_domains"] {
         if let Some(value) = fields.get(key) {
             let domains = value.as_array().ok_or("WebSearch domains must be arrays")?;
@@ -1785,13 +1774,15 @@ async fn nested_web_search(
     }
     let mut messages = vec![Message::text(Role::User, query)];
     // A paused response can already contain findings and source receipts.
-    // Accumulate one bounded answer across the whole nested operation.
+    // Accumulate one answer across the whole nested operation.
     let mut out = String::new();
     let mut sources = String::new();
     let mut source_urls = HashSet::new();
     // API server tools can pause mid-operation; replay their opaque blocks
-    // without fabricating client tool_result messages.
-    for _ in 0..4 {
+    // without fabricating client tool_result messages. The provider's stop
+    // reason terminates the loop: end_turn finishes, any other non-pause stop
+    // fails, and a pause that carries no content is treated as no progress.
+    loop {
         let mut request = MessagesRequest {
             model: model.into(), max_tokens: max_tokens.or_else(|| model_max_tokens(model))
                 .ok_or("Unknown Claude model: configure max_tokens explicitly")?, cache_control: None,
@@ -1827,11 +1818,11 @@ async fn nested_web_search(
         for block in &response.content {
             match block {
                 ContentBlock::Text { text, extra } => {
-                    out.push_str(bounded(text, MAX_OUTPUT - out.len()));
+                    out.push_str(text);
                     if let Some(Value::Array(citations)) = extra.get("citations") {
                         for citation in citations {
                             if let Some(url) = citation.get("url").and_then(Value::as_str) {
-                                add_source(&mut sources, &mut source_urls, url, None)?;
+                                add_source(&mut sources, &mut source_urls, url, None);
                             }
                         }
                     }
@@ -1845,7 +1836,7 @@ async fn nested_web_search(
                                     &mut source_urls,
                                     url,
                                     result.get("title").and_then(Value::as_str),
-                                )?;
+                                );
                             }
                         }
                     }
@@ -1854,6 +1845,9 @@ async fn nested_web_search(
             }
         }
         if response.stop_reason == Some(StopReason::PauseTurn) {
+            if response.content.is_empty() {
+                return Err("nested search paused without progress".into());
+            }
             messages.push(Message {
                 role: Role::Assistant,
                 content: response.content,
@@ -1863,13 +1857,9 @@ async fn nested_web_search(
         if out.trim().is_empty() && sources.is_empty() {
             return Err("nested search returned no readable result".into());
         }
-        // Sources have their own budget, independent of answer/block ordering.
-        // Reserve their complete text before truncating a potentially long answer.
-        out.truncate(bounded(&out, MAX_OUTPUT - sources.len()).len());
         out.push_str(&sources);
         return Ok(out);
     }
-    Err("nested search exceeded pause limit".into())
 }
 
 #[cfg(all(feature = "tools", not(target_family = "wasm")))]
@@ -1878,7 +1868,7 @@ async fn web_fetch_with_source<P: nanocodex_claude_tools::web::ApprovedWebFetchS
     source: &P,
     input: Value,
 ) -> std::result::Result<String, String> {
-    use nanocodex_claude_tools::web::{MAX_WEB_OUTPUT_BYTES, WebFetchRequest};
+    use nanocodex_claude_tools::web::WebFetchRequest;
     let fields = input
         .as_object()
         .ok_or("WebFetch input must be an object")?;
@@ -1977,18 +1967,13 @@ async fn web_fetch_with_source<P: nanocodex_claude_tools::web::ApprovedWebFetchS
     if response.role != Role::Assistant || response.stop_reason != Some(StopReason::EndTurn) {
         return Err("WebFetch summary did not end normally".into());
     }
+    // The summary is already bounded by the auxiliary request's output budget;
+    // return it whole. The per-receipt history bound applies when recorded.
     let citation = format!("\nSource: {}", page.final_url);
-    let answer_budget = MAX_WEB_OUTPUT_BYTES - citation.len();
     let mut out = String::new();
     for block in response.content {
         match block {
-            ContentBlock::Text { text, .. } => {
-                let mut end = text.len().min(answer_budget - out.len());
-                while !text.is_char_boundary(end) {
-                    end -= 1;
-                }
-                out.push_str(&text[..end]);
-            }
+            ContentBlock::Text { text, .. } => out.push_str(&text),
             ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {}
             _ => return Err("WebFetch summary returned a tool block".into()),
         }
