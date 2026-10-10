@@ -1385,6 +1385,9 @@ impl ClaudeBuilder {
             policy: self.policy,
             admission: Mutex::new(()),
             idle: Notify::new(),
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+            admission_order: AtomicU64::new(0),
+            waiters: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             compaction_cancel: Mutex::new(None),
             #[cfg(all(feature = "tools", not(target_family = "wasm")))]
             task_board: self.task_board,
@@ -2598,6 +2601,13 @@ struct State {
     policy: Option<Arc<dyn ClaudeExecutionPolicy>>,
     admission: Mutex<()>,
     idle: Notify,
+    /// Turns of this process whose durable attempt began and has not retired.
+    /// An automatic admission blocked only by such a turn waits for it.
+    attempts: std::sync::atomic::AtomicUsize,
+    /// Process-local admission order, taken under admission like the durable order.
+    admission_order: AtomicU64,
+    /// Orders of automatic admissions of this process still waiting to begin.
+    waiters: std::sync::Mutex<std::collections::BTreeSet<u64>>,
     compaction_cancel: Mutex<Option<Arc<Cancellation>>>,
     #[cfg(all(feature = "tools", not(target_family = "wasm")))]
     task_board: Option<Arc<nanocodex_claude_tools::tasks::ClaudeTasks>>,
@@ -2752,6 +2762,9 @@ impl Cancellation {
         self.flag.store(true, Ordering::SeqCst);
         self.notify.notify_waiters();
     }
+    fn is_cancelled(&self) -> bool {
+        self.flag.load(Ordering::SeqCst)
+    }
     async fn cancelled(&self) {
         if self.flag.load(Ordering::SeqCst) {
             return;
@@ -2768,6 +2781,302 @@ impl Cancellation {
 struct Driver {
     state: Arc<State>,
     handle: AgentHandle,
+}
+/// A durable attempt of this process. Retiring it wakes queued admissions.
+struct AttemptGuard(Arc<State>);
+impl AttemptGuard {
+    fn begin(state: Arc<State>) -> Self {
+        state.attempts.fetch_add(1, Ordering::SeqCst);
+        Self(state)
+    }
+}
+impl Drop for AttemptGuard {
+    fn drop(&mut self) {
+        self.0.attempts.fetch_sub(1, Ordering::SeqCst);
+        self.0.idle.notify_waiters();
+    }
+}
+impl State {
+    /// Whether an automatic admission taken at order is blocked only by work of
+    /// this process: a running attempt or an earlier admission still waiting.
+    fn local_blocker(&self, order: u64) -> bool {
+        !self.stopped.load(Ordering::SeqCst)
+            && (self.attempts.load(Ordering::SeqCst) > 0
+                || self
+                    .waiters
+                    .lock()
+                    .expect("waiters lock")
+                    .first()
+                    .is_some_and(|first| *first < order))
+    }
+}
+/// Settles an operation whose attempt began but whose prompt was rejected
+/// before any model request (for example an over-limit prompt), so it can never
+/// block a later prompt (#968). Its checkpoint is the unchanged conversation.
+/// A durability or store failure is not a rejection of the prompt: that
+/// operation is released and stays recoverable, as is one whose terminal
+/// cannot be written.
+async fn fail_begun(
+    state: &State,
+    policy: &dyn ClaudeExecutionPolicy,
+    id: String,
+    error: &NanocodexError,
+) {
+    if error.execution_policy_disposition().is_some() {
+        let _ = policy.release(id).await;
+        return;
+    }
+    let checkpoint = {
+        let conversation = state.conversation.lock().await;
+        state
+            .snapshot(&conversation)
+            .await
+            .ok()
+            .and_then(|snapshot| serde_json::to_value(snapshot).ok())
+    };
+    let settled = match checkpoint {
+        Some(checkpoint) => policy
+            .fail(id.clone(), checkpoint, error.to_string())
+            .await
+            .is_ok(),
+        None => false,
+    };
+    if !settled {
+        let _ = policy.release(id).await;
+    }
+}
+/// Retires an automatic operation that never began, so it cannot block later
+/// prompts. An operation whose attempt may have begun stays recoverable.
+async fn retire_unstarted(policy: &dyn ClaudeExecutionPolicy, id: String) {
+    if !policy.cancel_unstarted(id.clone()).await.unwrap_or(false) {
+        let _ = policy.release(id).await;
+    }
+}
+async fn start_turn(
+    state: &Arc<State>,
+    request: BackendPrompt,
+    resolution: crate::prompt::ImageResolution,
+    attempt: Option<AttemptGuard>,
+    cancellation: Arc<Cancellation>,
+) -> BackendTurn {
+    let state = state.clone();
+    // Code Mode effects resolve their durable identity from trusted
+    // accepted input and tool-call events, including ephemeral children.
+    let turn_id = request
+        .events
+        .turn_id()
+        .unwrap_or(request.events.request_id());
+    state.emit(
+        &request.events,
+        AgentEventKind::InputAccepted,
+        json!({
+            "session_id": state.session_id,
+            "turn_id": turn_id,
+            "item_id": format!("{turn_id}:prompt"),
+            "kind": "prompt",
+            "request_id": request.request_id,
+            "input": request.prompt.instruction,
+        }),
+    );
+    state.accepted_turns.fetch_add(1, Ordering::SeqCst);
+    let request_id = request.request_id.clone();
+    let key = request.key;
+    state.steering.lock().await.insert(
+        key,
+        TurnSteering {
+            pending: std::collections::VecDeque::new(),
+            receipts: HashMap::new(),
+            operation: request_id.clone(),
+            model_call_index: 1,
+            next_index: 0,
+            revision: request.prompt.instruction_revision(),
+            accepting: true,
+            images: resolution,
+            events: request.events.clone(),
+        },
+    );
+    state
+        .cancellations
+        .lock()
+        .await
+        .insert(key, cancellation.clone());
+    let (sender, receiver) = oneshot::channel();
+    let running = state.clone();
+    // Queued turns keep the speed selected when they were accepted.
+    let speed = state.speed();
+    let task = async move {
+        // The steering entry's publisher keeps the turn's event stream
+        // open, and shutdown waits until no turn remains, so the turn
+        // retires even when its run panics.
+        let result = AssertUnwindSafe(running.run(request, speed, cancellation))
+            .catch_unwind()
+            .await;
+        running.steering.lock().await.remove(&key);
+        running.cancellations.lock().await.remove(&key);
+        drop(attempt);
+        running.idle.notify_waiters();
+        let _ = sender.send(result.unwrap_or_else(|panic| std::panic::resume_unwind(panic)));
+    };
+    #[cfg(not(target_family = "wasm"))]
+    tokio::spawn(task);
+    #[cfg(target_family = "wasm")]
+    wasm_bindgen_futures::spawn_local(task);
+    BackendTurn {
+        request_id,
+        result: Box::pin(async move { receiver.await.unwrap_or(Err(NanocodexError::TurnStopped)) }),
+    }
+}
+/// Waits for local work ahead of an admitted automatic turn, then begins the same
+/// operation. Cancellation or stop retires it without an attempt (#968).
+async fn defer_turn(
+    state: Arc<State>,
+    policy: Arc<dyn ClaudeExecutionPolicy>,
+    mut request: BackendPrompt,
+    resolution: crate::prompt::ImageResolution,
+    id: String,
+    order: u64,
+) -> BackendTurn {
+    // Registered while admission is held, before any later admission looks.
+    state.waiters.lock().expect("waiters lock").insert(order);
+    let key = request.key;
+    let cancellation = Arc::new(Cancellation::default());
+    state
+        .cancellations
+        .lock()
+        .await
+        .insert(key, cancellation.clone());
+    let events = request.events.clone();
+    let request_id = Some(id.clone());
+    let (sender, receiver) = oneshot::channel();
+    let task = async move {
+        let started = loop {
+            // Register for retirement before re-checking, so no wake is lost.
+            let mut retired = std::pin::pin!(state.idle.notified());
+            retired.as_mut().enable();
+            if cancellation.is_cancelled() {
+                break Err((NanocodexError::TurnCancelled, false));
+            }
+            // Shutdown holds admission while it waits for every cancel handle to
+            // retire, so waiting for admission must also observe cancellation.
+            let admission = tokio::select! {
+                admission = state.admission.lock() => admission,
+                () = cancellation.cancelled() => break Err((NanocodexError::TurnCancelled, false)),
+            };
+            if state.stopped.load(Ordering::SeqCst) {
+                break Err((NanocodexError::AgentStopped, false));
+            }
+            match policy.begin_attempt(id.clone()).await {
+                Ok(()) => {
+                    let attempt = AttemptGuard::begin(state.clone());
+                    state.waiters.lock().expect("waiters lock").remove(&order);
+                    let frozen = crate::prompt::freeze_admitted(
+                        request.prompt,
+                        policy.as_ref(),
+                        &id,
+                        resolution,
+                    )
+                    .await;
+                    let (prompt, resolution) = match frozen {
+                        Ok(admitted) => admitted,
+                        Err(error) => {
+                            fail_begun(&state, policy.as_ref(), id.clone(), &error).await;
+                            drop(attempt);
+                            break Err((error, true));
+                        }
+                    };
+                    request.prompt = prompt;
+                    let turn =
+                        start_turn(&state, request, resolution, Some(attempt), cancellation).await;
+                    drop(admission);
+                    break Ok(turn);
+                }
+                Err(error) => {
+                    drop(admission);
+                    let blocked = error.execution_policy_disposition()
+                        == Some(nanocodex_agent::ExecutionPolicyDisposition::Retry);
+                    if blocked && state.local_blocker(order) {
+                        tokio::select! {
+                            () = retired.as_mut() => {}
+                            () = cancellation.cancelled() => {}
+                        }
+                        continue;
+                    }
+                    break Err((error, false));
+                }
+            }
+        };
+        let result = match started {
+            Ok(turn) => turn.result.await,
+            Err((error, begun)) => Err(abandon_deferred(
+                &state,
+                policy.as_ref(),
+                &events,
+                key,
+                id,
+                order,
+                error,
+                begun,
+            )
+            .await),
+        };
+        let _ = sender.send(result);
+    };
+    #[cfg(not(target_family = "wasm"))]
+    tokio::spawn(task);
+    #[cfg(target_family = "wasm")]
+    wasm_bindgen_futures::spawn_local(task);
+    BackendTurn {
+        request_id,
+        result: Box::pin(async move { receiver.await.unwrap_or(Err(NanocodexError::TurnStopped)) }),
+    }
+}
+/// Settles a deferred turn that will never run: no admitted operation is left
+/// pending, its cancel handle is released, and event consumers see a terminal.
+#[allow(clippy::too_many_arguments)]
+async fn abandon_deferred(
+    state: &Arc<State>,
+    policy: &dyn ClaudeExecutionPolicy,
+    events: &AgentEventPublisher,
+    key: BackendTurnKey,
+    id: String,
+    order: u64,
+    error: NanocodexError,
+    begun: bool,
+) -> NanocodexError {
+    state.waiters.lock().expect("waiters lock").remove(&order);
+    if !begun {
+        retire_unstarted(policy, id).await;
+    }
+    state.cancellations.lock().await.remove(&key);
+    let cancelled = matches!(error, NanocodexError::TurnCancelled);
+    if !cancelled {
+        state.emit(
+            events,
+            AgentEventKind::RunError,
+            json!({"message": error.to_string()}),
+        );
+    }
+    state.emit(
+        events,
+        AgentEventKind::RunFailed,
+        json!({
+            "status": if cancelled { "cancelled" } else { "failed" },
+            "model": state.model(),
+            "effort": state.thinking().as_str(),
+            "transport": "messages_sse",
+            "orchestration": "claude",
+            "model_calls": 0,
+            "tool_calls": 0,
+            "duration_ms": 0,
+            "duration_ns": 0,
+            "error": error.to_string(),
+            "estimated_cost": null,
+            "cost_usd": null,
+            "cost_status": "other"
+        }),
+    );
+    state.idle.notify_waiters();
+    error
 }
 fn unsupported(message: &str) -> NanocodexError {
     NanocodexError::InvalidRequest(message.into())
@@ -5343,154 +5652,131 @@ impl LifecycleBackend for Driver {
                     if state.stopped.load(Ordering::SeqCst) {
                         return Err(NanocodexError::AgentStopped);
                     }
-                    let mut resolution = crate::prompt::ImageResolution::of(&state.model());
-                    if let Some(policy) = &state.policy {
-                        let automatic = request.request_id.is_none();
-                        let candidate = request
-                            .request_id
-                            .clone()
-                            .unwrap_or_else(|| durable::candidate_id("turn"));
-                        let input =
-                            json!({"provider":"claude","kind":"prompt","prompt":request.prompt});
-                        let (id, admission) = policy.admit(candidate, input, automatic).await?;
-                        request.request_id = Some(id.clone());
-                        request.events = request.events.with_turn_id(id.clone());
-                        let mut terminal = match admission {
-                            Admission::Completed { output, .. } => {
-                                Some(durable::replay(id.clone(), output))
-                            }
-                            Admission::Failed { error, .. } => {
-                                Some(Err(NanocodexError::ReplayedExecutionFailed(error)))
-                            }
-                            Admission::Cancelled => Some(Err(NanocodexError::TurnCancelled)),
-                            Admission::Execute | Admission::Resume => None,
-                        };
-                        if terminal.is_none()
-                            && let Err(error) = policy.begin_attempt(id.clone()).await
-                        {
-                            // A queued turn admitted behind an unfinished earlier
-                            // operation cannot start until that one settles. Its
-                            // cancellation must not wait for it: no attempt began,
-                            // so the durable state can retire it without a checkpoint.
-                            let cancelled = request.cancel_on_admission
-                                && error.execution_policy_disposition()
-                                    == Some(nanocodex_agent::ExecutionPolicyDisposition::Retry)
-                                && policy.cancel_unstarted(id.clone()).await.unwrap_or(false);
-                            if !cancelled {
-                                let _ = policy.release(id).await;
-                                return Err(error);
-                            }
-                            terminal = Some(Err(NanocodexError::TurnCancelled));
+                    let resolution = crate::prompt::ImageResolution::of(&state.model());
+                    let Some(policy) = state.policy.clone() else {
+                        if request.request_id.is_some() {
+                            return Err(unsupported(
+                                "Claude request_id requires an attached durability policy",
+                            ));
                         }
-                        if let Some(result) = terminal {
-                            state.accepted_turns.fetch_add(1, Ordering::SeqCst);
-                            let (status, kind) = match &result {
-                                Ok(_) => ("completed", AgentEventKind::RunCompleted),
-                                Err(NanocodexError::TurnCancelled) => ("cancelled", AgentEventKind::RunFailed),
-                                Err(_) => ("failed", AgentEventKind::RunFailed),
-                            };
-                            // Cached terminals settle both public event streams
-                            // without claiming a fresh generation or tool effect.
-                            state.emit(
-                                &request.events,
-                                kind,
-                                json!({
-                                    "status":status,"model":state.model(),
-                                    "effort":state.thinking().as_str(),
-                                    "transport":"messages_sse","orchestration":"claude",
-                                    "replayed":true,"model_calls":0,"tool_calls":0,
-                                    "duration_ms":0,"duration_ns":0,
-                                    "final_message":result.as_ref().ok().map(TurnResult::final_message),
-                                    "usage":result.as_ref().ok().and_then(TurnResult::usage),
-                                    "error":result.as_ref().err().map(ToString::to_string),
-                                    "estimated_cost":null,"cost_usd":null,"cost_status":"other"
-                                }),
-                            );
-                            return Ok(BackendTurn {
-                                request_id: Some(id),
-                                result: Box::pin(async move { result }),
-                            });
-                        }
-                        (request.prompt, resolution) = match crate::prompt::freeze_admitted(request.prompt, policy.as_ref(), &id, resolution).await {
-                            Ok(admitted) => admitted,
-                            Err(error) => {
-                                let _ = policy.release(id).await;
-                                return Err(error);
-                            }
-                        };
-                    } else if request.request_id.is_some() {
-                        return Err(unsupported(
-                            "Claude request_id requires an attached durability policy",
-                        ));
-                    } else {
                         request.prompt = crate::prompt::freeze(request.prompt, resolution).await?;
-                    }
-                    // Code Mode effects resolve their durable identity from trusted
-                    // accepted input and tool-call events, including ephemeral children.
-                    let turn_id = request.events.turn_id().unwrap_or(request.events.request_id());
-                    state.emit(
-                        &request.events,
-                        AgentEventKind::InputAccepted,
-                        json!({
-                            "session_id": state.session_id,
-                            "turn_id": turn_id,
-                            "item_id": format!("{turn_id}:prompt"),
-                            "kind": "prompt",
-                            "request_id": request.request_id,
-                            "input": request.prompt.instruction,
-                        }),
-                    );
-                    state.accepted_turns.fetch_add(1, Ordering::SeqCst);
-                    let request_id = request.request_id.clone();
-                    let key = request.key;
-                    state.steering.lock().await.insert(
-                        key,
-                        TurnSteering {
-                            pending: std::collections::VecDeque::new(),
-                            receipts: HashMap::new(),
-                            operation: request_id.clone(),
-                            model_call_index: 1,
-                            next_index: 0,
-                            revision: request.prompt.instruction_revision(),
-                            accepting: true,
-                            images: resolution,
-                            events: request.events.clone(),
-                        },
-                    );
-                    let cancellation = Arc::new(Cancellation::default());
-                    state
-                        .cancellations
-                        .lock()
-                        .await
-                        .insert(key, cancellation.clone());
-                    let (sender, receiver) = oneshot::channel();
-                    let running = state.clone();
-                    // Queued turns keep the speed selected when they were accepted.
-                    let speed = state.speed();
-                    let task = async move {
-                        // The steering entry's publisher keeps the turn's event stream
-                        // open, and shutdown waits until no turn remains, so the turn
-                        // retires even when its run panics.
-                        let result = AssertUnwindSafe(running.run(request, speed, cancellation))
-                            .catch_unwind()
-                            .await;
-                        running.steering.lock().await.remove(&key);
-                        running.cancellations.lock().await.remove(&key);
-                        running.idle.notify_waiters();
-                        let _ = sender.send(
-                            result.unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+                        let cancellation = Arc::new(Cancellation::default());
+                        return Ok(
+                            start_turn(&state, request, resolution, None, cancellation).await
                         );
                     };
-                    #[cfg(not(target_family = "wasm"))]
-                    tokio::spawn(task);
-                    #[cfg(target_family = "wasm")]
-                    wasm_bindgen_futures::spawn_local(task);
-                    Ok(BackendTurn {
-                        request_id,
-                        result: Box::pin(async move {
-                            receiver.await.unwrap_or(Err(NanocodexError::TurnStopped))
-                        }),
-                    })
+                    let automatic = request.request_id.is_none();
+                    let candidate = request
+                        .request_id
+                        .clone()
+                        .unwrap_or_else(|| durable::candidate_id("turn"));
+                    let input =
+                        json!({"provider":"claude","kind":"prompt","prompt":request.prompt});
+                    let (id, admission) = policy.admit(candidate, input, automatic).await?;
+                    // Process-local order; equals the durable accepted order of this
+                    // process because both are taken while admission is held.
+                    let order = state.admission_order.fetch_add(1, Ordering::SeqCst);
+                    request.request_id = Some(id.clone());
+                    request.events = request.events.with_turn_id(id.clone());
+                    let mut terminal = match admission {
+                        Admission::Completed { output, .. } => {
+                            Some(durable::replay(id.clone(), output))
+                        }
+                        Admission::Failed { error, .. } => {
+                            Some(Err(NanocodexError::ReplayedExecutionFailed(error)))
+                        }
+                        Admission::Cancelled => Some(Err(NanocodexError::TurnCancelled)),
+                        Admission::Execute | Admission::Resume => None,
+                    };
+                    let mut attempt = None;
+                    if terminal.is_none() {
+                        match policy.begin_attempt(id.clone()).await {
+                            Ok(()) => attempt = Some(AttemptGuard::begin(state.clone())),
+                            Err(error) => {
+                                let blocked = error.execution_policy_disposition()
+                                    == Some(nanocodex_agent::ExecutionPolicyDisposition::Retry);
+                                // A queued turn admitted behind an unfinished earlier
+                                // operation cannot start until that one settles. Its
+                                // cancellation must not wait for it: no attempt began,
+                                // so the durable state can retire it without a checkpoint.
+                                if blocked
+                                    && request.cancel_on_admission
+                                    && policy.cancel_unstarted(id.clone()).await.unwrap_or(false)
+                                {
+                                    terminal = Some(Err(NanocodexError::TurnCancelled));
+                                } else if blocked && automatic && state.local_blocker(order) {
+                                    // An automatic identity is never returned on failure,
+                                    // so no caller could retry or cancel it (#968). Behind
+                                    // local work, hand back a cancellable turn that begins
+                                    // this same operation once it is first in line.
+                                    return Ok(defer_turn(
+                                        state.clone(),
+                                        policy,
+                                        request,
+                                        resolution,
+                                        id,
+                                        order,
+                                    )
+                                    .await);
+                                } else {
+                                    if automatic {
+                                        retire_unstarted(policy.as_ref(), id).await;
+                                    } else {
+                                        let _ = policy.release(id).await;
+                                    }
+                                    return Err(error);
+                                }
+                            }
+                        }
+                    }
+                    if let Some(result) = terminal {
+                        state.accepted_turns.fetch_add(1, Ordering::SeqCst);
+                        let (status, kind) = match &result {
+                            Ok(_) => ("completed", AgentEventKind::RunCompleted),
+                            Err(NanocodexError::TurnCancelled) => {
+                                ("cancelled", AgentEventKind::RunFailed)
+                            }
+                            Err(_) => ("failed", AgentEventKind::RunFailed),
+                        };
+                        // Cached terminals settle both public event streams
+                        // without claiming a fresh generation or tool effect.
+                        state.emit(
+                            &request.events,
+                            kind,
+                            json!({
+                                "status":status,"model":state.model(),
+                                "effort":state.thinking().as_str(),
+                                "transport":"messages_sse","orchestration":"claude",
+                                "replayed":true,"model_calls":0,"tool_calls":0,
+                                "duration_ms":0,"duration_ns":0,
+                                "final_message":result.as_ref().ok().map(TurnResult::final_message),
+                                "usage":result.as_ref().ok().and_then(TurnResult::usage),
+                                "error":result.as_ref().err().map(ToString::to_string),
+                                "estimated_cost":null,"cost_usd":null,"cost_status":"other"
+                            }),
+                        );
+                        return Ok(BackendTurn {
+                            request_id: Some(id),
+                            result: Box::pin(async move { result }),
+                        });
+                    }
+                    let (prompt, resolution) = match crate::prompt::freeze_admitted(
+                        request.prompt,
+                        policy.as_ref(),
+                        &id,
+                        resolution,
+                    )
+                    .await
+                    {
+                        Ok(admitted) => admitted,
+                        Err(error) => {
+                            fail_begun(&state, policy.as_ref(), id, &error).await;
+                            return Err(error);
+                        }
+                    };
+                    request.prompt = prompt;
+                    let cancellation = Arc::new(Cancellation::default());
+                    Ok(start_turn(&state, request, resolution, attempt, cancellation).await)
                 }
                 .await;
                 let _ = accepted.send(result);
@@ -5658,6 +5944,7 @@ impl LifecycleBackend for Driver {
                     }
                     let mut context = state.conversation.lock().await;
                     let mut operation = None;
+                    let mut _compaction_attempt = None;
                     if let Some(policy) = &state.policy {
                         let (id, admission) = policy
                             .admit(
@@ -5673,7 +5960,8 @@ impl LifecycleBackend for Driver {
                             }
                             Admission::Cancelled => return Err(NanocodexError::TurnCancelled),
                             Admission::Execute | Admission::Resume => {
-                                policy.begin_attempt(id.clone()).await?
+                                policy.begin_attempt(id.clone()).await?;
+                                _compaction_attempt = Some(AttemptGuard::begin(state.clone()));
                             }
                         }
                         operation = Some(id);

@@ -4073,6 +4073,12 @@ async fn run_inner(
                             })?;
                             updates.push(app.update(AppEvent::Transcript { pane, record }));
                             updates.push(app.update(AppEvent::WorkerTurnFinished { pane, terminal_expected: false }));
+                            // No run follows a rejected admission, so its transcript
+                            // error never reaches a run terminal. Show it now (#968).
+                            updates.push(app.update(AppEvent::NotifyError {
+                                pane,
+                                error: format!("Prompt was not started: {error}"),
+                            }));
                             for (pane, id) in
                                 take_waiting_steer_failures(&mut runtime.waiting_steers)
                             {
