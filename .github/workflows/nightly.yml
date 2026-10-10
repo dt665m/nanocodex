@@ -84,6 +84,11 @@ jobs:
           # sccache still keeps progress from a failed run: it uploads each
           # compiled object under its own content key as soon as it is built.
           cache-on-failure: false
+          # Only master publications seed target archives (~4.6GB for Linux, macOS
+          # and Windows together). PR-artifact and branch dispatches still restore
+          # master's entry and keep using sccache, but no longer write
+          # branch-scoped copies that nothing else can read.
+          save-if: ${{ inputs.pr == '' && github.ref == 'refs/heads/master' }}
       # rust-cache restores third-party dependencies but always rebuilds
       # workspace crates. sccache reuses unchanged workspace libraries across
       # runs; binaries and changed crates still compile from source.
@@ -350,6 +355,11 @@ jobs:
           # sccache still keeps progress from a failed run: it uploads each
           # compiled object under its own content key as soon as it is built.
           cache-on-failure: false
+          # Only master publications seed target archives (~4.6GB for Linux, macOS
+          # and Windows together). PR-artifact and branch dispatches still restore
+          # master's entry and keep using sccache, but no longer write
+          # branch-scoped copies that nothing else can read.
+          save-if: ${{ inputs.pr == '' && github.ref == 'refs/heads/master' }}
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba
         with:
           version: v0.16.0
