@@ -1671,6 +1671,7 @@ struct Service {
     listed_agent: Arc<Mutex<String>>,
     listed_title: Arc<Mutex<String>>,
     resume_gate: Arc<tokio::sync::Semaphore>,
+    routing_gate: Arc<tokio::sync::Semaphore>,
     active: bool,
     state_available: Arc<AtomicBool>,
     settings: Arc<Mutex<Value>>,
@@ -1926,6 +1927,7 @@ async fn enable_routing(
     axum::extract::Path(agent): axum::extract::Path<String>,
     body: axum::body::Bytes,
 ) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+    let _permit = service.routing_gate.acquire().await.unwrap();
     let body: Value = if body.is_empty() {
         json!({})
     } else {
@@ -2090,6 +2092,7 @@ struct Fixture {
     listed_agent: Arc<Mutex<String>>,
     listed_title: Arc<Mutex<String>>,
     resume_gate: Arc<tokio::sync::Semaphore>,
+    routing_gate: Arc<tokio::sync::Semaphore>,
     origin: String,
     terminal: Terminal,
     state_available: Arc<AtomicBool>,
@@ -2208,6 +2211,7 @@ impl Fixture {
         let listed_agent = Arc::new(Mutex::new(AGENT.to_owned()));
         let listed_title = Arc::new(Mutex::new("RETAINED_REMOTE_WORK".to_owned()));
         let resume_gate = Arc::new(tokio::sync::Semaphore::new(1));
+        let routing_gate = Arc::new(tokio::sync::Semaphore::new(1));
         let socket_paths = Arc::new(Mutex::new(Vec::new()));
         let vault_writes = Arc::new(Mutex::new(Vec::new()));
         let native_writes = Arc::new(Mutex::new(Vec::new()));
@@ -2294,6 +2298,7 @@ impl Fixture {
                 listed_agent: listed_agent.clone(),
                 listed_title: listed_title.clone(),
                 resume_gate: resume_gate.clone(),
+                routing_gate: routing_gate.clone(),
                 active,
                 state_available: state_available.clone(),
                 settings: settings.clone(),
@@ -2341,6 +2346,7 @@ impl Fixture {
             listed_agent,
             listed_title,
             resume_gate,
+            routing_gate,
             origin,
             terminal,
             state_available,
@@ -2407,6 +2413,19 @@ impl Fixture {
                 "type": kind, "payload": payload
             }}),
         );
+    }
+
+    /// Start a routing change and wait until the root accepts input again.
+    /// While it runs the root is non-interactive and drops typed input, yet a
+    /// lagging screen can still show the previous composer, "Enter send" and
+    /// a model label the status itself names. Hold the routing request until
+    /// the change's status is on screen, then wait for that status to clear.
+    async fn routing_change(&mut self, keys: impl FnOnce(&mut Terminal), status: &str) {
+        let pause = self.routing_gate.clone().acquire_owned().await.unwrap();
+        keys(&mut self.terminal);
+        self.terminal.wait_text(status).await;
+        drop(pause);
+        self.terminal.wait_no_text(status).await;
     }
 
     async fn submission(&mut self, expected: &str) -> String {
@@ -4718,7 +4737,13 @@ async fn terminal_resumes_by_generated_title() {
         "Resume title search (query=cobalt):\n{}",
         fixture.terminal.screen.lock().unwrap().screen().contents()
     );
+    // Hold the switch until its status is on screen. Otherwise a lagging PTY
+    // screen can lack "Resuming session" while the switch is still running,
+    // and the prompt typed into the non-interactive composer is dropped.
+    let pause = fixture.resume_gate.clone().acquire_owned().await.unwrap();
     fixture.terminal.input("\r");
+    fixture.terminal.wait_text("Resuming session").await;
+    drop(pause);
     fixture.replacement_connection().await;
     fixture.terminal.wait_no_text("Resuming session").await;
     fixture
@@ -6218,7 +6243,12 @@ async fn terminal_gateway_model_picker_routes_manual_selection_and_keeps_prompt_
     {
         fixture.terminal.prompt("/model", "\r");
         fixture.terminal.wait_text("Select model").await;
-        fixture.terminal.input("\x1b[B\r");
+        fixture
+            .routing_change(
+                |terminal| terminal.input("\x1b[B\r"),
+                &format!("Starting {model} session"),
+            )
+            .await;
         fixture.terminal.wait_no_text("Select model").await;
         tokio::time::timeout(TIMEOUT, async {
             while fixture.routing_bodies.lock().unwrap().len() <= index {
@@ -6267,14 +6297,24 @@ async fn terminal_gateway_model_picker_routes_manual_selection_and_keeps_prompt_
         fixture.routing_bodies.lock().unwrap().last().unwrap(),
         &json!({"model": "mimo-v2.6-pro", "thinking": "high"})
     );
-    fixture.terminal.prompt("/autoroute", "\r");
+    fixture
+        .routing_change(
+            |terminal| terminal.prompt("/autoroute", "\r"),
+            "Enabling automatic routing",
+        )
+        .await;
     fixture.terminal.wait_text("Auto · choosing").await;
     fixture.terminal.prompt("/thinking high", "\r");
     fixture
         .terminal
         .wait_text("Automatic routing controls the model and effort")
         .await;
-    fixture.terminal.prompt("/model gpt-6-astra", "\r");
+    fixture
+        .routing_change(
+            |terminal| terminal.prompt("/model gpt-6-astra", "\r"),
+            "Starting Astra session",
+        )
+        .await;
     fixture.terminal.wait_no_text("Auto · choosing").await;
     fixture.terminal.wait_text("gpt-6-astra").await;
     fixture.terminal.wait_text("Enter send").await;
@@ -6285,7 +6325,12 @@ async fn terminal_gateway_model_picker_routes_manual_selection_and_keeps_prompt_
     })
     .await
     .unwrap();
-    fixture.terminal.prompt("/model kimi-k3", "\r");
+    fixture
+        .routing_change(
+            |terminal| terminal.prompt("/model kimi-k3", "\r"),
+            "Starting kimi-k3 session",
+        )
+        .await;
     fixture.terminal.wait_text("kimi-k3").await;
     fixture.terminal.wait_text("Enter send").await;
     fixture
@@ -6569,7 +6614,15 @@ async fn copy_journey_expect(fixture: &mut Fixture, command: &str, key: &str, ex
 }
 
 async fn copy_journey_error(fixture: &mut Fixture, command: &str, expected: &str) {
-    fixture.terminal.prompt(command, "\r");
+    // Rejections reuse one persistent toast, so an earlier identical error can
+    // satisfy the wait before this command is read. Submitting clears the
+    // composer in the same render that shows the error, so wait for this
+    // command to appear in the composer and then disappear.
+    fixture.terminal.wait_no_text(command).await;
+    fixture.terminal.prompt(command, "");
+    fixture.terminal.wait_text(command).await;
+    fixture.terminal.input("\r");
+    fixture.terminal.wait_no_text(command).await;
     fixture.terminal.wait_text(expected).await;
     eprintln!(
         "PTY rejected {command:?}: {}",
@@ -6639,17 +6692,29 @@ async fn terminal_copy_keeps_raw_markdown_and_skips_unfinished_messages() {
     fixture.terminal.input("/copy response");
     fixture.terminal.wait_text("copy response").await;
     fixture.terminal.input("\r");
+    fixture.terminal.wait_no_text("copy response").await;
     fixture.terminal.wait_text("Usage: /copy [N]").await;
 
     // A successful copy is a terminal-input barrier after all rejected commands.
     copy_journey_expect(&mut fixture, "/copy", "\r", second).await;
     let output = fixture.terminal.output.lock().unwrap().clone();
+    let copies = String::from_utf8_lossy(&output)
+        .split("\x1b]52;c;")
+        .skip(1)
+        .map(|rest| {
+            let encoded = rest.split_once('\x07').map_or(rest, |(encoded, _)| encoded);
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .unwrap_or_else(|error| format!("<undecodable: {error}>"));
+            decoded.lines().next().unwrap_or_default().to_owned()
+        })
+        .collect::<Vec<_>>();
+    eprintln!("COPY journey OSC52 sequence: {copies:?}");
     assert_eq!(
-        String::from_utf8_lossy(&output)
-            .matches("\x1b]52;c;")
-            .count(),
+        copies.len(),
         6,
-        "errors must not copy and a streamed item must not count"
+        "errors must not copy and a streamed item must not count: {copies:?}"
     );
     // The next real prompt must be the next submission: no copy command may have
     // escaped as input, a queued follow-up, or a live steering request.
@@ -7170,7 +7235,9 @@ async fn terminal_review_branch_picker_navigates_filters_and_refreshes() {
     fixture.terminal.input("\x1b");
     fixture.terminal.wait_text("Uncommitted").await;
     fixture.terminal.input("\x1b");
-    fixture.terminal.wait_no_text("Search branches").await;
+    // "Search branches" is already gone after the first Esc; wait for the scope
+    // menu itself to close so the next paste cannot race the second Esc.
+    fixture.terminal.wait_no_text("Base branch").await;
     review_journey_normal_turn(&mut fixture, "AFTER_BRANCH_NO_MATCH_ENTER").await;
 
     review_journey_branches(&mut fixture).await;
@@ -7249,7 +7316,8 @@ async fn terminal_review_branch_picker_empty_and_nonrepo_recover_without_submitt
     fixture.terminal.input("\x1b");
     fixture.terminal.wait_text("Uncommitted").await;
     fixture.terminal.input("\x1b");
-    fixture.terminal.wait_no_text("Search branches").await;
+    // As above: wait for the scope menu, not the already-closed branch search.
+    fixture.terminal.wait_no_text("Base branch").await;
     review_journey_normal_turn(&mut fixture, "AFTER_BRANCH_EMPTY_REPO").await;
 
     review_journey_commit(&fixture);

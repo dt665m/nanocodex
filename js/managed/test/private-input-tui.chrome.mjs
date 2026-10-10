@@ -306,11 +306,15 @@ async function intakeAndReuseJourneys(){
   await panel(entry.path);
   await keypress('\x1bOR');await settled('Vault picker','Vault picker');
   // Safe item names and semantic roles are sufficient to choose; saved values stay broker-side.
-  for(let n=0;n<40;n++){
-   const rendered=visibleText();
-   if(rendered.includes('"'+entry.name+'" · '+entry.kind+' · '+entry.role))break;
-   await keypress('\x1b[B');
-   if(n===39)throw Error('Vault picker did not offer '+entry.kind);
+  // Await each rendered move: a lagging frame must not leave an extra queued
+  // arrow that silently moves past the matched item before Enter.
+  const pickerChoice=()=>visibleText().match(/Vault picker (\d+)\/(\d+): ([^\n]*)/);
+  for(let n=0;;n++){
+   const [,position,total,choice]=pickerChoice()||[];assert.ok(total,'Vault picker renders its current choice');
+   if(choice.includes('"'+entry.name+'" · '+entry.kind+' · '+entry.role))break;
+   if(n>=Number(total))throw Error('Vault picker did not offer '+entry.kind);
+   const next=String(Number(position)%Number(total)+1);
+   await keypress('\x1b[B');await wait(()=>pickerChoice()?.[1]===next,'Vault picker choice '+next);
   }
   await keypress('\r');await settled('Selected Vault:','selected Vault field');const beforeSave=saveCalls.length;await submit();
   assert.equal(await activePage.locator(entry.selector).inputValue(),entry.secret);
