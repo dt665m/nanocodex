@@ -404,7 +404,8 @@ fn local_entries(text: &str) -> Vec<(u64, f64)> {
     entries
 }
 /// Owner-private scratch directory, named for the owning process. A stream
-/// removes it before reporting a terminal status; drop covers task abort.
+/// removes it before reporting `stopped`; drop is only a best-effort fallback
+/// when the task is aborted.
 fn scratch() -> std::io::Result<tempfile::TempDir> {
     let dir = tempfile::Builder::new()
         .prefix(&format!("nanocodex-hls-{}-", std::process::id()))
@@ -418,19 +419,22 @@ fn scratch() -> std::io::Result<tempfile::TempDir> {
 }
 /// Windows refuses to delete a file that a just-terminated FFmpeg or a file
 /// scanner still holds open, and `TempDir`'s drop ignores that error; retry
-/// briefly so a terminal status does not leave captured segments behind.
-async fn remove_scratch(dir: tempfile::TempDir) {
+/// briefly, then return the last error so the caller never reports a clean stop
+/// while captured segments remain.
+async fn remove_scratch(dir: tempfile::TempDir) -> std::io::Result<()> {
     let path = dir.path().to_owned();
-    if dir.close().is_ok() {
-        return;
-    }
+    let Err(mut last) = dir.close() else {
+        return Ok(());
+    };
     for _ in 0..10 {
         tokio::time::sleep(Duration::from_millis(50)).await;
         match std::fs::remove_dir_all(&path) {
-            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {}
-            _ => return,
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => last = error,
         }
     }
+    Err(last)
 }
 /// One playback stream: FFmpeg -> local segments -> authenticated uploads.
 /// Status transitions are published on `events`; nothing here is logged.
@@ -528,11 +532,14 @@ pub(crate) async fn run(
             .await
             .ok();
     }
-    // Every encoder was killed and reaped above; a terminal status means the
-    // local segments are gone.
-    remove_scratch(dir).await;
+    // Every encoder was killed and reaped above. Only `stopped` promises that
+    // the local segments are gone: a cleanup failure turns a clean stop into
+    // broadcast_failed (the generic host failure every broker accepts), and an
+    // earlier failure keeps its own, primary code.
+    let cleaned = remove_scratch(dir).await.is_ok();
     match outcome {
-        None => emit("stopped", None),
+        None if cleaned => emit("stopped", None),
+        None => emit("failed", Some("broadcast_failed")),
         Some(error) => emit("failed", Some(error)),
     }
 }
@@ -1124,6 +1131,74 @@ mod tests {
             !state.lock().unwrap().deleted,
             "expired credentials are not used"
         );
+    }
+
+    /// A stop whose scratch directory cannot be removed is reported as a
+    /// failure, never as a clean stop, and the retained segments stay visible.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn undeletable_scratch_fails_the_stop_instead_of_reporting_stopped() {
+        use std::os::unix::fs::PermissionsExt;
+        let _serial = SERIAL.lock().await;
+        require_ffmpeg();
+        let state: Shared = Default::default();
+        let origin = serve(state.clone()).await;
+        let before = scratch_dirs();
+        let mut broadcast = synthetic();
+        let mut events = broadcast.events();
+        let mut seen = vec![
+            broadcast
+                .hls_request(&start(&origin, 60_000), &origin.origin())
+                .await,
+        ];
+        assert_eq!(
+            wait(&mut events, &mut seen, "live", 20).await["status"],
+            "live"
+        );
+        let created: Vec<_> = scratch_dirs()
+            .into_iter()
+            .filter(|d| !before.contains(d))
+            .collect();
+        assert_eq!(created.len(), 1);
+        // A read-only subdirectory holding a file: removal fails the same way a
+        // file still held open on Windows does, without disturbing the encoder.
+        let locked = created[0].join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("held.ts"), b"retained").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+        assert_eq!(
+            std::fs::remove_file(locked.join("held.ts"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "this journey needs a user that directory permissions apply to"
+        );
+
+        let stopped = broadcast
+            .hls_request(
+                &json!({"action":"stop","request_id":"s","stream_id":STREAM}),
+                &origin.origin(),
+            )
+            .await;
+        seen.push(events.borrow().clone());
+        seen.push(stopped.clone());
+        assert_eq!(stopped["status"], "failed", "{seen:?}");
+        assert_eq!(stopped["error"], "broadcast_failed");
+        assert_eq!(stopped["request_id"], "s");
+        let last = events.borrow().clone();
+        assert_eq!(
+            (last["status"].as_str(), last["error"].as_str()),
+            (Some("failed"), Some("broadcast_failed"))
+        );
+        assert!(
+            locked.join("held.ts").exists(),
+            "retained segments are not hidden"
+        );
+        assert!(!seen.iter().any(|v| v["status"] == "stopped"), "{seen:?}");
+        assert_tokenless(&seen);
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_dir_all(&created[0]).unwrap();
     }
 
     #[tokio::test]
