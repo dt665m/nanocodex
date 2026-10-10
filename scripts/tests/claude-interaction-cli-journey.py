@@ -99,6 +99,7 @@ def main():
         os.write(fd,b'1\r'); wait(at_gate.is_set,drain,'question answer did not arrive')
         # Release the held response only once the whole stale draft is rendered
         # in the composer; otherwise its tail lands in the approval dialog.
+        drain(); require(not visible('tui', b'approve'),'stale draft text visible before typing')
         os.write(fd,b'approve'); wait(lambda:visible('tui', b'approve'),drain,'stale draft not rendered'); gate.set()
         wait(lambda:visible('tui', b'Plan approval required'),drain,'plan approval absent'); time.sleep(.2); drain()
         os.write(fd,b'\r'); pending(8,drain) # stale draft must be cleared
