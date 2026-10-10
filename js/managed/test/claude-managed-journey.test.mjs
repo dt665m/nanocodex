@@ -818,9 +818,11 @@ test('Managed Code Mode Claude and mixed-family public delegation, account gates
       await mf.dispose(); mf=new Miniflare(options);
       await turn(media,'MULTIMODAL_PROOF recall all attached documents','journey-media-reopen');
       const replay=mediaRequests.at(-1).messages.flatMap(message=>Array.isArray(message.content)?message.content:[]);
-      for(const mime of ['image/png','image/jpeg','image/gif','image/webp','application/pdf','text/plain']) {
+      for(const mime of ['image/png','image/jpeg','image/webp','application/pdf','text/plain']) {
         assert.ok(replay.some(block=>block.source?.media_type===mime), `reopened history retains ${mime}`);
       }
+      // The GIF was sent as a PNG (876d83ea1): history keeps both PNG images.
+      assert.ok(replay.filter(block=>block.type==='image'&&block.source?.media_type==='image/png').length>=2,'reopened history retains the PNG and the converted GIF');
       // Exercise the same multipart upload + descriptor sent by iOS/macOS.
       const attachmentId='01234567-89ab-4def-8123-456789abcdef';
       const original=Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7','base64');
