@@ -1652,6 +1652,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tool_search_returns_the_requested_limit_beyond_the_former_cap_of_32() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/mcp-stdio-server.mjs");
+        let mcp = Mcp::builder()
+            .server(
+                "many",
+                McpServer::stdio("node")
+                    .arg(fixture.to_string_lossy())
+                    .env("NANOCODEX_MCP_FIXTURE_TOOL_COUNT", "48")
+                    .tool_exposure(McpToolExposure::DeferredOnly),
+            )
+            .build()
+            .unwrap();
+        mcp.start();
+
+        let search = mcp.state.search("echo", Some(40)).await.unwrap();
+        assert_eq!(search.tool_count(), 40);
+        let search = mcp.state.search("echo", None).await.unwrap();
+        assert_eq!(
+            search.tool_count(),
+            8,
+            "the omitted-limit default is unchanged"
+        );
+    }
+
+    #[tokio::test]
     async fn mcp_tool_exposure_selects_deferred_and_code_mode_surfaces_per_server() {
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/mcp-stdio-server.mjs");
