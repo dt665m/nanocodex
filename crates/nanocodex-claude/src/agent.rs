@@ -4,7 +4,7 @@ use crate::{
     MessagesRequest, Role, ServerToolDefinition, StopReason, StreamEvent, ToolDefinition,
     ToolResultContent, Usage, collect_stream,
 };
-use futures_util::StreamExt;
+use futures_util::{FutureExt as _, StreamExt};
 use nanocodex_agent::{
     AgentEvents, AgentHandle, AgentSessionContext, ChildSnapshot, CostStatus, HarnessFamily,
     HarnessModel, Model, Nanocodex, NanocodexError, ReportedTurnUsage, Result, SpawnOptions,
@@ -20,12 +20,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 mod durable;
 mod images;
+mod shared;
 use crate::execution::{Admission, ClaudeExecutionPolicy, Step};
 pub use durable::rewind_checkpoint;
 use durable::{Cursor, Effect, Snapshot};
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
+    panic::AssertUnwindSafe,
     pin::Pin,
     sync::{
         Arc, Weak,
@@ -42,6 +44,68 @@ use web_time::Instant;
 
 fn estimate_text_tokens(text: &str) -> u64 {
     (text.encode_utf16().count() as u64).div_ceil(4)
+}
+
+// Per-receipt history bound shared with the OpenAI session history. Without it,
+// one oversized receipt can exceed the model window, and compaction cannot
+// shrink it because the latest tool round is retained verbatim.
+const TOOL_RESULT_TOKEN_LIMIT: u64 = 12_000;
+
+/// Keeps the head and tail of `text` within `max_tokens` of the local estimate.
+fn truncate_middle(text: &str, max_tokens: u64) -> String {
+    let total = estimate_text_tokens(text);
+    if total <= max_tokens {
+        return text.to_owned();
+    }
+    let side = usize::try_from(max_tokens.saturating_mul(2)).unwrap_or(usize::MAX);
+    let mut units = 0;
+    let head = text
+        .char_indices()
+        .find(|(_, c)| {
+            units += c.len_utf16();
+            units > side
+        })
+        .map_or(text.len(), |(end, _)| end);
+    units = 0;
+    let tail = text
+        .char_indices()
+        .rev()
+        .find(|(_, c)| {
+            units += c.len_utf16();
+            units > side
+        })
+        .map_or(0, |(start, c)| start + c.len_utf8())
+        .max(head);
+    format!(
+        "{}…{} tokens truncated…{}",
+        &text[..head],
+        total - max_tokens,
+        &text[tail..]
+    )
+}
+
+/// Text shares one budget across a receipt; media and protocol blocks are kept.
+fn bound_tool_result(content: ToolResultContent) -> ToolResultContent {
+    match content {
+        ToolResultContent::Text(text) => {
+            ToolResultContent::Text(truncate_middle(&text, TOOL_RESULT_TOKEN_LIMIT))
+        }
+        ToolResultContent::Blocks(mut blocks) => {
+            let mut remaining = TOOL_RESULT_TOKEN_LIMIT;
+            for block in &mut blocks {
+                if block["type"] != "text" {
+                    continue;
+                }
+                let Some(text) = block["text"].as_str() else {
+                    continue;
+                };
+                let bounded = truncate_middle(text, remaining);
+                remaining = remaining.saturating_sub(estimate_text_tokens(text));
+                block["text"] = bounded.into();
+            }
+            ToolResultContent::Blocks(blocks)
+        }
+    }
 }
 
 const fn add_usage(total: &mut Usage, usage: &Usage) {
@@ -235,6 +299,25 @@ impl ClaudeTools {
             Arc::new(move |input, context| Box::pin(function(input, context))),
         ));
         self
+    }
+    /// Registers a tool written against the shared nanocodex [`Tool`] contract,
+    /// the same implementation a Responses agent installs in its `Tools`
+    /// registry.
+    ///
+    /// The tool receives this call's session, turn, call and host-context
+    /// identities, but no Responses history. Its output schema is appended to
+    /// the description because Claude definitions have no field for it, and
+    /// multimodal output reaches Claude as serialized JSON text.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for freeform, namespace and other non-function tools,
+    /// which Claude cannot call.
+    ///
+    /// [`Tool`]: nanocodex_oai_tools::Tool
+    pub fn shared_tool<T: nanocodex_oai_tools::Tool>(mut self, tool: T) -> Result<Self> {
+        self.tools.push(shared::bridge(tool)?);
+        Ok(self)
     }
 }
 type DynamicToolsFactory = Arc<dyn Fn() -> ClaudeTools + Send + Sync>;
@@ -1307,7 +1390,7 @@ impl ClaudeBuilder {
             task_board: self.task_board,
             cancellations: Mutex::new(HashMap::new()),
             stopped: AtomicBool::new(false),
-            sequence: AtomicU64::new(1),
+            sequence: std::sync::Mutex::new(1),
             accepted_turns: AtomicU64::new(accepted_turns),
             steering: Mutex::new(HashMap::new()),
             live_nested_starts: std::sync::Mutex::new(LiveNestedStarts::default()),
@@ -1576,14 +1659,16 @@ fn host_reply(
                 blocks.push(match item {
                     ToolResultBlock::Text { text } => json!({"type":"text","text":text}),
                     ToolResultBlock::Image { source } => {
-                        let image_url = match source {
+                        let source = match source {
                             ImageSource::Base64 { media_type, data } => {
-                                format!("data:{media_type};base64,{data}")
+                                crate::prompt::image_source(&format!(
+                                    "data:{media_type};base64,{data}"
+                                ))
+                                .map_err(|error| error.to_string())?
+                                .0
                             }
-                            ImageSource::Url { url } => url,
+                            ImageSource::Url { url } => json!({"type":"url","url":url}),
                         };
-                        let (source, _) = crate::prompt::image_source(&image_url)
-                            .map_err(|error| error.to_string())?;
                         json!({"type":"image","source":source})
                     }
                     ToolResultBlock::Document { file_data } => {
@@ -2458,6 +2543,11 @@ struct TurnSteering {
     next_index: u32,
     revision: Option<u64>,
     accepting: bool,
+    /// The native image resolution of the model this turn's requests name.
+    ///
+    /// Steers are prepared with it when accepted, so it is fixed at admission.
+    images: crate::prompt::ImageResolution,
+    events: AgentEventPublisher,
 }
 
 struct State {
@@ -2513,7 +2603,8 @@ struct State {
     task_board: Option<Arc<nanocodex_claude_tools::tasks::ClaudeTasks>>,
     cancellations: Mutex<HashMap<BackendTurnKey, Arc<Cancellation>>>,
     stopped: AtomicBool,
-    sequence: AtomicU64,
+    /// The sequence number of the next published event.
+    sequence: std::sync::Mutex<u64>,
     accepted_turns: AtomicU64,
     steering: Mutex<HashMap<BackendTurnKey, TurnSteering>>,
     // Nested Code Mode calls whose start was published live but whose result
@@ -2853,13 +2944,24 @@ impl State {
         let Ok(payload) = serde_json::value::to_raw_value(&payload) else {
             return;
         };
-        let _ = events.publish(AgentEvent {
+        let mut event = AgentEvent {
             protocol_version: 1,
             request_id: Arc::from(events.request_id()),
-            seq: self.sequence.fetch_add(1, Ordering::SeqCst),
+            seq: 0,
             kind,
             payload: Arc::from(payload),
-        });
+        };
+        // The publisher accepts only the next number in sequence, and turn runs
+        // and steering callers emit concurrently. Number and publish each event
+        // under one lock, and use a number only when its event is published.
+        let mut sequence = self
+            .sequence
+            .lock()
+            .expect("Claude event sequence lock poisoned");
+        event.seq = *sequence;
+        if events.publish(event).is_ok() {
+            *sequence += 1;
+        }
     }
     fn model(&self) -> String {
         self.model
@@ -3363,6 +3465,10 @@ impl State {
         let mut result = self
             .run_locked(&mut conversation, &request, speed, &cancel)
             .await;
+        // A steer accepted after the model loop could never reach the model.
+        if let Some(turn) = self.steering.lock().await.get_mut(&request.key) {
+            turn.accepting = false;
+        }
         // run_locked has dropped any active exec/wait observation future. Drain
         // cells even if cancellation arrived while the model request was pending.
         // Keep the conversation lock until cleanup completes, fencing the next turn.
@@ -3773,7 +3879,7 @@ impl State {
         {
             return Err(NanocodexError::InvalidRequest("durable Claude steering requires inline images; local image paths cannot be retained safely".into()));
         }
-        let frozen = crate::prompt::freeze(prompt)?;
+        let frozen = crate::prompt::freeze(prompt, turn.images).await?;
         let capacity = turn.pending.len() < 8;
         let local_index = || {
             turn.next_index
@@ -3784,12 +3890,16 @@ impl State {
             (&self.policy, &turn.operation)
             && policy.supports_steering()
         {
+            // Journaling the prepared steer keeps images the model never
+            // receives, such as URLs that may carry credentials, out of the
+            // journal. Recovery prepares it again without change.
+            let journaled = serde_json::to_string(&frozen).map_err(provider_error)?;
             let Some(index) = policy
                 .accept_steer(
                     operation.clone(),
                     id.clone(),
                     turn.model_call_index,
-                    input_json.clone(),
+                    journaled,
                     capacity,
                 )
                 .await?
@@ -3812,6 +3922,26 @@ impl State {
         if let Some(id) = &id {
             turn.receipts.insert(id.clone(), (input_json, false));
         }
+        let turn_id = turn
+            .events
+            .turn_id()
+            .unwrap_or(turn.events.request_id())
+            .to_owned();
+        let item = id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
+        self.emit(
+            &turn.events,
+            AgentEventKind::InputAccepted,
+            json!({
+                "session_id": self.session_id,
+                "turn_id": turn_id,
+                "item_id": format!("{turn_id}:steer:{item}"),
+                "kind": "steer",
+                "request_id": id,
+                "input": frozen.instruction,
+            }),
+        );
         turn.pending.push_back(PendingSteer {
             prompt: frozen,
             message_id: id,
@@ -4030,7 +4160,11 @@ impl State {
             ("started_after_ns".to_owned(), Value::Null),
         ]);
         self.emit(events, AgentEventKind::ToolResult, Value::Object(payload));
-        Ok(ContentBlock::tool_result_content(id, content, is_error))
+        Ok(ContentBlock::tool_result_content(
+            id,
+            bound_tool_result(content),
+            is_error,
+        ))
     }
     async fn lifecycle(
         &self,
@@ -4111,7 +4245,7 @@ impl State {
                 let prompt =
                     serde_json::from_str(&steer.input_json).map_err(durable::recovery_error)?;
                 turn.pending.push_back(PendingSteer {
-                    prompt: crate::prompt::freeze(prompt)?,
+                    prompt: crate::prompt::freeze(prompt, turn.images).await?,
                     message_id: steer.message_id,
                     index: steer.index,
                     after: steer.accepted_after_model_call_index,
@@ -4702,7 +4836,11 @@ impl State {
             });
             if has_tool_calls {
                 let mut results: Vec<_> = results.into_iter().map(Option::unwrap).collect();
-                images::prepare_tool_images(&mut results).await;
+                images::prepare_tool_images(
+                    &mut results,
+                    crate::prompt::ImageResolution::of(&cursor.template.model),
+                )
+                .await;
                 pending.push(Message::tool_results(results));
                 // Commit completed effects and explicit unknown-outcome receipts
                 // before returning cancellation or making another provider call.
@@ -5205,6 +5343,7 @@ impl LifecycleBackend for Driver {
                     if state.stopped.load(Ordering::SeqCst) {
                         return Err(NanocodexError::AgentStopped);
                     }
+                    let mut resolution = crate::prompt::ImageResolution::of(&state.model());
                     if let Some(policy) = &state.policy {
                         let automatic = request.request_id.is_none();
                         let candidate = request
@@ -5272,8 +5411,8 @@ impl LifecycleBackend for Driver {
                                 result: Box::pin(async move { result }),
                             });
                         }
-                        request.prompt = match crate::prompt::freeze_admitted(request.prompt, policy.as_ref(), &id).await {
-                            Ok(prompt) => prompt,
+                        (request.prompt, resolution) = match crate::prompt::freeze_admitted(request.prompt, policy.as_ref(), &id, resolution).await {
+                            Ok(admitted) => admitted,
                             Err(error) => {
                                 let _ = policy.release(id).await;
                                 return Err(error);
@@ -5284,7 +5423,7 @@ impl LifecycleBackend for Driver {
                             "Claude request_id requires an attached durability policy",
                         ));
                     } else {
-                        request.prompt = crate::prompt::freeze(request.prompt)?;
+                        request.prompt = crate::prompt::freeze(request.prompt, resolution).await?;
                     }
                     // Code Mode effects resolve their durable identity from trusted
                     // accepted input and tool-call events, including ephemeral children.
@@ -5314,6 +5453,8 @@ impl LifecycleBackend for Driver {
                             next_index: 0,
                             revision: request.prompt.instruction_revision(),
                             accepting: true,
+                            images: resolution,
+                            events: request.events.clone(),
                         },
                     );
                     let cancellation = Arc::new(Cancellation::default());
@@ -5327,11 +5468,18 @@ impl LifecycleBackend for Driver {
                     // Queued turns keep the speed selected when they were accepted.
                     let speed = state.speed();
                     let task = async move {
-                        let result = running.run(request, speed, cancellation).await;
+                        // The steering entry's publisher keeps the turn's event stream
+                        // open, and shutdown waits until no turn remains, so the turn
+                        // retires even when its run panics.
+                        let result = AssertUnwindSafe(running.run(request, speed, cancellation))
+                            .catch_unwind()
+                            .await;
                         running.steering.lock().await.remove(&key);
                         running.cancellations.lock().await.remove(&key);
                         running.idle.notify_waiters();
-                        let _ = sender.send(result);
+                        let _ = sender.send(
+                            result.unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+                        );
                     };
                     #[cfg(not(target_family = "wasm"))]
                     tokio::spawn(task);
