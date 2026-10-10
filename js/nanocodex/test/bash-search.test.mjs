@@ -624,7 +624,10 @@ async function recovery(runtime) {
 async function cancellation() {
   for (const mode of ["caller", "deadline"]) {
     const runtime = await justBash({ filesystem: memoryWorkspace(),
-      ...(mode === "deadline" ? { executionTimeoutMs: 1 } : {}) });
+      // The deadline must cut the 13 MiB scan (~450 ms locally) yet admit the
+      // trivial recovery command on the same runtime; 1 ms failed that echo on a
+      // loaded runner (CI run 38035736308), 100 ms leaves >4x and >50x margins.
+      ...(mode === "deadline" ? { executionTimeoutMs: 100 } : {}) });
     await runtime.filesystem.writeFile("large.txt", "a".repeat(13 * 1024 * 1024));
     const abort = new AbortController();
     const cmd = "rg -o '.{0,50}MISSING.{0,50}' large.txt";
