@@ -20,6 +20,10 @@ parent runtime drops the task tree, child history, messages, and results. A fres
 registry starts empty. Historical agent IDs do not identify recovered children;
 use `list_agents` to discover the current live registry before addressing agents.
 
+`wait_agent` waits 30 seconds when `timeout_ms` is omitted and otherwise
+honors the requested timeout without a ceiling; it returns as soon as one listed
+agent reaches a state the caller has not yet seen.
+
 `send_agent_message` keeps message intent (`purpose`) separate from thread
 correlation (`in_reply_to`). Referencing a message continues its existing two-party
 thread: coordination, findings, questions, and authorized delegation may flow in

@@ -1,13 +1,11 @@
 use std::{
-    fs::{self, File},
-    io::{self, Read},
+    fs, io,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
 use tracing::warn;
 
-const MAX_PROJECT_INSTRUCTIONS_BYTES: usize = 32 * 1024;
 const CANDIDATE_FILENAMES: [&str; 2] = ["AGENTS.override.md", "AGENTS.md"];
 const PROJECT_DOC_SEPARATOR: &str = "\n\n--- project-doc ---\n\n";
 
@@ -94,30 +92,19 @@ fn load_project_instructions(workspace: &Path) -> Result<Option<String>, Project
     directories.push(root);
     directories.reverse();
 
-    let mut remaining = MAX_PROJECT_INSTRUCTIONS_BYTES;
+    // Project docs are loaded whole, like global instructions; the model's
+    // context window, not a fixed byte budget, bounds what fits.
     let mut documents = Vec::new();
     for directory in directories {
-        if remaining == 0 {
-            break;
-        }
         let Some(path) = instruction_file(&directory)? else {
             continue;
         };
-        let (data, truncated) =
-            read_bounded(&path, remaining).map_err(|source| ProjectInstructionsError {
-                path: path.clone(),
-                source,
-            })?;
-        if truncated {
-            warn!(
-                path = %path.display(),
-                remaining_bytes = remaining,
-                "project doc exceeds remaining budget; truncating"
-            );
-        }
+        let data = fs::read(&path).map_err(|source| ProjectInstructionsError {
+            path: path.clone(),
+            source,
+        })?;
         let text = String::from_utf8_lossy(&data).into_owned();
         if !text.trim().is_empty() {
-            remaining -= data.len();
             documents.push(text);
         }
     }
@@ -155,16 +142,6 @@ fn instruction_file(directory: &Path) -> Result<Option<PathBuf>, ProjectInstruct
         }
     }
     Ok(None)
-}
-
-fn read_bounded(path: &Path, limit: usize) -> io::Result<(Vec<u8>, bool)> {
-    let file = File::open(path)?;
-    let mut data = Vec::with_capacity(limit.saturating_add(1).min(8 * 1024));
-    file.take(limit.saturating_add(1) as u64)
-        .read_to_end(&mut data)?;
-    let truncated = data.len() > limit;
-    data.truncate(limit);
-    Ok((data, truncated))
 }
 
 #[cfg(test)]
@@ -261,14 +238,10 @@ mod tests {
     }
 
     #[test]
-    fn empty_project_docs_do_not_consume_the_shared_budget() {
+    fn whitespace_project_docs_are_skipped() {
         let repo = tempdir().unwrap();
         fs::create_dir(repo.path().join(".git")).unwrap();
-        fs::write(
-            repo.path().join("AGENTS.md"),
-            " ".repeat(MAX_PROJECT_INSTRUCTIONS_BYTES),
-        )
-        .unwrap();
+        fs::write(repo.path().join("AGENTS.md"), " ".repeat(32 * 1024)).unwrap();
         let workspace = repo.path().join("crate");
         fs::create_dir(&workspace).unwrap();
         fs::write(workspace.join("AGENTS.md"), "use the crate instructions").unwrap();
@@ -276,6 +249,22 @@ mod tests {
         assert_eq!(
             load_instructions(&workspace, None),
             Some("use the crate instructions".to_owned())
+        );
+    }
+
+    #[test]
+    fn project_docs_beyond_the_former_32_kib_budget_are_loaded_whole() {
+        let repo = tempdir().unwrap();
+        fs::create_dir(repo.path().join(".git")).unwrap();
+        let root = format!("root {}", "r".repeat(64 * 1024));
+        fs::write(repo.path().join("AGENTS.md"), &root).unwrap();
+        let workspace = repo.path().join("crate");
+        fs::create_dir(&workspace).unwrap();
+        fs::write(workspace.join("AGENTS.md"), "crate tail").unwrap();
+
+        assert_eq!(
+            load_instructions(&workspace, None),
+            Some(format!("{root}\n\ncrate tail"))
         );
     }
 
