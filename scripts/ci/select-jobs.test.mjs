@@ -170,7 +170,7 @@ test("ci success accepts reduced matrices and rejects failures, cancellations, a
   const jobs = {
     test: [], "shared-hands": ["hands"], "voice-native": ["voice"], "windows-hand": ["windows"], clippy: ["rust"],
     "rust-extra": ["rust_extra"], "vm-guest": ["vm"], policy: ["policy"], "wasm-build": ["wasm"], "js-preview": ["preview"],
-    "wasm-quality": ["wasm_rust"], bindings: ["bindings"], python: ["python"], apps: ["apps"], codeql: ["codeql"],
+    "wasm-quality": ["wasm_rust"], bindings: ["bindings"], managed: [], python: ["python"], apps: ["apps"], codeql: ["codeql"],
   };
   const needs = selected => ({
     changes: { result: "success", outputs: outputs(selected) },
@@ -189,7 +189,8 @@ test("ci success accepts reduced matrices and rejects failures, cancellations, a
   const on = selected => ({ ...needs(selected), changes: { result: "success", outputs: { ...outputs(selected), tests: "true" } } });
   assert.equal(passes(on(["hands"])), false, "Hand changes with tests on require the Docker Hand job");
   assert.ok(passes({ ...on(["hands"]), "vm-guest": { result: "success" } }), "Hand changes with tests on run vm-guest");
-  assert.ok(passes({ ...on(families), test: { result: "success" } }), "tests on run the workspace test job");
+  assert.ok(passes({ ...on(families), test: { result: "success" }, managed: { result: "success" } }), "tests on run the workspace and managed test jobs");
+  assert.equal(passes({ ...on(families), test: { result: "success" } }), false, "tests on require the managed shards");
   assert.equal(passes({ ...needs(families), changes: { result: "success", outputs: {} } }), false, "missing selection");
   assert.equal(passes({ ...needs(families), "new-job": { result: "success" } }), false, "unmapped job");
 });

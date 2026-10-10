@@ -236,6 +236,7 @@ const gate = {
   "js-preview": o => o.preview,
   "wasm-quality": o => o.wasm_rust,
   bindings: o => o.bindings,
+  managed: o => o.tests && o.bindings,
   python: o => o.python,
   apps: o => o.apps,
   codeql: o => o.codeql,
