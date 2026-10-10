@@ -83,11 +83,29 @@ async function httpControl(body,credential=key,requestAgent=agent){
 }
 async function newLogin(path='/login'){
  if(activeId){await tools('browser_login_close',{});if(activePage&&!activePage.isClosed())await activePage.close();}
+ // While Playwright's connectOverCDP is attached it auto-attaches each new target. Observed
+ // with it attached (never without): the product's Page.navigate returns a loaderId, yet the
+ // tab's history stays at about:blank. Stay detached until Chrome reports the fixture commit.
+ if(browser){await browser.close();browser=undefined;}
  const operation=crypto.randomUUID();
  const hint=await tools('request_browser_login',{operation_id:operation,url:siteOrigin+path,allowed_origins:[siteOrigin]});
  activeId=hint.request_id;
- if(!browser)browser=await chromium.connectOverCDP(chromeEndpoint);
- await wait(()=>{activePage=browser.contexts().flatMap(c=>c.pages()).find(p=>p.url()===siteOrigin+path&&!p.isClosed());return activePage;},'fixture page');
+ const pageTargets=async()=>(await (await fetch(chromeEndpoint+'/json/list',{signal:AbortSignal.timeout(2000)})).json()).filter(t=>t.type==='page');
+ const until=Date.now()+15000;
+ try{
+  while(!(await pageTargets()).some(t=>t.url===siteOrigin+path)){if(fixtureError)throw fixtureError;if(Date.now()>until)throw Error('Timed out fixture page commit');await delay(25);}
+  browser=await chromium.connectOverCDP(chromeEndpoint);
+  await wait(()=>{activePage=browser.contexts().flatMap(c=>c.pages()).find(p=>p.url()===siteOrigin+path&&!p.isClosed());return activePage;},'fixture page',Math.max(0,until-Date.now()));
+ }catch(error){
+  // Metadata only: synthetic fixture URLs and target IDs, never page content.
+  try{
+   const known=url=>url==='about:blank'||url===''||url.startsWith(siteOrigin+'/')?url:'[other]';
+   const diagnosis={path,request_id:hint.request_id,chrome_pages:(await pageTargets()).slice(0,20).map(t=>({id:t.id,url:known(t.url)})),
+    playwright_pages:browser?browser.contexts().flatMap(c=>c.pages()).slice(0,20).map(p=>known(p.url())):null};
+   assertNoPrivateInput(diagnosis,'fixture page diagnosis');trace.fixture_page_diagnosis=diagnosis;
+  }catch{}
+  throw error;
+ }
  await activePage.locator('input').first().waitFor();
  return hint;
 }
