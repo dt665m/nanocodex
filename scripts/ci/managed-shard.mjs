@@ -22,12 +22,19 @@ export function steps(script = pkg.scripts.test) {
   });
 }
 
+// Whole scripts that ci.yml's bindings job already runs with dedicated
+// artifacts ("Exercise ..." and "Test managed Claude ..." steps).
+export const coveredByBindings = new Set([
+  "test:sites", "test:session-control", "test:startup", "test:claude-managed", "test:provider-vault",
+  "test:hand-preparation", "test:cua-routing", "test:hand-paths", "test:hand-reconnect-agent",
+]);
+
 // Weighted greedy assignment keeps shards balanced as journeys are added.
 // Weights are approximate CI seconds; unknown steps count as 60.
 const weights = {
   "vitest run": 240, "test:recovery": 300, "test:routing": 180, "test:services": 150,
   "test:provider-vault": 120, "test:agent-runs": 120, "test:connect-signin": 90, "test:crm-search": 90,
-  "test:user-data": 90, "test:hosted-tools": 90, "test:apps": 90, "test:session-control": 90,
+  "test:user-data": 90, "test:hosted-tools": 90, "test:apps": 90,
 };
 export function assign(list, total) {
   const shards = Array.from({ length: total }, () => ({ load: 0, steps: [] }));
@@ -44,12 +51,12 @@ export function assign(list, total) {
 
 function main(argv) {
   if (argv[0] === "--list") {
-    for (const [i, shard] of assign(steps(), Number(argv[1])).entries()) console.log(i + 1 + ": " + shard.steps.map(s => s.name).join(", "));
+    for (const [i, shard] of assign(steps().filter(step => !coveredByBindings.has(step.name)), Number(argv[1])).entries()) console.log(i + 1 + ": " + shard.steps.map(s => s.name).join(", "));
     return;
   }
   const [index, total] = (argv[0] ?? "").split("/").map(Number);
   if (!Number.isInteger(index) || !Number.isInteger(total) || index < 1 || index > total) throw new Error("usage: managed-shard.mjs INDEX/TOTAL");
-  const mine = assign(steps(), total)[index - 1].steps;
+  const mine = assign(steps().filter(step => !coveredByBindings.has(step.name)), total)[index - 1].steps;
   const results = [];
   for (const step of mine) {
     console.log("::group::" + step.name);
