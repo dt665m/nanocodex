@@ -78,6 +78,8 @@ jobs:
       - uses: taiki-e/install-action@3522286d40783523f9c7880e33f785905b4c20d0 # v2
         with:
           tool: cargo-nextest
+      - name: Install FFmpeg for the real HLS capture journeys
+        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends ffmpeg
       - run: cargo nextest run --workspace --locked --profile ci
       - name: Test public library harness journeys
         run: |
@@ -298,6 +300,9 @@ jobs:
       - name: Check shared native capture policy and platform adapters
         if: needs.changes.outputs.tests == 'true'
         run: cargo nextest run --locked --profile ci -p nanocodex-hand
+      - name: Install FFmpeg for the real HLS capture journeys
+        if: needs.changes.outputs.tests == 'true'
+        run: choco install ffmpeg --yes --no-progress
       - name: Test the account Hand
         if: needs.changes.outputs.tests == 'true'
         shell: pwsh
