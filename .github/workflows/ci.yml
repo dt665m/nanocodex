@@ -96,6 +96,8 @@ jobs:
           path: |
             output/harness-routing/**
             output/library-harness/**
+            output/claude-resume-cli/**
+            output/claude-loop-cli/**
           if-no-files-found: warn
 
   shared-hands:
