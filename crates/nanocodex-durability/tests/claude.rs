@@ -3608,6 +3608,322 @@ async fn automatic_turn_admitted_behind_a_running_turn_starts_under_its_identity
     server.abort();
 }
 
+/// Loopback provider for queued-turn tests: the first turn runs one gated tool
+/// round; queued prompts are answered by their own text.
+async fn queued_turn_server() -> (
+    ClaudeClient,
+    Arc<Mutex<Vec<Value>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    server(|index, body| {
+        let last = body["messages"]
+            .as_array()
+            .and_then(|messages| messages.last())
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        if index == 1 {
+            sse(signed_round(), "tool_use", 10)
+        } else if last.contains("second queued") {
+            sse(text("second finished"), "end_turn", 10)
+        } else if last.contains("third queued") {
+            sse(text("third finished"), "end_turn", 10)
+        } else {
+            sse(text("first turn finished"), "end_turn", 10)
+        }
+    })
+    .await
+}
+
+fn last_user_message(request: &Value) -> String {
+    request["messages"]
+        .as_array()
+        .and_then(|messages| messages.last())
+        .map(ToString::to_string)
+        .unwrap_or_default()
+}
+
+/// #968: two automatic prompts queued behind a running turn each get a turn
+/// handle at once, then run in admission order under their admitted identities.
+/// The order must not depend on which waiter wakes first when the turn ahead
+/// retires, so the scenario also runs repeatedly on a multi-thread runtime.
+async fn two_queued_automatic_turns_round() {
+    use std::time::Duration;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.sqlite");
+    let (client, requests, server) = queued_turn_server().await;
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (notify, gate) = (started.clone(), release.clone());
+    let state = reopen(&path).await;
+    let (agent, events) = Nanocodex::builder(Claude::new(client, "test"))
+        .max_tokens(4096)
+        .tool(tool(), move |_| {
+            notify.notify_one();
+            let gate = gate.clone();
+            async move {
+                gate.notified().await;
+                Ok::<_, String>("effect done".to_owned())
+            }
+        })
+        .durability(state.clone())
+        .await
+        .unwrap()
+        .build()
+        .unwrap();
+    let first = agent
+        .prompt(PromptRequest::new("run the long tool").request_id("running-first"))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .unwrap();
+    let second = tokio::time::timeout(Duration::from_secs(5), agent.prompt("second queued"))
+        .await
+        .expect("a queued automatic prompt returns its turn while the first runs")
+        .unwrap();
+    let third = tokio::time::timeout(Duration::from_secs(5), agent.prompt("third queued"))
+        .await
+        .expect("a second queued automatic prompt returns its turn as well")
+        .unwrap();
+    let second_id = second.request_id().unwrap().to_owned();
+    let third_id = third.request_id().unwrap().to_owned();
+    assert_ne!(second_id, third_id);
+    let retained = state.state().await.unwrap();
+    let pending: Vec<_> = retained
+        .pending_operations()
+        .into_iter()
+        .map(|(id, _)| id.to_owned())
+        .collect();
+    assert!(
+        pending.contains(&second_id) && pending.contains(&third_id),
+        "{pending:?}"
+    );
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        1,
+        "queued turns wait for the first"
+    );
+
+    release.notify_one();
+    let first = tokio::time::timeout(Duration::from_secs(5), first.result())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.final_message(), "first turn finished");
+    let second = tokio::time::timeout(Duration::from_secs(5), second.result())
+        .await
+        .unwrap()
+        .expect("the earlier queued turn runs");
+    let third = tokio::time::timeout(Duration::from_secs(5), third.result())
+        .await
+        .unwrap()
+        .expect("the later queued turn runs instead of failing behind the earlier one");
+    assert_eq!(second.final_message(), "second finished");
+    assert_eq!(third.final_message(), "third finished");
+    let requests = requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 4);
+    assert!(last_user_message(&requests[2]).contains("second queued"));
+    assert!(last_user_message(&requests[3]).contains("third queued"));
+    let retained = state.state().await.unwrap();
+    assert!(
+        retained.pending_operations().is_empty(),
+        "no admitted turn is orphaned"
+    );
+    for id in [&second_id, &third_id] {
+        assert!(matches!(
+            retained.operation(id).unwrap().status,
+            nanocodex_durability::OperationStatus::Completed { .. }
+        ));
+    }
+    agent.shutdown().await.unwrap();
+    drop((agent, events));
+    server.abort();
+}
+
+#[tokio::test]
+async fn two_automatic_turns_queued_behind_a_running_turn_run_in_admission_order() {
+    two_queued_automatic_turns_round().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queued_automatic_turns_run_in_order_under_any_wake_order() {
+    for _ in 0..8 {
+        two_queued_automatic_turns_round().await;
+    }
+}
+
+#[tokio::test]
+async fn cancelling_a_waiting_automatic_turn_retires_it_and_the_next_still_runs() {
+    // #968: a queued automatic prompt must be cancellable before it begins,
+    // without waiting for the running turn and without blocking the next one.
+    use std::time::Duration;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.sqlite");
+    let (client, requests, server) = queued_turn_server().await;
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (notify, gate) = (started.clone(), release.clone());
+    let state = reopen(&path).await;
+    let (agent, events) = Nanocodex::builder(Claude::new(client, "test"))
+        .max_tokens(4096)
+        .tool(tool(), move |_| {
+            notify.notify_one();
+            let gate = gate.clone();
+            async move {
+                gate.notified().await;
+                Ok::<_, String>("effect done".to_owned())
+            }
+        })
+        .durability(state.clone())
+        .await
+        .unwrap()
+        .build()
+        .unwrap();
+    let first = agent
+        .prompt(PromptRequest::new("run the long tool").request_id("running-first"))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .unwrap();
+    let second = tokio::time::timeout(Duration::from_secs(5), agent.prompt("second queued"))
+        .await
+        .expect("a queued automatic prompt returns its turn while the first runs")
+        .unwrap();
+    let third = tokio::time::timeout(Duration::from_secs(5), agent.prompt("third queued"))
+        .await
+        .expect("a second queued automatic prompt returns its turn as well")
+        .unwrap();
+    let second_id = second.request_id().unwrap().to_owned();
+
+    tokio::time::timeout(Duration::from_secs(5), second.cancel())
+        .await
+        .expect("cancelling a waiting turn must not wait for the running one")
+        .unwrap();
+    let cancelled = tokio::time::timeout(Duration::from_secs(5), second.result())
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            cancelled,
+            Err(nanocodex_agent::NanocodexError::TurnCancelled)
+        ),
+        "{cancelled:?}"
+    );
+    assert!(matches!(
+        state
+            .state()
+            .await
+            .unwrap()
+            .operation(&second_id)
+            .unwrap()
+            .status,
+        nanocodex_durability::OperationStatus::Cancelled { .. }
+    ));
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        1,
+        "the cancelled turn never reached HTTP"
+    );
+
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), first.result())
+        .await
+        .unwrap()
+        .unwrap();
+    let third = tokio::time::timeout(Duration::from_secs(5), third.result())
+        .await
+        .unwrap()
+        .expect("the turn behind the cancelled one still runs");
+    assert_eq!(third.final_message(), "third finished");
+    assert_eq!(requests.lock().unwrap().len(), 3);
+    assert!(state.state().await.unwrap().pending_operations().is_empty());
+    agent.shutdown().await.unwrap();
+    drop((agent, events));
+    server.abort();
+}
+
+#[tokio::test]
+async fn stopping_while_an_automatic_turn_waits_retires_it_for_the_next_session() {
+    // #968: shutdown with a queued automatic prompt retires that prompt instead
+    // of leaving it pending, so the reopened session accepts the next prompt.
+    use std::time::Duration;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.sqlite");
+    let (client, requests, server) = queued_turn_server().await;
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (notify, gate) = (started.clone(), release.clone());
+    let (agent, events) = Nanocodex::builder(Claude::new(client.clone(), "test"))
+        .max_tokens(4096)
+        .tool(tool(), move |_| {
+            notify.notify_one();
+            let gate = gate.clone();
+            async move {
+                gate.notified().await;
+                Ok::<_, String>("effect done".to_owned())
+            }
+        })
+        .durability(reopen(&path).await)
+        .await
+        .unwrap()
+        .build()
+        .unwrap();
+    let first = agent
+        .prompt(PromptRequest::new("run the long tool").request_id("running-first"))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .unwrap();
+    let second = tokio::time::timeout(Duration::from_secs(5), agent.prompt("second queued"))
+        .await
+        .expect("a queued automatic prompt returns its turn while the first runs")
+        .unwrap();
+    let stopping = {
+        let agent = agent.clone();
+        tokio::spawn(async move { agent.shutdown().await })
+    };
+    release.notify_one();
+    let stopped = tokio::time::timeout(Duration::from_secs(5), second.result())
+        .await
+        .unwrap();
+    assert!(
+        stopped.is_err(),
+        "a turn that never began cannot complete: {stopped:?}"
+    );
+    tokio::time::timeout(Duration::from_secs(5), stopping)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let _ = first.result().await;
+    drop((agent, events));
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        1,
+        "the queued turn never reached HTTP"
+    );
+
+    let state = reopen(&path).await;
+    let retained = state.state().await.unwrap();
+    assert!(
+        retained
+            .pending_operations()
+            .into_iter()
+            .all(|(id, _)| id == "running-first"),
+        "the queued automatic turn must not be left pending: {:?}",
+        retained
+            .pending_operations()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>()
+    );
+    drop(retained);
+    drop(state);
+    server.abort();
+}
+
 #[tokio::test]
 async fn cancelling_a_turn_queued_behind_an_unfinished_operation_settles_immediately() {
     // Hosted regression (managed session 01a120ef, 2026-10-09): a prompt
