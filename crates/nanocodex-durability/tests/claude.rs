@@ -3925,6 +3925,211 @@ async fn stopping_while_an_automatic_turn_waits_retires_it_for_the_next_session(
 }
 
 #[tokio::test]
+async fn an_over_limit_prompt_rejected_after_its_attempt_began_leaves_nothing_pending() {
+    // #968: a prompt rejected while freezing its input, after its durable
+    // attempt began, was released and left pending. It then blocked every later
+    // prompt of the session and of a reopened session.
+    use nanocodex_agent::input::{Prompt, UserInput};
+    use std::time::Duration;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.sqlite");
+    let (client, requests, server) = server(|_, _| sse(text("accepted"), "end_turn", 10)).await;
+    let state = reopen(&path).await;
+    let (agent, events) = Nanocodex::builder(Claude::new(client.clone(), "test"))
+        .max_tokens(4096)
+        .durability(state.clone())
+        .await
+        .unwrap()
+        .build()
+        .unwrap();
+    let over_limit = Prompt::content((0..101).map(|index| UserInput::Text {
+        text: format!("item {index}"),
+    }));
+    let rejected = match agent.prompt(PromptRequest::new(over_limit)).await {
+        Ok(turn) => turn.result().await.err(),
+        Err(error) => Some(error),
+    }
+    .expect("an over-limit prompt is rejected");
+    assert!(
+        rejected.to_string().contains("exceeds 100 content items"),
+        "{rejected}"
+    );
+    assert!(
+        state.state().await.unwrap().pending_operations().is_empty(),
+        "the rejected prompt must not stay pending"
+    );
+    let next = tokio::time::timeout(Duration::from_secs(5), async {
+        agent.prompt("next prompt").await.unwrap().result().await
+    })
+    .await
+    .unwrap()
+    .expect("the next prompt runs");
+    assert_eq!(next.final_message(), "accepted");
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        1,
+        "the rejected prompt never reached HTTP"
+    );
+    agent.shutdown().await.unwrap();
+    drop((agent, events, state));
+
+    let reopened = reopen(&path).await;
+    assert!(
+        reopened
+            .state()
+            .await
+            .unwrap()
+            .pending_operations()
+            .is_empty()
+    );
+    let (agent, events) = Nanocodex::builder(Claude::new(client, "test"))
+        .max_tokens(4096)
+        .durability(reopened)
+        .await
+        .unwrap()
+        .build()
+        .unwrap();
+    let after = tokio::time::timeout(Duration::from_secs(5), async {
+        agent.prompt("after reopen").await.unwrap().result().await
+    })
+    .await
+    .unwrap()
+    .expect("a reopened session accepts prompts");
+    assert_eq!(after.final_message(), "accepted");
+    agent.shutdown().await.unwrap();
+    drop((agent, events));
+    server.abort();
+}
+
+#[tokio::test]
+async fn a_foreign_blocker_fails_automatic_prompts_visibly_without_leaving_them_pending() {
+    // An automatic prompt blocked by an unfinished operation that no turn of
+    // this process is running fails visibly and leaves nothing of its own
+    // pending. Once that operation is resumed and settles, prompts run again,
+    // including in a reopened session.
+    use std::time::Duration;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.sqlite");
+    let (client, requests, server) = queued_turn_server().await;
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (notify, gate) = (started.clone(), release.clone());
+    let state = reopen(&path).await;
+    let (agent, events) = Nanocodex::builder(Claude::new(client.clone(), "test"))
+        .max_tokens(4096)
+        .tool(tool(), move |_| {
+            notify.notify_one();
+            let gate = gate.clone();
+            async move {
+                gate.notified().await;
+                Ok::<_, String>("effect done".to_owned())
+            }
+        })
+        .durability(state.clone())
+        .await
+        .unwrap()
+        .build()
+        .unwrap();
+    let pending = |state: nanocodex_durability::DurableState| -> Vec<String> {
+        state
+            .pending_operations()
+            .into_iter()
+            .map(|(id, _)| id.to_owned())
+            .collect()
+    };
+    let first = agent
+        .prompt(PromptRequest::new("run the long tool").request_id("running-first"))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .unwrap();
+    // A caller-owned identity behind the running turn is refused for its
+    // caller to retry, leaving an unfinished operation that nothing runs.
+    let foreign = || PromptRequest::new("foreign queued").request_id("foreign-x");
+    let refused = match agent.prompt(foreign()).await {
+        Ok(turn) => turn.result().await.err(),
+        Err(error) => Some(error),
+    }
+    .expect("a caller-owned identity behind a running turn is refused");
+    assert_eq!(
+        refused.execution_policy_disposition(),
+        Some(nanocodex_agent::ExecutionPolicyDisposition::Retry),
+        "{refused}"
+    );
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), first.result())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending(state.state().await.unwrap()), ["foreign-x"]);
+
+    let blocked = match tokio::time::timeout(Duration::from_secs(5), agent.prompt("second queued"))
+        .await
+        .expect("a foreign blocker is never waited for")
+    {
+        Ok(turn) => tokio::time::timeout(Duration::from_secs(5), turn.result())
+            .await
+            .unwrap()
+            .err(),
+        Err(error) => Some(error),
+    }
+    .expect("an automatic prompt behind a foreign blocker fails visibly");
+    assert!(blocked.to_string().contains("foreign-x"), "{blocked}");
+    assert_eq!(
+        pending(state.state().await.unwrap()),
+        ["foreign-x"],
+        "the refused automatic prompt must not stay pending"
+    );
+
+    let resumed = tokio::time::timeout(Duration::from_secs(5), async {
+        agent.prompt(foreign()).await.unwrap().result().await
+    })
+    .await
+    .unwrap()
+    .expect("the foreign operation resumes under its identity");
+    assert_eq!(resumed.final_message(), "first turn finished");
+    let third = tokio::time::timeout(Duration::from_secs(5), async {
+        agent.prompt("third queued").await.unwrap().result().await
+    })
+    .await
+    .unwrap()
+    .expect("prompts run once the foreign operation settled");
+    assert_eq!(third.final_message(), "third finished");
+    assert!(pending(state.state().await.unwrap()).is_empty());
+    assert!(
+        !requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| last_user_message(request).contains("second queued")),
+        "the refused prompt never reached HTTP"
+    );
+    agent.shutdown().await.unwrap();
+    drop((agent, events, state));
+
+    let reopened = reopen(&path).await;
+    assert!(pending(reopened.state().await.unwrap()).is_empty());
+    let (agent, events) = Nanocodex::builder(Claude::new(client, "test"))
+        .max_tokens(4096)
+        .durability(reopened)
+        .await
+        .unwrap()
+        .build()
+        .unwrap();
+    let after = tokio::time::timeout(Duration::from_secs(5), async {
+        agent.prompt("third queued").await.unwrap().result().await
+    })
+    .await
+    .unwrap()
+    .expect("a reopened session accepts prompts");
+    assert_eq!(after.final_message(), "third finished");
+    agent.shutdown().await.unwrap();
+    drop((agent, events));
+    server.abort();
+}
+
+#[tokio::test]
 async fn cancelling_a_turn_queued_behind_an_unfinished_operation_settles_immediately() {
     // Hosted regression (managed session 01a120ef, 2026-10-09): a prompt
     // dispatched while an earlier turn was still running a long tool was

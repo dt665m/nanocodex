@@ -2810,6 +2810,41 @@ impl State {
                     .is_some_and(|first| *first < order))
     }
 }
+/// Settles an operation whose attempt began but whose prompt was rejected
+/// before any model request (for example an over-limit prompt), so it can never
+/// block a later prompt (#968). Its checkpoint is the unchanged conversation.
+/// A durability or store failure is not a rejection of the prompt: that
+/// operation is released and stays recoverable, as is one whose terminal
+/// cannot be written.
+async fn fail_begun(
+    state: &State,
+    policy: &dyn ClaudeExecutionPolicy,
+    id: String,
+    error: &NanocodexError,
+) {
+    if error.execution_policy_disposition().is_some() {
+        let _ = policy.release(id).await;
+        return;
+    }
+    let checkpoint = {
+        let conversation = state.conversation.lock().await;
+        state
+            .snapshot(&conversation)
+            .await
+            .ok()
+            .and_then(|snapshot| serde_json::to_value(snapshot).ok())
+    };
+    let settled = match checkpoint {
+        Some(checkpoint) => policy
+            .fail(id.clone(), checkpoint, error.to_string())
+            .await
+            .is_ok(),
+        None => false,
+    };
+    if !settled {
+        let _ = policy.release(id).await;
+    }
+}
 /// Retires an automatic operation that never began, so it cannot block later
 /// prompts. An operation whose attempt may have begun stays recoverable.
 async fn retire_unstarted(policy: &dyn ClaudeExecutionPolicy, id: String) {
@@ -2944,7 +2979,7 @@ async fn defer_turn(
                     let (prompt, resolution) = match frozen {
                         Ok(admitted) => admitted,
                         Err(error) => {
-                            let _ = policy.release(id.clone()).await;
+                            fail_begun(&state, policy.as_ref(), id.clone(), &error).await;
                             drop(attempt);
                             break Err((error, true));
                         }
@@ -5735,7 +5770,7 @@ impl LifecycleBackend for Driver {
                     {
                         Ok(admitted) => admitted,
                         Err(error) => {
-                            let _ = policy.release(id).await;
+                            fail_begun(&state, policy.as_ref(), id, &error).await;
                             return Err(error);
                         }
                     };
