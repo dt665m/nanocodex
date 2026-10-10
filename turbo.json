@@ -56,6 +56,10 @@
       "dependsOn": ["nanocodex-connect-protocol#build"],
       "outputs": []
     },
+    "nanocodex-tools#test": {
+      "dependsOn": ["build"],
+      "outputs": []
+    },
     "nanocodex-computer#test": {
       "dependsOn": ["^build"],
       "cache": false,
