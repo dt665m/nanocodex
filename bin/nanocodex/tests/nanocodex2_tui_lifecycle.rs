@@ -4073,12 +4073,13 @@ async fn terminal_keeps_uncertain_steering_ordered_across_a_replacement_connecti
         .unwrap()
         .unwrap();
     fixture.terminal.prompt("BEFORE_FAILURE", "\r");
-    fixture.terminal.wait_text("BEFORE_FAILURE").await;
+    // The pasted draft is visible before Enter is handled; break the stream only once it is queued.
+    wait_queued(&fixture.terminal, "BEFORE_FAILURE").await;
     fixture.break_stream();
     fixture.replacement_connection().await;
     fixture.terminal.wait_text("Reconnected").await;
     fixture.terminal.prompt("AFTER_RECOVERY", "\r");
-    fixture.terminal.wait_text("AFTER_RECOVERY").await;
+    wait_queued(&fixture.terminal, "AFTER_RECOVERY").await;
     assert!(
         tokio::time::timeout(Duration::from_millis(200), fixture.steers.recv())
             .await
@@ -4432,6 +4433,32 @@ async fn terminal_marks_receiptless_tools_unknown_and_accepts_their_late_result(
     wait_line(&fixture.terminal, &["×", "ACTUALLY_FAILED_READ.txt"]).await;
     fixture.complete(&turn);
     fixture.terminal.wait_text("Enter send").await;
+}
+
+/// Waits until the text has left the composer draft and is shown above it (in the queue), so
+/// its Enter has been handled. A pasted draft is visible before the TUI reads the Enter.
+async fn wait_queued(terminal: &Terminal, text: &str) {
+    let queued = tokio::time::timeout(TIMEOUT, async {
+        loop {
+            let screen = terminal.screen.lock().unwrap().screen().contents();
+            let lines: Vec<&str> = screen.lines().collect();
+            // The composer is the last box whose top border carries the context gauge.
+            if let Some(top) = lines
+                .iter()
+                .rposition(|line| line.starts_with("╭─") && line.contains("%/"))
+                && lines[..top].iter().any(|line| line.contains(text))
+                && !lines[top..].iter().any(|line| line.contains(text))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    if queued.is_err() {
+        let screen = terminal.screen.lock().unwrap().screen().contents();
+        panic!("{text:?} never left the composer for the queue:\n{screen}");
+    }
 }
 
 /// Waits until one rendered row contains every needle.
