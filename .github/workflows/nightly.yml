@@ -238,6 +238,18 @@ jobs:
           path: ${{ runner.temp }}/update-local-e2e
           if-no-files-found: ignore
           retention-days: 7
+      # The identity report and the exact Linux helper payload (~2.5MB) let a
+      # later run diff an unexpectedly changed Hand identity member by member.
+      - name: Retain Hand identity evidence
+        if: always() && matrix.component == 'cli'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: nightly-hand-identity-${{ matrix.target }}
+          path: |
+            ${{ runner.temp }}/hand-identity-inputs.json
+            ${{ runner.temp }}/linux-screen-helpers.tar.gz
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Retain Cargo build timings
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
