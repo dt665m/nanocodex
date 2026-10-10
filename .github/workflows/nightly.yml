@@ -561,6 +561,7 @@ jobs:
   publish:
     if: >-
       github.repository == 'gakonst/nanocodex' &&
+      github.ref == 'refs/heads/master' &&
       (github.event_name != 'workflow_dispatch' || inputs.pr == '')
     name: publish immutable and rolling nightlies
     # Publication waits for the read-only Hand reuse test and comparison, so a

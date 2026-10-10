@@ -7,7 +7,9 @@ Foundry's label-grouped, contributor-attributed GitHub release notes.
 ## Nightly releases
 
 The `Nightly Release` workflow runs daily and may also be dispatched manually.
-Each successful run publishes an immutable `nightly-<full SHA>` prerelease and
+Only runs from `master` with no pull request input publish releases; branch and
+pull request builds produce artifacts without changing the rolling nightly.
+Each successful publication creates an immutable `nightly-<full SHA>` prerelease and
 refreshes the rolling `nightly` prerelease with the same gzip-compressed
 binaries and `SHA256SUMS`. The immutable release is assembled as a draft and
 published only after every asset is attached, so updaters never observe a
