@@ -647,19 +647,23 @@ impl Tool for SpawnAgent {
 }
 
 fn spawn_agent_parameters() -> Value {
-    let models = [HarnessFamily::Codex, HarnessFamily::Claude]
-        .into_iter()
-        .flat_map(HarnessModel::for_family)
-        .map(|model| Some(model.as_str()))
-        .chain([Some("glm-5.3"), Some("kimi"), Some("mimo"), None])
-        .collect::<Vec<_>>();
+    let models = [
+        HarnessFamily::Codex,
+        HarnessFamily::Claude,
+        HarnessFamily::Muse,
+    ]
+    .into_iter()
+    .flat_map(HarnessModel::for_family)
+    .map(|model| Some(model.as_str()))
+    .chain([Some("glm-5.3"), Some("kimi"), Some("mimo"), None])
+    .collect::<Vec<_>>();
     json!({
         "type": "object",
         "properties": {
             "role": { "type": "string", "description": "A short role describing the subagent's specialty." },
             "task": { "type": "string", "description": "A complete, focused task for the subagent." },
             "harness": {
-                "type": ["string", "null"], "enum": ["codex", "claude", null],
+                "type": ["string", "null"], "enum": ["codex", "claude", "muse", null],
                 "description": "Native agent-loop family; null inherits the parent's family. A family switch selects that family's defaults."
             },
             "model": {

@@ -103,9 +103,9 @@ macro_rules! settings_methods {
 macro_rules! tool_methods {
     () => {
         /// Installs this tool selection, materialized separately for every
-        /// agent. Codex installs it natively (its default is the standard
-        /// Codex tools); Claude bridges the same tools into its native client
-        /// catalog (its default is no client tools).
+        /// agent. Codex and Muse install it natively (their default is the
+        /// standard Responses tools); Claude bridges the same tools into its
+        /// native client catalog (its default is no client tools).
         #[cfg(feature = "oai-tools")]
         #[cfg_attr(docsrs, doc(cfg(feature = "oai-tools")))]
         #[must_use]

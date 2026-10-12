@@ -16,7 +16,7 @@ pub use nanocodex_agent::NanocodexBuilder as CodexBuilder;
 pub use nanocodex_agent::{
     AgentEvents, AgentSessionContext, Capabilities, ClaudeModel, CostStatus, EstimatedUsdCost,
     ExecutionPolicyDisposition, ForkPoint, ForkRequest, HarnessFamily, HarnessModel, Lineage,
-    ModelCapabilities, ModelTransport, Mutability, NanocodexError, Origin, Persistence,
+    ModelCapabilities, ModelTransport, MuseModel, Mutability, NanocodexError, Origin, Persistence,
     PromptRequest, PromptRoute, ReportedTurnUsage, ServiceTier, SessionCheckpoint, SessionInfo,
     Turn, TurnControl, TurnResult, TurnUsage, UsdAmount, WeakAgent,
 };
@@ -29,7 +29,7 @@ mod runtime;
 pub use nanocodex_claude::Claude;
 #[cfg(feature = "muse")]
 #[cfg_attr(docsrs, doc(cfg(feature = "muse")))]
-pub use nanocodex_muse::{Muse, MuseBuilder, MuseModel};
+pub use nanocodex_muse::{Muse, MuseBuilder};
 
 #[cfg(feature = "durability")]
 #[cfg_attr(docsrs, doc(cfg(feature = "durability")))]
@@ -179,6 +179,9 @@ pub mod prelude {
     #[cfg(feature = "durability")]
     #[cfg_attr(docsrs, doc(cfg(feature = "durability")))]
     pub use crate::DurableAgentExt;
+    #[cfg(feature = "muse")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "muse")))]
+    pub use crate::Muse;
     #[cfg(all(not(target_family = "wasm"), feature = "muse"))]
     #[cfg_attr(docsrs, doc(cfg(all(not(target_family = "wasm"), feature = "muse"))))]
     pub use crate::MuseHarness;
@@ -206,13 +209,10 @@ pub mod prelude {
         doc(cfg(all(feature = "openai", feature = "oai-tools", not(target_family = "wasm"))))
     )]
     pub use crate::tool;
-    pub use crate::{Agent, ClaudeModel, HarnessFamily, HarnessModel, Model, Thinking};
+    pub use crate::{Agent, ClaudeModel, HarnessFamily, HarnessModel, Model, MuseModel, Thinking};
     #[cfg(feature = "openai")]
     #[cfg_attr(docsrs, doc(cfg(feature = "openai")))]
     pub use crate::{CodexBuilder, OpenAi};
-    #[cfg(feature = "muse")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "muse")))]
-    pub use crate::{Muse, MuseModel};
 }
 
 #[cfg(all(feature = "openai", feature = "oai-tools", not(target_family = "wasm")))]

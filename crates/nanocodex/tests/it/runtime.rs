@@ -2,18 +2,22 @@
 //! fixtures; the runtime, recipes, tool bridges, subagent registry, routing,
 //! resume and shutdown run normally.
 use axum::{Json, Router, routing::post};
+#[cfg(any(feature = "claude", feature = "durability"))]
+use nanocodex::Thinking;
+#[cfg(feature = "claude")]
 use nanocodex::{
-    ClaudeHarness, ClaudeModel, CodexHarness, HarnessFamily, HarnessModel, Model, Nanocodex,
-    NanocodexError, OpenAi, SessionCheckpoint, Thinking,
+    ClaudeHarness, ClaudeModel, HarnessModel, SessionCheckpoint, claude::ClaudeClient,
+};
+use nanocodex::{
+    CodexHarness, HarnessFamily, Model, Nanocodex, NanocodexError, OpenAi,
     agent::{AgentHandle, SpawnOptions},
-    claude::ClaudeClient,
     oai::transport::ResponsesTransport,
     tool,
     tools::Tools,
 };
-use nanocodex_subagents::{
-    AgentId, AgentStatus, AgentTask, Registry, channel, install_tools, start_agent_with,
-};
+use nanocodex_subagents::{AgentId, AgentStatus, Registry, channel, install_tools};
+#[cfg(feature = "claude")]
+use nanocodex_subagents::{AgentTask, start_agent_with};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
@@ -21,6 +25,7 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
+#[cfg(feature = "claude")]
 use tokio::sync::Semaphore;
 
 const DEADLINE: Duration = Duration::from_secs(10);
@@ -85,6 +90,49 @@ fn responses(body: &Value, ordinal: usize) -> String {
     let has_exec = declares(body, "exec");
     let output = if continuation {
         json!([{"type":"message","role":"assistant","content":[{"type":"output_text","text":"native done"}]}])
+    } else if last_user.contains("[delegate-muse]") {
+        let description = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "exec")
+            .unwrap()["description"]
+            .as_str()
+            .unwrap();
+        let declaration = description
+            .split("spawn_agent(args:")
+            .nth(1)
+            .unwrap_or_default();
+        let model = declaration
+            .lines()
+            .find(|line| line.trim_start().starts_with("model:"))
+            .and_then(|line| {
+                line.split('"')
+                    .skip(1)
+                    .step_by(2)
+                    .filter(|model| last_user.contains(model))
+                    .max_by_key(|model| model.len())
+            });
+        let family = declaration
+            .lines()
+            .find(|line| line.trim_start().starts_with("harness:"))
+            .is_some_and(|line| {
+                line.split('"')
+                    .skip(1)
+                    .step_by(2)
+                    .any(|family| family == "muse")
+            });
+        match (model, family) {
+            (Some(model), true) => {
+                let args = json!({"role":"synthetic Muse specialist", "task":"[submit] Complete the assignment.",
+                    "harness":"muse", "model":model, "thinking":null, "output_contract":{"kind":"string"}});
+                json!([{"type":"function_call", "call_id":format!("delegate-{ordinal}"),
+                    "name":"exec", "arguments":json!({"input":format!("text(await tools.spawn_agent({args}));")}).to_string()}])
+            }
+            _ => {
+                json!([{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Muse delegation unavailable"}]}])
+            }
+        }
     } else if body["model"]
         .as_str()
         .is_some_and(|model| model.starts_with("muse-"))
@@ -93,7 +141,14 @@ fn responses(body: &Value, ordinal: usize) -> String {
     {
         json!([{"type":"function_call","call_id":format!("muse-call-{ordinal}"),"name":"exec","arguments":json!({"input":"text(await tools.runtime_echo({text: 'ping'}));"}).to_string()}])
     } else if last_user.contains("[submit]") && has_exec {
-        json!([{"type":"custom_tool_call","call_id":format!("codex-call-{ordinal}"),"name":"exec","input":SUBMIT}])
+        if body["model"]
+            .as_str()
+            .is_some_and(|model| model.starts_with("muse-"))
+        {
+            json!([{"type":"function_call","call_id":format!("muse-call-{ordinal}"),"name":"exec","arguments":json!({"input":SUBMIT}).to_string()}])
+        } else {
+            json!([{"type":"custom_tool_call","call_id":format!("codex-call-{ordinal}"),"name":"exec","input":SUBMIT}])
+        }
     } else if last_user.contains("[echo]") && declares(body, "runtime_echo") {
         json!([{"type":"function_call","call_id":format!("codex-call-{ordinal}"),"name":"runtime_echo","arguments":"{\"text\":\"ping\"}"}])
     } else {
@@ -197,6 +252,7 @@ fn last(transcript: &Transcript, transport: &str) -> Value {
         .clone()
 }
 
+#[cfg(feature = "claude")]
 fn task(text: &str) -> AgentTask {
     AgentTask {
         role: "synthetic specialist".into(),
@@ -215,6 +271,7 @@ async fn completed(registry: &Registry, session: &str, id: AgentId) {
     );
 }
 
+#[cfg(feature = "claude")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn runtime_spawns_isolated_roots_routes_children_resumes_and_shuts_down() {
     tokio::time::timeout(DEADLINE * 6, journey())
@@ -222,6 +279,7 @@ async fn runtime_spawns_isolated_roots_routes_children_resumes_and_shuts_down() 
         .expect("runtime journey deadline");
 }
 
+#[cfg(feature = "claude")]
 async fn journey() {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let evidence =
@@ -957,5 +1015,66 @@ async fn muse_durable_runtime_replays_restores_and_branches() {
     fresh.shutdown().await.unwrap();
     println!(
         "MUSE_DURABILITY receipt replay without HTTP; conflict rejected; native and portable restore; durable summary, child model and historical branch retained"
+    );
+}
+
+#[cfg(feature = "muse")]
+#[tokio::test]
+async fn muse_subagent_tools_advertise_and_route_every_version() {
+    use nanocodex::{Muse, MuseHarness, MuseModel};
+    let evidence =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../output/muse-sdk-gates");
+    std::fs::create_dir_all(&evidence).unwrap();
+    let transcript: Transcript = Arc::default();
+    let trace = evidence.join(format!("delegation-{}.json", std::process::id()));
+    println!("TRANSCRIPT {}", trace.display());
+    let address = serve(Arc::clone(&transcript), trace).await;
+    let provider = Muse::builder("synthetic-key")
+        .api_base_url(format!("http://{address}"))
+        .build()
+        .unwrap();
+    let (registry, _control, _updates) = channel(4);
+    let handles: Handles = Arc::default();
+    let runtime = Nanocodex::builder()
+        .muse(MuseHarness::new(provider).tools_factory({
+            let (registry, handles) = (Arc::clone(&registry), Arc::clone(&handles));
+            move |handle| Ok(registry_tools(&handles, handle, Arc::clone(&registry)))
+        }))
+        .build()
+        .unwrap();
+    let (parent, _) = runtime.spawn().build().await.unwrap();
+    for model in MuseModel::ALL {
+        let result = parent
+            .prompt(format!("[delegate-muse] Select {}.", model.as_str()))
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+        assert_eq!(result.final_message(), "native done");
+        let entries = registry
+            .directory(parent.session_id(), true, false)
+            .await
+            .unwrap();
+        let child = entries.iter().max_by_key(|entry| entry.agent_id).unwrap();
+        completed(&registry, parent.session_id(), child.agent_id).await;
+        let requests = transcript.lock().unwrap();
+        assert!(requests.iter().any(|frame| {
+            frame["request"]["model"] == model.as_str()
+                && frame["request"]
+                    .to_string()
+                    .contains("[submit] Complete the assignment.")
+        }));
+    }
+    assert_eq!(
+        registry
+            .directory(parent.session_id(), true, false)
+            .await
+            .unwrap()
+            .len(),
+        MuseModel::ALL.len()
+    );
+    runtime.shutdown().await.unwrap();
+    println!(
+        "MUSE_DELEGATION every advertised version selected through the live spawn tool, routed to its native provider, and completed its output contract"
     );
 }
