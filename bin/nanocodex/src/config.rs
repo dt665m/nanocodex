@@ -33,6 +33,7 @@ use crate::vm::{ConfiguredVm, VmArgs};
 
 mod claude;
 mod codex;
+mod muse;
 pub(crate) use claude::frontend as claude_frontend;
 pub(crate) use claude::interaction::{
     InteractionReceiver, PendingInteraction, serve_terminal as serve_claude_terminal,
@@ -122,7 +123,7 @@ impl ModelArgs {
         let variable = match family {
             HarnessFamily::Codex => "OPENAI_REASONING_EFFORT",
             HarnessFamily::Claude => "ANTHROPIC_REASONING_EFFORT",
-            HarnessFamily::Muse => return Err(eyre!("Muse requires a configured SDK harness")),
+            HarnessFamily::Muse => "META_REASONING_EFFORT",
         };
         std::env::var(variable)
             .ok()
@@ -182,6 +183,9 @@ pub(crate) struct AgentArgs {
     #[command(flatten)]
     pub(crate) claude_auth: crate::auth::ClaudeAuthArgs,
 
+    #[command(flatten)]
+    pub(crate) muse_auth: crate::auth::MuseAuthArgs,
+
     /// Working directory exposed to the coding tools.
     #[arg(long)]
     cwd: Option<PathBuf>,
@@ -189,15 +193,19 @@ pub(crate) struct AgentArgs {
     #[command(flatten)]
     model_policy: ModelArgs,
 
-    /// Select the native coding harness: codex or claude.
-    #[arg(long, global = true, value_parser = ["codex", "claude"])]
+    /// Select the native coding harness: codex, claude or muse.
+    #[arg(long, global = true, value_parser = ["codex", "claude", "muse"])]
     harness: Option<String>,
 
     /// Select the native Claude harness (shorthand for --harness claude).
     #[arg(long, global = true)]
     claude: bool,
 
-    /// Model in the selected harness family. Defaults use OPENAI_MODEL or ANTHROPIC_MODEL.
+    /// Select the native Muse harness (shorthand for --harness muse).
+    #[arg(long, global = true, conflicts_with = "claude")]
+    muse: bool,
+
+    /// Model in the selected harness family. Defaults use OPENAI_MODEL, ANTHROPIC_MODEL or META_MODEL.
     #[arg(long, global = true, value_parser = NonEmptyStringValueParser::new())]
     model: Option<String>,
 
@@ -370,6 +378,7 @@ impl AgentArgs {
         let capabilities = model.capabilities(nanocodex::ModelTransport::Native);
         self.harness = Some(model.family().to_string());
         self.claude = model.family() == HarnessFamily::Claude;
+        self.muse = model.family() == HarnessFamily::Muse;
         self.model = Some(model.to_string());
         self.model_policy.thinking = Some(capabilities.normalize_thinking(thinking));
         self.fast_mode = Some(capabilities.fast_mode() && fast_mode);
@@ -433,8 +442,9 @@ impl AgentArgs {
         let family = session.family();
         let explicit = match (self.claude, self.harness.as_deref()) {
             (true, _) | (false, Some("claude")) => Some(HarnessFamily::Claude),
+            (false, Some("muse")) => Some(HarnessFamily::Muse),
             (false, Some(_)) => Some(HarnessFamily::Codex),
-            (false, None) => None,
+            (false, None) => self.muse.then_some(HarnessFamily::Muse),
         };
         if let Some(explicit) = explicit.filter(|explicit| *explicit != family) {
             return Err(eyre!(
@@ -468,6 +478,7 @@ impl AgentArgs {
         }
         self.harness = Some(family.to_string());
         self.claude = family == HarnessFamily::Claude;
+        self.muse = family == HarnessFamily::Muse;
         // An environment default must never silently switch a resumed model.
         // An explicit --model remains a deliberate, family-validated override.
         if self.model.is_none() {
@@ -490,6 +501,12 @@ impl AgentArgs {
             || self.selected_harness().ok() == Some(HarnessFamily::Claude)
     }
 
+    pub(crate) fn local_muse_available(&self) -> bool {
+        self.muse_auth.has_api_key()
+            || self.muse_auth.has_saved_credentials()
+            || self.selected_harness().ok() == Some(HarnessFamily::Muse)
+    }
+
     pub(crate) fn harness_model(&self) -> Result<HarnessModel> {
         let family = self.selected_harness()?;
         self.model_policy.requested_thinking(family)?;
@@ -499,11 +516,23 @@ impl AgentArgs {
     }
 
     pub(crate) fn selected_harness(&self) -> Result<HarnessFamily> {
+        if self.muse {
+            if self.claude
+                || self
+                    .harness
+                    .as_deref()
+                    .is_some_and(|family| family != "muse")
+            {
+                return Err(eyre!("--muse conflicts with the selected harness"));
+            }
+            return Ok(HarnessFamily::Muse);
+        }
         match (self.claude, self.harness.as_deref()) {
             (true, Some(family)) if family != "claude" => {
                 Err(eyre!("--claude conflicts with --harness {family}"))
             }
             (true, _) | (false, Some("claude")) => Ok(HarnessFamily::Claude),
+            (false, Some("muse")) => Ok(HarnessFamily::Muse),
             (false, Some(_)) => Ok(HarnessFamily::Codex),
             (false, None) => Ok(self.default_harness()),
         }
@@ -526,6 +555,9 @@ impl AgentArgs {
         if std::env::var_os("ANTHROPIC_MODEL").is_some() {
             return HarnessFamily::Claude;
         }
+        if std::env::var_os("META_MODEL").is_some() {
+            return HarnessFamily::Muse;
+        }
         let responses_only = self.mpp.is_enabled()
             || self.model_id_prefix.is_some()
             || self.websocket_url.is_some()
@@ -538,23 +570,32 @@ impl AgentArgs {
         }
         if self.claude_api_key.is_some() || self.claude_auth.has_saved_credentials() {
             HarnessFamily::Claude
+        } else if self.muse_auth.has_api_key() || self.muse_auth.has_saved_credentials() {
+            HarnessFamily::Muse
         } else {
             HarnessFamily::Codex
         }
     }
 
-    /// Whether a harness family was chosen with --claude, --harness or a model.
+    /// Whether a harness family was chosen with --claude, --muse, --harness or a model.
     pub(crate) fn has_explicit_harness(&self) -> bool {
         self.claude
+            || self.muse
             || self.harness.is_some()
             || self.model.is_some()
             || std::env::var_os("OPENAI_MODEL").is_some()
             || std::env::var_os("ANTHROPIC_MODEL").is_some()
+            || std::env::var_os("META_MODEL").is_some()
     }
 
-    /// The local Claude harness has no VM support; keep a defaulted session on Codex.
+    /// Only the local Codex harness supports VMs; keep a defaulted session on Codex.
     pub(crate) fn prefer_codex_for_vm(&mut self, vm: &VmArgs) {
-        if vm.is_enabled() && !self.claude && self.harness.is_none() && self.model.is_none() {
+        if vm.is_enabled()
+            && !self.claude
+            && !self.muse
+            && self.harness.is_none()
+            && self.model.is_none()
+        {
             self.harness = Some(HarnessFamily::Codex.to_string());
         }
     }
@@ -564,7 +605,7 @@ impl AgentArgs {
         let variable = match family {
             HarnessFamily::Codex => "OPENAI_MODEL",
             HarnessFamily::Claude => "ANTHROPIC_MODEL",
-            HarnessFamily::Muse => return Err(eyre!("Muse requires a configured SDK harness")),
+            HarnessFamily::Muse => "META_MODEL",
         };
         let environment = std::env::var(variable).ok();
         self.model
@@ -718,6 +759,11 @@ impl AgentArgs {
                 .build_claude(root, codex_home, vm, tui, requested_model)
                 .await;
         }
+        if harness == HarnessFamily::Muse {
+            return self
+                .build_muse(root, codex_home, vm, tui, requested_model)
+                .await;
+        }
         let thinking = self
             .model_policy
             .requested_thinking(harness)?
@@ -788,6 +834,7 @@ impl AgentArgs {
             .harness(
                 recipe.clone(),
                 self.claude_connection()?,
+                None,
                 &tools,
                 &root.workspace,
                 registry,
@@ -1024,13 +1071,16 @@ impl AgentArgs {
         &self,
         codex: codex::CodexRecipe,
         claude: claude::ClaudeConnection,
+        muse_connection: Option<muse::MuseConnection>,
         tools: &Tools,
         workspace: &Path,
         registry: Option<Arc<nanocodex_subagents::Registry>>,
         mcp_handle: Option<McpHandle>,
         workspaces: &Arc<claude::WorkspaceRegistry>,
     ) -> Result<nanocodex::HarnessBuilder> {
-        let harness = codex::register_codex_recipe(nanocodex::Harness::builder(), codex);
+        let harness = codex::register_codex_recipe(nanocodex::Harness::builder(), codex.clone());
+        let muse = muse::MuseRecipe::new(self, codex, muse_connection);
+        let harness = muse::register_muse_recipe(harness, muse);
         Ok(claude::register_claude_recipe(
             harness,
             claude,

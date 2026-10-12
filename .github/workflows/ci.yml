@@ -100,6 +100,7 @@ jobs:
             output/claude-resume-cli/**
             output/claude-loop-cli/**
             output/ncl-local-subagents/**
+            output/muse-cli/**
           if-no-files-found: warn
 
   shared-hands:
@@ -421,11 +422,16 @@ jobs:
           mkdir -p output/muse
           set -o pipefail
           cargo test --locked -p nanocodex-muse -- --nocapture 2>&1 | tee output/muse/journeys.log
+          cargo test --locked -p nanocodex --no-default-features --features muse,tools,durability muse_ -- --nocapture 2>&1 | tee output/muse/sdk.log
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
           name: muse-journeys
-          path: output/muse/
+          path: |
+            output/muse/
+            output/muse-runtime/**
+            output/muse-durability/**
+            output/muse-sdk-gates/**
 
   rust-extra:
     needs: changes

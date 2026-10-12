@@ -17,7 +17,7 @@ const jobRoots = {
   windows: ["nanocodex-bin", "nanocodex-hand-daemon"],
   vm: ["nanocodex-vm"],
   voice: ["nanocodex-voice-native"],
-  muse: ["nanocodex-muse"],
+  muse: ["nanocodex-muse", "nanocodex"],
   python: ["nanocodex-python"],
   wasm_rust: ["nanocodex-wasm"],
 };

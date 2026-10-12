@@ -325,6 +325,10 @@ pub(crate) fn model_catalog(launch: &LocalLaunch) -> Vec<nanocodex_managed::Avai
             HarnessModel::for_family(HarnessFamily::Claude)
                 .filter(|_| launch.args.local_claude_available()),
         )
+        .chain(
+            HarnessModel::for_family(HarnessFamily::Muse)
+                .filter(|_| launch.args.local_muse_available()),
+        )
         .filter_map(|model| {
             let id: ManagedModel = model.as_str().parse().ok()?;
             let capabilities = model.capabilities(ModelTransport::Native);

@@ -27,6 +27,52 @@ const CLIENT_ID: &str = "1031625952748946";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RESPONSE_BYTES: usize = 16 * 1024;
 
+/// Public endpoints for native Muse OAuth and inference-key exchange.
+/// Production defaults use Meta; HTTP is accepted only for loopback hosts.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MuseAuthConfig {
+    /// Device authorization issuer (without the OIDC path).
+    pub issuer: String,
+    /// API origin serving `/muse-code/key`.
+    pub api_origin: String,
+}
+
+impl Default for MuseAuthConfig {
+    fn default() -> Self {
+        Self {
+            issuer: ISSUER.into(),
+            api_origin: API_ORIGIN.into(),
+        }
+    }
+}
+
+impl MuseAuthConfig {
+    fn validate(&self) -> Result<(), MuseAuthError> {
+        for value in [&self.issuer, &self.api_origin] {
+            let url = reqwest::Url::parse(value).map_err(|_| MuseAuthError::Invalid)?;
+            let loopback = url.host_str().is_some_and(|host| {
+                host == "localhost"
+                    || host
+                        .trim_matches(['[', ']'])
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(|ip| ip.is_loopback())
+            });
+            if !(url.scheme() == "https" || url.scheme() == "http" && loopback)
+                || url.host_str().is_none()
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || url.query().is_some()
+                || url.fragment().is_some()
+                || url.path() != "/"
+            {
+                return Err(MuseAuthError::Invalid);
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Failure resolving or exchanging Muse credentials. Never contains tokens or HTTP bodies.
 #[derive(Debug, thiserror::Error)]
 pub enum MuseAuthError {
@@ -112,7 +158,22 @@ impl MuseAuth {
     /// # Errors
     /// Returns an error for empty or invalid bearer credentials.
     pub fn new(credentials: MuseCredential) -> Result<Self, MuseAuthError> {
-        Self::with_endpoint(credentials, key_url(API_ORIGIN))
+        Self::with_config(credentials, &MuseAuthConfig::default())
+    }
+
+    /// Creates a manager for an explicit native OAuth deployment.
+    ///
+    /// # Errors
+    /// Returns a redacted error for invalid credentials or endpoint origins.
+    pub fn with_config(
+        credentials: MuseCredential,
+        config: &MuseAuthConfig,
+    ) -> Result<Self, MuseAuthError> {
+        config.validate()?;
+        Self::with_endpoint(
+            credentials,
+            key_url(config.api_origin.trim_end_matches('/')),
+        )
     }
 
     fn with_endpoint(credentials: MuseCredential, key_url: String) -> Result<Self, MuseAuthError> {
@@ -268,7 +329,20 @@ impl MuseLogin {
     /// # Errors
     /// Returns a redacted error if authorization cannot be started.
     pub async fn start() -> Result<Self, MuseAuthError> {
-        Self::start_with_endpoints(ISSUER, API_ORIGIN).await
+        Self::start_with_config(&MuseAuthConfig::default()).await
+    }
+
+    /// Starts device OAuth for an explicit native deployment.
+    ///
+    /// # Errors
+    /// Returns a redacted error for invalid origins or failed authorization.
+    pub async fn start_with_config(config: &MuseAuthConfig) -> Result<Self, MuseAuthError> {
+        config.validate()?;
+        Self::start_with_endpoints(
+            config.issuer.trim_end_matches('/'),
+            config.api_origin.trim_end_matches('/'),
+        )
+        .await
     }
 
     async fn start_with_endpoints(issuer: &str, origin: &str) -> Result<Self, MuseAuthError> {

@@ -49,7 +49,10 @@ let credentials = manager.credentials().await; // Persistence is the host's choi
 `MuseCredential` exposes both the OAuth `access_token` and inference `api_key`.
 `MuseAuth` keeps them in memory and recovers an unauthorized inference request
 with one key exchange and retry. Call `credentials().await` after a turn to
-retrieve updated credentials. Storage belongs to the caller.
+retrieve updated credentials. Storage belongs to the caller. Native callers can
+use `MuseAuthConfig` with `MuseLogin::start_with_config` and
+`MuseAuth::with_config` for explicit OAuth deployments. The local CLI wires
+this flow through `ncl --muse auth login|status|logout`.
 
 ## Images
 

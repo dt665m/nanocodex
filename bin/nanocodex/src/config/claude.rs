@@ -325,6 +325,7 @@ impl AgentArgs {
             .harness(
                 codex,
                 connection.clone(),
+                None,
                 &catalog,
                 &workspace,
                 tool_registry.clone(),

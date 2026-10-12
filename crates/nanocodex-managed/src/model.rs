@@ -218,7 +218,10 @@ impl FromStr for ManagedModel {
             "@cf/zai-org/glm-5.3" => Ok(Model::Glm53.into()),
             "kimi-k3" => Ok(Model::Kimi.into()),
             "mimo-v2.6-pro" => Ok(Model::Mimo.into()),
-            _ => Err("unsupported managed model identity"),
+            _ => value
+                .parse::<nanocodex_agent::MuseModel>()
+                .map(|model| Self::Oai(model.into()))
+                .map_err(|_| "unsupported managed model identity"),
         }
     }
 }
