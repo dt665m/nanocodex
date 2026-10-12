@@ -99,7 +99,10 @@ impl ModelConfig {
             Model::Glm53 | Model::Kimi | Model::Mimo => GLM_SYSTEM_PROMPT,
             Model::Sol => SOL_SYSTEM_PROMPT,
             Model::Luna => LUNA_SYSTEM_PROMPT,
-            Model::MuseSpark13 | Model::MuseSpark13Contributor => "",
+            Model::MuseSpark13
+            | Model::MuseSpark13Contributor
+            | Model::MuseWonder10
+            | Model::MuseWonderFull10 => "",
         });
         let base =
             if self.system_prompt.is_none() && matches!(self.model, Model::Kimi | Model::Mimo) {

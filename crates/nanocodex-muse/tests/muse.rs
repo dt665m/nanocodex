@@ -2,7 +2,10 @@
 #![allow(missing_docs)]
 
 use eyre::{Result, eyre};
-use nanocodex_muse::{Model, Muse, Nanocodex, ServiceTier, Thinking, Tools, tools::ToolExposure};
+use nanocodex_muse::{
+    Model, Muse, MuseModel, Nanocodex, ServiceTier, Thinking, Tools, tools::ToolExposure,
+};
+use nanocodex_oai_api::pricing::CostStatus;
 use serde_json::{Value, json};
 use std::time::Duration;
 use tokio::{
@@ -56,7 +59,12 @@ async fn request_with_headers(listener: &TcpListener) -> Result<(TcpStream, Valu
     let body: Value = serde_json::from_slice(&bytes[end..end + len])?;
     assert!(matches!(
         body["model"].as_str(),
-        Some("muse-spark-1.3" | "muse-spark-1.3-contributor")
+        Some(
+            "muse-spark-1.3"
+                | "muse-spark-1.3-contributor"
+                | "muse-wonder-1.0"
+                | "muse-wonder-full-1.0"
+        )
     ));
     assert_eq!(body["store"], false);
     assert_eq!(body["stream"], true);
@@ -193,7 +201,25 @@ async fn contributor_uses_its_model_id_for_tools_compaction_and_continuation() -
     file_edit_compaction_journey(serde_json::from_value(json!("muse-spark-1.3-contributor"))?).await
 }
 
+#[tokio::test]
+async fn wonder_models_run_tools_and_compaction_with_usage_but_unpublished_costs() -> Result<()> {
+    for id in ["muse-wonder-1.0", "muse-wonder-full-1.0"] {
+        let model = id.parse::<MuseModel>().map_err(|error| eyre!(error))?;
+        assert!(
+            Muse::builder("synthetic-test-key")
+                .model(model)
+                .thinking(Thinking::None)
+                .build()
+                .is_err()
+        );
+        file_edit_compaction_journey(model.into()).await?;
+    }
+    Ok(())
+}
+
 async fn file_edit_compaction_journey(model: Model) -> Result<()> {
+    let wonder = matches!(model, Model::MuseWonder10 | Model::MuseWonderFull10);
+    let thinking = if wonder { Thinking::Max } else { Thinking::Low };
     let workspace = tempfile::tempdir()?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = format!("http://{}/v1", listener.local_addr()?);
@@ -201,7 +227,10 @@ async fn file_edit_compaction_journey(model: Model) -> Result<()> {
         let (stream, first, headers) = request_with_headers(&listener).await?;
         assert!(!headers.contains("x-codex-turn-state:"));
         assert_eq!(first["model"], model.as_str());
-        assert_eq!(first["reasoning"]["effort"], "low");
+        assert_eq!(
+            first["reasoning"]["effort"],
+            if wonder { "max" } else { "low" }
+        );
         let exec_tool = first["tools"]
             .as_array()
             .unwrap()
@@ -289,6 +318,7 @@ async fn file_edit_compaction_journey(model: Model) -> Result<()> {
     });
     let provider = Muse::builder("synthetic-test-key")
         .model(model)
+        .thinking(thinking)
         .api_base_url(endpoint)
         .context_window_tokens(40_000)
         .build()?;
@@ -323,26 +353,24 @@ async fn file_edit_compaction_journey(model: Model) -> Result<()> {
     assert_eq!(usage.output_tokens(), 6);
     assert_eq!(usage.reasoning_output_tokens(), 3);
     assert_eq!(usage.total_tokens(), 9_038);
-    let expected = match model {
-        Model::MuseSpark13 => "0.0063479",
-        Model::MuseSpark13Contributor => "0.000461832",
+    match model {
+        Model::MuseWonder10 | Model::MuseWonderFull10 => {
+            assert!(usage.estimated_cost().is_none());
+            assert_eq!(usage.cost_status(), CostStatus::PricingUnavailable);
+        }
+        Model::MuseSpark13 | Model::MuseSpark13Contributor => {
+            let expected = if model == Model::MuseSpark13 {
+                "0.0063479"
+            } else {
+                "0.000461832"
+            };
+            let cost = usage.estimated_cost().expect("cost from usage");
+            assert_eq!(cost.amount().decimal(), expected);
+            assert_eq!(cost.service_tier(), ServiceTier::Standard);
+            assert_eq!(usage.cost_status(), CostStatus::EstimatedFromUsage);
+        }
         _ => unreachable!("Muse journey"),
-    };
-    assert_eq!(
-        usage
-            .estimated_cost()
-            .expect("cost from usage")
-            .amount()
-            .decimal(),
-        expected
-    );
-    assert_eq!(
-        usage
-            .estimated_cost()
-            .expect("cost from usage")
-            .service_tier(),
-        ServiceTier::Standard
-    );
+    }
     assert_eq!(
         std::fs::read_to_string(workspace.path().join("hello.txt"))?,
         "hello Muse\n"

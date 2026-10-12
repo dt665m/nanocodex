@@ -1,7 +1,7 @@
 //! Convenience selectors for the shared Muse model identifiers.
 use nanocodex_oai_api::Model;
 use serde::{Deserialize, Serialize};
-/// Muse Spark subscription variant.
+/// Muse model selector.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(into = "Model", try_from = "Model")]
 pub enum MuseModel {
@@ -10,6 +10,10 @@ pub enum MuseModel {
     Spark,
     /// Subsidized Spark: Meta may train on prompts and completions.
     Contributor,
+    /// Wonder 1.0.
+    Wonder,
+    /// Wonder Full 1.0.
+    WonderFull,
 }
 impl MuseModel {
     /// Provider-native model ID.
@@ -18,6 +22,8 @@ impl MuseModel {
         match self {
             Self::Spark => Model::MuseSpark13.as_str(),
             Self::Contributor => Model::MuseSpark13Contributor.as_str(),
+            Self::Wonder => Model::MuseWonder10.as_str(),
+            Self::WonderFull => Model::MuseWonderFull10.as_str(),
         }
     }
 }
@@ -26,6 +32,8 @@ impl From<MuseModel> for Model {
         match model {
             MuseModel::Spark => Self::MuseSpark13,
             MuseModel::Contributor => Self::MuseSpark13Contributor,
+            MuseModel::Wonder => Self::MuseWonder10,
+            MuseModel::WonderFull => Self::MuseWonderFull10,
         }
     }
 }
@@ -35,13 +43,17 @@ impl TryFrom<Model> for MuseModel {
         match model {
             Model::MuseSpark13 => Ok(Self::Spark),
             Model::MuseSpark13Contributor => Ok(Self::Contributor),
+            Model::MuseWonder10 => Ok(Self::Wonder),
+            Model::MuseWonderFull10 => Ok(Self::WonderFull),
             other => Err(invalid_model(other.as_str())),
         }
     }
 }
 
 fn invalid_model(value: &str) -> String {
-    format!("invalid Muse model {value:?}; expected muse-spark-1.3 or muse-spark-1.3-contributor")
+    format!(
+        "invalid Muse model {value:?}; expected muse-spark-1.3, muse-spark-1.3-contributor, muse-wonder-1.0, or muse-wonder-full-1.0"
+    )
 }
 
 impl std::fmt::Display for MuseModel {

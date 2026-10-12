@@ -455,9 +455,11 @@ pub(super) fn record_usage(
     span.record("reasoning_output_tokens", reasoning_output_tokens);
     span.record("total_tokens", usage.total_tokens);
     let estimate = estimate_for_model(usage, model, service_tier);
-    let amount = estimate.amount().decimal();
-    span.record("cost.usd", amount.as_str());
-    span.record("cost.service_tier", estimate.service_tier().as_str());
+    if estimate.is_available() {
+        let amount = estimate.amount().decimal();
+        span.record("cost.usd", amount.as_str());
+        span.record("cost.service_tier", estimate.service_tier().as_str());
+    }
 }
 
 pub(super) fn record_turn_usage(span: &tracing::Span, usage: &TurnUsage) {

@@ -1,6 +1,6 @@
 # Nanocodex Muse
 
-Muse Spark 1.3 over HTTP/SSE Responses, using the `nanocodex-agent` reference
+Muse Spark 1.3 and Wonder 1.0 over HTTP/SSE Responses, using the `nanocodex-agent` reference
 loop and shared tool, transport, event and usage types. Muse owns its protocol
 adapter, authentication, images and Claude-style summary compaction.
 
@@ -23,7 +23,10 @@ agent.shutdown().await?;
 Defaults: `muse-spark-1.3`, low reasoning, `https://api.meta.ai/v1`, and
 client-owned history (`store: false`). `.model(MuseModel::Contributor)` selects
 `muse-spark-1.3-contributor`, which permits Meta training. Neither model supports
-`Thinking::None`; Contributor also excludes `Thinking::Max`. Tools use mandatory
+`Thinking::None`; Contributor also excludes `Thinking::Max`.
+`.model(MuseModel::Wonder)` and `.model(MuseModel::WonderFull)` select
+`muse-wonder-1.0` and `muse-wonder-full-1.0`, with reasoning through `Thinking::Max`.
+Tools use mandatory
 Code Mode, matching the reference harness.
 
 ## Authentication
@@ -69,7 +72,8 @@ The optional `nanocodex` facade's `muse` feature exports the provider and
 attribution is in `THIRD-PARTY-LICENSES`. Override it with `.instructions(...)`.
 
 Token usage and Spark cost estimates use Responses usage; context estimates
-before a response are approximate. Muse Image's per-image fee is separate.
+before a response are approximate. Wonder reports tokens with `PricingUnavailable`
+until Meta publishes rates. Muse Image's per-image fee is separate.
 
 WASM callers provide `MuseBuilder::host_transport(...)`; the host must honor
 `HostConnectRequest::responses_lite_headers()` and `additional_headers()`.

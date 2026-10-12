@@ -168,6 +168,10 @@ impl UsageTotals {
             .map_or(0, |details| details.reasoning_tokens);
         self.total_tokens += usage.total_tokens;
         let estimate = nanocodex_oai_api::pricing::estimate_for_model(usage, model, service_tier);
+        if !estimate.is_available() {
+            self.estimated_cost = None;
+            return;
+        }
         self.estimated_cost = Some(
             self.estimated_cost
                 .take()
@@ -245,6 +249,13 @@ impl RunStats {
             (None, None) => None,
         };
         let reported = self.usage.reported || self.warmup_usage.reported;
+        let cost_status = if !reported {
+            CostStatus::UsageNotReported
+        } else if estimated_cost.is_some() {
+            CostStatus::EstimatedFromUsage
+        } else {
+            CostStatus::PricingUnavailable
+        };
         TurnUsage::from_reported(ReportedTurnUsage {
             input_tokens: self.usage.input_tokens + self.warmup_usage.input_tokens,
             cached_input_tokens: self.usage.cached_input_tokens
@@ -256,11 +267,7 @@ impl RunStats {
                 + self.warmup_usage.reasoning_output_tokens,
             total_tokens: self.usage.total_tokens + self.warmup_usage.total_tokens,
             estimated_cost: estimated_cost.filter(|_| reported),
-            cost_status: if reported {
-                CostStatus::EstimatedFromUsage
-            } else {
-                CostStatus::UsageNotReported
-            },
+            cost_status,
         })
     }
 }

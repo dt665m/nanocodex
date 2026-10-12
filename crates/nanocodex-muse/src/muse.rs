@@ -5,10 +5,11 @@ use crate::{BuilderBackend, NanocodexBuilder};
 
 const MUSE_SYSTEM_PROMPT: &str = include_str!("../prompts/muse.md");
 
-/// Muse Spark 1.3 using HTTP/SSE Responses and client-owned conversation history.
+/// Muse using HTTP/SSE Responses and client-owned conversation history.
 #[derive(Clone)]
 pub struct Muse {
     inner: OpenAi<crate::service::MuseServiceFactory>,
+    model: Model,
 }
 
 /// Validates a Muse provider recipe before starting the agent driver.
@@ -37,7 +38,7 @@ impl Muse {
 }
 
 impl MuseBuilder {
-    /// Selects Standard or Contributor by the shared model identifier.
+    /// Selects Spark, Contributor, Wonder or Wonder Full by the shared identifier.
     /// Contributor permits Meta to train on prompts and completions.
     #[must_use]
     pub fn model(mut self, model: impl Into<Model>) -> Self {
@@ -88,11 +89,14 @@ impl MuseBuilder {
     pub fn build(self) -> Result<Muse, OpenAiError> {
         if crate::MuseModel::try_from(self.model).is_err() {
             return Err(OpenAiError::InvalidConfiguration {
-                detail: "Muse requires muse-spark-1.3 or muse-spark-1.3-contributor",
+                detail: "Muse requires muse-spark-1.3, muse-spark-1.3-contributor, muse-wonder-1.0, or muse-wonder-full-1.0",
             });
         }
         let inner = self.inner.build()?;
-        Ok(Muse { inner })
+        Ok(Muse {
+            inner,
+            model: self.model,
+        })
     }
 }
 
@@ -100,7 +104,12 @@ impl BuilderBackend for Muse {
     type Builder = NanocodexBuilder<crate::service::MuseServiceFactory>;
 
     fn into_builder(self) -> Self::Builder {
-        self.inner.into_builder().instructions(MUSE_SYSTEM_PROMPT)
+        let prompt = if matches!(self.model, Model::MuseWonder10 | Model::MuseWonderFull10) {
+            MUSE_SYSTEM_PROMPT.replace("Muse Spark", "Muse Wonder")
+        } else {
+            MUSE_SYSTEM_PROMPT.to_owned()
+        };
+        self.inner.into_builder().instructions(prompt)
     }
 }
 
