@@ -1,17 +1,7 @@
+use std::sync::Arc;
 #[cfg(feature = "openai")]
 use std::{collections::VecDeque, path::PathBuf};
-use std::{
-    fmt,
-    future::Future,
-    pin::Pin,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    task::{Context, Poll},
-};
 
-use futures_util::Stream;
 #[cfg(feature = "openai")]
 use nanocodex_oai_api::{
     __private::{EventSink, ModelConfig, ResponsesServiceFactory, into_openai_parts},
@@ -21,11 +11,7 @@ use nanocodex_oai_api::{
     tower::{ResponsesAttempt, ResponsesClient, ResponsesServiceResponse, StandardServiceFactory},
     transport::{ResponsesHistory, ResponsesTransport, TransportStats},
 };
-use nanocodex_oai_api::{
-    Model, Prompt, Thinking,
-    events::{AgentEvent, AgentEvents},
-    pricing::ServiceTier,
-};
+use nanocodex_oai_api::{Model, Prompt, Thinking, events::AgentEvents, pricing::ServiceTier};
 #[cfg(feature = "openai")]
 use nanocodex_oai_tools::Tools;
 #[cfg(feature = "openai")]
@@ -156,20 +142,17 @@ pub mod execution;
 #[cfg(feature = "openai")]
 mod executor;
 mod handle;
-mod session_context;
 #[cfg(feature = "openai")]
 mod spawn;
 mod turn;
 
-pub use backend::BuilderBackend;
 #[cfg(feature = "openai")]
 pub use builder::NanocodexBuilder;
 #[cfg(feature = "openai")]
 pub use context_source::ExecutionEnvironment;
-pub use handle::AgentHandle;
-pub use handle::Nanocodex;
-pub use session_context::AgentSessionContext;
-pub use turn::{PromptRequest, PromptRoute, SpawnOptions, Turn, TurnControl, TurnResult};
+pub use nanocodex_agent_reference::{
+    AgentHandle, AgentSessionContext, Nanocodex, SpawnOptions, TurnResult,
+};
 
 #[cfg(feature = "openai")]
 use backend::{BackendRuntime, LocalLifecycle};

@@ -20,6 +20,7 @@ rustdoc-args = ["-D", "warnings"]
 [features]
 default = ["openai"]
 openai = [
+    "nanocodex-agent-reference/openai",
     "rollout",
     "dep:chrono",
     "dep:iana-time-zone",
@@ -39,7 +40,7 @@ openai = [
     "dep:async-trait",
 ]
 
-rollout = ["dep:chrono", "dep:tracing", "dep:uuid"]
+rollout = ["nanocodex-agent-reference/rollout", "dep:chrono", "dep:tracing", "dep:uuid"]
 
 [dependencies]
 nanocodex-home.workspace = true

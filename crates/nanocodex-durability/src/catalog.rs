@@ -294,6 +294,9 @@ mod native {
                     .map(Some)
                     .map_err(|error| Error::InvalidState(error.to_string()))
                 }
+                HarnessFamily::Muse => Err(Error::InvalidState(
+                    "portable Muse checkpoints require the Muse harness".into(),
+                )),
                 #[cfg(feature = "claude")]
                 HarnessFamily::Claude => nanocodex_claude::session_checkpoint(
                     &record.session_id,
@@ -866,7 +869,7 @@ mod native {
     /// Re-encodes a hydrated native checkpoint for a new state of `family`.
     fn encode_native(family: HarnessFamily, value: Value) -> Result<EncodedPayload> {
         match family {
-            HarnessFamily::Claude => EncodedPayload::encode(&value),
+            HarnessFamily::Claude | HarnessFamily::Muse => EncodedPayload::encode(&value),
             HarnessFamily::Codex => {
                 let snapshot: nanocodex_agent::session::SessionSnapshot =
                     serde_json::from_value(value).map_err(Error::InvalidPayload)?;

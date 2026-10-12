@@ -21,10 +21,10 @@ type WorkerMcpServer = Readonly<{
   timeoutMs?: number | undefined;
 }>;
 type WorkerMcpServers = Readonly<Record<string, string | URL | WorkerMcpServer>>;
-type WorkerToolExposureOptions = {
-  mcp?: WorkerMcpServers | false | undefined;
-  toolMode?: "code-only" | undefined;
-};
+/** Code Mode (exec/wait) by default; `direct` exposes host tools to the provider without code evaluation. Remote MCP requires Code Mode. */
+type WorkerToolExposureOptions =
+  | { mcp?: false | undefined; toolMode?: "code-only" | "direct" | undefined }
+  | { mcp: WorkerMcpServers; toolMode?: "code-only" | undefined };
 
 /** Creates a Rust/WASM Agent in a package-owned browser module Worker. */
 export function create(options: create.ManagedOptions): Promise<AgentLifecycle>;

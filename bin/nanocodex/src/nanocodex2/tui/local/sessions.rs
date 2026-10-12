@@ -110,7 +110,7 @@ impl From<&crate::sessions::SessionSummary> for LocalSession {
             // Claude previews are raw first prompts; catalog previews of Codex
             // threads are shown as recorded.
             preview: session.preview().map(|preview| match session.family() {
-                HarnessFamily::Claude => single_line(preview),
+                HarnessFamily::Claude | HarnessFamily::Muse => single_line(preview),
                 _ => preview.to_owned(),
             }),
             model: session.model().map(|model| model.to_string()),

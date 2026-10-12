@@ -19,6 +19,12 @@ pub struct MuseBuilder {
 }
 
 impl Muse {
+    /// Shared model identifier configured on this provider.
+    #[must_use]
+    pub const fn selected_model(&self) -> Model {
+        self.model
+    }
+
     /// Creates a recipe with Meta API-key authentication. The key is never logged.
     #[must_use]
     pub fn builder(auth: impl Into<OpenAiAuth>) -> MuseBuilder {
@@ -104,18 +110,15 @@ impl BuilderBackend for Muse {
     type Builder = NanocodexBuilder<crate::service::MuseServiceFactory>;
 
     fn into_builder(self) -> Self::Builder {
-        let prompt = if matches!(self.model, Model::MuseWonder10 | Model::MuseWonderFull10) {
-            MUSE_SYSTEM_PROMPT.replace("Muse Spark", "Muse Wonder")
-        } else {
-            MUSE_SYSTEM_PROMPT.to_owned()
-        };
-        self.inner.into_builder().instructions(prompt)
+        let prompt = system_prompt(self.model);
+        NanocodexBuilder::from_openai(self.inner).instructions(prompt)
     }
 }
 
-impl nanocodex_agent_reference::BuilderBackend for Muse {
-    type Builder = NanocodexBuilder<crate::service::MuseServiceFactory>;
-    fn into_builder(self) -> Self::Builder {
-        BuilderBackend::into_builder(self)
+pub(crate) fn system_prompt(model: Model) -> String {
+    if matches!(model, Model::MuseWonder10 | Model::MuseWonderFull10) {
+        MUSE_SYSTEM_PROMPT.replace("Muse Spark", "Muse Wonder")
+    } else {
+        MUSE_SYSTEM_PROMPT.to_owned()
     }
 }

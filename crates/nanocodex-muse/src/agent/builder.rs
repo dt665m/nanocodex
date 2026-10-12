@@ -26,15 +26,13 @@ pub struct NanocodexBuilder<F = StandardServiceFactory> {
     pub(super) factory: F,
 }
 
-impl<F> BuilderBackend for OpenAi<F>
+impl<F> NanocodexBuilder<F>
 where
     F: ResponsesServiceFactory,
 {
-    type Builder = NanocodexBuilder<F>;
-
-    fn into_builder(self) -> Self::Builder {
-        let (config, factory) = into_openai_parts(self);
-        NanocodexBuilder {
+    pub(crate) fn from_openai(provider: OpenAi<F>) -> Self {
+        let (config, factory) = into_openai_parts(provider);
+        Self {
             config,
             tools: ToolsConfiguration::Shared(Tools::default()),
             workspace: None,
@@ -167,7 +165,12 @@ impl<F> NanocodexBuilder<F> {
     /// Without this call the agent inherits the client default. The selected
     /// model is fixed for the lifetime of the agent thread.
     #[must_use]
-    pub const fn model(mut self, model: Model) -> Self {
+    pub fn model(mut self, model: Model) -> Self {
+        if self.config.system_prompt.as_deref()
+            == Some(crate::muse::system_prompt(self.config.model).as_str())
+        {
+            self.config.system_prompt = Some(crate::muse::system_prompt(model).into());
+        }
         self.config.model = model;
         if !self.config.thinking_explicit {
             self.config.thinking = model.default_thinking();
@@ -538,10 +541,9 @@ where
         // An explicitly selected tier must be one the model offers; the
         // client default remains a preference clamped per model.
         if builder.service_tier_explicit {
-            crate::HarnessModel::Codex(builder.config.model)
+            crate::HarnessModel::from_responses(builder.config.model)
                 .capabilities(crate::ModelTransport::Native)
-                .check_service_tier(builder.config.service_tier)
-                .map_err(crate::error::model_capability_error)?;
+                .check_service_tier(builder.config.service_tier)?;
         }
     }
     validate(&builder.config, builder.prompt_cache.key.as_deref())?;
@@ -717,7 +719,7 @@ mod tests {
             "history": [canonical_context],
         }))
         .expect("snapshot envelope should decode before model validation");
-        let result = Nanocodex::builder(OpenAi::builder("test-key").build().unwrap())
+        let result = NanocodexBuilder::from_openai(OpenAi::builder("test-key").build().unwrap())
             .resume_native_snapshot(obsolete)
             .build();
         let error = match result {
@@ -728,7 +730,7 @@ mod tests {
 
         let snapshot = serde_json::from_value(serde_json::json!({
             "version": 1,
-            "model": "gpt-6-luna",
+            "model": "muse-wonder-full-1.0",
             "lineage_id": "019c0d31-c308-7d91-bff4-5dca82d15ac6",
             "prompt_cache_key": "retained-model",
             "workspace": workspace,
@@ -741,7 +743,7 @@ mod tests {
             auth: OpenAiAuth::api_key("test-key"),
             ..ModelConfig::default()
         };
-        config.model = Model::Sol;
+        config.model = Model::MuseSpark13;
         let builder = NanocodexBuilder {
             config,
             tools: ToolsConfiguration::Shared(
@@ -767,7 +769,7 @@ mod tests {
 
         assert_eq!(
             *observed_model.lock().expect("model observation lock"),
-            Some(Model::Luna)
+            Some(Model::MuseWonderFull10)
         );
         agent.shutdown().await.expect("agent shutdown");
         drop(events);

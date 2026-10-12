@@ -26,6 +26,13 @@ fn valid_path(name: &str) -> bool {
         && name.split('/').all(|part| !matches!(part, "" | "." | ".."))
 }
 
+/// Every packaged program (the helper and, on macOS, the microphone recorder)
+/// lives in bin/ and must be launchable; libraries and receipts stay 0600.
+fn is_executable(name: &str) -> bool {
+    name.strip_prefix(ROOT)
+        .is_some_and(|relative| relative.starts_with("bin/"))
+}
+
 pub(super) fn cached(directory: &Path, expected_archive: Option<&str>) -> Result<bool> {
     let receipt_path = directory.join(RECEIPT);
     if receipt_path.is_symlink()
@@ -83,18 +90,23 @@ pub(super) fn cached(directory: &Path, expected_archive: Option<&str>) -> Result
         if !metadata.is_file() || total > MAX_BYTES {
             return Ok(false);
         }
-        #[cfg(unix)]
-        if name.ends_with("/bin/nanocodex-voice-host") {
-            use std::os::unix::fs::PermissionsExt;
-            if metadata.permissions().mode() & 0o111 == 0 {
-                return Ok(false);
-            }
-        }
-        let Ok(bytes) = fs::read(path) else {
+        let Ok(bytes) = fs::read(&path) else {
             return Ok(false);
         };
         if hex::encode(Sha256::digest(bytes)) != digest {
             return Ok(false);
+        }
+        // Receipts record content, not modes. Earlier updaters installed the
+        // macOS recorder 0600; restore a verified program's mode in place so
+        // those versions stay activatable and recover without a download.
+        #[cfg(unix)]
+        if is_executable(name) {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o111 == 0
+                && fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).is_err()
+            {
+                return Ok(false);
+            }
         }
     }
     Ok(required_files(&names))
@@ -151,11 +163,7 @@ pub(super) fn install(directory: &Path, bytes: &[u8]) -> Result<()> {
         }
         let path = staging.path().join(&name);
         fs::create_dir_all(path.parent().unwrap())?;
-        super::store::atomic_write(
-            &path,
-            &contents,
-            name.ends_with("/bin/nanocodex-voice-host"),
-        )?;
+        super::store::atomic_write(&path, &contents, is_executable(&name))?;
         receipt.push_str(&format!(
             "{}  {name}\n",
             hex::encode(Sha256::digest(contents))

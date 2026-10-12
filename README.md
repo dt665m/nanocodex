@@ -429,32 +429,35 @@ native tools and transcript format. A model from the wrong family fails before
 provider dispatch. Claude aliases are `opus`, `sonnet`, `fable` and `haiku`;
 `haiku` selects Claude Haiku 5.5, and `claude-haiku-4-5` still selects Haiku 4.5.
 
-Libraries compose the same routing through [`Harness`](crates/nanocodex/README.md)
-with concrete provider builders and host-owned construction recipes.
+Libraries configure [`Nanocodex`](crates/nanocodex/README.md) once with provider
+clients, tools, and defaults, then spawn independent agents. `Harness` remains
+available for custom host-owned construction recipes.
 
 ## Rust: start here
 
-Build one agent, submit ordered prompts through its cheap handle, and await a
-typed result:
+Configure a reusable runtime, spawn an agent, and await typed turn results:
 
 ```rust,no_run
-use nanocodex::{Nanocodex, OpenAi};
+use nanocodex::{CodexHarness, Nanocodex, OpenAi};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let openai = OpenAi::new(std::env::var("OPENAI_API_KEY")?)?;
-    let (agent, _events) = Nanocodex::builder(openai)
+    let nano = Nanocodex::builder()
+        .openai(CodexHarness::new(openai)
+            .code_mode(true)
+            .workspace(std::env::current_dir()?))
         .instructions(
             "You are a Rust coding agent. Preserve unrelated work and run relevant tests.",
         )
-        .workspace(std::env::current_dir()?)
         .build()?;
 
+    let (agent, _events) = nano.spawn().build().await?;
     let turn = agent.prompt("Find and fix the failing parser test.").await?;
     let result = turn.await?;
     println!("{}", result.final_message());
 
-    agent.shutdown().await?;
+    nano.shutdown().await?;
     Ok(())
 }
 ```
@@ -488,7 +491,7 @@ arbitrary-model API. See [GPT-6 model contracts and upstream sources](docs/GPT_6
 
 ```text
 your application
-  ├─ cheap Nanocodex command handle ── prompt / steer / cancel / fork
+  ├─ cheap Agent command handle ── prompt / steer / cancel / fork
   ├─ optional typed events ─────────── UI / persistence / telemetry
   ├─ caller-defined tools ──────────── your data and capabilities
   ├─ optional durability layer ─────── total state / recovery / stores
@@ -593,7 +596,7 @@ runtime. Register the standard workspace set, implement the typed `Tool`
 contract, or write a Rust function with `#[tool]`:
 
 ```rust,no_run
-use nanocodex::{Nanocodex, OpenAi, Tools, tool};
+use nanocodex::{Agent, OpenAi, Tools, tool};
 
 #[tool(description = "Multiplies two signed integers.")]
 async fn multiply(left: i64, right: i64) -> Result<i64, &'static str> {
@@ -602,7 +605,7 @@ async fn multiply(left: i64, right: i64) -> Result<i64, &'static str> {
 
 # fn build(openai: OpenAi) -> Result<(), Box<dyn std::error::Error>> {
 let tools = Tools::builder().without_defaults().tool(multiply).build()?;
-let (_agent, _events) = Nanocodex::builder(openai).tools(tools).build()?;
+let (_agent, _events) = Agent::builder(openai).tools(tools).build()?;
 # Ok(())
 # }
 ```
@@ -688,10 +691,11 @@ without requiring the host to declare a DAG. The executable examples are
 
 ## JavaScript: Node, browser, and WASM
 
-The repository's `nanocodex` package exposes viem-style `Agent`, `Actions`, and
-`Transport` namespaces for Node and browser hosts. The current registry release
-contains the core root, Node, browser, and WASM entrypoints; newer browser-tool
-and subagent exports shown below currently require a pinned checkout. The
+The repository's `nanocodex` package exposes a reusable `Nanocodex` factory
+alongside `Agent`, `Actions`, and `Transport` namespaces for Node and browser hosts.
+The reusable factory and newer browser-tool and subagent exports shown below
+require a pinned checkout until the next package release. The current registry
+release contains the core root, Node, browser, and WASM entrypoints. The
 Rust/WASM engine still
 owns prompt ordering, history, tool calls, branching, snapshots, and cleanup;
 JavaScript owns WebSocket creation, credentials, UI, persistence, and ordinary
@@ -700,24 +704,31 @@ application tools.
 ### Node.js
 
 ```js
-import { Agent, Transport } from "nanocodex/node";
+import { Nanocodex, Transport } from "nanocodex/node";
 
-const agent = await Agent.create({
-  transport: Transport.openAi({ apiKey: process.env.OPENAI_API_KEY }),
-  instructions: "You are a coding agent. Make focused changes and verify them.",
-  workspace: process.cwd(),
-  tools: [{
-    name: "lookup_issue",
-    description: "Return one issue by number.",
-    parameters: {
-      type: "object",
-      properties: { number: { type: "integer" } },
-      required: ["number"],
-      additionalProperties: false,
+const nano = await Nanocodex.create({
+  backends: {
+    codex: {
+      transport: Transport.openAi({ apiKey: process.env.OPENAI_API_KEY }),
+      workspace: process.cwd(),
+      codeMode: true,
+      tools: [{
+        name: "lookup_issue",
+        description: "Return one issue by number.",
+        parameters: {
+          type: "object",
+          properties: { number: { type: "integer" } },
+          required: ["number"],
+          additionalProperties: false,
+        },
+        handler: ({ number }) => issueTracker.get(number),
+      }],
     },
-    handler: ({ number }) => issueTracker.get(number),
-  }],
+  },
+  instructions: "You are a coding agent. Make focused changes and verify them.",
 });
+
+const agent = await nano.spawn();
 
 try {
   const turn = agent.turn.prompt({ input: "Fix issue 42." });
@@ -732,9 +743,16 @@ try {
     turn.dispose();
   }
 } finally {
-  await agent.session.shutdown();
+  await nano.shutdown();
 }
 ```
+
+Spawn more agents with `nano.spawn({ instructions, model, thinking })`; each has
+its own conversation and inherits the configured runtime defaults. Each backend
+configures its own tools, Code Mode, and workspace. A JS workspace path supplies
+working-directory context; a filesystem adapter supplies actual rooted file
+access. Sharing an adapter intentionally shares files. `Agent.create`
+remains available for direct single-agent construction.
 
 Use `Transport.chatGpt({ subscription })` for a caller-owned ChatGPT
 subscription or `Transport.mpp({ session })` for a caller-owned MPP session.

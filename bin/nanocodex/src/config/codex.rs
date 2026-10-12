@@ -61,12 +61,12 @@ impl CodexRecipe {
         client: OpenAi,
         session_id: SessionId,
         workspace: PathBuf,
-    ) -> nanocodex::NanocodexBuilder {
+    ) -> nanocodex::CodexBuilder {
         let tools = self.tools.clone();
         let registry = self.registry.clone();
         let workspaces = Arc::clone(&self.workspaces);
         let tool_workspace = workspace.clone();
-        let mut builder = Nanocodex::builder(client)
+        let mut builder = Agent::builder(client)
             .session_id(session_id)
             .reasoning_mode(self.reasoning_mode)
             .fast_mode(self.fast_mode)

@@ -33,13 +33,14 @@ impl ChildState {
     /// Decodes and validates a Codex checkpoint.
     pub(super) fn from_checkpoint(checkpoint: SessionCheckpoint) -> Result<Self> {
         checkpoint.validate()?;
-        checkpoint.require_family(HarnessFamily::Codex)?;
-        let HarnessModel::Codex(model) = checkpoint.model() else {
+        checkpoint.require_family(HarnessFamily::Muse)?;
+        let HarnessModel::Muse(model) = checkpoint.model() else {
             return Err(NanocodexError::CheckpointFamilyMismatch {
-                expected: HarnessFamily::Codex,
+                expected: HarnessFamily::Muse,
                 found: checkpoint.family(),
             });
         };
+        let model = model.into();
         let session_id = checkpoint.session_id().to_owned();
         let thinking = checkpoint.thinking();
         let lineage = checkpoint.lineage().clone();
@@ -98,7 +99,7 @@ impl ChildState {
         .map_err(|error| NanocodexError::InvalidCheckpoint(error.to_string()))?;
         Ok(SessionCheckpoint::native(
             self.session_id,
-            HarnessModel::Codex(self.model),
+            HarnessModel::from_responses(self.model),
             self.thinking,
             self.lineage,
             self.conversation_id.as_ref(),
@@ -106,91 +107,6 @@ impl ChildState {
             has_conversation,
             payload,
         ))
-    }
-}
-
-impl SessionCheckpoint {
-    /// Wraps a Codex-native session snapshot, such as one loaded from a
-    /// durable store, as a portable checkpoint with the thinking and tier it
-    /// recorded. `thinking` applies only to snapshots written before the
-    /// setting was recorded, which also resume at the standard tier.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`NanocodexError::InvalidCheckpoint`] for an invalid
-    /// session ID, model, or snapshot.
-    #[doc(hidden)]
-    pub fn codex(
-        session_id: impl Into<String>,
-        lineage: Lineage,
-        thinking: Thinking,
-        snapshot: SessionSnapshot,
-    ) -> Result<Self> {
-        // Snapshots record the session's own settings; only older snapshots
-        // fall back to the caller's thinking and the standard tier.
-        let state = ChildState {
-            session_id: session_id.into(),
-            model: snapshot.model()?,
-            thinking: snapshot.thinking().unwrap_or(thinking),
-            service_tier: snapshot.service_tier().unwrap_or(ServiceTier::Standard),
-            stateless_http: false,
-            lineage,
-            conversation_id: Arc::from(snapshot.lineage_id()),
-            conversation: Some(snapshot),
-        };
-        state.validate()?;
-        state.into_checkpoint()
-    }
-
-    /// Decodes the pre-contract Codex child residency JSON (`session_id`,
-    /// `model`, `thinking`, `service_tier` or `fast_mode`, `stateless_http`,
-    /// `conversation`) stored by older durable journals.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`NanocodexError::InvalidCheckpoint`] when it is malformed.
-    #[doc(hidden)]
-    pub fn from_legacy_codex_child(value: serde_json::Value, lineage: Lineage) -> Result<Self> {
-        #[derive(serde::Deserialize)]
-        struct Legacy {
-            session_id: String,
-            model: Model,
-            thinking: Thinking,
-            #[serde(flatten)]
-            payload: serde_json::Value,
-        }
-        let invalid =
-            |error: serde_json::Error| NanocodexError::InvalidCheckpoint(error.to_string());
-        let legacy: Legacy = serde_json::from_value(value).map_err(invalid)?;
-        let payload: CodexPayload = serde_json::from_value(legacy.payload).map_err(invalid)?;
-        let conversation_id = payload.conversation.as_ref().map_or_else(
-            || Arc::from(legacy.session_id.as_str()),
-            |conversation| Arc::from(conversation.lineage_id()),
-        );
-        let state = ChildState {
-            session_id: legacy.session_id,
-            model: legacy.model,
-            thinking: legacy.thinking,
-            service_tier: payload.service_tier,
-            stateless_http: payload.stateless_http,
-            conversation: payload.conversation,
-            lineage,
-            conversation_id,
-        };
-        state.validate()?;
-        state.into_checkpoint()
-    }
-
-    /// Codex-native conversation carried by this checkpoint, when it has one.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`NanocodexError::CheckpointFamilyMismatch`] for another
-    /// family's checkpoint, or [`NanocodexError::InvalidCheckpoint`]
-    /// when the payload is malformed.
-    #[doc(hidden)]
-    pub fn codex_snapshot(&self) -> Result<Option<SessionSnapshot>> {
-        Ok(ChildState::from_checkpoint(self.clone())?.conversation)
     }
 }
 
@@ -229,11 +145,11 @@ impl CheckpointSource {
 
     /// Identity and lineage a fork of this session derives from.
     pub(super) fn child_info(&self, session_id: &SessionId, origin: crate::Origin) -> SessionInfo {
-        SessionInfo {
-            session_id: session_id.to_string(),
-            family: HarnessFamily::Codex,
-            lineage: Lineage::child_of(&self.lineage, self.session_id.as_ref(), origin),
-        }
+        SessionInfo::new(
+            session_id.to_string(),
+            HarnessFamily::Muse,
+            Lineage::child_of(&self.lineage, self.session_id.as_ref(), origin),
+        )
     }
 
     pub(super) fn conversation_id(&self) -> &str {

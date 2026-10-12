@@ -59,6 +59,35 @@ export async function createAgentClient(runtime, options = {}, requestedReservat
   return createAgent(raw, runtime, reservation, reserveSession);
 }
 
+/**
+ * Internal owner seam (Nanocodex.create): caller dispose() then only detaches
+ * the public handle; the session and its accepted work stay owned until
+ * shutdownOwnedAgent joins them.
+ */
+export function retainAgentForOwner(agent, owner) {
+  const state = knownAgentState(agent);
+  state.ownerRetained = true;
+  // Forks and session siblings created through any path are admitted by the same owner.
+  if (owner !== undefined) state.owner = owner;
+}
+
+function ownerAdmission(state, start) {
+  return state.owner === undefined ? start() : state.owner.admit(start);
+}
+
+/** Internal owner seam: cancels and joins a retained Agent even after caller dispose(). */
+export function shutdownOwnedAgent(agent) {
+  const state = knownAgentState(agent);
+  if (state.shutdownPromise) return state.shutdownPromise;
+  if (state.released) return Promise.resolve();
+  if (typeof state.raw.shutdown !== "function" && state.runtime.shutdown === undefined) {
+    return Promise.reject(new Error("this Nanocodex runtime does not expose graceful shutdown"));
+  }
+  state.disposed = true;
+  state.shutdownPromise = joinAgentShutdown(state);
+  return state.shutdownPromise;
+}
+
 /** Internal adapter seam: observes completion of the owned Agent release path. */
 export function observeAgentRelease(agent, listener) {
   if (typeof listener !== "function") throw new TypeError("Agent release observer must be a function");
@@ -214,11 +243,13 @@ export async function fork(agent, options) {
   const state = agentState(agent);
   const at = options?.at;
   const origin = forkOrigin(options?.origin);
-  let raw;
-  if (at === undefined) raw = await state.raw.fork(origin);
-  else if (resultStates.has(at)) raw = await state.raw.forkAtTurn(resultState(at).raw, origin);
-  else raw = await state.raw.forkAtCheckpoint(encodeCheckpoint(at), origin);
-  return createAgent(raw, state.runtime);
+  return ownerAdmission(state, async () => {
+    let raw;
+    if (at === undefined) raw = await state.raw.fork(origin);
+    else if (resultStates.has(at)) raw = await state.raw.forkAtTurn(resultState(at).raw, origin);
+    else raw = await state.raw.forkAtCheckpoint(encodeCheckpoint(at), origin);
+    return createAgent(raw, state.runtime);
+  });
 }
 
 function forkOrigin(origin) {
@@ -272,7 +303,7 @@ export function cancelAll(agent) {
 
 export async function spawn(agent) {
   const state = agentState(agent);
-  return createAgent(await state.raw.spawn(), state.runtime);
+  return ownerAdmission(state, async () => createAgent(await state.raw.spawn(), state.runtime));
 }
 
 export async function spawnSubagent(agent, options) {
@@ -920,6 +951,15 @@ function agentView(state, extensions) {
     },
     dispose() {
       if (state.shutdownPromise) return;
+      // A runtime-owned handle detaches here; its owner joins the actual shutdown.
+      if (state.ownerRetained) {
+        state.disposed = true;
+        // Detached handles stop buffering events; the owner still joins the session.
+        const errors = [];
+        for (const subscription of [...state.subscriptions]) runCleanup(errors, () => subscription.close(true));
+        throwCleanupErrors(errors);
+        return;
+      }
       releaseAgentState(state);
     },
   };

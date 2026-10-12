@@ -82,3 +82,5 @@ export type {
 } from "./host.mjs";
 
 export * as Claude from "./Claude.mjs";
+
+export * as Nanocodex from "./Nanocodex.mjs";

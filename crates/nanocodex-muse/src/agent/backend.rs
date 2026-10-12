@@ -2,349 +2,10 @@
 use super::handle::request_fork;
 use super::*;
 
-/// Input that selects the concrete builder returned by [`Nanocodex::builder`].
-///
-/// Backend types use the associated builder to expose their own deliberate
-/// policy while sharing the same lifecycle handle after build.
-pub trait BuilderBackend {
-    /// Builder configured by this backend input.
-    type Builder;
-
-    /// Converts the backend input into its concrete builder.
-    fn into_builder(self) -> Self::Builder;
-}
-
-/// Backend operation future used at the lifecycle-erasure boundary.
-#[cfg(not(target_family = "wasm"))]
-pub type BackendFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
-
-/// Backend operation future used at the lifecycle-erasure boundary.
-#[cfg(target_family = "wasm")]
-pub type BackendFuture<T> = Pin<Box<dyn Future<Output = T> + 'static>>;
-
-/// Opaque key assigned by the common agent handle before backend admission.
-#[doc(hidden)]
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct BackendTurnKey(pub u64);
-
-/// Validated prompt input handed to one lifecycle backend.
-#[doc(hidden)]
-pub struct BackendPrompt {
-    /// Common handle identity for control operations.
-    pub key: BackendTurnKey,
-    /// Validated prompt input.
-    pub prompt: Prompt,
-    /// Optional caller-owned durable operation identity.
-    pub request_id: Option<String>,
-    /// Whether the prompt must be durably cancelled as part of admission.
-    pub cancel_on_admission: bool,
-    /// Canonical publisher routing events to both session and turn streams.
-    pub events: nanocodex_oai_api::events::AgentEventPublisher,
-}
-
-/// One admitted backend turn and its independently awaitable result.
-#[doc(hidden)]
-pub struct BackendTurn {
-    /// Durable request identity selected during admission, when any.
-    pub request_id: Option<String>,
-    /// Independently awaitable terminal result.
-    pub result: BackendFuture<Result<TurnResult>>,
-}
-
-/// Atomic live-routing decision made by a backend driver.
-#[doc(hidden)]
-pub enum BackendPromptRoute {
-    /// The input started a new turn.
-    Started(BackendTurn),
-    /// The input was steered into the active turn.
-    Steered,
-}
-
-pub use nanocodex_agent_reference::backend::{ChildJournal, ChildJournalStore};
-
-/// Embedding-owned construction of clean native children.
-///
-/// Implementations retain provider recipes and approved host capabilities. The
-/// supplied parent is weak and never extends the owning driver's lifetime.
-pub trait AgentFactory: Send + Sync + 'static {
-    /// Builds the selected native family without starting its first turn.
-    fn spawn(
-        &self,
-        parent: AgentHandle,
-        options: SpawnOptions,
-        host_context: Option<Arc<str>>,
-    ) -> BackendFuture<Result<(Nanocodex, AgentEvents)>>;
-
-    /// Rejects construction after the native owning runtime begins shutdown.
-    fn ensure_available(&self, parent: AgentHandle) -> BackendFuture<Result<()>> {
-        let settings = self.settings(parent);
-        Box::pin(async move { settings.await.map(|_| ()) })
-    }
-
-    /// Constructs an ordered clean batch and observes each materialized child.
-    /// Native runtimes may override this to retain atomic admission and rollback.
-    fn spawn_many(
-        &self,
-        parent: AgentHandle,
-        count: usize,
-        observer: Arc<dyn Fn(&str) + Send + Sync>,
-        host_context: Option<Arc<str>>,
-    ) -> BackendFuture<Result<Vec<(Nanocodex, AgentEvents)>>> {
-        let pending = (0..count)
-            .map(|_| self.spawn(parent.clone(), SpawnOptions::new(), host_context.clone()))
-            .collect::<Vec<_>>();
-        Box::pin(async move {
-            let mut children: Vec<(Nanocodex, AgentEvents)> = Vec::with_capacity(count);
-            for child in pending {
-                match child.await {
-                    Ok(child) => children.push(child),
-                    Err(error) => {
-                        for (child, _) in &children {
-                            let _ = child.shutdown().await;
-                        }
-                        return Err(error);
-                    }
-                }
-            }
-            // All or nothing: observers see only a batch that started completely.
-            for (child, _) in &children {
-                observer(child.session_id());
-            }
-            Ok(children)
-        })
-    }
-
-    /// Reads the owning runtime's current settings for model-boundary inheritance.
-    fn settings(
-        &self,
-        parent: AgentHandle,
-    ) -> BackendFuture<Result<(crate::HarnessModel, Thinking)>> {
-        Box::pin(async move {
-            let model = parent.harness_model();
-            Ok((model, model.default_thinking()))
-        })
-    }
-
-    /// Forks the parent's native conversation when this factory supports it.
-    fn fork(
-        &self,
-        _parent: AgentHandle,
-        _request: ForkRequest,
-    ) -> BackendFuture<Result<(Nanocodex, AgentEvents)>> {
-        unsupported("fork")
-    }
-
-    /// Rebinds approved host capabilities to a checkpoint of this factory's family,
-    /// keeping the checkpoint's session identity.
-    fn restore(
-        &self,
-        _parent: AgentHandle,
-        _checkpoint: SessionCheckpoint,
-        _host_context: Option<Arc<str>>,
-    ) -> BackendFuture<Result<(Nanocodex, AgentEvents)>> {
-        unsupported("restore")
-    }
-}
-
-fn unsupported<T: 'static>(capability: &'static str) -> BackendFuture<Result<T>> {
-    Box::pin(async move { Err(NanocodexError::UnsupportedCapability { capability }) })
-}
-
-/// Backend implementor contract behind the common `Nanocodex` lifecycle.
-///
-/// This trait erases only lifecycle control after a concrete driver has been
-/// built. Provider Tower services remain concrete, driver-owned types.
-#[doc(hidden)]
-pub trait LifecycleBackend: Send + Sync + 'static {
-    /// Immutable native agent-loop family.
-    fn harness_family(&self) -> crate::HarnessFamily;
-
-    /// Lifecycle operations this backend supports.
-    fn capabilities(&self) -> Capabilities;
-
-    /// Where this session is persisted, when it is.
-    fn persistence(&self) -> Option<Persistence> {
-        None
-    }
-
-    /// Admits one prompt and returns the complete accepted turn.
-    fn submit(&self, prompt: BackendPrompt) -> BackendFuture<Result<BackendTurn>>;
-
-    /// Atomically starts a turn or steers the active one.
-    fn route(&self, prompt: BackendPrompt) -> BackendFuture<Result<BackendPromptRoute>>;
-
-    /// Steers one exact active turn.
-    fn steer(&self, key: BackendTurnKey, prompt: Prompt) -> BackendFuture<Result<()>>;
-
-    /// Admits a steer with a caller-owned identity unique within this turn.
-    fn steer_with_id(
-        &self,
-        _key: BackendTurnKey,
-        _id: String,
-        _prompt: Prompt,
-    ) -> BackendFuture<Result<()>> {
-        unsupported("identified_steering")
-    }
-
-    /// Withdraws the latest steer if it has not reached a model boundary.
-    fn withdraw_steer(&self, _key: BackendTurnKey, _id: String) -> BackendFuture<Result<bool>> {
-        unsupported("identified_steering")
-    }
-
-    /// Cancels one exact unfinished turn.
-    fn cancel(&self, key: BackendTurnKey) -> BackendFuture<Result<()>>;
-
-    /// Changes the model within this backend's family, subject to
-    /// [`Capabilities::model`].
-    fn set_harness_model(&self, model: crate::HarnessModel) -> BackendFuture<Result<()>>;
-
-    /// Changes reasoning policy for later turns.
-    fn set_thinking(&self, thinking: Thinking) -> BackendFuture<Result<()>>;
-
-    /// Changes priority policy for later turns.
-    fn set_fast_mode(&self, enabled: bool) -> BackendFuture<Result<()>>;
-
-    /// Changes processing policy for later turns.
-    ///
-    /// Backends with only a priority switch reject Ultrafast unless they override this method.
-    fn set_service_tier(&self, service_tier: ServiceTier) -> BackendFuture<Result<()>> {
-        match service_tier {
-            ServiceTier::Standard => self.set_fast_mode(false),
-            ServiceTier::Priority | ServiceTier::Fast => self.set_fast_mode(true),
-            ServiceTier::Ultrafast => unsupported("ultrafast_service_tier"),
-        }
-    }
-
-    /// Compacts retained context.
-    fn compact(&self) -> BackendFuture<Result<()>>;
-
-    /// Appends adapter-owned developer context.
-    fn append_developer_message(&self, text: String) -> BackendFuture<Result<AgentSessionContext>>;
-
-    /// Reads the latest safe model-visible context.
-    fn context(&self) -> BackendFuture<Result<AgentSessionContext>>;
-
-    /// Captures the latest committed boundary without waiting for an active turn.
-    fn checkpoint(&self) -> BackendFuture<Result<SessionCheckpoint>>;
-
-    /// Waits until a just-created durable child's first checkpoint is
-    /// persisted, so the child is listed and resumable before its first turn.
-    /// Backends without durable children have nothing to persist.
-    fn persist_initial(&self) -> BackendFuture<Result<()>> {
-        Box::pin(async { Ok(()) })
-    }
-
-    /// Retracts the first checkpoint of a child whose creation was abandoned,
-    /// never history the child held before it was created or restored.
-    fn discard_initial(&self) -> BackendFuture<Result<()>> {
-        Box::pin(async { Ok(()) })
-    }
-
-    /// Starts a clean sibling lifecycle.
-    fn spawn(&self, options: SpawnOptions) -> BackendFuture<Result<(Nanocodex, AgentEvents)>>;
-
-    /// Forks from the requested boundary with the requested provenance.
-    fn fork(&self, request: ForkRequest) -> BackendFuture<Result<(Nanocodex, AgentEvents)>>;
-
-    /// Flushes backend-owned persistence.
-    fn flush(&self) -> BackendFuture<Result<()>>;
-
-    /// Disconnects local resources without requesting cancellation of durable work.
-    ///
-    /// Backends without detached durable execution fall back to ordinary
-    /// shutdown.
-    fn disconnect(&self) -> BackendFuture<Result<()>> {
-        self.shutdown()
-    }
-
-    /// Idempotently shuts down local resources.
-    fn shutdown(&self) -> BackendFuture<Result<()>>;
-}
-
-/// Backend-neutral construction context for the common agent handle.
-#[doc(hidden)]
-pub struct BackendRuntime {
-    agent_id: Arc<str>,
-    session_id: Arc<str>,
-    lineage: Lineage,
-    #[cfg(feature = "openai")]
-    local_session_id: Option<SessionId>,
-    events: nanocodex_oai_api::events::AgentEventPublisher,
-}
-
-impl BackendRuntime {
-    /// Creates one session event channel before the concrete driver starts.
-    #[must_use]
-    pub fn new(session_id: impl Into<Arc<str>>) -> (Self, AgentEvents) {
-        let session_id = session_id.into();
-        Self::with_agent_id(Arc::clone(&session_id), session_id)
-    }
-
-    /// Creates one session event channel with a distinct durable agent identity.
-    #[must_use]
-    pub fn with_agent_id(
-        agent_id: impl Into<Arc<str>>,
-        session_id: impl Into<Arc<str>>,
-    ) -> (Self, AgentEvents) {
-        let agent_id = agent_id.into();
-        let session_id = session_id.into();
-        let (events, stream) =
-            nanocodex_oai_api::events::AgentEventPublisher::channel(session_id.to_string());
-        (
-            Self {
-                lineage: Lineage::root(session_id.as_ref()),
-                agent_id,
-                session_id,
-                #[cfg(feature = "openai")]
-                local_session_id: None,
-                events,
-            },
-            stream,
-        )
-    }
-
-    /// Records where this session came from; defaults to a fresh root.
-    #[must_use]
-    pub fn with_lineage(mut self, lineage: Lineage) -> Self {
-        self.lineage = lineage;
-        self
-    }
-
-    #[cfg(feature = "openai")]
-    pub(super) fn new_openai(session_id: SessionId) -> (Self, AgentEvents) {
-        let (mut runtime, events) = Self::new(session_id.to_string());
-        runtime.local_session_id = Some(session_id);
-        (runtime, events)
-    }
-
-    /// Returns the canonical event publisher consumed by the concrete driver.
-    #[must_use]
-    pub fn events(&self) -> nanocodex_oai_api::events::AgentEventPublisher {
-        self.events.clone()
-    }
-
-    /// Erases one concrete lifecycle implementation into the common handle.
-    #[must_use]
-    pub fn bind<B>(self, backend: B) -> Nanocodex
-    where
-        B: LifecycleBackend,
-    {
-        let session = SessionInfo {
-            session_id: self.session_id.to_string(),
-            family: backend.harness_family(),
-            lineage: self.lineage,
-        };
-        Nanocodex {
-            backend: Arc::new(backend),
-            events: self.events,
-            next_turn: Arc::new(AtomicU64::new(1)),
-            agent_id: self.agent_id,
-            session: Arc::new(session),
-            #[cfg(feature = "openai")]
-            local_session_id: self.local_session_id,
-        }
-    }
-}
+pub use nanocodex_agent_reference::backend::{
+    AgentFactory, BackendFuture, BackendPrompt, BackendPromptRoute, BackendRuntime, BackendTurn,
+    BackendTurnKey, ChildJournal, LifecycleBackend,
+};
 
 /// Resolves a public fork point against this Codex conversation tree.
 #[cfg(feature = "openai")]
@@ -363,7 +24,7 @@ pub(super) fn resolve_fork_point(
                 if !boundary.is::<super::checkpoint::ReplayedBoundary>()
                     && let Ok(checkpoint) = boundary.checkpoint()
                 {
-                    checkpoint.require_family(crate::HarnessFamily::Codex)?;
+                    checkpoint.require_family(crate::HarnessFamily::Muse)?;
                 }
                 return Err(NanocodexError::ReplayedCheckpointUnavailable);
             };
@@ -373,7 +34,7 @@ pub(super) fn resolve_fork_point(
             Ok(ForkFrom::Live(committed))
         }
         crate::session::ForkPoint::Checkpoint(checkpoint) => {
-            checkpoint.require_family(crate::HarnessFamily::Codex)?;
+            checkpoint.require_family(crate::HarnessFamily::Muse)?;
             if checkpoint.conversation_id() != conversation_id {
                 return Err(NanocodexError::CheckpointLineageMismatch);
             }
@@ -382,6 +43,9 @@ pub(super) fn resolve_fork_point(
                 .ok_or(NanocodexError::ForkBeforeCompletedTurn)?;
             Ok(ForkFrom::Snapshot(Box::new(conversation)))
         }
+        _ => Err(NanocodexError::UnsupportedCapability {
+            capability: "fork_point",
+        }),
     }
 }
 
@@ -421,7 +85,7 @@ const CODEX_CAPABILITIES: Capabilities = {
 #[cfg(feature = "openai")]
 impl LifecycleBackend for LocalLifecycle {
     fn harness_family(&self) -> crate::HarnessFamily {
-        crate::HarnessFamily::Codex
+        crate::HarnessFamily::Muse
     }
 
     fn capabilities(&self) -> Capabilities {
@@ -608,13 +272,14 @@ impl LifecycleBackend for LocalLifecycle {
     }
 
     fn set_harness_model(&self, model: crate::HarnessModel) -> BackendFuture<Result<()>> {
-        let crate::HarnessModel::Codex(model) = model else {
+        let crate::HarnessModel::Muse(model) = model else {
             return Box::pin(async {
                 Err(NanocodexError::InvalidRequest(
                     "model belongs to another harness family".into(),
                 ))
             });
         };
+        let model = model.into();
         let commands = self.commands.clone();
         let shutdown = self.shutdown.clone();
         Box::pin(async move {

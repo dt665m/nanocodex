@@ -9,7 +9,7 @@
 use std::{path::PathBuf, sync::Arc};
 
 use eyre::Result;
-use nanocodex::{HarnessModel, Nanocodex, OpenAi, tools::mcp::McpHandle};
+use nanocodex::{Agent, HarnessModel, OpenAi, tools::mcp::McpHandle};
 
 use crate::config::{AgentArgs, ConfiguredAgent, InteractionReceiver, SessionScheduler};
 use crate::nanocodex2::tui::backend::Capabilities;
@@ -48,7 +48,7 @@ pub(crate) struct LocalLaunch {
 /// A running local agent and the resources it must release on exit.
 pub(crate) struct LocalBackend {
     pub(crate) launch: LocalLaunch,
-    pub(crate) handle: Nanocodex,
+    pub(crate) handle: Agent,
     pub(crate) model: HarnessModel,
     pub(crate) workspace: PathBuf,
     pub(crate) parts: LocalParts,

@@ -7,7 +7,7 @@
 
 use std::sync::{Arc, Mutex, PoisonError};
 
-use nanocodex::Nanocodex;
+use nanocodex::Agent;
 use nanocodex_agent::{PromptRequest, TurnControl, TurnResult};
 use nanocodex_managed::AgentSettings;
 use tokio::{sync::mpsc, task::JoinSet};
@@ -36,7 +36,7 @@ const MAX_INLINE_COLLAPSE_BYTES: usize = 48 * 1024;
 #[derive(Clone)]
 pub(crate) struct Side {
     pub(crate) pane: PaneId,
-    pub(crate) agent: Nanocodex,
+    pub(crate) agent: Agent,
     /// A side turn is running.
     pub(crate) busy: bool,
     /// At least one side turn completed.
@@ -88,7 +88,7 @@ impl Drop for Registration {
 /// Runs one local side conversation until its pane closes.
 pub(in crate::nanocodex2::tui) async fn run(
     pane: PaneId,
-    main: Nanocodex,
+    main: Agent,
     settings: AgentSettings,
     start_sequence: u64,
     mut requests: mpsc::UnboundedReceiver<Request>,

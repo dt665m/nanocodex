@@ -385,31 +385,35 @@ pub(super) fn handle_idle_command<S>(
             host_context,
             result,
         } => {
-            let model = options.model.unwrap_or(defaults.model);
-            let thinking = options.thinking.unwrap_or_else(|| {
-                if model == defaults.model {
-                    defaults.thinking
-                } else {
-                    model.default_thinking()
-                }
-            });
             let outcome = options
                 .validate_harness()
                 .and_then(|()| {
                     if options
-                        .selected_harness()
-                        .is_some_and(|family| family != crate::HarnessFamily::Codex)
-                        || options
-                            .selected_harness_model()
-                            .is_some_and(|model| model.family() != crate::HarnessFamily::Codex)
+                        .selected_family()
+                        .is_some_and(|family| family != crate::HarnessFamily::Muse)
                     {
                         return Err(NanocodexError::InvalidRequest(
                             "selected harness requires a configured child factory".into(),
                         ));
                     }
-                    validate_model_thinking(model, thinking)
+                    // Shared selection semantics: omitted settings inherit,
+                    // an explicit model or family takes its own defaults.
+                    let resolved = options.resolve(
+                        crate::HarnessModel::from_responses(defaults.model),
+                        defaults.thinking,
+                    )?;
+                    let Some(crate::HarnessModel::Muse(model)) = resolved.selected_harness_model()
+                    else {
+                        return Err(NanocodexError::InvalidRequest(
+                            "selected harness requires a configured child factory".into(),
+                        ));
+                    };
+                    let model = model.into();
+                    let thinking = resolved.selected_thinking().unwrap_or(defaults.thinking);
+                    validate_model_thinking(model, thinking)?;
+                    Ok((model, thinking))
                 })
-                .and_then(|()| {
+                .and_then(|(model, thinking)| {
                     if let Some(snapshot) = restore {
                         return spawner.restore_child(
                             snapshot,
@@ -425,7 +429,7 @@ pub(super) fn handle_idle_command<S>(
                         model,
                         thinking,
                         defaults.service_tier,
-                        options.stateless_http,
+                        true,
                         host_context.or_else(|| spawner.host_context.as_ref().map(Arc::clone)),
                         execution,
                     )

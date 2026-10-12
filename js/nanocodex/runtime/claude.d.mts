@@ -42,15 +42,16 @@ export type CodexHarnessOptions = Readonly<{
   thinking?: import('../types.mjs').Thinking;
   instructions?: string;
   workspace?: string;
-  toolMode?: 'code-only';
-  /** Overrides Node QuickJS; required in non-Worker Web API hosts. */
+  /** Code Mode by default; direct exposes this child's host tools without evaluation. */
+  toolMode?: 'code-only' | 'direct';
+  /** Overrides Node QuickJS; required for Code Mode in non-Worker Web API hosts. */
   codeEvaluator?: import('../types.mjs').CodeEvaluator;
   tools?: import('../types.mjs').ToolConfiguration;
 }>;
 export type Options = Readonly<{
   harness?: 'claude';
-  /** Only exec and wait are exposed to the model; native tools run inside exec. */
-  toolMode?: 'code-only';
+  /** Default code-only exposes only exec and wait (native tools run inside exec); direct exposes native tools to Messages without evaluation. */
+  toolMode?: 'code-only' | 'direct';
   /** Overrides Node QuickJS or browser Worker evaluation; required in other Web API hosts. */
   codeEvaluator?: import('../types.mjs').CodeEvaluator;
   /** Opt in to the canonical shared subagent task tree. */

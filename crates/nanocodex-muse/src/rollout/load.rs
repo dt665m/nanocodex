@@ -185,7 +185,7 @@ impl DurableSession {
         .map_err(|error| crate::NanocodexError::InvalidCheckpoint(error.to_string()))?;
         Ok(crate::SessionCheckpoint::native(
             self.thread_id.clone(),
-            crate::HarnessModel::Codex(self.model),
+            crate::HarnessModel::from_responses(self.model),
             self.model.default_thinking(),
             crate::Lineage::root(self.thread_id.as_str()),
             self.snapshot.lineage_id(),

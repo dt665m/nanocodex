@@ -71,3 +71,5 @@ export * as Claude from "./Claude.mjs";
 
 /** Every known model's accepted thinking, processing tiers and reasoning modes on each transport, from the bundled WASM's shared capability source. */
 export function modelCapabilities(): readonly import("../types.mjs").ModelCapabilityEntry[];
+
+export * as Nanocodex from "./Nanocodex.mjs";

@@ -469,7 +469,7 @@ fn configured_claude_builder(
     let system_workspaces = workspaces.clone();
     let has_registry = registry.is_some();
     let schedule_owner = session_id.clone();
-    let mut builder = Nanocodex::builder(Claude::new(client, model.as_str()))
+    let mut builder = Agent::builder(Claude::new(client, model.as_str()))
         .subagent_type_resolver(agents::profiles::selected_name)
         .session_id(session_id)
         .workspace(workspace.to_string_lossy().into_owned())

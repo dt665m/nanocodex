@@ -83,3 +83,5 @@ export function multiplex(socket: WebSocket): Readonly<{
   lane(streamId: string): WebSocket;
   close(code?: number, reason?: string): void;
 }>;
+
+export { anthropic, type ClaudeTransport } from "../runtime/claude-transport.mjs";

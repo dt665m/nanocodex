@@ -32,9 +32,11 @@ request() {
       return 0
     fi
     # A body that drops mid-transfer still reports HTTP 200, so classify by
-    # curl's exit status first and consult the HTTP code only for exit 22.
-    case "$request_status" in
-      22)
+    # curl's exit status first. --fail reports an HTTP error status as exit 22,
+    # or over HTTP/2 as exit 56 with some curl builds (stock macOS curl 8.7.1);
+    # only then does the 4xx/5xx code decide.
+    case "$request_status:$request_code" in
+      22:*|56:[45][0-9][0-9])
         case "$request_code" in
           408|429|5??) ;;
           403)
@@ -47,7 +49,7 @@ request() {
             ;;
         esac
         ;;
-      5|6|7|16|18|28|35|52|55|56|92) ;;
+      5:*|6:*|7:*|16:*|18:*|28:*|35:*|52:*|55:*|56:*|92:*) ;;
       *)
         say "request failed (curl exit $request_status)"
         return 1

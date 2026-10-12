@@ -2,8 +2,8 @@
 //! builders, Code Mode, registry admission, eviction and routing run normally.
 use axum::{Json, Router, routing::post};
 use nanocodex::{
-    Claude, ClaudeModel, DurableAgentExt as _, Harness, HarnessFamily, HarnessModel, Model,
-    Mutability, Nanocodex, NanocodexError, OpenAi, ReasoningMode, SessionCheckpoint, Thinking,
+    Agent, Claude, ClaudeModel, DurableAgentExt as _, Harness, HarnessFamily, HarnessModel, Model,
+    Mutability, NanocodexError, OpenAi, ReasoningMode, SessionCheckpoint, Thinking,
     agent::{AgentHandle, SpawnOptions},
     claude::{ClaudeClient, ClaudeToolReply, ClaudeTools, ToolResultContent},
     durability::{MemoryStore, SessionRecord, SessionStore},
@@ -234,7 +234,7 @@ async fn journey() {
     // provider requests, without installing task-tree tools on these sessions.
     let policy_handles: Handles = Arc::default();
     let captured = Arc::clone(&policy_handles);
-    let (luna, _events) = Nanocodex::builder(openai.clone())
+    let (luna, _events) = Agent::builder(openai.clone())
         .model(Model::Luna)
         .thinking(Thinking::None)
         .tools_factory(move |handle| {
@@ -269,7 +269,7 @@ async fn journey() {
     sol.shutdown().await.unwrap();
     luna.shutdown().await.unwrap();
 
-    let (astra, _events) = Nanocodex::builder(openai.clone())
+    let (astra, _events) = Agent::builder(openai.clone())
         .model(Model::Astra)
         .reasoning_mode(ReasoningMode::Pro)
         .build()
@@ -286,12 +286,11 @@ async fn journey() {
     assert_eq!(astra_request["request"]["reasoning"]["mode"], "pro");
     astra.shutdown().await.unwrap();
 
-    let (opus, _events) =
-        Nanocodex::builder(Claude::new(claude.clone(), ClaudeModel::Opus55.as_str()))
-            .thinking(Thinking::Medium)
-            .unwrap()
-            .build()
-            .unwrap();
+    let (opus, _events) = Agent::builder(Claude::new(claude.clone(), ClaudeModel::Opus55.as_str()))
+        .thinking(Thinking::Medium)
+        .unwrap()
+        .build()
+        .unwrap();
     opus.set_harness_model(ClaudeModel::Haiku45.into())
         .await
         .unwrap();
@@ -312,7 +311,7 @@ async fn journey() {
     let used_session = opus.session_id().to_owned();
     opus.shutdown().await.unwrap();
     let (restored, _events) =
-        Nanocodex::builder(Claude::new(claude.clone(), ClaudeModel::Haiku45.as_str()))
+        Agent::builder(Claude::new(claude.clone(), ClaudeModel::Haiku45.as_str()))
             .resume(used_snapshot)
             .unwrap()
             .build()
@@ -345,7 +344,7 @@ async fn journey() {
     restored.shutdown().await.unwrap();
 
     let (untouched, _events) =
-        Nanocodex::builder(Claude::new(claude.clone(), ClaudeModel::Haiku45.as_str()))
+        Agent::builder(Claude::new(claude.clone(), ClaudeModel::Haiku45.as_str()))
             .thinking(Thinking::None)
             .unwrap()
             .build()
@@ -353,7 +352,7 @@ async fn journey() {
     let untouched_snapshot = untouched.checkpoint().await.unwrap();
     untouched.shutdown().await.unwrap();
     let (mutable, _events) =
-        Nanocodex::builder(Claude::new(claude.clone(), ClaudeModel::Haiku45.as_str()))
+        Agent::builder(Claude::new(claude.clone(), ClaudeModel::Haiku45.as_str()))
             .resume(untouched_snapshot)
             .unwrap()
             .build()
@@ -384,15 +383,14 @@ async fn journey() {
     let haiku: HarnessModel = "haiku".parse().unwrap();
     assert_eq!(haiku, HarnessModel::Claude(ClaudeModel::Haiku55));
     assert!(matches!(
-        Nanocodex::builder(Claude::new(claude.clone(), haiku.as_str())).thinking(Thinking::None),
+        Agent::builder(Claude::new(claude.clone(), haiku.as_str())).thinking(Thinking::None),
         Err(NanocodexError::InvalidRequest(_))
     ));
-    let (opus, _events) =
-        Nanocodex::builder(Claude::new(claude.clone(), ClaudeModel::Opus55.as_str()))
-            .thinking(Thinking::Max)
-            .unwrap()
-            .build()
-            .unwrap();
+    let (opus, _events) = Agent::builder(Claude::new(claude.clone(), ClaudeModel::Opus55.as_str()))
+        .thinking(Thinking::Max)
+        .unwrap()
+        .build()
+        .unwrap();
     opus.set_harness_model(haiku).await.unwrap();
     opus.prompt("claude-haiku-5-5-policy")
         .await
@@ -428,7 +426,7 @@ async fn journey() {
                     let HarnessModel::Codex(model) = request.model else {
                         unreachable!()
                     };
-                    let mut builder = Nanocodex::builder(openai)
+                    let mut builder = Agent::builder(openai)
                         .model(model)
                         .thinking(request.thinking)
                         .spawn_factory(request.spawn_factory)
@@ -460,15 +458,14 @@ async fn journey() {
                     restore_calls.fetch_add(1, Ordering::SeqCst);
                 }
                 async move {
-                    let mut builder =
-                        Nanocodex::builder(Claude::new(claude, request.model.as_str()))
-                            .thinking(request.thinking)?
-                            .host_context(request.host_context)
-                            .spawn_factory(request.spawn_factory)
-                            .tools_factory(move |handle| {
-                                capture(&handles, &handle);
-                                Ok(claude_tools(handle, Arc::clone(&registry)))
-                            });
+                    let mut builder = Agent::builder(Claude::new(claude, request.model.as_str()))
+                        .thinking(request.thinking)?
+                        .host_context(request.host_context)
+                        .spawn_factory(request.spawn_factory)
+                        .tools_factory(move |handle| {
+                            capture(&handles, &handle);
+                            Ok(claude_tools(handle, Arc::clone(&registry)))
+                        });
                     if let Some(checkpoint) = request.checkpoint {
                         builder = builder.resume(checkpoint)?;
                     }

@@ -122,9 +122,9 @@ workspaces skip that injection; host-backed directory roots are left alone.
 Host execution remains the default:
 
 ```rust,no_run
-# use nanocodex::{Nanocodex, OpenAiAuth};
+# use nanocodex::{Agent, OpenAiAuth};
 # fn build(auth: OpenAiAuth) -> nanocodex::Result<()> {
-let (agent, events) = Nanocodex::builder(auth).build()?;
+let (agent, events) = Agent::builder(auth).build()?;
 # drop((agent, events));
 # Ok(())
 # }
@@ -163,7 +163,7 @@ mounts, private process configuration, and guest readiness stay inside
 `nanocodex-vm`:
 
 ```rust,no_run
-# use nanocodex::{Nanocodex, OpenAiAuth};
+# use nanocodex::{Agent, OpenAiAuth};
 # use nanocodex_vm::image::PreparedRootDisk;
 # async fn build(
 #     auth: OpenAiAuth,
@@ -178,7 +178,7 @@ let workspace = image.private_workspace(
 .launch()
 .await?;
 let tools = workspace.tools_builder().await?.build()?;
-let (agent, events) = Nanocodex::builder(auth)
+let (agent, events) = Agent::builder(auth)
     .workspace(workspace.guest_workspace())
     .tools(tools)
     .build()?;
@@ -198,14 +198,14 @@ before creating the factory. The factory clones the prepared tool selection for
 each driver, sharing the same VM, filesystem, and retained guest shell sessions:
 
 ```rust,no_run
-# use nanocodex::{Nanocodex, OpenAiAuth};
+# use nanocodex::{Agent, OpenAiAuth};
 # use nanocodex_vm::tools::VmToolSession;
 # async fn build(auth: OpenAiAuth, session: VmToolSession) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 let tools = session.tools().tools_builder().await?
     .working_directory("/workspace")
     .default_shell("sh")
     .build()?;
-let (agent, events) = Nanocodex::builder(auth)
+let (agent, events) = Agent::builder(auth)
     .workspace("/workspace")
     .tools_factory(move |_agent| Ok(tools.clone()))
     .build()?;

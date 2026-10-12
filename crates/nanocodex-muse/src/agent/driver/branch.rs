@@ -178,7 +178,7 @@ where
         // A subagent of a durable session is durable exactly like a fork.
         let branch_policy = parent.branch_policy(&crate::SessionInfo::new(
             session_id_text.as_str(),
-            crate::HarnessFamily::Codex,
+            crate::HarnessFamily::Muse,
             lineage.clone(),
         ))?;
         let mut config = (*self.config).clone();
@@ -253,7 +253,7 @@ where
         // the durable state and rollout it recorded under the same session ID.
         let branch_policy = parent.branch_policy(&crate::SessionInfo::new(
             snapshot.session_id.as_str(),
-            crate::HarnessFamily::Codex,
+            crate::HarnessFamily::Muse,
             lineage.clone(),
         ))?;
         let mut spawner = self.for_new_thread("restore", branch_policy)?;

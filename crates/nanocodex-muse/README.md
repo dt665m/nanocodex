@@ -1,7 +1,7 @@
 # Nanocodex Muse
 
 Muse Spark 1.3 and Wonder 1.0 over HTTP/SSE Responses, using the `nanocodex-agent` reference
-loop and shared tool, transport, event and usage types. Muse owns its protocol
+loop with the shared `Agent` lifecycle, tool, transport, event and usage types. Muse owns its protocol
 adapter, authentication, images and Claude-style summary compaction.
 
 ## Quick start
@@ -27,7 +27,7 @@ client-owned history (`store: false`). `.model(MuseModel::Contributor)` selects
 `.model(MuseModel::Wonder)` and `.model(MuseModel::WonderFull)` select
 `muse-wonder-1.0` and `muse-wonder-full-1.0`, with reasoning through `Thinking::Max`.
 Tools use mandatory
-Code Mode, matching the reference harness.
+Code Mode.
 
 ## Authentication
 
@@ -60,7 +60,7 @@ Image generation is disabled by default. On native targets,
 `Tools::builder().image_generation(true)` enables `tools.image_gen__imagegen`
 inside `exec`, calling
 `muse-image-1.0` through Responses for generation and reference-image edits.
-Results return as image content to Spark and are saved in the chosen workspace.
+Results return as image content to Muse and are saved in the chosen workspace.
 Transparency is unsupported; account access and quota determine availability.
 See [Meta's image guide](https://dev.meta.ai/docs/image-generation).
 

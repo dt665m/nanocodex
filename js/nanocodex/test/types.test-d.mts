@@ -789,13 +789,14 @@ const privateMcpServer = {
 } satisfies McpServer;
 void privateMcpServer;
 
-// The public model-facing mode is mandatory across both harness families.
+// Code Mode is the default; direct model-facing tools are an explicit opt-in
+// for both harness families. The legacy mixed mode stays unavailable.
 const strictMode: NonNullable<Parameters<typeof Agent.create>[0]['toolMode']> = 'code-only';
-// @ts-expect-error Direct model-facing tools are no longer supported.
 const directMode: NonNullable<Parameters<typeof Agent.create>[0]['toolMode']> = 'direct';
 // @ts-expect-error Mixed direct and Code Mode tools are no longer supported.
 const mixedMode: NonNullable<Parameters<typeof Agent.create>[0]['toolMode']> = 'code';
 const claudeStrictMode: NonNullable<import('../host/Claude.mjs').Options['toolMode']> = 'code-only';
-// @ts-expect-error Claude follows the same mandatory Code Mode contract.
 const claudeDirectMode: NonNullable<import('../host/Claude.mjs').Options['toolMode']> = 'direct';
+// @ts-expect-error Direct mode cannot flatten remote MCP tools.
+void Agent.create({ transport: Transport.openAi({ apiKey: 'fixture' }), toolMode: 'direct', mcp: { fixture: 'https://mcp.example.com' } });
 void [strictMode, directMode, mixedMode, claudeStrictMode, claudeDirectMode];

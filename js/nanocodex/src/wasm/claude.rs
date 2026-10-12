@@ -3,15 +3,17 @@
 //! `create` accepts camelCase JSON: model (required), apiKey OR authHostId,
 //! sessionId (optional; durable IDs must match durabilityId), endpoint,
 //! subscriptionCompatibility, hostDefinitionId (required with tools),
-//! tools (exec/wait definitions), maxTokens, thinking (effort),
+//! toolMode ("code-only" default, or "direct"), tools (exec/wait definitions
+//! in Code Mode; native client definitions in direct mode), maxTokens, thinking (effort),
 //! adaptiveThinking, keepThinking, fastMode, cache ("off", "5m", "1h"), autoCompact
 //! (false rejects unsupported disabling, true keeps backend policy),
 //! autoCompactWindowTokens, contextWindowTokens, instructions, systemBlocks,
 //! workspace, parallelTools, parallelSafeTools (host-derived),
 //! durabilityHostId, durabilityId, resume (a portable Claude session
 //! checkpoint whose conversation the new session continues),
-//! terminalReceiptRetention. Code Mode is mandatory; provider tools and direct
-//! client tool search are rejected. Credentials never enter a checkpoint.
+//! terminalReceiptRetention. Code Mode is the default; direct mode is an
+//! explicit opt-in. Provider tools and client tool search are rejected in both
+//! modes. Credentials never enter a checkpoint.
 //!
 //! Host contracts: claudeAuth(authHostId) -> Promise<JSON header map string>;
 //! executeClaudeTool(hostDefinitionId, name, inputJson, sessionId, callId, model,
@@ -172,15 +174,25 @@ enum CachePolicy {
 }
 
 impl ClaudeConfig {
+    /// Direct mode is an explicit opt-in; an absent mode keeps Code Mode.
+    fn is_direct(&self) -> bool {
+        self.tool_mode.as_deref() == Some("direct")
+    }
+
     fn validate(&self) -> Result<(), &'static str> {
-        if !matches!(self.tool_mode.as_deref(), None | Some("code-only")) {
+        if !matches!(
+            self.tool_mode.as_deref(),
+            None | Some("code-only" | "direct")
+        ) {
             return Err("unsupported Claude toolMode");
         }
-        if !self.server_tools.is_empty()
-            || self.client_tool_search
-            || self.tools.len() != 2
-            || !self.tools.iter().any(|tool| tool.name == "exec")
-            || !self.tools.iter().any(|tool| tool.name == "wait")
+        if !self.server_tools.is_empty() || self.client_tool_search {
+            return Err("Claude does not expose provider or client search tools directly");
+        }
+        if !self.is_direct()
+            && (self.tools.len() != 2
+                || !self.tools.iter().any(|tool| tool.name == "exec")
+                || !self.tools.iter().any(|tool| tool.name == "wait"))
         {
             return Err("Claude Code Mode must expose only exec and wait");
         }
@@ -448,6 +460,31 @@ impl WasmNanocodex {
     /// echo configuration values, which may contain credentials.
     #[wasm_bindgen(js_name = createClaude)]
     pub async fn create_claude(config_json: &str) -> Result<Self, JsValue> {
+        Self::create_claude_with_codex_auth(config_json, None).await
+    }
+
+    /// Builds a Claude-native session whose Codex children authenticate with
+    /// the Rust-owned ChatGPT subscription credential lifecycle.
+    ///
+    /// Identical to `createClaude` except that an alternate Codex harness uses
+    /// the subscription's current authorization instead of its recipe API key.
+    ///
+    /// # Errors
+    ///
+    /// Throws when the configuration, subscription or agent policy is invalid.
+    #[wasm_bindgen(js_name = createClaudeWithChatGpt)]
+    pub async fn create_claude_with_chat_gpt(
+        config_json: &str,
+        subscription: &super::WasmChatGptSubscription,
+    ) -> Result<Self, JsValue> {
+        let auth = subscription.inner.authorization().await.map_err(js_error)?;
+        Self::create_claude_with_codex_auth(config_json, Some(auth)).await
+    }
+
+    async fn create_claude_with_codex_auth(
+        config_json: &str,
+        codex_auth: Option<nanocodex::oai::auth::OpenAiAuth>,
+    ) -> Result<Self, JsValue> {
         // Serde errors can include caller-supplied strings; do not echo config secrets.
         let config: ClaudeConfig = serde_json::from_str(config_json)
             .map_err(|_| js_error("invalid Claude configuration"))?;
@@ -467,11 +504,15 @@ impl WasmNanocodex {
                 .codex_harness
                 .clone()
                 .map(|recipe| {
-                    let key = recipe
-                        .get("api_key")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| js_error("Codex harness requires explicit transport"))?;
-                    let auth = nanocodex::oai::auth::OpenAiAuth::api_key(key.to_owned());
+                    let auth = if let Some(auth) = codex_auth.clone() {
+                        auth
+                    } else {
+                        let key = recipe
+                            .get("api_key")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| js_error("Codex harness requires explicit transport"))?;
+                        nanocodex::oai::auth::OpenAiAuth::api_key(key.to_owned())
+                    };
                     Ok::<_, JsValue>((recipe, auth))
                 })
                 .transpose()?;
@@ -506,6 +547,7 @@ pub(super) async fn build_claude(
     host_context: Option<Arc<str>>,
 ) -> Result<(RustNanocodex, AgentEvents), JsValue> {
     config.validate().map_err(js_error)?;
+    let direct = config.is_direct();
     let endpoint = config.endpoint.unwrap_or_else(|| {
         if config.subscription_compatibility {
             nanocodex_claude::ANTHROPIC_SUBSCRIPTION_MESSAGES_URL.to_owned()
@@ -593,13 +635,19 @@ pub(super) async fn build_claude(
     if let Some(workspace) = config.workspace {
         builder = builder.workspace(workspace);
     }
-    builder = builder.code_only(true);
-    let code_definitions = if factory.is_some() {
+    // Direct mode registers every host definition as a native client tool and
+    // installs subagent tools beside them; Code Mode nests both under exec.
+    builder = builder.code_only(!direct);
+    let code_definitions = if factory.is_some() && !direct {
         config.tools.clone()
     } else {
         Vec::new()
     };
-    for definition in config.tools.into_iter().filter(|_| factory.is_none()) {
+    for definition in config
+        .tools
+        .into_iter()
+        .filter(|_| direct || factory.is_none())
+    {
         let host_id = config
             .host_definition_id
             .ok_or_else(|| js_error("explicit Claude tools require hostDefinitionId"))?;
@@ -646,6 +694,9 @@ pub(super) async fn build_claude(
                     agent,
                     registry.clone(),
                 )?;
+                if direct {
+                    return Ok(native);
+                }
                 let mut tools = ClaudeTools::new();
                 for definition in &code_definitions {
                     let name = definition.name.clone();

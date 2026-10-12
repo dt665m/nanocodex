@@ -39,3 +39,5 @@ export type ManagedIdentity =
 export function managed(options: ManagedClientOptions & Readonly<{
   agent: ManagedIdentity;
 }>): ManagedTransport;
+
+export { anthropic, type ClaudeTransport } from "../runtime/claude-transport.mjs";

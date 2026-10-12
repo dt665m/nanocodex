@@ -871,9 +871,9 @@ where
                                         drop(result.send(outcome));
                                     }
                                     Some(Command::SetServiceTier { service_tier, result }) => {
-                                        let outcome = crate::HarnessModel::Codex(thread_model)
+                                        let outcome = crate::HarnessModel::from_responses(thread_model)
                                             .capabilities(crate::ModelTransport::Native)
-                                            .check_service_tier(service_tier).map_err(crate::error::model_capability_error)
+                                            .check_service_tier(service_tier)
                                             .map(|()| default_service_tier = service_tier);
                                         drop(result.send(outcome));
                                     }
@@ -1549,9 +1549,9 @@ where
                                 drop(result.send(outcome));
                             }
                             Some(Command::SetServiceTier { service_tier, result }) => {
-                                let outcome = crate::HarnessModel::Codex(thread_model)
+                                let outcome = crate::HarnessModel::from_responses(thread_model)
                                     .capabilities(crate::ModelTransport::Native)
-                                    .check_service_tier(service_tier).map_err(crate::error::model_capability_error)
+                                    .check_service_tier(service_tier)
                                     .map(|()| default_service_tier = service_tier);
                                 drop(result.send(outcome));
                             }
@@ -1646,16 +1646,13 @@ where
                     }
                     let persisted = committed;
                     (
-                        persisted.map(|()| TurnResult {
-                            request_id: execution_operation.clone(),
-                            turn_id: None,
-                            final_message,
-                            usage: Some(usage),
-                            boundary: Some(self.checkpoints.live(
-                                checkpoint,
-                                thinking,
-                                service_tier,
-                            )),
+                        persisted.map(|()| {
+                            TurnResult::from_backend(
+                                execution_operation.clone(),
+                                final_message,
+                                Some(usage),
+                                Some(self.checkpoints.live(checkpoint, thinking, service_tier)),
+                            )
                         }),
                         false,
                         None,
@@ -2180,18 +2177,17 @@ async fn accept_execution_command(
                 drop(result.send(Err(error)));
                 return None;
             }
-            drop(result.send(Ok(TurnResult {
-                request_id: Some(operation_id),
-                turn_id: None,
-                final_message: output.final_message,
-                usage: Some(output.usage),
-                boundary: Some(checkpoints.replayed(
+            drop(result.send(Ok(TurnResult::from_backend(
+                Some(operation_id),
+                output.final_message,
+                Some(output.usage),
+                Some(checkpoints.replayed(
                     snapshot,
                     config.model,
                     replay_thinking,
                     service_tier.unwrap_or(config.service_tier),
                 )),
-            })));
+            ))));
             None
         }
         Ok((operation_id, AdmittedExecution::Failed { error })) => {
@@ -2366,18 +2362,17 @@ async fn accept_idle_route(
                 drop(turn_result.send(Err(error)));
                 return None;
             }
-            drop(turn_result.send(Ok(TurnResult {
-                request_id: Some(operation_id),
-                turn_id: None,
-                final_message: output.final_message,
-                usage: Some(output.usage),
-                boundary: Some(checkpoints.replayed(
+            drop(turn_result.send(Ok(TurnResult::from_backend(
+                Some(operation_id),
+                output.final_message,
+                Some(output.usage),
+                Some(checkpoints.replayed(
                     snapshot,
                     config.model,
                     default_thinking,
                     config.service_tier,
                 )),
-            })));
+            ))));
             None
         }
         Ok((operation_id, AdmittedExecution::Failed { error })) => {
@@ -2444,13 +2439,17 @@ pub(super) fn agent_session_context(
         .map(|checkpoint| checkpoint.model().workspace().to_owned())
         .or_else(|| configured_workspace.map(str::to_owned))
         .map_or_else(|| context_source.resolve_workspace(None), Ok)?;
-    Ok(AgentSessionContext::new(checkpoint, workspace))
+    Ok(AgentSessionContext::from_backend(
+        workspace,
+        checkpoint.map_or_else(Vec::new, |checkpoint| checkpoint.model().snapshot_history()),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{outcome_requires_reopen, requires_reopen_after_turn};
-    use crate::{NanocodexError, error::ResponsesError};
+    use crate::NanocodexError;
+    use nanocodex_oai_api::transport::ResponsesError;
     use nanocodex_oai_api::{ResponseError, tower::ResponsesServiceError};
 
     #[test]

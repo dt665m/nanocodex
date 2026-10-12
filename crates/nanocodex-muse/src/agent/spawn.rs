@@ -146,7 +146,7 @@ where
     let shutdown = DriverShutdown::default();
     let mut child_handle = AgentHandle::new(
         Arc::<str>::from(session_id_text.as_str()),
-        crate::HarnessModel::Codex(spawner.config.model),
+        crate::HarnessModel::from_responses(spawner.config.model),
         Arc::new(super::handle::OpenAiAgentFactory {
             commands: commands.downgrade(),
             shutdown: shutdown.clone(),
@@ -186,7 +186,7 @@ where
             }),
         initial_resume.as_ref().map(InitialResume::history_len),
     )?;
-    let (runtime, event_stream) = BackendRuntime::new_openai(session_id);
+    let (runtime, event_stream) = BackendRuntime::new(session_id.to_string());
     let runtime = runtime.with_lineage(origin.lineage.clone());
     let events = EventSink::from_publisher(runtime.events());
     shutdown.set_execution_policy_owned(execution.identifies_prompts());
@@ -303,18 +303,17 @@ pub(super) fn validate(config: &ModelConfig, prompt_cache_key: Option<&str>) -> 
 }
 
 pub(super) fn validate_model_thinking(model: Model, thinking: Thinking) -> Result<()> {
-    crate::HarnessModel::Codex(model)
+    crate::MuseModel::try_from(model).map_err(NanocodexError::InvalidRequest)?;
+    crate::HarnessModel::from_responses(model)
         .capabilities(crate::ModelTransport::Native)
         .check_thinking(thinking)
-        .map_err(crate::error::model_capability_error)
 }
 
 pub(super) fn validate_model_reasoning_mode(
     model: Model,
     reasoning_mode: ReasoningMode,
 ) -> Result<()> {
-    crate::HarnessModel::Codex(model)
+    crate::HarnessModel::from_responses(model)
         .capabilities(crate::ModelTransport::Native)
         .check_reasoning_mode(reasoning_mode)
-        .map_err(crate::error::model_capability_error)
 }

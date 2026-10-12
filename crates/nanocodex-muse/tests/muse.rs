@@ -221,6 +221,7 @@ async fn file_edit_compaction_journey(model: Model) -> Result<()> {
     let wonder = matches!(model, Model::MuseWonder10 | Model::MuseWonderFull10);
     let thinking = if wonder { Thinking::Max } else { Thinking::Low };
     let workspace = tempfile::tempdir()?;
+    let rollout_home = tempfile::tempdir()?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = format!("http://{}/v1", listener.local_addr()?);
     let server = tokio::spawn(async move {
@@ -335,6 +336,9 @@ async fn file_edit_compaction_journey(model: Model) -> Result<()> {
     let (agent, mut events) = Nanocodex::builder(provider)
         .service_tier(ServiceTier::Standard)
         .workspace(workspace.path())
+        .rollout(nanocodex_muse::rollout::RolloutConfig::new(
+            rollout_home.path(),
+        ))
         .instructions("Complete the user's file task.")
         .tools(tools)
         .build()?;
@@ -379,6 +383,15 @@ async fn file_edit_compaction_journey(model: Model) -> Result<()> {
     timeout(Duration::from_secs(10), agent.compact()).await??;
     agent.set_fast_mode(false).await?;
     assert_eq!(turn(&agent, "What did you create?").await?, "hello Muse");
+    agent.flush().await?;
+    let persistence = agent.persistence().expect("rollout metadata");
+    let info = persistence.rollout.expect("shared rollout metadata");
+    assert_eq!(info.thread_id(), agent.session_id());
+    assert_eq!(
+        info.committed_bytes(),
+        std::fs::metadata(info.path())?.len()
+    );
+    assert!(std::fs::read_to_string(info.path())?.contains("Created hello.txt"));
     agent.shutdown().await?;
     server.await??;
     let mut count = 0;

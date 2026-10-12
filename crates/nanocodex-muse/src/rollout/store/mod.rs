@@ -12,40 +12,7 @@ use writer::RolloutWriter;
 
 use crate::session::{Origin, SessionStart};
 
-/// Stable identity and file location of a recorded Nanocodex thread.
-#[derive(Clone, Debug)]
-pub struct RolloutInfo {
-    thread_id: String,
-    path: PathBuf,
-    committed_bytes: Arc<AtomicU64>,
-}
-
-impl PartialEq for RolloutInfo {
-    fn eq(&self, other: &Self) -> bool {
-        self.thread_id == other.thread_id && self.path == other.path
-    }
-}
-impl Eq for RolloutInfo {}
-
-impl RolloutInfo {
-    /// Exclusive byte boundary of successfully flushed, complete rollout records.
-    #[must_use]
-    pub fn committed_bytes(&self) -> u64 {
-        self.committed_bytes.load(Ordering::Acquire)
-    }
-
-    /// UUID accepted by `codex resume` and `codex exec resume`.
-    #[must_use]
-    pub fn thread_id(&self) -> &str {
-        &self.thread_id
-    }
-
-    /// Codex-compatible JSONL rollout path.
-    #[must_use]
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-}
+pub use nanocodex_agent_reference::rollout::RolloutInfo;
 
 #[derive(Clone, Debug)]
 pub(crate) struct RolloutRecorder {
@@ -79,7 +46,7 @@ impl RolloutOrigin<'_> {
         match self.start {
             SessionStart::New(Origin::Root) => "root",
             SessionStart::New(Origin::Fork | Origin::Branch | Origin::SideConversation) => "fork",
-            SessionStart::New(Origin::Subagent) => "spawn",
+            SessionStart::New(_) => "spawn",
             SessionStart::Resume => "resume",
             SessionStart::Restore => "restore",
         }
@@ -91,9 +58,7 @@ impl RolloutOrigin<'_> {
             SessionStart::New(Origin::Subagent) => "subagent",
             SessionStart::New(Origin::Fork | Origin::Branch) => "branch",
             SessionStart::New(Origin::SideConversation) => "side_conversation",
-            SessionStart::New(Origin::Root) | SessionStart::Resume | SessionStart::Restore => {
-                "root"
-            }
+            SessionStart::New(_) | SessionStart::Resume | SessionStart::Restore => "root",
         }
     }
 
@@ -420,11 +385,7 @@ impl RolloutRecorder {
             }
         }));
         Self {
-            info: RolloutInfo {
-                thread_id: thread_id.to_owned(),
-                path,
-                committed_bytes,
-            },
+            info: RolloutInfo::from_backend(thread_id, path, committed_bytes),
             commands,
         }
     }

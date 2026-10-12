@@ -30,8 +30,10 @@ const MPP_CLIENT_PROTOCOL_ERROR_CLOSE_CODE = 3008;
 export function createNodeHost(options = {}) {
   const preservation = createBeforeCompaction(options.beforeCompaction);
   const toolMode = options.toolMode ?? "code-only";
-  if (toolMode !== "code-only") {
-    throw new TypeError("toolMode must be code-only");
+  // Code Mode is the default; direct mode is an explicit opt-in that exposes
+  // host tools to the provider without dynamic code evaluation.
+  if (toolMode !== "code-only" && toolMode !== "direct") {
+    throw new TypeError("toolMode must be code-only or direct");
   }
   if (options.codeEvaluator !== undefined && typeof options.codeEvaluator !== "function") {
     throw new TypeError("codeEvaluator must be a function");
@@ -45,6 +47,9 @@ export function createNodeHost(options = {}) {
   }
   if (toolsMcp && options.mcpServers) {
     throw new TypeError("MCP is already configured in Tools");
+  }
+  if ((toolsMcp || options.mcpServers) && toolMode === "direct") {
+    throw new TypeError("remote MCP requires Code Mode");
   }
   const toolsLifecycle = options.tools?.[toolRuntimeLifecycle];
   toolsLifecycle?.available();

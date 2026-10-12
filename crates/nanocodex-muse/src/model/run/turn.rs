@@ -113,7 +113,7 @@ where
                 session
                     .conversation
                     .managed
-                    .repair_rejected_request(error.rejected_request_repair());
+                    .repair_rejected_request(rejected_request_repair(&error));
                 session.conversation.reset_for_full_request();
                 let checkpoint = Self::checkpoint_from_session(
                     &session,
@@ -336,7 +336,7 @@ where
                         session
                             .conversation
                             .managed
-                            .repair_rejected_request(error.rejected_request_repair());
+                            .repair_rejected_request(rejected_request_repair(&error));
                         session.conversation.commit_interrupted();
                         session.preserve_inherited_delta = false;
                     }
@@ -1056,5 +1056,19 @@ where
             )?;
         }
         Ok(())
+    }
+}
+
+// The shared error retains recovery policy; history repair belongs to this loop.
+fn rejected_request_repair(
+    error: &crate::NanocodexError,
+) -> nanocodex_oai_api::__private::RejectedRequestRepair<'_> {
+    use nanocodex_oai_api::__private::RejectedRequestRepair;
+    RejectedRequestRepair {
+        replace_images: error.requires_image_repair(),
+        ..error
+            .responses_error()
+            .map(RejectedRequestRepair::for_error)
+            .unwrap_or_default()
     }
 }

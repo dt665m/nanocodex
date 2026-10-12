@@ -10,9 +10,9 @@ use eyre::{Result, WrapErr, eyre};
     all(target_os = "linux", not(target_env = "musl")),
     all(target_os = "macos", target_arch = "aarch64")
 ))]
-use nanocodex::NanocodexBuilder;
+use nanocodex::CodexBuilder;
 use nanocodex::{
-    AgentEvents, DurableAgentExt as _, HarnessFamily, HarnessModel, Model, Nanocodex, OpenAi,
+    Agent, AgentEvents, DurableAgentExt as _, HarnessFamily, HarnessModel, Model, OpenAi,
     ReasoningMode, Thinking, Tools,
     agent::{rollout::RolloutConfig, session::SessionId},
     oai::{
@@ -52,7 +52,7 @@ pub(crate) struct HostChannels {
 
 pub(crate) struct ConfiguredAgent {
     pub(crate) host: HostChannels,
-    pub(crate) handle: Nanocodex,
+    pub(crate) handle: Agent,
     pub(crate) events: AgentEvents,
     pub(crate) realtime: Option<OpenAi>,
     pub(crate) child_agents: Option<Arc<ChildAgents>>,
@@ -122,6 +122,7 @@ impl ModelArgs {
         let variable = match family {
             HarnessFamily::Codex => "OPENAI_REASONING_EFFORT",
             HarnessFamily::Claude => "ANTHROPIC_REASONING_EFFORT",
+            HarnessFamily::Muse => return Err(eyre!("Muse requires a configured SDK harness")),
         };
         std::env::var(variable)
             .ok()
@@ -563,6 +564,7 @@ impl AgentArgs {
         let variable = match family {
             HarnessFamily::Codex => "OPENAI_MODEL",
             HarnessFamily::Claude => "ANTHROPIC_MODEL",
+            HarnessFamily::Muse => return Err(eyre!("Muse requires a configured SDK harness")),
         };
         let environment = std::env::var(variable).ok();
         self.model
@@ -735,7 +737,7 @@ impl AgentArgs {
         };
         let model = match requested_model {
             Some(HarnessModel::Codex(model)) => model,
-            Some(HarnessModel::Claude(_)) => {
+            Some(HarnessModel::Claude(_) | HarnessModel::Muse(_)) => {
                 unreachable!("model family was validated")
             }
             None => connected_account_default_model(auth.mode()),
@@ -1111,11 +1113,7 @@ type SubagentHandles = (
 );
 
 /// Subagent control for a built root; the TUI services updates itself.
-fn child_agents(
-    handle: &Nanocodex,
-    runtime: Option<SubagentRuntime>,
-    tui: bool,
-) -> SubagentHandles {
+fn child_agents(handle: &Agent, runtime: Option<SubagentRuntime>, tui: bool) -> SubagentHandles {
     runtime.map_or((None, None), |(_, control, updates)| {
         let (drain_updates, subagent_updates) = if tui {
             (None, Some(updates))
@@ -1186,7 +1184,7 @@ impl EvalAgentArgs {
         model: Model,
         thinking: Thinking,
         web_search: bool,
-    ) -> Result<(NanocodexBuilder, SharedAuth)> {
+    ) -> Result<(CodexBuilder, SharedAuth)> {
         self.model_policy.requested_thinking(HarnessFamily::Codex)?;
         let auth = self.auth.resolve()?;
         let builder = eval_builder_with_auth(auth.nanocodex()?, model, thinking, web_search)?;
@@ -1227,10 +1225,10 @@ fn eval_builder_with_auth(
     model: Model,
     thinking: Thinking,
     web_search: bool,
-) -> Result<NanocodexBuilder> {
+) -> Result<CodexBuilder> {
     let tools = Tools::builder().web_search(web_search).build()?;
     let openai = OpenAi::new(auth)?;
-    Ok(Nanocodex::builder(openai)
+    Ok(Agent::builder(openai)
         .model(model)
         .thinking(thinking)
         .tools(tools))

@@ -303,7 +303,7 @@ test("browser subagent lifecycle failures leave bindings retryable", async () =>
 test("browser host never flattens remote MCP tools into direct mode", () => {
   assert.throws(
     () => createBrowserHost({ mcp: { fixture: { client: {} } }, toolMode: "direct" }),
-    /toolMode must be code-only/,
+    /remote MCP requires Code Mode/,
   );
 });
 

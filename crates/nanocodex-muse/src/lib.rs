@@ -10,12 +10,12 @@ compile_error!(
 
 extern crate self as nanocodex_agent;
 
+#[cfg(feature = "openai")]
 mod agent;
-mod error;
 #[cfg(feature = "openai")]
 mod service_tier_serde;
 pub use nanocodex_agent_reference::{
-    ClaudeModel, HarnessFamily, HarnessModel, ModelCapabilities, ModelTransport,
+    ClaudeModel, HarnessFamily, HarnessModel, ModelCapabilities, ModelTransport, MuseModel,
 };
 #[cfg(feature = "openai")]
 mod model;
@@ -43,20 +43,20 @@ pub use nanocodex_agent_reference::usage;
 /// Backend implementor surface used by first-party lifecycle crates.
 #[doc(hidden)]
 pub mod backend {
-    pub use crate::agent::backend::*;
     pub use crate::session::TurnBoundary;
+    pub use nanocodex_agent_reference::backend::*;
 }
 
-pub use agent::{
-    AgentHandle, AgentSessionContext, BuilderBackend, Nanocodex, PromptRequest, PromptRoute,
-    SpawnOptions, Turn, TurnControl, TurnResult,
-};
 #[cfg(feature = "openai")]
 #[cfg_attr(docsrs, doc(cfg(feature = "openai")))]
 pub use agent::{ExecutionEnvironment, NanocodexBuilder};
 #[cfg(feature = "openai")]
-pub use error::CompactionRecovery;
-pub use error::{ExecutionPolicyDisposition, NanocodexError, Result};
+pub use nanocodex_agent_reference::CompactionRecovery;
+pub use nanocodex_agent_reference::{
+    AgentHandle, AgentSessionContext, BuilderBackend, Nanocodex, PromptRequest, PromptRoute,
+    SpawnOptions, Turn, TurnControl, TurnResult, WeakAgent,
+};
+pub use nanocodex_agent_reference::{ExecutionPolicyDisposition, NanocodexError, Result};
 pub use nanocodex_oai_api::{Model, ReasoningMode, Thinking, events::AgentEvents};
 #[cfg(feature = "openai")]
 #[cfg_attr(docsrs, doc(cfg(feature = "openai")))]
@@ -106,7 +106,7 @@ pub mod input {
 #[cfg(all(feature = "openai", not(target_family = "wasm")))]
 #[cfg_attr(docsrs, doc(cfg(all(feature = "openai", not(target_family = "wasm")))))]
 pub mod transport {
-    pub use crate::error::ResponsesError;
+    pub use nanocodex_oai_api::transport::ResponsesError;
     pub use nanocodex_oai_api::{
         responses::RequestProfile,
         tower::{
@@ -151,5 +151,3 @@ mod image_generation;
 #[cfg(feature = "openai")]
 /// Protocol version header required by every Meta API request.
 const API_VERSION_HEADER: (&str, &str) = ("x-api-version", "1.0.0");
-mod muse_model;
-pub use muse_model::MuseModel;

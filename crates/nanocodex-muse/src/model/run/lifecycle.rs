@@ -68,7 +68,7 @@ enum RecordedCompactionOutcome {
         #[serde(default)]
         requires_session_stop: bool,
         #[serde(default)]
-        recovery: crate::error::CompactionRecovery,
+        recovery: crate::CompactionRecovery,
     },
 }
 
@@ -454,9 +454,9 @@ where
                             .responses_error()
                             .is_some_and(|source| source.is_misalignment_policy_violation());
                         let recovery = if error.requires_image_repair() {
-                            crate::error::CompactionRecovery::ReplaceRejectedImages
+                            crate::CompactionRecovery::ReplaceRejectedImages
                         } else {
-                            crate::error::CompactionRecovery::None
+                            crate::CompactionRecovery::None
                         };
                         let compaction_error = error.to_string();
                         if let Some(steps) = &execution_steps {
@@ -592,7 +592,7 @@ mod compaction_receipt_tests {
         let receipt = RecordedCompactionOutcome::Failure {
             compaction_error: "stop this conversation".into(),
             requires_session_stop: true,
-            recovery: crate::error::CompactionRecovery::None,
+            recovery: crate::CompactionRecovery::None,
         };
         let replay: RecordedCompactionOutcome =
             serde_json::from_value(serde_json::to_value(receipt).unwrap()).unwrap();
@@ -611,7 +611,7 @@ mod compaction_receipt_tests {
             let receipt = RecordedCompactionOutcome::Failure {
                 compaction_error: "rejected image".into(),
                 requires_session_stop: stop,
-                recovery: crate::error::CompactionRecovery::ReplaceRejectedImages,
+                recovery: crate::CompactionRecovery::ReplaceRejectedImages,
             };
             let replay: RecordedCompactionOutcome =
                 serde_json::from_value(serde_json::to_value(receipt).unwrap()).unwrap();

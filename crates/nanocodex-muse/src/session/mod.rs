@@ -2,8 +2,7 @@ use std::fmt;
 #[cfg(feature = "openai")]
 use std::sync::Arc;
 
-mod contract;
-pub use contract::{
+pub use nanocodex_agent_reference::session::{
     Capabilities, ForkPoint, ForkRequest, Lineage, Mutability, Origin, Persistence,
     SessionCheckpoint, SessionInfo, TurnBoundary,
 };
@@ -47,7 +46,7 @@ impl SessionStart {
             Self::New(Origin::Root) => "root",
             Self::New(Origin::Fork | Origin::Branch) => "fork",
             Self::New(Origin::SideConversation) => "side_conversation",
-            Self::New(Origin::Subagent) => "spawn",
+            Self::New(_) => "spawn",
             Self::Resume => "resume",
             Self::Restore => "restore",
         }
@@ -408,14 +407,6 @@ impl SessionSnapshot {
     #[cfg(feature = "openai")]
     pub(crate) fn lineage_id(&self) -> &str {
         &self.lineage_id
-    }
-
-    /// Model pinned by this boundary.
-    #[cfg(feature = "openai")]
-    pub(crate) fn model(&self) -> Result<Model> {
-        self.model.parse::<Model>().map_err(|error| {
-            NanocodexError::InvalidCheckpoint(format!("snapshot model is unsupported: {error}"))
-        })
     }
 
     #[cfg(feature = "openai")]
