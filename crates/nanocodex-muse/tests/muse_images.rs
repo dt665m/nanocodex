@@ -592,7 +592,7 @@ async fn generation_journey() -> Result<()> {
         Result::<()>::Ok(())
     });
     let provider = Muse::builder("synthetic-key")
-        .model(nanocodex_muse::MuseModel::Contributor)
+        .model(nanocodex_muse::MuseModel::Spark13Contributor)
         .api_base_url(endpoint)
         .context_window_tokens(40_000)
         .build()?;

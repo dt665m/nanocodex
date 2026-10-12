@@ -249,7 +249,7 @@ targets; WebAssembly hosts use [`Agent`] and [`Harness`].
 
 Enable `muse` for the Muse-owned adaptation of the reference agent loop, sharing
 Responses transports and tool types. `Muse::builder(auth)` selects Spark;
-`.model(MuseModel::Wonder)` and `.model(MuseModel::WonderFull)` select Wonder.
+`.model(MuseModel::Wonder10)` and `.model(MuseModel::WonderFull10)` select Wonder.
 Build one common `Agent` with `Agent::builder(muse)`, or share a provider across
 agents with `Nanocodex::builder().muse(muse).build()?` and `nano.spawn().build().await?`.
 Image generation remains opt-in through `Tools::builder().image_generation(true)`.

@@ -29,9 +29,9 @@ impl Muse {
     #[must_use]
     pub fn builder(auth: impl Into<OpenAiAuth>) -> MuseBuilder {
         MuseBuilder {
-            model: crate::MuseModel::Spark.into(),
+            model: crate::MuseModel::Spark13.into(),
             inner: OpenAi::builder(auth.into())
-                .model(crate::MuseModel::Spark.into())
+                .model(crate::MuseModel::Spark13.into())
                 .api_base_url("https://api.meta.ai/v1")
                 .context_window_tokens(Model::MuseSpark13.max_context_window_tokens())
                 .transport(nanocodex_oai_api::transport::ResponsesTransport::Https)
@@ -44,7 +44,7 @@ impl Muse {
 }
 
 impl MuseBuilder {
-    /// Selects Spark, Contributor, Wonder or Wonder Full by the shared identifier.
+    /// Selects a versioned Spark or Wonder model by the shared identifier.
     /// Contributor permits Meta to train on prompts and completions.
     #[must_use]
     pub fn model(mut self, model: impl Into<Model>) -> Self {
@@ -95,7 +95,7 @@ impl MuseBuilder {
     pub fn build(self) -> Result<Muse, OpenAiError> {
         if crate::MuseModel::try_from(self.model).is_err() {
             return Err(OpenAiError::InvalidConfiguration {
-                detail: "Muse requires muse-spark-1.3, muse-spark-1.3-contributor, muse-wonder-1.0, or muse-wonder-full-1.0",
+                detail: "Muse requires muse-spark-1.1, muse-spark-1.2, muse-spark-1.2-contributor, muse-spark-1.3, muse-spark-1.3-contributor, muse-wonder-1.0, or muse-wonder-full-1.0",
             });
         }
         let inner = self.inner.build()?;

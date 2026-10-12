@@ -60,7 +60,10 @@ async fn request_with_headers(listener: &TcpListener) -> Result<(TcpStream, Valu
     assert!(matches!(
         body["model"].as_str(),
         Some(
-            "muse-spark-1.3"
+            "muse-spark-1.1"
+                | "muse-spark-1.2"
+                | "muse-spark-1.2-contributor"
+                | "muse-spark-1.3"
                 | "muse-spark-1.3-contributor"
                 | "muse-wonder-1.0"
                 | "muse-wonder-full-1.0"
@@ -174,21 +177,34 @@ async fn malformed_custom_tool_wrappers_fail_without_panicking_the_agent() -> Re
 
 #[tokio::test]
 async fn muse_edits_a_file_compacts_and_continues_with_authentic_tool_receipts() -> Result<()> {
-    file_edit_compaction_journey(serde_json::from_value(json!("muse-spark-1.3"))?).await
+    for id in ["muse-spark-1.1", "muse-spark-1.2", "muse-spark-1.3"] {
+        let model = id.parse::<MuseModel>().map_err(|error| eyre!(error))?;
+        if model != MuseModel::Spark13 {
+            assert!(
+                Muse::builder("synthetic-test-key")
+                    .model(model)
+                    .thinking(Thinking::Max)
+                    .build()
+                    .is_err()
+            );
+        }
+        file_edit_compaction_journey(model.into()).await?;
+    }
+    Ok(())
 }
 
 #[tokio::test]
 async fn contributor_uses_its_model_id_for_tools_compaction_and_continuation() -> Result<()> {
     assert!(
         Muse::builder("synthetic-test-key")
-            .model(nanocodex_muse::MuseModel::Contributor)
+            .model(nanocodex_muse::MuseModel::Spark13Contributor)
             .thinking(Thinking::Max)
             .build()
             .is_err()
     );
     for model in [
-        nanocodex_muse::MuseModel::Spark,
-        nanocodex_muse::MuseModel::Contributor,
+        nanocodex_muse::MuseModel::Spark13,
+        nanocodex_muse::MuseModel::Spark13Contributor,
     ] {
         assert!(
             Muse::builder("synthetic-test-key")
@@ -198,11 +214,15 @@ async fn contributor_uses_its_model_id_for_tools_compaction_and_continuation() -
                 .is_err()
         );
     }
-    file_edit_compaction_journey(serde_json::from_value(json!("muse-spark-1.3-contributor"))?).await
+    for id in ["muse-spark-1.2-contributor", "muse-spark-1.3-contributor"] {
+        let model = id.parse::<MuseModel>().map_err(|error| eyre!(error))?;
+        file_edit_compaction_journey(model.into()).await?;
+    }
+    Ok(())
 }
 
 #[tokio::test]
-async fn wonder_models_run_tools_and_compaction_with_usage_but_unpublished_costs() -> Result<()> {
+async fn wonder_models_run_tools_and_compaction_with_model_pricing() -> Result<()> {
     for id in ["muse-wonder-1.0", "muse-wonder-full-1.0"] {
         let model = id.parse::<MuseModel>().map_err(|error| eyre!(error))?;
         assert!(
@@ -358,15 +378,20 @@ async fn file_edit_compaction_journey(model: Model) -> Result<()> {
     assert_eq!(usage.reasoning_output_tokens(), 3);
     assert_eq!(usage.total_tokens(), 9_038);
     match model {
-        Model::MuseWonder10 | Model::MuseWonderFull10 => {
+        Model::MuseWonderFull10 => {
             assert!(usage.estimated_cost().is_none());
             assert_eq!(usage.cost_status(), CostStatus::PricingUnavailable);
         }
-        Model::MuseSpark13 | Model::MuseSpark13Contributor => {
-            let expected = if model == Model::MuseSpark13 {
-                "0.0063479"
-            } else {
-                "0.000461832"
+        Model::MuseSpark11
+        | Model::MuseSpark12
+        | Model::MuseSpark12Contributor
+        | Model::MuseSpark13
+        | Model::MuseSpark13Contributor
+        | Model::MuseWonder10 => {
+            let expected = match model {
+                Model::MuseWonder10 => "0.0190872",
+                Model::MuseSpark12Contributor | Model::MuseSpark13Contributor => "0.000461832",
+                _ => "0.0063479",
             };
             let cost = usage.estimated_cost().expect("cost from usage");
             assert_eq!(cost.amount().decimal(), expected);

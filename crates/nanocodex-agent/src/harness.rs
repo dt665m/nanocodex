@@ -34,7 +34,7 @@ impl HarnessFamily {
         match self {
             Self::Codex => HarnessModel::Codex(Model::Sol),
             Self::Claude => HarnessModel::Claude(ClaudeModel::Opus55),
-            Self::Muse => HarnessModel::Muse(MuseModel::Spark),
+            Self::Muse => HarnessModel::Muse(MuseModel::Spark13),
         }
     }
 }
@@ -151,44 +151,52 @@ impl FromStr for ClaudeModel {
 pub enum MuseModel {
     /// Standard Spark 1.3.
     #[default]
-    Spark,
-    /// Subsidized Spark: Meta may train on prompts and completions.
-    Contributor,
+    Spark13,
+    /// Subsidized Spark 1.3: Meta may train on prompts and completions.
+    Spark13Contributor,
+    /// Standard Spark 1.2.
+    Spark12,
+    /// Subsidized Spark 1.2: Meta may train on prompts and completions.
+    Spark12Contributor,
+    /// Standard Spark 1.1.
+    Spark11,
     /// Wonder 1.0.
-    Wonder,
+    Wonder10,
     /// Wonder Full 1.0.
-    WonderFull,
+    WonderFull10,
 }
 impl MuseModel {
     /// Validated Muse models exposed by the shared harness router.
-    pub const ALL: [Self; 4] = [
-        Self::Spark,
-        Self::Contributor,
-        Self::Wonder,
-        Self::WonderFull,
+    pub const ALL: [Self; 7] = [
+        Self::Spark13,
+        Self::Spark13Contributor,
+        Self::Spark12,
+        Self::Spark12Contributor,
+        Self::Spark11,
+        Self::Wonder10,
+        Self::WonderFull10,
     ];
     /// Native Responses selector for this Muse model.
     #[must_use]
     pub const fn model(self) -> Model {
         match self {
-            Self::Spark => Model::MuseSpark13,
-            Self::Contributor => Model::MuseSpark13Contributor,
-            Self::Wonder => Model::MuseWonder10,
-            Self::WonderFull => Model::MuseWonderFull10,
+            Self::Spark13 => Model::MuseSpark13,
+            Self::Spark13Contributor => Model::MuseSpark13Contributor,
+            Self::Spark12 => Model::MuseSpark12,
+            Self::Spark12Contributor => Model::MuseSpark12Contributor,
+            Self::Spark11 => Model::MuseSpark11,
+            Self::Wonder10 => Model::MuseWonder10,
+            Self::WonderFull10 => Model::MuseWonderFull10,
         }
     }
 
     /// Provider-native model ID.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Spark => Model::MuseSpark13.as_str(),
-            Self::Contributor => Model::MuseSpark13Contributor.as_str(),
-            Self::Wonder => Model::MuseWonder10.as_str(),
-            Self::WonderFull => Model::MuseWonderFull10.as_str(),
-        }
+        self.model().as_str()
     }
 }
+
 impl From<MuseModel> for Model {
     fn from(model: MuseModel) -> Self {
         model.model()
@@ -198,10 +206,13 @@ impl TryFrom<Model> for MuseModel {
     type Error = String;
     fn try_from(model: Model) -> Result<Self, Self::Error> {
         match model {
-            Model::MuseSpark13 => Ok(Self::Spark),
-            Model::MuseSpark13Contributor => Ok(Self::Contributor),
-            Model::MuseWonder10 => Ok(Self::Wonder),
-            Model::MuseWonderFull10 => Ok(Self::WonderFull),
+            Model::MuseSpark13 => Ok(Self::Spark13),
+            Model::MuseSpark13Contributor => Ok(Self::Spark13Contributor),
+            Model::MuseSpark12 => Ok(Self::Spark12),
+            Model::MuseSpark12Contributor => Ok(Self::Spark12Contributor),
+            Model::MuseSpark11 => Ok(Self::Spark11),
+            Model::MuseWonder10 => Ok(Self::Wonder10),
+            Model::MuseWonderFull10 => Ok(Self::WonderFull10),
             other => Err(invalid_muse_model(other.as_str())),
         }
     }
@@ -209,7 +220,7 @@ impl TryFrom<Model> for MuseModel {
 
 fn invalid_muse_model(value: &str) -> String {
     format!(
-        "invalid Muse model {value:?}; expected muse-spark-1.3, muse-spark-1.3-contributor, muse-wonder-1.0, or muse-wonder-full-1.0"
+        "invalid Muse model {value:?}; expected muse-spark-1.1, muse-spark-1.2, muse-spark-1.2-contributor, muse-spark-1.3, muse-spark-1.3-contributor, muse-wonder-1.0, or muse-wonder-full-1.0"
     )
 }
 
@@ -244,10 +255,13 @@ impl HarnessModel {
     #[doc(hidden)]
     pub const fn from_responses(model: Model) -> Self {
         match model {
-            Model::MuseSpark13 => Self::Muse(MuseModel::Spark),
-            Model::MuseSpark13Contributor => Self::Muse(MuseModel::Contributor),
-            Model::MuseWonder10 => Self::Muse(MuseModel::Wonder),
-            Model::MuseWonderFull10 => Self::Muse(MuseModel::WonderFull),
+            Model::MuseSpark13 => Self::Muse(MuseModel::Spark13),
+            Model::MuseSpark13Contributor => Self::Muse(MuseModel::Spark13Contributor),
+            Model::MuseSpark12 => Self::Muse(MuseModel::Spark12),
+            Model::MuseSpark12Contributor => Self::Muse(MuseModel::Spark12Contributor),
+            Model::MuseSpark11 => Self::Muse(MuseModel::Spark11),
+            Model::MuseWonder10 => Self::Muse(MuseModel::Wonder10),
+            Model::MuseWonderFull10 => Self::Muse(MuseModel::WonderFull10),
             _ => Self::Codex(model),
         }
     }

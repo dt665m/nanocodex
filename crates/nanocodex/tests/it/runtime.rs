@@ -575,7 +575,7 @@ async fn muse_runtime_uses_common_agents_with_optional_image_generation() {
         .muse(MuseHarness::new(provider.clone()).tools(echo_tools()))
         .build()
         .unwrap();
-    for model in [MuseModel::Wonder, MuseModel::WonderFull] {
+    for model in MuseModel::ALL {
         let (agent, _) = runtime.spawn().model(model).build().await.unwrap();
         let agent: Agent = agent;
         assert_eq!(agent.harness_family(), HarnessFamily::Muse);
@@ -685,7 +685,7 @@ async fn muse_runtime_uses_common_agents_with_optional_image_generation() {
     }
     let (codex, _) = mixed.spawn().build().await.unwrap();
     let (muse_child, _) = codex
-        .spawn_with(SpawnOptions::new().harness_model(MuseModel::Wonder.into()))
+        .spawn_with(SpawnOptions::new().harness_model(MuseModel::Wonder10.into()))
         .await
         .unwrap();
     assert_eq!(muse_child.harness_family(), HarnessFamily::Muse);
@@ -714,7 +714,7 @@ async fn muse_runtime_uses_common_agents_with_optional_image_generation() {
     );
     assert_eq!(
         last(&transcript, "responses")["model"],
-        MuseModel::Wonder.as_str()
+        MuseModel::Wonder10.as_str()
     );
     let (codex_child, _) = restored
         .spawn_with(SpawnOptions::new().model(Model::Sol))

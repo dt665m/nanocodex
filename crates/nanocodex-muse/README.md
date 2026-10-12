@@ -1,6 +1,6 @@
 # Nanocodex Muse
 
-Muse Spark 1.3 and Wonder 1.0 over HTTP/SSE Responses, using the `nanocodex-agent` reference
+Muse Spark 1.1–1.3 and Wonder 1.0 over HTTP/SSE Responses, using the `nanocodex-agent` reference
 loop with the shared `Agent` lifecycle, tool, transport, event and usage types. Muse owns its protocol
 adapter, authentication, images and Claude-style summary compaction.
 
@@ -21,11 +21,11 @@ agent.shutdown().await?;
 ```
 
 Defaults: `muse-spark-1.3`, low reasoning, `https://api.meta.ai/v1`, and
-client-owned history (`store: false`). `.model(MuseModel::Contributor)` selects
-`muse-spark-1.3-contributor`, which permits Meta training. Neither model supports
-`Thinking::None`; Contributor also excludes `Thinking::Max`.
-`.model(MuseModel::Wonder)` and `.model(MuseModel::WonderFull)` select
-`muse-wonder-1.0` and `muse-wonder-full-1.0`, with reasoning through `Thinking::Max`.
+client-owned history (`store: false`). Versioned selectors are `Spark11`,
+`Spark12`, `Spark12Contributor`, `Spark13`, `Spark13Contributor`, `Wonder10`
+and `WonderFull10`. Contributor variants permit Meta training.
+All models reject `Thinking::None`; Spark 1.1, 1.2 and Contributor variants
+also reject `Thinking::Max`.
 Tools use mandatory
 Code Mode.
 
@@ -71,9 +71,9 @@ The optional `nanocodex` facade's `muse` feature exports the provider and
 [OpenCode's Meta prompt](https://github.com/anomalyco/opencode/blob/b9f3b382fcfd82b57103b29b77572f112ce9e1e5/packages/opencode/src/session/prompt/meta.txt);
 attribution is in `THIRD-PARTY-LICENSES`. Override it with `.instructions(...)`.
 
-Token usage and Spark cost estimates use Responses usage; context estimates
-before a response are approximate. Wonder reports tokens with `PricingUnavailable`
-until Meta publishes rates. Muse Image's per-image fee is separate.
+Token usage and Spark/Wonder cost estimates use Responses usage; context estimates
+before a response are approximate. Wonder Full reports tokens with `PricingUnavailable`
+because it has no published token rates. Muse Image's per-image fee is separate.
 
 WASM callers provide `MuseBuilder::host_transport(...)`; the host must honor
 `HostConnectRequest::responses_lite_headers()` and `additional_headers()`.

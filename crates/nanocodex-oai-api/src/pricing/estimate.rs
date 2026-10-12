@@ -128,13 +128,19 @@ const MIMO_STANDARD: TokenRates = TokenRates {
 };
 // https://dev.meta.ai/docs/pricing-rate-limits
 // Meta publishes no separate cache-write fee or long-context premium.
-const MUSE_SPARK13_STANDARD: TokenRates = TokenRates {
+const MUSE_WONDER10_STANDARD: TokenRates = TokenRates {
+    input: 4_000,
+    cached_input: 200,
+    cache_write_input: 4_000,
+    output: 20_000,
+};
+const MUSE_SPARK_STANDARD: TokenRates = TokenRates {
     input: 1_250,
     cached_input: 150,
     cache_write_input: 1_250,
     output: 4_250,
 };
-const MUSE_SPARK13_CONTRIBUTOR: TokenRates = TokenRates {
+const MUSE_SPARK_CONTRIBUTOR: TokenRates = TokenRates {
     input: 100,
     cached_input: 2,
     cache_write_input: 100,
@@ -166,9 +172,14 @@ impl TokenRates {
 
         let long = input_tokens > LONG_CONTEXT_THRESHOLD;
         match (model, service_tier, long) {
-            (Model::MuseSpark13, _, _) => MUSE_SPARK13_STANDARD,
-            (Model::MuseSpark13Contributor, _, _) => MUSE_SPARK13_CONTRIBUTOR,
-            (Model::MuseWonder10 | Model::MuseWonderFull10, _, _) => UNAVAILABLE_RATES,
+            (Model::MuseSpark11 | Model::MuseSpark12 | Model::MuseSpark13, _, _) => {
+                MUSE_SPARK_STANDARD
+            }
+            (Model::MuseSpark12Contributor | Model::MuseSpark13Contributor, _, _) => {
+                MUSE_SPARK_CONTRIBUTOR
+            }
+            (Model::MuseWonder10, _, _) => MUSE_WONDER10_STANDARD,
+            (Model::MuseWonderFull10, _, _) => UNAVAILABLE_RATES,
             (Model::Glm53, _, _) => GLM53_STANDARD,
             (Model::Kimi, _, _) => KIMI_STANDARD,
             (Model::Mimo, _, _) => MIMO_STANDARD,
@@ -231,7 +242,10 @@ impl ServiceTier {
         match (model, self) {
             (Model::Glm53 | Model::Kimi | Model::Mimo, _) => Self::Standard,
             (
-                Model::MuseSpark13
+                Model::MuseSpark11
+                | Model::MuseSpark12
+                | Model::MuseSpark12Contributor
+                | Model::MuseSpark13
                 | Model::MuseSpark13Contributor
                 | Model::MuseWonder10
                 | Model::MuseWonderFull10,
@@ -447,7 +461,7 @@ pub(crate) fn estimate_tokens(
         cache_write_input,
         output,
         service_tier,
-        pricing_unavailable: matches!(model, Model::MuseWonder10 | Model::MuseWonderFull10),
+        pricing_unavailable: matches!(model, Model::MuseWonderFull10),
     }
 }
 
