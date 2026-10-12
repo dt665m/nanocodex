@@ -180,3 +180,6 @@ use handle::request_command;
 use spawn::{build_agent, spawn_agent_driver, validate};
 #[cfg(feature = "openai")]
 use turn::{Command, ExecutionOperation, ForkFrom, PromptRouteKind, QueuedTurn, TurnKey};
+
+#[cfg(feature = "openai")]
+pub use checkpoint::session_checkpoint;

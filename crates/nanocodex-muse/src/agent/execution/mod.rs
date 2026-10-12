@@ -11,9 +11,9 @@ mod platform;
 #[path = "disabled.rs"]
 mod platform;
 
-use std::{collections::VecDeque, future::Future, pin::Pin, sync::Arc};
+use std::{collections::VecDeque, sync::Arc};
 
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Serialize, de::DeserializeOwned};
 
 use crate::{
     NanocodexError, Result, ServiceTier,
@@ -24,595 +24,10 @@ use crate::{
 #[cfg(not(target_family = "wasm"))]
 use crate::rollout::{RolloutConfig, RolloutInfo};
 
-/// Boxed operation returned by an [`ExecutionPolicy`].
-#[cfg(not(target_family = "wasm"))]
-pub type ExecutionFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
-
-/// Boxed operation returned by an [`ExecutionPolicy`].
-#[cfg(target_family = "wasm")]
-pub type ExecutionFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
-
-/// Result of admitting one identified execution into an attached policy.
-pub enum ExecutionAdmission {
-    /// Execute a newly accepted operation.
-    Execute,
-    /// Resume an unfinished operation admitted by an earlier host instance.
-    Resume,
-    /// Return an already completed operation without executing it again.
-    Completed {
-        /// Session boundary committed with the output.
-        snapshot: SessionSnapshot,
-        /// Previously completed turn output.
-        output: ExecutionOutput,
-    },
-    /// Return an already failed operation without executing it again.
-    Failed {
-        /// Session boundary committed with the failure.
-        snapshot: SessionSnapshot,
-        /// Previously retained failure detail.
-        error: String,
-    },
-    /// The operation was explicitly cancelled.
-    Cancelled,
-}
-
-/// Result of beginning one externally observable execution step.
-pub enum ExecutionStepAdmission {
-    /// Perform the effect.
-    Execute,
-    /// Reuse the exact JSON output retained by a prior attempt.
-    Replay(String),
-}
-
-/// Current execution metadata and the active model context.
-/// Hosts persist context records independently from the small execution position.
-pub struct ExecutionContinuation {
-    /// Serialized execution position and settings, excluding conversation bodies.
-    pub state_json: String,
-    /// Active conversation items in model order.
-    pub history: Vec<nanocodex_oai_api::responses::ResponseItem>,
-    /// Frozen request prefix for the current execution.
-    pub prefix: Vec<nanocodex_oai_api::responses::ResponseItem>,
-}
-
-/// One live steering input retained for deterministic operation recovery.
-#[derive(Clone, Debug)]
-pub struct ExecutionSteer {
-    /// Stable one-based FIFO position within the operation.
-    pub index: u32,
-    /// Model call that was current when the steering input was accepted.
-    pub accepted_after_model_call_index: u32,
-    /// Model-call ordinal before which this input was applied, when known.
-    pub model_call_index: Option<u32>,
-    /// Exact serialized [`nanocodex_oai_api::Prompt`] accepted by the turn.
-    pub input_json: String,
-}
-
-/// Optional caller identity paired with a retained steering input.
-pub type IdentifiedExecutionSteer = (Option<String>, ExecutionSteer);
-
-/// Serializable result retained at a completed agent boundary.
-#[derive(Clone, Deserialize, Serialize)]
-pub struct ExecutionOutput {
-    /// Final assistant message.
-    pub final_message: String,
-    /// Exact token and cost accounting for the turn.
-    pub usage: TurnUsage,
-}
-
-/// Model, reasoning effort and processing tier a just-created child starts with.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct InitialSettings {
-    /// Model the child runs.
-    pub model: crate::Model,
-    /// Reasoning effort of the child's turns.
-    pub thinking: crate::Thinking,
-    /// Processing tier of the child's turns.
-    pub service_tier: ServiceTier,
-}
-
-/// Optional higher-layer policy for admitting executions and intercepting effects.
-///
-/// The core agent invokes this interface at its existing transactional
-/// boundaries but does not choose a persistence format, retry policy, storage
-/// backend, or recovery algorithm. Higher crates may implement those choices
-/// without becoming a dependency of `nanocodex-agent`.
-#[cfg(not(target_family = "wasm"))]
-pub trait ExecutionPolicy: Send + Sync {
-    /// Identity of the durable state this policy persists the session to,
-    /// reported by [`crate::Nanocodex::persistence`]. Defaults to none.
-    fn durable_state_id(&self) -> Option<String> {
-        None
-    }
-
-    /// Supplies the policy that persists a fork, side conversation, subagent
-    /// or restored subagent of this session as its own resumable state. The
-    /// default `None` rejects every child of a policy-owned session with
-    /// [`NanocodexError::ExecutionPolicyBranchUnsupported`] instead of
-    /// starting an unsaved one. Called before the child starts; the child
-    /// policy is owned by that child alone, and a restored subagent receives
-    /// the policy for its existing session ID.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error to reject the child.
-    fn branch(&self, _child: &crate::SessionInfo) -> Result<Option<Arc<dyn ExecutionPolicy>>> {
-        Ok(None)
-    }
-
-    /// Resolves a failed attempt against the authoritative operation state.
-    /// A pending operation must return a retry/reopen disposition, even when
-    /// its original failure was not a transport or storage error.
-    fn recover_failure<'a>(
-        &'a self,
-        _operation_id: String,
-        error: NanocodexError,
-    ) -> ExecutionFuture<'a, NanocodexError> {
-        Box::pin(async move { error })
-    }
-
-    /// Releases policy-owned lifecycle state after all Agent work has stopped.
-    ///
-    /// The default is a no-op so existing stateless policies remain source
-    /// compatible. Stateful policies should make this operation idempotent.
-    fn shutdown<'a>(&'a self) -> ExecutionFuture<'a, Result<()>> {
-        Box::pin(async { Ok(()) })
-    }
-
-    /// Commits a model-only resumable boundary such as standalone compaction.
-    /// The default fails closed so omission cannot acknowledge an uncommitted
-    /// boundary.
-    fn commit_checkpoint<'a>(
-        &'a self,
-        _snapshot: SessionSnapshot,
-    ) -> ExecutionFuture<'a, Result<()>> {
-        Box::pin(async {
-            Err(NanocodexError::ExecutionPolicyCapabilityUnsupported {
-                capability: "commit_checkpoint",
-            })
-        })
-    }
-
-    /// Persists the first checkpoint of a just-created fork, side
-    /// conversation, subagent or restored subagent, so the child is listed
-    /// and resumable before its first turn. A state that already holds a
-    /// checkpoint keeps it: restoring a child never replaces its history.
-    /// A fresh subagent has no conversation yet (`None`): its state records
-    /// only its catalog identity and the settings it was created with. The
-    /// default persists nothing.
-    fn commit_initial_checkpoint<'a>(
-        &'a self,
-        _snapshot: Option<SessionSnapshot>,
-        _settings: InitialSettings,
-    ) -> ExecutionFuture<'a, Result<()>> {
-        Box::pin(async { Ok(()) })
-    }
-
-    /// Retracts state written only by [`Self::commit_initial_checkpoint`]
-    /// when the child's creation is abandoned, such as a failed atomic batch.
-    /// Never removes history the state held before. The default does nothing.
-    fn discard_initial_checkpoint<'a>(&'a self) -> ExecutionFuture<'a, Result<()>> {
-        Box::pin(async { Ok(()) })
-    }
-
-    /// Admits a caller-identified operation.
-    fn admit<'a>(
-        &'a self,
-        operation_id: String,
-        input_json: String,
-    ) -> ExecutionFuture<'a, Result<ExecutionAdmission>>;
-
-    /// Admits an automatically identified operation, recovering an unfinished
-    /// compatible operation when the policy selects one.
-    fn admit_automatic<'a>(
-        &'a self,
-        candidate_operation_id: String,
-        input_json: String,
-    ) -> ExecutionFuture<'a, Result<(String, ExecutionAdmission)>>;
-
-    /// Releases a live claim when command acceptance is abandoned.
-    fn release<'a>(&'a self, operation_id: String) -> ExecutionFuture<'a, ()>;
-
-    /// Marks an admitted operation as cancelled. The default fails closed so
-    /// omission cannot terminalize an operation by merely returning success.
-    fn cancel<'a>(
-        &'a self,
-        _operation_id: String,
-        _snapshot: Option<SessionSnapshot>,
-    ) -> ExecutionFuture<'a, Result<()>> {
-        Box::pin(async {
-            Err(NanocodexError::ExecutionPolicyCapabilityUnsupported {
-                capability: "cancel",
-            })
-        })
-    }
-
-    /// Starts another attempt for an admitted operation.
-    fn begin_attempt<'a>(&'a self, operation_id: String) -> ExecutionFuture<'a, Result<()>>;
-
-    /// Retains steering input before acknowledging it to the caller.
-    fn accept_steer<'a>(
-        &'a self,
-        _operation_id: String,
-        _accepted_after_model_call_index: u32,
-        _input_json: String,
-    ) -> ExecutionFuture<'a, Result<u32>> {
-        Box::pin(async {
-            Err(NanocodexError::ExecutionPolicyCapabilityUnsupported {
-                capability: "accept_steer",
-            })
-        })
-    }
-
-    /// Whether identified steering acceptance atomically retains replay receipts.
-    fn supports_steer_receipts(&self) -> bool {
-        false
-    }
-
-    /// Atomically retains caller identity with input. `None` replays a prior acceptance.
-    /// Policies without receipt support retain their existing acceptance behavior.
-    fn accept_identified_steer<'a>(
-        &'a self,
-        operation_id: String,
-        _message_id: String,
-        accepted_after_model_call_index: u32,
-        input_json: String,
-        capacity_available: bool,
-    ) -> ExecutionFuture<'a, Result<Option<u32>>> {
-        Box::pin(async move {
-            if !capacity_available {
-                return Err(NanocodexError::SteerQueueFull);
-            }
-            self.accept_steer(operation_id, accepted_after_model_call_index, input_json)
-                .await
-                .map(Some)
-        })
-    }
-
-    /// Returns steering inputs retained for the current operation attempt.
-    fn retained_steers<'a>(
-        &'a self,
-        _operation_id: String,
-    ) -> ExecutionFuture<'a, Result<Vec<ExecutionSteer>>> {
-        Box::pin(async { Ok(Vec::new()) })
-    }
-
-    /// Returns optional caller identities alongside retained steering inputs.
-    /// Existing policies keep their original uncorrelated return type.
-    fn retained_identified_steers<'a>(
-        &'a self,
-        operation_id: String,
-    ) -> ExecutionFuture<'a, Result<Vec<IdentifiedExecutionSteer>>> {
-        Box::pin(async move {
-            self.retained_steers(operation_id)
-                .await
-                .map(|steers| steers.into_iter().map(|steer| (None, steer)).collect())
-        })
-    }
-
-    /// Durably removes the latest unbound steering input.
-    fn withdraw_steer<'a>(
-        &'a self,
-        _operation_id: String,
-        _steer_index: u32,
-    ) -> ExecutionFuture<'a, Result<()>> {
-        Box::pin(async {
-            Err(NanocodexError::ExecutionPolicyCapabilityUnsupported {
-                capability: "withdraw_steer",
-            })
-        })
-    }
-
-    /// Binds retained steering input to the model boundary that consumes it.
-    fn bind_steer<'a>(
-        &'a self,
-        _operation_id: String,
-        _steer_index: u32,
-        _model_call_index: u32,
-    ) -> ExecutionFuture<'a, Result<()>> {
-        Box::pin(async {
-            Err(NanocodexError::ExecutionPolicyCapabilityUnsupported {
-                capability: "bind_steer",
-            })
-        })
-    }
-
-    /// Reads the current conversation and execution position of an interrupted turn.
-    fn continuation<'a>(
-        &'a self,
-        operation_id: String,
-    ) -> ExecutionFuture<'a, Result<Option<ExecutionContinuation>>>;
-
-    /// Atomically replaces the current execution state and retires its settled effects.
-    fn advance<'a>(
-        &'a self,
-        operation_id: String,
-        continuation: ExecutionContinuation,
-    ) -> ExecutionFuture<'a, Result<()>>;
-
-    /// Begins or replays one typed external effect.
-    fn begin_step<'a>(
-        &'a self,
-        operation_id: String,
-        step_id: String,
-        kind: String,
-        input_json: String,
-    ) -> ExecutionFuture<'a, Result<ExecutionStepAdmission>>;
-
-    /// Commits the output of one executed effect.
-    fn complete_step<'a>(
-        &'a self,
-        operation_id: String,
-        step_id: String,
-        output_json: String,
-    ) -> ExecutionFuture<'a, Result<()>>;
-
-    /// Atomically commits a terminal turn output and its resumable boundary.
-    fn complete<'a>(
-        &'a self,
-        operation_id: String,
-        snapshot: SessionSnapshot,
-        output: ExecutionOutput,
-    ) -> ExecutionFuture<'a, Result<()>>;
-
-    /// Records a failed attempt that may be resumed later.
-    fn fail_attempt<'a>(
-        &'a self,
-        operation_id: String,
-        error: String,
-    ) -> ExecutionFuture<'a, Result<()>>;
-
-    /// Atomically commits a failed turn and its resumable boundary.
-    fn fail<'a>(
-        &'a self,
-        operation_id: String,
-        snapshot: SessionSnapshot,
-        error: String,
-    ) -> ExecutionFuture<'a, Result<()>>;
-}
-
-/// Optional higher-layer policy for admitting executions and intercepting effects.
-///
-/// JavaScript host futures remain isolate-local, while the policy handle stays
-/// thread-safe so cheap agent capabilities retain their public `Send + Sync`
-/// guarantees on every target.
-#[cfg(target_family = "wasm")]
-pub trait ExecutionPolicy: Send + Sync {
-    /// Identity of the durable state this policy persists the session to,
-    /// reported by [`crate::Nanocodex::persistence`]. Defaults to none.
-    fn durable_state_id(&self) -> Option<String> {
-        None
-    }
-
-    /// Supplies the policy that persists a fork, side conversation, subagent
-    /// or restored subagent of this session as its own resumable state. The
-    /// default `None` rejects every child of a policy-owned session with
-    /// [`NanocodexError::ExecutionPolicyBranchUnsupported`] instead of
-    /// starting an unsaved one. Called before the child starts; the child
-    /// policy is owned by that child alone, and a restored subagent receives
-    /// the policy for its existing session ID.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error to reject the child.
-    fn branch(&self, _child: &crate::SessionInfo) -> Result<Option<Arc<dyn ExecutionPolicy>>> {
-        Ok(None)
-    }
-
-    /// Resolves a failed attempt against the authoritative operation state.
-    /// Pending work must remain recoverable regardless of the original error.
-    fn recover_failure<'a>(
-        &'a self,
-        _operation_id: String,
-        error: NanocodexError,
-    ) -> ExecutionFuture<'a, NanocodexError> {
-        Box::pin(async move { error })
-    }
-
-    /// Releases policy-owned lifecycle state after all Agent work has stopped.
-    ///
-    /// The default is a no-op so existing stateless policies remain source
-    /// compatible. Stateful policies should make this operation idempotent.
-    fn shutdown<'a>(&'a self) -> ExecutionFuture<'a, Result<()>> {
-        Box::pin(async { Ok(()) })
-    }
-
-    /// Commits a model-only resumable boundary such as standalone compaction.
-    /// The default fails closed.
-    fn commit_checkpoint<'a>(
-        &'a self,
-        _snapshot: SessionSnapshot,
-    ) -> ExecutionFuture<'a, Result<()>> {
-        Box::pin(async {
-            Err(NanocodexError::ExecutionPolicyCapabilityUnsupported {
-                capability: "commit_checkpoint",
-            })
-        })
-    }
-
-    /// Persists the first checkpoint of a just-created fork, side
-    /// conversation, subagent or restored subagent, so the child is listed
-    /// and resumable before its first turn. A state that already holds a
-    /// checkpoint keeps it: restoring a child never replaces its history.
-    /// A fresh subagent has no conversation yet (`None`): its state records
-    /// only its catalog identity and the settings it was created with. The
-    /// default persists nothing.
-    fn commit_initial_checkpoint<'a>(
-        &'a self,
-        _snapshot: Option<SessionSnapshot>,
-        _settings: InitialSettings,
-    ) -> ExecutionFuture<'a, Result<()>> {
-        Box::pin(async { Ok(()) })
-    }
-
-    /// Retracts state written only by [`Self::commit_initial_checkpoint`]
-    /// when the child's creation is abandoned, such as a failed atomic batch.
-    /// Never removes history the state held before. The default does nothing.
-    fn discard_initial_checkpoint<'a>(&'a self) -> ExecutionFuture<'a, Result<()>> {
-        Box::pin(async { Ok(()) })
-    }
-
-    /// Admits a caller-identified operation.
-    fn admit<'a>(
-        &'a self,
-        operation_id: String,
-        input_json: String,
-    ) -> ExecutionFuture<'a, Result<ExecutionAdmission>>;
-    /// Admits or recovers an automatically identified operation.
-    fn admit_automatic<'a>(
-        &'a self,
-        candidate_operation_id: String,
-        input_json: String,
-    ) -> ExecutionFuture<'a, Result<(String, ExecutionAdmission)>>;
-    /// Releases an abandoned live claim.
-    fn release<'a>(&'a self, operation_id: String) -> ExecutionFuture<'a, ()>;
-    /// Marks an operation as cancelled. The default fails closed.
-    fn cancel<'a>(
-        &'a self,
-        _operation_id: String,
-        _snapshot: Option<SessionSnapshot>,
-    ) -> ExecutionFuture<'a, Result<()>> {
-        Box::pin(async {
-            Err(NanocodexError::ExecutionPolicyCapabilityUnsupported {
-                capability: "cancel",
-            })
-        })
-    }
-    /// Starts another operation attempt.
-    fn begin_attempt<'a>(&'a self, operation_id: String) -> ExecutionFuture<'a, Result<()>>;
-    /// Retains steering input before acknowledging it to the caller.
-    fn accept_steer<'a>(
-        &'a self,
-        _operation_id: String,
-        _accepted_after_model_call_index: u32,
-        _input_json: String,
-    ) -> ExecutionFuture<'a, Result<u32>> {
-        Box::pin(async {
-            Err(NanocodexError::ExecutionPolicyCapabilityUnsupported {
-                capability: "accept_steer",
-            })
-        })
-    }
-    /// Whether identified steering acceptance atomically retains replay receipts.
-    fn supports_steer_receipts(&self) -> bool {
-        false
-    }
-
-    /// Atomically retains caller identity with input. `None` replays a prior acceptance.
-    /// Policies without receipt support retain their existing acceptance behavior.
-    fn accept_identified_steer<'a>(
-        &'a self,
-        operation_id: String,
-        _message_id: String,
-        accepted_after_model_call_index: u32,
-        input_json: String,
-        capacity_available: bool,
-    ) -> ExecutionFuture<'a, Result<Option<u32>>> {
-        Box::pin(async move {
-            if !capacity_available {
-                return Err(NanocodexError::SteerQueueFull);
-            }
-            self.accept_steer(operation_id, accepted_after_model_call_index, input_json)
-                .await
-                .map(Some)
-        })
-    }
-
-    /// Returns steering inputs retained for the current operation attempt.
-    fn retained_steers<'a>(
-        &'a self,
-        _operation_id: String,
-    ) -> ExecutionFuture<'a, Result<Vec<ExecutionSteer>>> {
-        Box::pin(async { Ok(Vec::new()) })
-    }
-    /// Returns optional caller identities alongside retained steering inputs.
-    /// Existing policies keep their original uncorrelated return type.
-    fn retained_identified_steers<'a>(
-        &'a self,
-        operation_id: String,
-    ) -> ExecutionFuture<'a, Result<Vec<IdentifiedExecutionSteer>>> {
-        Box::pin(async move {
-            self.retained_steers(operation_id)
-                .await
-                .map(|steers| steers.into_iter().map(|steer| (None, steer)).collect())
-        })
-    }
-
-    /// Durably removes the latest unbound steering input.
-    fn withdraw_steer<'a>(
-        &'a self,
-        _operation_id: String,
-        _steer_index: u32,
-    ) -> ExecutionFuture<'a, Result<()>> {
-        Box::pin(async {
-            Err(NanocodexError::ExecutionPolicyCapabilityUnsupported {
-                capability: "withdraw_steer",
-            })
-        })
-    }
-
-    /// Binds retained steering input to the model boundary that consumes it.
-    fn bind_steer<'a>(
-        &'a self,
-        _operation_id: String,
-        _steer_index: u32,
-        _model_call_index: u32,
-    ) -> ExecutionFuture<'a, Result<()>> {
-        Box::pin(async {
-            Err(NanocodexError::ExecutionPolicyCapabilityUnsupported {
-                capability: "bind_steer",
-            })
-        })
-    }
-    /// Reads the current conversation and execution position of an interrupted turn.
-    fn continuation<'a>(
-        &'a self,
-        operation_id: String,
-    ) -> ExecutionFuture<'a, Result<Option<ExecutionContinuation>>>;
-
-    /// Atomically replaces the current execution state and retires its settled effects.
-    fn advance<'a>(
-        &'a self,
-        operation_id: String,
-        continuation: ExecutionContinuation,
-    ) -> ExecutionFuture<'a, Result<()>>;
-
-    /// Begins or replays one external effect.
-    fn begin_step<'a>(
-        &'a self,
-        operation_id: String,
-        step_id: String,
-        kind: String,
-        input_json: String,
-    ) -> ExecutionFuture<'a, Result<ExecutionStepAdmission>>;
-    /// Commits one effect output.
-    fn complete_step<'a>(
-        &'a self,
-        operation_id: String,
-        step_id: String,
-        output_json: String,
-    ) -> ExecutionFuture<'a, Result<()>>;
-    /// Commits a terminal turn and resumable boundary.
-    fn complete<'a>(
-        &'a self,
-        operation_id: String,
-        snapshot: SessionSnapshot,
-        output: ExecutionOutput,
-    ) -> ExecutionFuture<'a, Result<()>>;
-    /// Records a failed attempt.
-    fn fail_attempt<'a>(
-        &'a self,
-        operation_id: String,
-        error: String,
-    ) -> ExecutionFuture<'a, Result<()>>;
-    /// Commits a failed turn and resumable boundary.
-    fn fail<'a>(
-        &'a self,
-        operation_id: String,
-        snapshot: SessionSnapshot,
-        error: String,
-    ) -> ExecutionFuture<'a, Result<()>>;
-}
+pub use nanocodex_agent_reference::execution::{
+    ExecutionAdmission, ExecutionContinuation, ExecutionFuture, ExecutionOutput, ExecutionPolicy,
+    ExecutionSteer, ExecutionStepAdmission, IdentifiedExecutionSteer, InitialSettings,
+};
 
 #[derive(Clone, Default)]
 pub(crate) struct ExecutionConfig {
@@ -832,9 +247,7 @@ impl Execution {
             .as_ref()
             .ok_or(NanocodexError::ExecutionPolicyNotConfigured)?;
         let input = encode(input)?;
-        Ok(map_admission(
-            policy.admit(operation_id.to_owned(), input).await?,
-        ))
+        map_admission(policy.admit(operation_id.to_owned(), input).await?)
     }
 
     pub(crate) async fn admit_automatic<T: Serialize + ?Sized>(
@@ -849,7 +262,7 @@ impl Execution {
         let (operation_id, admission) = policy
             .admit_automatic(candidate_operation_id, encode(input)?)
             .await?;
-        Ok((operation_id, map_admission(admission)))
+        Ok((operation_id, map_admission(admission)?))
     }
 
     pub(crate) async fn release_claim(&self, operation_id: &str) {
@@ -940,7 +353,7 @@ impl Execution {
         Ok((
             Some(operation_id),
             Some(input_json),
-            map_admission(admission),
+            map_admission(admission)?,
         ))
     }
 
@@ -996,7 +409,9 @@ impl Execution {
 
     pub(crate) async fn commit_checkpoint(&self, checkpoint: &CommittedSession) -> Result<()> {
         if let Some(policy) = &self.policy {
-            policy.commit_checkpoint(checkpoint.snapshot()).await?;
+            policy
+                .commit_checkpoint(checkpoint.snapshot().try_into()?)
+                .await?;
         }
         Ok(())
     }
@@ -1013,7 +428,13 @@ impl Execution {
     ) -> Result<()> {
         if let Some(policy) = &self.policy {
             policy
-                .commit_initial_checkpoint(checkpoint.map(CommittedSession::snapshot), settings)
+                .commit_initial_checkpoint(
+                    checkpoint
+                        .map(CommittedSession::snapshot)
+                        .map(TryInto::try_into)
+                        .transpose()?,
+                    settings,
+                )
                 .await?;
         }
         Ok(())
@@ -1061,16 +482,17 @@ impl Execution {
     }
 }
 
-fn map_admission(admission: ExecutionAdmission) -> AdmittedExecution {
-    match admission {
+fn map_admission(admission: ExecutionAdmission) -> Result<AdmittedExecution> {
+    Ok(match admission {
         ExecutionAdmission::Execute => AdmittedExecution::Execute,
         ExecutionAdmission::Resume => AdmittedExecution::Resume,
-        ExecutionAdmission::Completed { snapshot, output } => {
-            AdmittedExecution::Completed { output, snapshot }
-        }
+        ExecutionAdmission::Completed { snapshot, output } => AdmittedExecution::Completed {
+            output,
+            snapshot: snapshot.try_into()?,
+        },
         ExecutionAdmission::Failed { snapshot: _, error } => AdmittedExecution::Failed { error },
         ExecutionAdmission::Cancelled => AdmittedExecution::Cancelled,
-    }
+    })
 }
 
 #[derive(Clone)]
@@ -1371,12 +793,14 @@ async fn persist_operation(
         return Ok(());
     };
     let Some(operation_id) = operation_id else {
-        return policy.commit_checkpoint(checkpoint.snapshot()).await;
+        return policy
+            .commit_checkpoint(checkpoint.snapshot().try_into()?)
+            .await;
     };
     match outcome {
         ExecutionOutcome::Completed(output) => {
             policy
-                .complete(operation_id, checkpoint.snapshot(), output)
+                .complete(operation_id, checkpoint.snapshot().try_into()?, output)
                 .await
         }
         ExecutionOutcome::Interrupted => {
@@ -1391,7 +815,7 @@ async fn persist_operation(
                 policy.fail_attempt(operation_id, error).await
             } else {
                 policy
-                    .fail(operation_id, checkpoint.snapshot(), error)
+                    .fail(operation_id, checkpoint.snapshot().try_into()?, error)
                     .await
             }
         }
@@ -1407,6 +831,7 @@ async fn cancel_with_reclaim(
     input_json: Option<String>,
     snapshot: Option<SessionSnapshot>,
 ) -> Result<()> {
+    let snapshot = snapshot.map(TryInto::try_into).transpose()?;
     let outcome = policy.cancel(operation_id.clone(), snapshot.clone()).await;
     if !outcome.as_ref().is_err_and(|error| {
         matches!(

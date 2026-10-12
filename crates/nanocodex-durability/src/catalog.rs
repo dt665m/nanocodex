@@ -273,8 +273,8 @@ mod native {
         /// # Errors
         ///
         /// Returns [`Error::InvalidState`] when the checkpoint cannot be
-        /// decoded, or for a Claude session when this crate is built without
-        /// its `claude` feature.
+        /// decoded, or when this crate is built without the owning harness
+        /// feature (`claude` or `muse`).
         pub fn session_checkpoint(&self) -> Result<Option<nanocodex_agent::SessionCheckpoint>> {
             let Some(checkpoint) = &self.checkpoint else {
                 return Ok(None);
@@ -294,8 +294,18 @@ mod native {
                     .map(Some)
                     .map_err(|error| Error::InvalidState(error.to_string()))
                 }
+                #[cfg(feature = "muse")]
+                HarnessFamily::Muse => nanocodex_muse::session_checkpoint(
+                    record.session_id.clone(),
+                    record.lineage.clone(),
+                    record.model.default_thinking(),
+                    serde_json::from_value(checkpoint.clone()).map_err(Error::InvalidPayload)?,
+                )
+                .map(Some)
+                .map_err(|error| Error::InvalidState(error.to_string())),
+                #[cfg(not(feature = "muse"))]
                 HarnessFamily::Muse => Err(Error::InvalidState(
-                    "portable Muse checkpoints require the Muse harness".into(),
+                    "portable Muse checkpoints require the muse feature of nanocodex-durability".into(),
                 )),
                 #[cfg(feature = "claude")]
                 HarnessFamily::Claude => nanocodex_claude::session_checkpoint(
@@ -869,8 +879,8 @@ mod native {
     /// Re-encodes a hydrated native checkpoint for a new state of `family`.
     fn encode_native(family: HarnessFamily, value: Value) -> Result<EncodedPayload> {
         match family {
-            HarnessFamily::Claude | HarnessFamily::Muse => EncodedPayload::encode(&value),
-            HarnessFamily::Codex => {
+            HarnessFamily::Claude => EncodedPayload::encode(&value),
+            HarnessFamily::Codex | HarnessFamily::Muse => {
                 let snapshot: nanocodex_agent::session::SessionSnapshot =
                     serde_json::from_value(value).map_err(Error::InvalidPayload)?;
                 Ok(crate::context::prepare_snapshot(snapshot, &HashSet::new())?.payload)

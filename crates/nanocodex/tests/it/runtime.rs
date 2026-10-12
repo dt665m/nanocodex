@@ -735,3 +735,227 @@ async fn muse_runtime_uses_common_agents_with_optional_image_generation() {
     mixed.shutdown().await.unwrap();
     opted_in.shutdown().await.unwrap();
 }
+
+#[cfg(all(feature = "muse", feature = "durability"))]
+#[tokio::test]
+async fn muse_durable_runtime_replays_restores_and_branches() {
+    use nanocodex::durability::{BranchPoint, MemoryStore, SessionRecord, SessionStore};
+    use nanocodex::{Agent, DurableAgentExt, Muse, MuseHarness, MuseModel, PromptRequest};
+
+    let evidence =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../output/muse-durability");
+    std::fs::create_dir_all(&evidence).unwrap();
+    let transcript: Transcript = Arc::default();
+    let trace = evidence.join(format!("journey-{}.json", std::process::id()));
+    println!("TRANSCRIPT {}", trace.display());
+    let address = serve(Arc::clone(&transcript), trace).await;
+    let provider = Muse::builder("synthetic-key")
+        .api_base_url(format!("http://{address}"))
+        .build()
+        .unwrap();
+    let store = SessionStore::new(MemoryStore::new().unwrap()).unwrap();
+    let identity = nanocodex::agent::session::SessionId::default().to_string();
+    let state = store
+        .session(SessionRecord::root(
+            &identity,
+            MuseModel::Spark13.into(),
+            None,
+        ))
+        .await
+        .unwrap();
+    let builder = Agent::builder(provider.clone())
+        .thinking(Thinking::High)
+        .tools(echo_tools())
+        .durability(state)
+        .await
+        .unwrap();
+    let (agent, _) = builder.clone().build().unwrap();
+    assert!(matches!(
+        builder.build(),
+        Err(NanocodexError::InvalidExecutionPolicy(_))
+    ));
+    assert_eq!(agent.session_id(), identity);
+    let prompt = || PromptRequest::new("[echo]").request_id("first");
+    let result = agent.prompt(prompt()).await.unwrap().await.unwrap();
+    assert_eq!(result.final_message(), "native done");
+    let usage = result.usage().cloned();
+    agent.shutdown().await.unwrap();
+    let calls = transcript.lock().unwrap().len();
+    let stored = store.load(&identity).await.unwrap();
+    assert_eq!(stored.turns.len(), 1);
+    assert!(stored.transcript.iter().any(|item| matches!(
+        item, nanocodex::durability::TranscriptItem::Tool { name, .. } if name == "exec"
+    )));
+    assert!(
+        stored
+            .checkpoint
+            .as_ref()
+            .unwrap()
+            .to_string()
+            .contains("echo:ping")
+    );
+    std::fs::write(
+        evidence.join("stored-session.json"),
+        serde_json::to_string_pretty(&stored.checkpoint).unwrap(),
+    )
+    .unwrap();
+    let checkpoint = stored.session_checkpoint().unwrap().unwrap();
+    assert_eq!(checkpoint.family(), HarnessFamily::Muse);
+    assert_eq!(checkpoint.thinking(), Thinking::High);
+    let recipe = || {
+        Nanocodex::builder()
+            .muse(MuseHarness::new(provider.clone()).tools(echo_tools()))
+            .build()
+            .unwrap()
+    };
+    let runtime = recipe();
+    let (resumed, _) = runtime.open(&store, &identity).await.unwrap();
+    let replay = resumed.prompt(prompt()).await.unwrap().await.unwrap();
+    assert_eq!(replay.final_message(), "native done");
+    assert_eq!(replay.usage(), usage.as_ref());
+    assert_eq!(
+        transcript.lock().unwrap().len(),
+        calls,
+        "receipt replay makes no HTTP call"
+    );
+    assert!(
+        resumed
+            .prompt(PromptRequest::new("different input").request_id("first"))
+            .await
+            .is_err()
+    );
+    assert_eq!(transcript.lock().unwrap().len(), calls);
+    resumed
+        .prompt(PromptRequest::new("Continue durable history.").request_id("second"))
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+    assert!(
+        last(&transcript, "responses")
+            .to_string()
+            .contains("echo:ping")
+    );
+    resumed.compact().await.unwrap();
+    let compacted = store.load(&identity).await.unwrap();
+    assert!(
+        compacted
+            .checkpoint
+            .as_ref()
+            .unwrap()
+            .to_string()
+            .contains("<muse_context_summary>")
+    );
+    std::fs::write(
+        evidence.join("compacted-session.json"),
+        serde_json::to_string_pretty(&compacted.checkpoint).unwrap(),
+    )
+    .unwrap();
+    let (child, _) = resumed
+        .spawn_with(SpawnOptions::new().model(MuseModel::Wonder10.into()))
+        .await
+        .unwrap();
+    let child_id = child.session_id().to_owned();
+    child.prompt("Durable child.").await.unwrap().await.unwrap();
+    assert_eq!(
+        last(&transcript, "responses")["model"],
+        MuseModel::Wonder10.as_str()
+    );
+    runtime.shutdown().await.unwrap();
+
+    let branch = store
+        .branch(&identity, BranchPoint::Through("first".into()), None)
+        .await
+        .unwrap();
+    let branch_id = branch.record.session_id.clone();
+    drop(branch);
+    let reopened = recipe();
+    let (root, _) = reopened.open(&store, &identity).await.unwrap();
+    root.prompt("Continue after durable compaction.")
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+    assert!(
+        last(&transcript, "responses")
+            .to_string()
+            .contains("<muse_context_summary>")
+    );
+    let (child, _) = reopened.open(&store, &child_id).await.unwrap();
+    assert_eq!(child.harness_family(), HarnessFamily::Muse);
+    child
+        .prompt("Reopened child.")
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+    assert_eq!(
+        last(&transcript, "responses")["model"],
+        MuseModel::Wonder10.as_str()
+    );
+    let (branch, _) = reopened.open(&store, &branch_id).await.unwrap();
+    branch
+        .prompt("Branch from first turn.")
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+    let body = last(&transcript, "responses").to_string();
+    assert!(body.contains("echo:ping"));
+    assert!(!body.contains("Continue durable history."));
+    assert_eq!(
+        branch.session().lineage.parent_session_id.as_deref(),
+        Some(identity.as_str())
+    );
+    reopened.shutdown().await.unwrap();
+
+    let native: nanocodex::muse::session::SessionSnapshot =
+        serde_json::from_value(stored.checkpoint.unwrap()).unwrap();
+    assert!(matches!(
+        Agent::builder(provider.clone())
+            .resume(checkpoint)
+            .unwrap()
+            .durability(store.resume(&identity).await.unwrap())
+            .await,
+        Err(NanocodexError::InvalidCheckpoint(_))
+    ));
+    let latest = store
+        .load(&identity)
+        .await
+        .unwrap()
+        .session_checkpoint()
+        .unwrap()
+        .unwrap();
+    let (configured, _) = Agent::builder(provider.clone())
+        .resume(latest)
+        .unwrap()
+        .durability(store.resume(&identity).await.unwrap())
+        .await
+        .unwrap()
+        .build()
+        .unwrap();
+    configured.shutdown().await.unwrap();
+    let fresh = recipe();
+    let (portable, _) = fresh
+        .resume(
+            nanocodex::muse::session_checkpoint(
+                identity.clone(),
+                stored.summary.record.lineage,
+                Thinking::Low,
+                native,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    portable
+        .prompt("Portable restore.")
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+    fresh.shutdown().await.unwrap();
+    println!(
+        "MUSE_DURABILITY receipt replay without HTTP; conflict rejected; native and portable restore; durable summary, child model and historical branch retained"
+    );
+}

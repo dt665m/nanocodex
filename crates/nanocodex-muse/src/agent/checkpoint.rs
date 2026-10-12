@@ -110,6 +110,42 @@ impl ChildState {
     }
 }
 
+/// Wraps a Muse-native durable snapshot as a portable checkpoint, retaining
+/// its recorded thinking, tier, identity and cache lineage.
+///
+/// # Errors
+///
+/// Returns [`NanocodexError::InvalidCheckpoint`] for an invalid session ID,
+/// model or snapshot.
+pub fn session_checkpoint(
+    session_id: impl Into<String>,
+    lineage: Lineage,
+    thinking: Thinking,
+    snapshot: SessionSnapshot,
+) -> Result<SessionCheckpoint> {
+    let model = snapshot.model()?;
+    if !matches!(
+        crate::HarnessModel::from_responses(model),
+        crate::HarnessModel::Muse(_)
+    ) {
+        return Err(NanocodexError::InvalidCheckpoint(
+            "the Muse harness requires a Muse snapshot".into(),
+        ));
+    }
+    let state = ChildState {
+        session_id: session_id.into(),
+        model,
+        thinking: snapshot.thinking().unwrap_or(thinking),
+        service_tier: snapshot.service_tier().unwrap_or(ServiceTier::Standard),
+        stateless_http: true,
+        lineage,
+        conversation_id: Arc::from(snapshot.lineage_id()),
+        conversation: Some(snapshot),
+    };
+    state.validate()?;
+    state.into_checkpoint()
+}
+
 /// Whether a driver uses full-history HTTP without stored responses.
 pub(super) const fn is_stateless_http(config: &ModelConfig) -> bool {
     matches!(config.responses_transport, ResponsesTransport::Https)

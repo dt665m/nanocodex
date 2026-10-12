@@ -6099,6 +6099,7 @@ dependencies = [
  "nanocodex-agent",
  "nanocodex-claude",
  "nanocodex-claude-tools",
+ "nanocodex-muse",
  "nanocodex-oai-api",
  "nanocodex-oai-tools",
  "nanocodex-subagents",

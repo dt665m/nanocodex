@@ -67,7 +67,10 @@ See [Meta's image guide](https://dev.meta.ai/docs/image-generation).
 ## Configuration
 
 The optional `nanocodex` facade's `muse` feature exports the provider and
-`nanocodex::muse` lifecycle types. The crate-local `prompts/muse.md` adapts
+`nanocodex::muse` lifecycle types. With `durability` enabled, Muse supports
+`DurableAgentExt` and runtime `open`, including receipt replay,
+durable children and catalog checkpoints. Enable `muse` directly on
+`nanocodex-durability` when composing without the facade. The crate-local `prompts/muse.md` adapts
 [OpenCode's Meta prompt](https://github.com/anomalyco/opencode/blob/b9f3b382fcfd82b57103b29b77572f112ce9e1e5/packages/opencode/src/session/prompt/meta.txt);
 attribution is in `THIRD-PARTY-LICENSES`. Override it with `.instructions(...)`.
 

@@ -24,7 +24,7 @@ claude = [
     "nanocodex-durability?/claude",
     "nanocodex-oai-tools?/code-mode",
 ]
-muse = ["dep:nanocodex-muse", "openai"]
+muse = ["dep:nanocodex-muse", "nanocodex-durability?/muse", "openai"]
 claude-tools = ["claude", "dep:nanocodex-claude-tools", "nanocodex-claude/tools"]
 durability = ["dep:nanocodex-durability", "openai"]
 managed = ["dep:nanocodex-managed"]

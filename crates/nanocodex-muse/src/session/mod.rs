@@ -290,6 +290,39 @@ pub struct SessionSnapshot {
     service_tier: Option<crate::ServiceTier>,
 }
 
+// The execution seam uses the reference Responses snapshot contract. Muse
+// retains its own resume interpretation; the common snapshot adds only the
+// reference harness's default reasoning state, which Muse does not consume.
+#[cfg(feature = "openai")]
+impl TryFrom<SessionSnapshot> for nanocodex_agent_reference::session::SessionSnapshot {
+    type Error = NanocodexError;
+
+    fn try_from(snapshot: SessionSnapshot) -> Result<Self> {
+        let json = serde_json::to_string(&snapshot).map_err(NanocodexError::ExecutionPayload)?;
+        serde_json::from_str(&json).map_err(NanocodexError::ExecutionPayload)
+    }
+}
+
+#[cfg(feature = "openai")]
+impl TryFrom<nanocodex_agent_reference::session::SessionSnapshot> for SessionSnapshot {
+    type Error = NanocodexError;
+
+    fn try_from(snapshot: nanocodex_agent_reference::session::SessionSnapshot) -> Result<Self> {
+        let json = serde_json::to_string(&snapshot).map_err(NanocodexError::ExecutionPayload)?;
+        let snapshot: Self =
+            serde_json::from_str(&json).map_err(NanocodexError::ExecutionPayload)?;
+        if !matches!(
+            crate::HarnessModel::from_responses(snapshot.model()?),
+            crate::HarnessModel::Muse(_)
+        ) {
+            return Err(NanocodexError::InvalidCheckpoint(
+                "the Muse harness requires a Muse snapshot".into(),
+            ));
+        }
+        Ok(snapshot)
+    }
+}
+
 /// Session metadata separated from independently persisted conversation items.
 #[derive(Clone, serde::Deserialize, serde::Serialize)]
 #[serde(transparent)]
@@ -407,6 +440,13 @@ impl SessionSnapshot {
     #[cfg(feature = "openai")]
     pub(crate) fn lineage_id(&self) -> &str {
         &self.lineage_id
+    }
+
+    #[cfg(feature = "openai")]
+    pub(crate) fn model(&self) -> Result<Model> {
+        self.model.parse::<Model>().map_err(|error| {
+            NanocodexError::InvalidCheckpoint(format!("snapshot model is unsupported: {error}"))
+        })
     }
 
     #[cfg(feature = "openai")]

@@ -87,10 +87,9 @@ pub(super) fn recipe(harness: MuseHarness, runtime: &Settings) -> Recipe {
                 builder = builder.resume(checkpoint)?;
             }
             #[cfg(feature = "durability")]
-            if spec.durable_state.is_some() {
-                return Err(NanocodexError::UnsupportedCapability {
-                    capability: "muse_durability",
-                });
+            if let Some(state) = spec.durable_state {
+                use crate::DurableAgentExt as _;
+                builder = builder.durability(state).await?;
             }
             builder.build()
         })

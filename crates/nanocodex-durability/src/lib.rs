@@ -17,6 +17,8 @@ pub use catalog::{
 mod claude;
 mod context;
 mod memory;
+#[cfg(feature = "muse")]
+mod muse;
 #[cfg(all(feature = "postgres", not(target_family = "wasm")))]
 mod postgres;
 mod session;

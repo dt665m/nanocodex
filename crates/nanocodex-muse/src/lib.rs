@@ -49,7 +49,7 @@ pub mod backend {
 
 #[cfg(feature = "openai")]
 #[cfg_attr(docsrs, doc(cfg(feature = "openai")))]
-pub use agent::{ExecutionEnvironment, NanocodexBuilder};
+pub use agent::{ExecutionEnvironment, NanocodexBuilder, session_checkpoint};
 #[cfg(feature = "openai")]
 pub use nanocodex_agent_reference::CompactionRecovery;
 pub use nanocodex_agent_reference::{
