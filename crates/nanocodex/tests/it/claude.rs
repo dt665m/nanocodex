@@ -2,7 +2,7 @@
 //! extension, and a completed request replays after the host reopens its store.
 use axum::{Json, Router, routing::post};
 use nanocodex::{
-    Claude, DurableAgentExt, Nanocodex, PromptRequest,
+    Agent, Claude, DurableAgentExt, PromptRequest,
     claude::ClaudeClient,
     durability::{DurableSession, MemoryStore},
 };
@@ -47,7 +47,7 @@ async fn claude_durable_receipt_replays_through_facade() {
             .await
             .unwrap();
         // Unknown models need an explicit Messages budget since c7d02b6bb.
-        let (agent, _events) = Nanocodex::builder(Claude::new(client.clone(), "synthetic-claude"))
+        let (agent, _events) = Agent::builder(Claude::new(client.clone(), "synthetic-claude"))
             .max_tokens(4096)
             .durability(state)
             .await

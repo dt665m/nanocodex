@@ -29,7 +29,7 @@ use clap::{Args, builder::NonEmptyStringValueParser};
 use eyre::{Result, WrapErr, eyre};
 use futures_util::StreamExt as _;
 use nanocodex::{
-    DurableAgentExt as _, Nanocodex, NanocodexError, OpenAi, PromptRequest, Turn, TurnControl,
+    Agent, DurableAgentExt as _, NanocodexError, OpenAi, PromptRequest, Turn, TurnControl,
 };
 use nanocodex_durability::{DurableSession, SqliteStore};
 use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
@@ -168,7 +168,7 @@ struct AppState {
 }
 
 struct AgentRuntime {
-    agent: Nanocodex,
+    agent: Agent,
     controls: Mutex<HashMap<String, TurnControl>>,
     submissions: Mutex<()>,
 }
@@ -228,7 +228,7 @@ impl AppState {
             .websocket_warmup(false)
             .build()
             .map_err(ApiError::internal)?;
-        let builder = Nanocodex::builder(openai)
+        let builder = Agent::builder(openai)
             .workspace(self.workspace.as_ref().clone())
             .durability(durable)
             .await

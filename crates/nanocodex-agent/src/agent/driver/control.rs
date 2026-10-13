@@ -289,9 +289,6 @@ pub(super) async fn begin_shutdown(
                 drop(route_result.send(Err(NanocodexError::AgentStopped)));
                 drop(turn_result);
             }
-            Command::Snapshot { result } => {
-                drop(result.send(Err(NanocodexError::AgentStopped)));
-            }
             Command::ChildSnapshot { result } => {
                 drop(result.send(Err(NanocodexError::AgentStopped)));
             }
@@ -342,56 +339,44 @@ pub(super) fn handle_idle_command<S>(
     defaults: TurnDefaults,
     session_id: &str,
     workspace: Option<Arc<str>>,
+    execution: &Execution,
 ) where
     S: Service<ResponsesAttempt, Response = ResponsesServiceResponse> + AgentSend + 'static,
     S::Error: Into<ResponseError> + AgentSend + 'static,
     S::Future: AgentSend,
 {
     match command {
-        Command::Snapshot { result } => {
-            drop(
-                result.send(
-                    latest
-                        .ok_or(NanocodexError::ForkBeforeCompletedTurn)
-                        .map(|checkpoint| checkpoint.snapshot()),
-                ),
-            );
-        }
         Command::ChildSnapshot { result } => {
-            drop(result.send(Ok(ChildRuntimeSnapshot {
+            drop(result.send(Ok(ChildState {
                 session_id: session_id.to_owned(),
                 model: defaults.model,
                 thinking: defaults.thinking,
                 service_tier: defaults.service_tier,
-                stateless_http: matches!(
-                    spawner.config.responses_transport,
-                    ResponsesTransport::Https
-                ) && matches!(
-                    spawner.config.responses_history,
-                    ResponsesHistory::FullReplay
-                ) && !spawner.config.store_responses,
+                stateless_http: is_stateless_http(&spawner.config),
                 conversation: latest.map(|checkpoint| checkpoint.snapshot()),
+                lineage: spawner.lineage.clone(),
+                conversation_id: Arc::clone(&spawner.lineage_id),
             })));
         }
         Command::Fork {
-            checkpoint,
+            origin,
+            point,
+            session_id: child_session_id,
+            policy,
             result,
-            side_conversation,
         } => {
-            let checkpoint = checkpoint.or_else(|| latest.cloned());
-            let outcome = checkpoint
-                .ok_or(NanocodexError::ForkBeforeCompletedTurn)
-                .and_then(|checkpoint| {
-                    spawner.spawn_fork(
-                        &checkpoint,
-                        session_id,
-                        defaults.model,
-                        defaults.thinking,
-                        defaults.service_tier,
-                        spawner.host_context.as_ref().map(Arc::clone),
-                        side_conversation,
-                    )
-                });
+            let outcome = spawner.spawn_fork(
+                point,
+                latest,
+                session_id,
+                defaults.model,
+                defaults.thinking,
+                defaults.service_tier,
+                spawner.host_context.as_ref().map(Arc::clone),
+                origin,
+                child_session_id,
+                policy,
+            );
             drop(result.send(outcome));
         }
         Command::Spawn {
@@ -400,37 +385,41 @@ pub(super) fn handle_idle_command<S>(
             host_context,
             result,
         } => {
-            let model = options.model.unwrap_or(defaults.model);
-            let thinking = options.thinking.unwrap_or_else(|| {
-                if model == defaults.model {
-                    defaults.thinking
-                } else {
-                    model.default_thinking()
-                }
-            });
             let outcome = options
                 .validate_harness()
                 .and_then(|()| {
                     if options
-                        .selected_harness()
+                        .selected_family()
                         .is_some_and(|family| family != crate::HarnessFamily::Codex)
-                        || options
-                            .selected_harness_model()
-                            .is_some_and(|model| model.family() != crate::HarnessFamily::Codex)
                     {
                         return Err(NanocodexError::InvalidRequest(
                             "selected harness requires a configured child factory".into(),
                         ));
                     }
-                    validate_model_thinking(model, thinking)
+                    // Shared selection semantics: omitted settings inherit,
+                    // an explicit model or family takes its own defaults.
+                    let resolved = options.resolve(
+                        crate::HarnessModel::Codex(defaults.model),
+                        defaults.thinking,
+                    )?;
+                    let Some(crate::HarnessModel::Codex(model)) = resolved.selected_harness_model()
+                    else {
+                        return Err(NanocodexError::InvalidRequest(
+                            "selected harness requires a configured child factory".into(),
+                        ));
+                    };
+                    let thinking = resolved.thinking.unwrap_or(defaults.thinking);
+                    validate_model_thinking(model, thinking)?;
+                    Ok((model, thinking))
                 })
-                .and_then(|()| {
+                .and_then(|(model, thinking)| {
                     if let Some(snapshot) = restore {
                         return spawner.restore_child(
                             snapshot,
                             workspace,
                             session_id,
                             host_context,
+                            execution,
                         );
                     }
                     spawner.spawn_clean(
@@ -441,6 +430,7 @@ pub(super) fn handle_idle_command<S>(
                         defaults.service_tier,
                         options.stateless_http,
                         host_context.or_else(|| spawner.host_context.as_ref().map(Arc::clone)),
+                        execution,
                     )
                 });
             drop(result.send(outcome));
@@ -458,6 +448,7 @@ pub(super) fn handle_idle_command<S>(
                 count,
                 observer.as_deref(),
                 host_context,
+                execution,
             );
             drop(result.send(outcome));
         }

@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use eyre::{Result, WrapErr};
 use nanocodex::{
-    AgentEvents, Nanocodex, OpenAi, Thinking, Tools, TurnResult,
+    Agent, AgentEvents, ForkRequest, OpenAi, Thinking, Tools, TurnResult,
     agent::{events::AgentEventKind, session::SessionId},
     oai::{OpenAiBuilder, tower::StandardServiceFactory, transport::ResponsesTransport},
 };
@@ -51,7 +51,7 @@ async fn main() -> Result<()> {
     let tools = Tools::builder().without_defaults().build()?;
     let lineage = SessionId::new();
     let workspace = std::env::current_dir().wrap_err("failed to resolve the current directory")?;
-    let (agent, root_events) = Nanocodex::builder(openai)
+    let (agent, root_events) = Agent::builder(openai)
         .session_id(lineage)
         .instructions(LEDGER_PROMPT)
         .thinking(Thinking::Low)
@@ -78,9 +78,9 @@ async fn main() -> Result<()> {
         checkpoints.push(result);
     }
 
-    // `fork()` samples the latest safe model/tool boundary, which is
+    // `ForkRequest::latest()` samples the latest safe model/tool boundary, which is
     // deterministically completed turn 10 here. The response ID remains private.
-    let (latest, latest_events) = agent.fork().await?;
+    let (latest, latest_events) = agent.fork(ForkRequest::latest()).await?;
     observers.push(observe_events("latest@10", latest_events));
 
     // Prompt acceptance is separate from result waiting. The root driver starts
@@ -95,9 +95,9 @@ async fn main() -> Result<()> {
     println!("\nroot turn 11 accepted; forking turns 3, 6, and 9 while it runs");
 
     let ((branch_3, events_3), (branch_6, events_6), (branch_9, events_9)) = tokio::try_join!(
-        agent.fork_from(checkpoint(&checkpoints, 3)?),
-        agent.fork_from(checkpoint(&checkpoints, 6)?),
-        agent.fork_from(checkpoint(&checkpoints, 9)?),
+        agent.fork(ForkRequest::at_turn(checkpoint(&checkpoints, 3)?)),
+        agent.fork(ForkRequest::at_turn(checkpoint(&checkpoints, 6)?)),
+        agent.fork(ForkRequest::at_turn(checkpoint(&checkpoints, 9)?)),
     )?;
     observers.extend([
         observe_events("branch@3", events_3),

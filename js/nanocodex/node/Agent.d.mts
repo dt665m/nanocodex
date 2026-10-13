@@ -14,13 +14,12 @@ import type { Workspace } from "./workspace.mjs";
 import type { Tools } from "../tools/Tools.mjs";
 
 export type Agent = DefaultAgent;
-type ToolExposureOptions = {
-  mcp?: McpServers | false | undefined;
-  toolMode?: "code-only" | undefined;
-};
+/** Code Mode (exec/wait) by default; `direct` exposes host tools to the provider without code evaluation. Remote MCP requires Code Mode. */
+type ToolExposureOptions =
+  | { mcp?: false | undefined; toolMode?: "code-only" | "direct" | undefined }
+  | { mcp: McpServers; toolMode?: "code-only" | undefined };
 
 /** Creates a Node-hosted Rust/WASM Agent. */
-export function create(options: import('../runtime/claude.mjs').Options & { harness: 'claude' }): Promise<import('../runtime/claude.mjs').Agent>;
 export function create(options: create.ManagedOptions): Promise<AgentLifecycle>;
 export function create(options: create.Options): Promise<create.ReturnType>;
 export declare namespace create {
@@ -28,7 +27,8 @@ export declare namespace create {
     transport: ManagedTransport;
     tools?: Tools | undefined;
   }>;
-  type Options = AgentOptions & ToolExposureOptions & {
+  /** Codex (OpenAI Responses) harness options. */
+  type CodexOptions = AgentOptions & ToolExposureOptions & {
     codeEvaluator?: CodeEvaluator | undefined;
     /** Opt-in durable application-tool and Code Mode receipts for safe cold recovery. */
     codeEffectJournal?: CodeEffectJournal | undefined;
@@ -45,9 +45,13 @@ export declare namespace create {
     | {
       durability: DurabilityStore;
       durabilityId: string;
-      /** The root remains durable; all subagent children are ephemeral. */
+      /** The root remains durable, and so is every fork, side conversation and subagent: each reports its own `session.persistence()`. */
       tools?: ToolConfiguration<SubagentTool> | undefined;
     }
   );
+  /** Claude (Messages) harness options; see docs/CLAUDE_JAVASCRIPT.md. */
+  type ClaudeOptions = import('../runtime/claude.mjs').Options & { harness: 'claude' };
+  /** Options of either harness family, discriminated by `harness`; both return the same Agent. */
+  type Options = CodexOptions | ClaudeOptions;
   type ReturnType = Agent;
 }

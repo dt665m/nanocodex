@@ -8,7 +8,7 @@ use std::{
 
 use eyre::{Result, WrapErr};
 use nanocodex::{
-    AgentEvents, Nanocodex, OpenAi, Thinking, Tool, Tools,
+    Agent, AgentEvents, ForkRequest, OpenAi, Thinking, Tool, Tools,
     agent::{AgentHandle, events::AgentEventKind},
     tools::{
         ToolContext, ToolDefinition, ToolInput, ToolOutput, ToolResult, contract::async_trait,
@@ -75,7 +75,7 @@ and when enough evidence has been gathered.";
 #[derive(Default)]
 struct ChildAgents {
     next_id: AtomicU64,
-    agents: tokio::sync::Mutex<HashMap<u64, Nanocodex>>,
+    agents: tokio::sync::Mutex<HashMap<u64, Agent>>,
 }
 
 impl ChildAgents {
@@ -83,11 +83,11 @@ impl ChildAgents {
         self.next_id.fetch_add(1, Ordering::Relaxed) + 1
     }
 
-    async fn insert(&self, id: u64, agent: Nanocodex) {
+    async fn insert(&self, id: u64, agent: Agent) {
         self.agents.lock().await.insert(id, agent);
     }
 
-    async fn get(&self, id: u64) -> Option<Nanocodex> {
+    async fn get(&self, id: u64) -> Option<Agent> {
         self.agents.lock().await.get(&id).cloned()
     }
 }
@@ -204,7 +204,7 @@ impl Tool for ChildAgent {
             .ok_or_else(|| std::io::Error::other("child-agent registry stopped"))?;
         let (child, events) = match self.kind {
             ChildKind::Spawn => self.agent.spawn().await,
-            ChildKind::Fork => self.agent.fork().await,
+            ChildKind::Fork => self.agent.fork(ForkRequest::latest()).await,
         }?;
         let agent_id = agents.next_id();
 
@@ -280,7 +280,7 @@ async fn main() -> Result<()> {
     let child_agents = Arc::new(ChildAgents::default());
     let tools_agents = Arc::downgrade(&child_agents);
     let openai = OpenAi::new(api_key)?;
-    let (agent, events) = Nanocodex::builder(openai)
+    let (agent, events) = Agent::builder(openai)
         .instructions(
             "You are the lead engineering orchestrator. Code Mode exposes spawn_agent for a reusable clean child, fork_agent for a reusable child with the invoking agent's latest safe context, and prompt_agent for follow-up turns using a returned agent_id. Decide your own decomposition, concurrency, sequencing, follow-ups, and synthesis. Treat worker outputs as attributed evidence rather than fabricating them.",
         )

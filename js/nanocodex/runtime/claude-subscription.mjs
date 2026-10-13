@@ -1,6 +1,10 @@
 // Authority-bearing host glue only: all OAuth transitions are Rust-owned.
 // Neither this bridge nor its private results belong in session/tool/model state.
 const hosts = new Map();
+const subscriptions = new WeakSet();
+
+/** Brand check for an open handle returned by ClaudeSubscription.open(). */
+export function isClaudeSubscription(value) { return subscriptions.has(value); }
 const MAX_BYTES = 64 * 1024;
 const TOKEN = 'https://platform.claude.com/v1/oauth/token';
 const PROFILE = 'https://api.anthropic.com/api/oauth/profile';
@@ -21,7 +25,7 @@ export async function openSubscription(options, openRaw, { replaceHost = false }
       if (disposed || hosts.get(id) !== host) throw new Error('Claude subscription host is no longer owned');
       return raw[name](...args);
     };
-    return Object.freeze({
+    const subscription = Object.freeze({
       id,
       startLogin: async () => JSON.parse(await call('startLogin')),
       completeLogin: async (code) => {
@@ -35,6 +39,8 @@ export async function openSubscription(options, openRaw, { replaceHost = false }
       logout: async () => call('logout'),
       dispose() { if (disposed) return; disposed = true; if (hosts.get(id) === host) hosts.delete(id); raw.free(); },
     });
+    subscriptions.add(subscription);
+    return subscription;
   } catch { if (hosts.get(id) === host) hosts.delete(id); throw new Error('Claude subscription unavailable'); }
 }
 const bridge = Object.freeze({

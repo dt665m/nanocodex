@@ -114,6 +114,8 @@ import {
 import type {
   AgentEvent,
   AgentSessionContext,
+  CodeEffectContext,
+  CodeEffectReceipt,
   EventWatcher,
   NamedTool,
   PromptInput,
@@ -433,6 +435,25 @@ const MAX_RETRY_DELAY_MS = 60_000;
 // Set while the resident runtime owns unfinished subagents. A restarted
 // isolate has no runtime to ask, so its alarm uses this to rebuild one.
 const SUBAGENTS_ACTIVE_KEY = "managed.subagents_active";
+// WebSocket replay has no client acknowledgement and Workers expose no send
+// backpressure, so one connection may queue at most this many bytes of
+// replayed history. The socket then closes with 1013 and the client
+// reconnects from its last delivered cursor, exactly as after a network drop.
+const SOCKET_REPLAY_WINDOW_BYTES = 2 * 1024 * 1024;
+const SOCKET_REPLAY_MIN_WINDOW_BYTES = 128 * 1024;
+const SOCKET_REPLAY_CONTINUE_CODE = 1013;
+// Survives isolate resets: a replay window that started but never finished.
+// Each interrupted window halves the next one, so a reconnecting client can
+// never drive the object into the same failing replay again and again.
+const SOCKET_REPLAY_GUARD_KEY = "managed.socket_replay_guard";
+const SOCKET_REPLAY_STRIKE_TTL_MS = 10 * 60_000;
+// Same persisted guard for runtime construction. A construction that never
+// settled was killed with its isolate (for example by its memory limit);
+// opportunistic rebuilds (alarm-driven subagent restore) stop until the
+// strikes decay, so they cannot crash-loop the object. Turns and explicit
+// requests still construct, under their own bounded retry policy.
+const RUNTIME_CONSTRUCTION_GUARD_KEY = "managed.runtime_construction_guard";
+const SPECULATIVE_CONSTRUCTION_MAX_STRIKES = 1;
 const MAX_IMPORT_BATCHES_PER_CREATE = 4;
 const UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -1063,12 +1084,17 @@ type CredentialBindingOwnership = Readonly<{
   strategy?: "session_v1";
 }>;
 
-type PortableDurabilityArchive = Readonly<{
+type PortableDurabilityStateArchive = Readonly<{
   records: readonly Readonly<{ key: string; value: string }>[];
   format: "nanocodex-durability-state-v2";
   payload: string;
   revision: string;
   stateId: string;
+}>;
+
+/** A root archive; its durable task-tree journal, when present, travels nested. */
+type PortableDurabilityArchive = PortableDurabilityStateArchive & Readonly<{
+  subagents?: PortableDurabilityStateArchive;
 }>;
 
 type ManagedDurabilityArchive = Readonly<{
@@ -1454,11 +1480,273 @@ function dropStaleSubagentStatus(rootSessionId: string, sessionId: string, reaso
   return undefined;
 }
 
+// Durable outbox of root-child completions: one row per logical completion,
+// keyed by (child session, instruction revision of the turn that completed).
+// The lifecycle callback records the row before it returns, so the registry's
+// acknowledgement (which clears its journaled pending_completion) implies the
+// row: both live in this object's SQLite storage, which commits writes in
+// order. A row is settled only by (a) admission of its deterministic wake turn
+// or (b) the parent turn being terminal after a COMMITTED root wait_agent or
+// list_agents receipt reported exactly (child, revision); receipt_committed is
+// written in the same transaction as that receipt. A live wait report alone
+// never settles anything. An explicit close (release) of the child settles its
+// rows. Settled rows stay as tombstones for SUBAGENT_COMPLETION_TOMBSTONE_MS,
+// far beyond the registry's acknowledgement journal write, so a completion
+// re-announced after a restart cannot reopen a decided one. next_at/attempts
+// back off undecided idle-parent rows; rows waiting on a busy parent need no
+// alarm because every terminal turn re-drains.
+const SUBAGENT_COMPLETIONS_TABLE = `CREATE TABLE IF NOT EXISTS managed_subagent_completions (
+  session_id TEXT NOT NULL, revision INTEGER NOT NULL, created_at INTEGER NOT NULL,
+  receipt_committed INTEGER NOT NULL DEFAULT 0, settled TEXT, settled_at INTEGER,
+  attempts INTEGER NOT NULL DEFAULT 0, next_at INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (session_id, revision))`;
+const SUBAGENT_COMPLETION_TOMBSTONE_MS = 7 * 24 * 60 * 60 * 1000;
+// Highest decided revision per child session, kept for the life of the object
+// (one row per child): a pending completion re-announced from an old registry
+// journal after its tombstone was collected is still recognised as decided.
+// Instruction revisions only grow, so nothing new is at or below it.
+const SUBAGENT_COMPLETIONS_DECIDED_TABLE = "CREATE TABLE IF NOT EXISTS managed_subagent_completion_decided (session_id TEXT PRIMARY KEY, revision INTEGER NOT NULL)";
+
+function decidedSubagentRevision(storage: DurableObjectStorage, sessionId: string): number | undefined {
+  storage.sql.exec(SUBAGENT_COMPLETIONS_DECIDED_TABLE);
+  return storage.sql.exec<{ revision: number }>(
+    "SELECT revision FROM managed_subagent_completion_decided WHERE session_id = ?", sessionId).toArray()[0]?.revision;
+}
+
+/** Raises the child's decided revision and, in the same transaction, settles
+ * its older undecided completions as superseded: the parent already got the
+ * newer one, so an older notice would only repeat it. Newer revisions are
+ * never affected. */
+function raiseDecidedSubagentRevision(storage: DurableObjectStorage, sessionId: string, revision: number): void {
+  storage.sql.exec(SUBAGENT_COMPLETIONS_DECIDED_TABLE);
+  storage.sql.exec(`INSERT INTO managed_subagent_completion_decided (session_id, revision) VALUES (?, ?)
+    ON CONFLICT(session_id) DO UPDATE SET revision = MAX(revision, excluded.revision)`, sessionId, revision);
+  storage.sql.exec("UPDATE managed_subagent_completions SET settled = 'superseded', settled_at = ? "
+    + "WHERE session_id = ? AND revision < ? AND settled IS NULL", Date.now(), sessionId, revision);
+}
+const SUBAGENT_COMPLETION_MAX_BACKOFF_MS = 60 * 60 * 1000;
+
+type SubagentCompletionRow = { session_id: string; revision: number; receipt_committed: number };
+
+export function subagentCompletionRevision(event: unknown): number | undefined {
+  const status = (event as { status?: unknown } | null)?.status;
+  const revision = status && typeof status === "object" ? (status as { completion_revision?: unknown }).completion_revision : undefined;
+  return typeof revision === "number" && Number.isSafeInteger(revision) && revision >= 0 ? revision : undefined;
+}
+
+/** Completed agents a wait_agent/list_agents receipt reported, with the
+ * revision of the turn whose result it showed. Anything else reports none. */
+export function reportedSubagentCompletions(name: string, receipt: unknown): { agentId: string; revision: number }[] {
+  if ((name !== "wait_agent" && name !== "list_agents") || !receipt || typeof receipt !== "object") return [];
+  const wire = receipt as Record<string, unknown>;
+  if (wire.success !== true || wire.thrown === true) return [];
+  const candidates: unknown[] = [wire.structured_result, wire.value, wire.output];
+  if (typeof wire.output === "string") {
+    try { candidates.push(JSON.parse(wire.output)); } catch { /* plain text output */ }
+  }
+  for (const candidate of candidates) {
+    const agents = (candidate as { agents?: unknown } | null)?.agents;
+    if (!Array.isArray(agents)) continue;
+    return agents.flatMap(agent => {
+      const entry = agent as { agent_id?: unknown; status?: { state?: unknown }; completion_revision?: unknown } | null;
+      return entry && entry.status?.state === "completed"
+        && Number.isSafeInteger(entry.agent_id) && Number.isSafeInteger(entry.completion_revision)
+        && (entry.completion_revision as number) >= 0
+        ? [{ agentId: String(entry.agent_id), revision: entry.completion_revision as number }] : [];
+    });
+  }
+  return [];
+}
+
+/** False for a completion already decided (re-announced from an old journal). */
+export function recordSubagentCompletion(storage: DurableObjectStorage, sessionId: string, revision: number): boolean {
+  storage.sql.exec(SUBAGENT_COMPLETIONS_TABLE);
+  const now = Date.now();
+  storage.sql.exec("DELETE FROM managed_subagent_completions WHERE settled IS NOT NULL AND settled_at < ?",
+    now - SUBAGENT_COMPLETION_TOMBSTONE_MS);
+  const decided = decidedSubagentRevision(storage, sessionId);
+  if (decided !== undefined && revision <= decided) return false;
+  storage.sql.exec("INSERT OR IGNORE INTO managed_subagent_completions (session_id, revision, created_at, next_at) VALUES (?, ?, ?, ?)",
+    sessionId, revision, now, now);
+  return subagentCompletion(storage, sessionId, revision)?.settled === null;
+}
+
+export function markSubagentCompletionReceipt(storage: DurableObjectStorage, sessionId: string, revision: number): void {
+  storage.sql.exec(SUBAGENT_COMPLETIONS_TABLE);
+  const decided = decidedSubagentRevision(storage, sessionId);
+  if (decided !== undefined && revision <= decided) return;
+  const now = Date.now();
+  storage.sql.exec(`INSERT INTO managed_subagent_completions (session_id, revision, created_at, receipt_committed, next_at)
+    VALUES (?, ?, ?, 1, ?) ON CONFLICT(session_id, revision) DO UPDATE SET receipt_committed = 1`,
+  sessionId, revision, now, now);
+}
+
+/** True only for the decision that actually settled the row. */
+export function settleSubagentCompletion(storage: DurableObjectStorage, sessionId: string, revision: number, reason: string): boolean {
+  storage.sql.exec(SUBAGENT_COMPLETIONS_TABLE);
+  return storage.transactionSync(() => {
+    const settled = storage.sql.exec("UPDATE managed_subagent_completions SET settled = ?, settled_at = ? WHERE session_id = ? AND revision = ? AND settled IS NULL",
+      reason, Date.now(), sessionId, revision).rowsWritten > 0;
+    if (settled) raiseDecidedSubagentRevision(storage, sessionId, revision);
+    return settled;
+  });
+}
+
+/** How an idle parent already consumed this completion, if it did: through a
+ * committed receipt for exactly it, or for a newer revision of the same child
+ * (which shows the newer result, so this notice is superseded). */
+export function consumedSubagentCompletion(storage: DurableObjectStorage, sessionId: string, revision: number): "receipt_committed" | "superseded" | undefined {
+  storage.sql.exec(SUBAGENT_COMPLETIONS_TABLE);
+  const rows = storage.sql.exec<{ revision: number }>(
+    "SELECT revision FROM managed_subagent_completions WHERE session_id = ? AND revision >= ? AND receipt_committed = 1",
+    sessionId, revision).toArray();
+  if (rows.some(row => row.revision === revision)) return "receipt_committed";
+  return rows.length > 0 ? "superseded" : undefined;
+}
+
+/** An explicitly closed child's completions need no decision any more. */
+export function settleReleasedSubagentCompletions(storage: DurableObjectStorage, sessionId: string): number {
+  storage.sql.exec(SUBAGENT_COMPLETIONS_TABLE);
+  return storage.transactionSync(() => {
+    const released = storage.sql.exec<{ revision: number }>("UPDATE managed_subagent_completions SET settled = 'released', settled_at = ? "
+      + "WHERE session_id = ? AND settled IS NULL RETURNING revision", Date.now(), sessionId).toArray();
+    if (released.length > 0) raiseDecidedSubagentRevision(storage, sessionId, Math.max(...released.map(row => row.revision)));
+    return released.length;
+  });
+}
+
+/** An idle parent's undecided row is retried later: 2 s doubling to 1 h. */
+export function deferSubagentCompletion(storage: DurableObjectStorage, sessionId: string, revision: number): { attempts: number; next_at: number } | undefined {
+  storage.sql.exec(SUBAGENT_COMPLETIONS_TABLE);
+  return storage.sql.exec<{ attempts: number; next_at: number }>("UPDATE managed_subagent_completions SET attempts = attempts + 1, "
+    + "next_at = ? + MIN(?, 2000 * (1 << MIN(attempts, 11))) WHERE session_id = ? AND revision = ? AND settled IS NULL "
+    + "RETURNING attempts, next_at",
+  Date.now(), SUBAGENT_COMPLETION_MAX_BACKOFF_MS, sessionId, revision).toArray()[0];
+}
+
+/** Undecided rows already due: a failed alarm drain must back them all off. */
+export function dueSubagentCompletions(storage: DurableObjectStorage, now: number): SubagentCompletionRow[] {
+  storage.sql.exec(SUBAGENT_COMPLETIONS_TABLE);
+  return storage.sql.exec<SubagentCompletionRow>(
+    "SELECT session_id, revision, receipt_committed FROM managed_subagent_completions WHERE settled IS NULL AND next_at <= ?", now).toArray();
+}
+
+// The outbox alarm never fires sooner than this after it is scheduled.
+const SUBAGENT_COMPLETION_MIN_ALARM_MS = 2_000;
+
+/** A failed alarm drain (for example a runtime rebuild that throws) backs off
+ * every due row, so the next alarm can't fire at once again. */
+export function backOffDueSubagentCompletions(storage: DurableObjectStorage, now: number): { session_id: string; revision: number; attempts: number; next_at: number }[] {
+  return dueSubagentCompletions(storage, now).flatMap(row => {
+    const next = deferSubagentCompletion(storage, row.session_id, row.revision);
+    return next ? [{ session_id: row.session_id, revision: row.revision, ...next }] : [];
+  });
+}
+
+/** When an idle parent's outbox needs the alarm, never sooner than the floor. */
+export function subagentCompletionAlarmAt(storage: DurableObjectStorage, now: number): number | undefined {
+  const next = nextSubagentCompletionAttempt(storage);
+  return next === undefined ? undefined : Math.max(now + SUBAGENT_COMPLETION_MIN_ALARM_MS, next);
+}
+
+export function nextSubagentCompletionAttempt(storage: DurableObjectStorage): number | undefined {
+  storage.sql.exec(SUBAGENT_COMPLETIONS_TABLE);
+  const next = storage.sql.exec<{ next: number | null }>(
+    "SELECT MIN(next_at) AS next FROM managed_subagent_completions WHERE settled IS NULL").toArray()[0]?.next;
+  return typeof next === "number" ? next : undefined;
+}
+
+export function subagentCompletion(storage: DurableObjectStorage, sessionId: string, revision: number): SubagentCompletionRow & { settled: string | null } | undefined {
+  storage.sql.exec(SUBAGENT_COMPLETIONS_TABLE);
+  return storage.sql.exec<SubagentCompletionRow & { settled: string | null }>(
+    "SELECT session_id, revision, receipt_committed, settled FROM managed_subagent_completions WHERE session_id = ? AND revision = ?",
+    sessionId, revision).toArray()[0];
+}
+
+export function pendingSubagentCompletions(storage: DurableObjectStorage): SubagentCompletionRow[] {
+  storage.sql.exec(SUBAGENT_COMPLETIONS_TABLE);
+  return storage.sql.exec<SubagentCompletionRow>(
+    "SELECT session_id, revision, receipt_committed FROM managed_subagent_completions WHERE settled IS NULL ORDER BY created_at").toArray();
+}
+
+/**
+ * Resolves authority for a root-level child restored by managed durability
+ * import whose spawning turn belongs to the source agent. Returns undefined
+ * unless this agent adopted imported history, rootSessionId is this agent's own
+ * root, and a destination root turn is live.
+ */
+export type ManagedImportedSubagentAuthority = (rootSessionId: string) => TurnAuthorization | undefined;
+
+/**
+ * The live root turn's authority for an imported child, or undefined unless
+ * this agent completed a managed portability adoption and rootSessionId is
+ * its own root runtime session. Agents that never adopted history keep the
+ * strict spawning-turn requirement.
+ */
+export function managedImportedSubagentAuthority(
+  storage: DurableObjectStorage,
+  rootSessionId: string,
+  activeAuthorization: TurnAuthorization | undefined,
+): TurnAuthorization | undefined {
+  if (activeAuthorization === undefined) return undefined;
+  const adopted = storage.sql.exec<{ singleton: number }>(
+    "SELECT singleton FROM managed_portability_restoration WHERE singleton = 1",
+  ).toArray().length > 0;
+  if (!adopted) return undefined;
+  const ownRoot = storage.sql.exec<{ session_id: string }>(
+    "SELECT session_id FROM nanocodex_cloudflare_agent WHERE singleton = 1",
+  ).toArray()[0]?.session_id;
+  return ownRoot !== undefined && ownRoot === rootSessionId ? activeAuthorization : undefined;
+}
+
+/**
+ * Child routes are destination-local and are never imported. Export refuses
+ * routed or cross-harness children, and import accepts only native GPT roots,
+ * so every child of an adopted tree ran on its parent's unrouted native
+ * transport at the source. On first inference, a restored child of that
+ * imported lineage (adopted agent, live binding whose journal host context
+ * names no destination turn) receives exactly that native route, and a nested
+ * child only below a native parent route. Fresh spawns commit their route
+ * before first inference and never reach this. Anything else gets no route and
+ * fails closed. Callers must have checked that the root is native GPT.
+ */
+export function adoptImportedSubagentRoute(
+  storage: DurableObjectStorage,
+  bindings: ManagedSubagentBindings,
+  rootSessionId: string,
+  sessionId: string,
+): RetainedChildRoute | undefined {
+  const binding = bindings.authorizations.get(sessionId);
+  if (binding === undefined || binding.root_session_id !== rootSessionId || bindings.routes.has(sessionId)) return undefined;
+  if (storage.sql.exec<{ singleton: number }>(
+    "SELECT singleton FROM managed_portability_restoration WHERE singleton = 1",
+  ).toArray().length === 0) return undefined;
+  if (storage.sql.exec<{ id: string }>(
+    "SELECT id FROM managed_turns WHERE id = ?", binding.host_context_ref,
+  ).toArray().length !== 0) return undefined;
+  let parentSessionId = rootSessionId;
+  if (binding.parentAgentId !== null) {
+    const parent = [...bindings.authorizations.values()].find(row =>
+      row.root_session_id === rootSessionId && row.agentId === binding.parentAgentId);
+    const parentRoute = parent === undefined ? undefined : bindings.routes.get(parent.sessionId);
+    if (parent === undefined || parentRoute === undefined || parentRoute.route !== null
+      || parentRoute.claudeModel !== undefined || parentRoute.codexModel !== undefined
+      || parent.host_context_ref !== binding.host_context_ref) return undefined;
+    parentSessionId = parent.sessionId;
+  }
+  const route: RetainedChildRoute = {
+    routeId: crypto.randomUUID(), parentSessionId, hostContextRef: binding.host_context_ref, route: null,
+  };
+  bindings.routes.set(sessionId, route);
+  return route;
+}
+
 /** Managed half of the private live Cloudflare subagent lifecycle. */
 export function applyManagedSubagentLifecycle(
   storage: DurableObjectStorage,
   bindings: ManagedSubagentBindings,
   value: unknown,
+  importedAuthority?: ManagedImportedSubagentAuthority,
 ): ManagedSubagentAuthorizationRow | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new TypeError("invalid managed subagent lifecycle event");
@@ -1532,8 +1820,23 @@ export function applyManagedSubagentLifecycle(
       "SELECT authorization_json FROM managed_turns WHERE id = ?",
       hostContextRef,
     ).toArray()[0];
-    if (turn === undefined) throw new ManagedSubagentLifecycleError("subagent_authorization_turn_missing", "managed subagent authorization turn is missing");
-    authorizationJson = JSON.stringify(parseTurnAuthorization(turn.authorization_json));
+    if (turn !== undefined) {
+      authorizationJson = JSON.stringify(parseTurnAuthorization(turn.authorization_json));
+    } else {
+      // A managed import restores the source task tree, but the source's
+      // spawning turns exist only in its turn archive, never as destination
+      // managed_turns rows, and source authority does not transfer. On an
+      // adopted agent, a root-level child whose spawning turn is absent is
+      // bound with exactly the authority of the live destination root turn
+      // that first binds it (in place of the absent spawning turn), and not at
+      // all without a live turn. Like a locally spawned child, the binding then
+      // persists: later turns reuse it unchanged (the retained branch above),
+      // and nested children inherit it. It keeps the journal host context, so
+      // status, release and conflict checks match exactly.
+      const adopted = importedAuthority?.(rootSessionId);
+      if (adopted === undefined) throw new ManagedSubagentLifecycleError("subagent_authorization_turn_missing", "managed subagent authorization turn is missing");
+      authorizationJson = JSON.stringify(parseTurnAuthorization(JSON.stringify(adopted)));
+    }
   } else {
     const parent = [...bindings.authorizations.values()].find(row =>
       row.root_session_id === rootSessionId && row.agentId === descriptor.parentAgentId);
@@ -4245,6 +4548,9 @@ export class DurableAgentSession extends DurableComputerObject {
   #agent?: CloudflareAgent.Agent;
   #subagentBindings = new ManagedSubagentBindings();
   #agentPromise?: Promise<CloudflareAgent.Agent>;
+  #socketReplayTail: Promise<void> = Promise.resolve();
+  // Identifies this isolate's replay windows and constructions in persisted guards.
+  readonly #socketReplayToken = crypto.randomUUID();
   #agentConstruction?: AgentConstructionOwnership;
   readonly #agentConstructions = new Set<AgentConstructionOwnership>();
   #agentShutdownPromise?: Promise<void>;
@@ -4593,7 +4899,10 @@ export class DurableAgentSession extends DurableComputerObject {
       this.#operations.record(event, this.#sessionId());
       this.#finishedRunAgent = this.#openToolCalls.observe(event) ?? this.#finishedRunAgent;
     });
-    this.#codeEffectJournal = createManagedCodeEffectJournal(this.ctx.storage);
+    this.#codeEffectJournal = createManagedCodeEffectJournal(this.ctx.storage, {
+      // Runs inside the receipt's own commit transaction.
+      onCommitted: (context, receipt) => this.#observeSubagentReceipt(context, receipt),
+    });
     this.#eventArchive = new ManagedEventArchive<StreamMessage>(
       this.ctx.storage,
       this.env.NANOCODEX_HISTORY,
@@ -5456,9 +5765,24 @@ export class DurableAgentSession extends DurableComputerObject {
         || this.ctx.storage.sql.exec("SELECT turn_id FROM managed_output_checkpoints LIMIT 1").toArray().length
         || this.ctx.storage.sql.exec("SELECT name FROM managed_connect_inputs LIMIT 1").toArray().length)
         return json({ error: "session_resources_not_portable", message: "Configured sessions, webhooks and published artifacts are not yet portable." }, { status: 409 });
+      // Child routes are not portable (see adoptImportedSubagentRoute): only
+      // trees whose children all use the unrouted native transport export.
+      if ([...this.#subagentBindings.routes.values()].some(route => route.route !== null
+        || route.claudeModel !== undefined || route.codexModel !== undefined)) {
+        return json({ error: "subagent_routes_not_portable", message: "Routed or cross-harness subagents are not yet portable. Close them before exporting this agent." }, { status: 409 });
+      }
       if (this.#goals.get()) return json({ error: "goal_present", message: "Clear the goal with /goal clear before exporting; goals are not portable yet." }, { status: 409 });
       if (this.#cronTriggers.hasTriggers() || this.#cronTriggers.hasDeliveries()) {
         return json({ error: "cron_triggers_present", message: "Delete cron triggers and wait for pending deliveries before exporting this agent; schedules are not portable yet." }, { status: 409 });
+      }
+      // The completion outbox is destination-local and never exported: an
+      // undecided row would be lost with the source. Deliver it first.
+      if (pendingSubagentCompletions(this.ctx.storage).length > 0) {
+        this.ctx.waitUntil(this.#drainSubagentCompletions().catch(() => {}));
+        return json({ error: "subagent_completions_pending", message: "Wait for subagent completions to be delivered (or close those subagents) before exporting this agent." }, {
+          status: 409,
+          headers: { "retry-after": "2" },
+        });
       }
       if (this.#durabilityImportState === "pending") {
         return json({ error: "durability_import_pending" }, { status: 409 });
@@ -6342,14 +6666,42 @@ export class DurableAgentSession extends DurableComputerObject {
       this.#scheduleRecovery();
       return;
     }
+    // An exported or importing agent no longer owns its outbox.
+    const nextCompletion = this.#durabilityExported || this.#durabilityImportState === "pending"
+      ? undefined : nextSubagentCompletionAttempt(this.ctx.storage);
+    if (this.#session() !== undefined && nextCompletion !== undefined && nextCompletion <= Date.now()
+      && !this.#agent && !this.#speculativeConstructionAllowed("subagent_completion")) {
+      // A runtime construction died with its isolate: a recorded completion
+      // must not rebuild it from an alarm. The rows stay undecided and back
+      // off; the next turn or a later alarm, once the guard decays, delivers.
+      for (const row of backOffDueSubagentCompletions(this.ctx.storage, Date.now())) {
+        console.warn({ type: "managed.subagent_completion", action: "alarm_drain_paused", revision: row.revision,
+          attempts: row.attempts, next_at: row.next_at, agent: this.#sessionId() });
+      }
+    } else if (this.#session() !== undefined && nextCompletion !== undefined && nextCompletion <= Date.now()) {
+      // Recorded completions outlive the runtime that received them.
+      try {
+        if (!this.#agent) await this.#ensureAgent();
+        await this.#drainSubagentCompletions();
+      } catch (error) {
+        // A persistent failure (for example rebuilding the runtime) must back
+        // off every due row, never re-arm the alarm at once.
+        for (const row of backOffDueSubagentCompletions(this.ctx.storage, Date.now())) {
+          console.warn({ type: "managed.subagent_completion", action: "alarm_drain_failed", revision: row.revision,
+            attempts: row.attempts, next_at: row.next_at, agent: this.#sessionId(), error_kind: errorKind(error) });
+        }
+      }
+    }
     if (!this.#agent && !this.#agentPromise && this.#session() !== undefined
-      && this.ctx.storage.kv.get(SUBAGENTS_ACTIVE_KEY) === true) {
+      && this.ctx.storage.kv.get(SUBAGENTS_ACTIVE_KEY) === true
+      && this.#speculativeConstructionAllowed("subagent_restore")) {
       // Eviction or a deploy dropped a runtime that still owned children.
       // Rebuilding it lets the durable registry restore the task tree and
       // resume interrupted children without waiting for the next prompt.
       try {
         await this.#ensureAgent();
         console.info({ type: "managed.subagents_recovered" });
+        await this.#drainSubagentCompletions();
       } catch (error) {
         console.warn({ type: "managed.subagent_recovery_failed", error_kind: errorKind(error) });
       }
@@ -7188,15 +7540,66 @@ export class DurableAgentSession extends DurableComputerObject {
     if (cursor !== latestCursor) void this.#replayClientSocket(server, cursor);
     // Observers omit the opt-in; only admitted interactive sockets start the
     // existing coalesced task. Neither ready nor replay waits for preparation.
-    if (prepare) this.#prepareActiveConversation(authorization);
-    else this.#warmPersonalization();
+    // Attaching never reconstructs a restored runtime: a long thread's agent
+    // is the largest allocation this object makes, and a reconnecting client
+    // would repeat it on every attempt. A fresh session (no accepted turn) or
+    // a resident agent is prepared; a restored one is built by its next turn.
+    if (prepare && (this.#agent !== undefined
+      || (session.accepted_turns === 0 && this.#speculativeConstructionAllowed("socket_prepare")))) {
+      this.#prepareActiveConversation(authorization);
+    } else this.#warmPersonalization();
     return new Response(null, { status: 101, webSocket: client,
       ...(prepare ? { headers: { [CONVERSATION_PREPARE_HEADER]: CONVERSATION_PREPARE_VALUE } } : {}) });
   }
 
-  async #replayClientSocket(socket: WebSocket, after: string): Promise<void> {
+  /** Replays are serialized per object: one bounded window is in flight at a
+   * time, however many sockets reconnect or resume after hibernation. */
+  #replayClientSocket(socket: WebSocket, after: string): Promise<void> {
+    const task = this.#socketReplayTail.then(() => this.#replayClientWindow(socket, after));
+    this.#socketReplayTail = task.catch(() => {});
+    return task;
+  }
+
+  /** Strikes against work interrupted by an isolate reset, without starting any. */
+  #guardStrikes(key: string): number {
+    const guard = this.ctx.storage.kv.get<{ token: string | null; strikes: number; at: number }>(key);
+    if (guard === undefined || Date.now() - guard.at >= SOCKET_REPLAY_STRIKE_TTL_MS) return 0;
+    // Work owned by another isolate never finished: that isolate was reset.
+    return guard.strikes + (guard.token && guard.token !== this.#socketReplayToken ? 1 : 0);
+  }
+
+  /** Persists that guarded work started in this isolate; returns its strikes. */
+  #beginGuarded(key: string): number {
+    const strikes = this.#guardStrikes(key);
+    this.ctx.storage.kv.put(key, { token: this.#socketReplayToken, strikes, at: Date.now() });
+    return strikes;
+  }
+
+  /** Guarded work settled in this isolate; one strike decays. */
+  #finishGuarded(key: string): void {
+    const guard = this.ctx.storage.kv.get<{ token: string | null; strikes: number; at: number }>(key);
+    if (guard === undefined || guard.token !== this.#socketReplayToken) return;
+    if (guard.strikes <= 1) this.ctx.storage.kv.delete(key);
+    else this.ctx.storage.kv.put(key, { token: null, strikes: guard.strikes - 1, at: guard.at });
+  }
+
+  /** Starts one persisted replay window and returns its byte budget. */
+  #beginSocketReplay(): number {
+    const strikes = this.#beginGuarded(SOCKET_REPLAY_GUARD_KEY);
+    if (strikes > 0) this.#observe("managed.socket_replay_degraded", { interrupted: strikes }, "warn");
+    return Math.max(SOCKET_REPLAY_MIN_WINDOW_BYTES, SOCKET_REPLAY_WINDOW_BYTES / 2 ** Math.min(strikes, 8));
+  }
+
+  #finishSocketReplay(): void {
+    this.#finishGuarded(SOCKET_REPLAY_GUARD_KEY);
+  }
+
+  async #replayClientWindow(socket: WebSocket, after: string): Promise<void> {
+    if (socket.readyState !== WebSocket.OPEN) return;
+    const window = this.#beginSocketReplay();
     const page = this.#eventArchive.pageReader(this.#eventLog);
     let cursor = after;
+    let sent = 0;
     try {
       while (socket.readyState === WebSocket.OPEN) {
         const events = await page(cursor, MAX_HISTORY_PAGE_SIZE);
@@ -7208,7 +7611,16 @@ export class DurableAgentSession extends DurableComputerObject {
             ...(event.turn_id === null ? {} : { turn_id: event.turn_id }),
           };
           const encoded = JSON.stringify(message);
+          const bytes = utf8ByteLength(encoded);
+          // Delivered events are durable and cursor-addressed; the client
+          // resumes after the last one it received. A single event larger
+          // than the window is still delivered whole, alone.
+          if (sent > 0 && sent + bytes > window) {
+            closeSocket(socket, SOCKET_REPLAY_CONTINUE_CODE, "event replay continues from the delivered cursor");
+            return;
+          }
           if (!this.#sendEncoded(socket, encoded)) return;
+          sent += bytes;
           cursor = event.cursor;
           socket.serializeAttachment({
             ...(socket.deserializeAttachment() as SessionSocketAttachment),
@@ -7230,6 +7642,8 @@ export class DurableAgentSession extends DurableComputerObject {
         message: "durable event replay failed",
       });
       closeSocket(socket, 1011, "durable event replay failed");
+    } finally {
+      this.#finishSocketReplay();
     }
   }
 
@@ -9927,7 +10341,7 @@ export class DurableAgentSession extends DurableComputerObject {
       "SELECT name FROM sqlite_master WHERE type = 'table'",
     ).toArray().map(({ name }) => name));
     this.ctx.storage.transactionSync(() => {
-      for (const table of ["managed_recovery_safety", "managed_recovery_progress", "managed_recovery_call_indices", "managed_code_effect_legacy_parents", "managed_code_effect_legacy_sessions", "managed_code_effect_migration", "managed_code_effect_runtime", "managed_code_effects", "managed_code_effect_receipt_chunks", "managed_configuration", "managed_environment_setup", "managed_webhook", "managed_webhook_deliveries", "managed_turn_usage", "managed_model_usage", "managed_artifacts", "managed_artifact_publications", "managed_output_checkpoints", "managed_output_checkpoint_chunks", "managed_turn_file_owners", "managed_connect_inputs"]) if (initializedTables.has(table)) this.ctx.storage.sql.exec(`DELETE FROM ${table}`);
+      for (const table of ["managed_recovery_safety", "managed_recovery_progress", "managed_recovery_call_indices", "managed_code_effect_legacy_parents", "managed_code_effect_legacy_sessions", "managed_code_effect_migration", "managed_code_effect_runtime", "managed_code_effects", "managed_code_effect_receipt_chunks", "managed_configuration", "managed_environment_setup", "managed_webhook", "managed_webhook_deliveries", "managed_turn_usage", "managed_model_usage", "managed_artifacts", "managed_artifact_publications", "managed_output_checkpoints", "managed_output_checkpoint_chunks", "managed_turn_file_owners", "managed_connect_inputs", "managed_subagent_completions", "managed_subagent_completion_decided"]) if (initializedTables.has(table)) this.ctx.storage.sql.exec(`DELETE FROM ${table}`);
       this.ctx.storage.sql.exec("DROP TABLE IF EXISTS managed_fork_seed");
       this.ctx.storage.sql.exec("DELETE FROM managed_turn_dispatch_chunks");
       this.ctx.storage.sql.exec("DELETE FROM managed_turn_input_chunks");
@@ -10134,7 +10548,10 @@ export class DurableAgentSession extends DurableComputerObject {
       const admitted = this.#managedTurn(current.id);
       if (admitted && (admitted.state === "cancelling" || admitted.retry_at !== null)) break;
     }
-    try { if (this.#goalRuntime.pending()) await this.#continueGoal(); } finally { await this.#scheduleNextAlarm(); }
+    try {
+      if (this.#goalRuntime.pending()) await this.#continueGoal();
+      if (pendingSubagentCompletions(this.ctx.storage).length > 0) await this.#drainSubagentCompletions();
+    } finally { await this.#scheduleNextAlarm(); }
   }
 
   #prepareActiveConversation(authorization: TurnAuthorization): void {
@@ -10166,6 +10583,14 @@ export class DurableAgentSession extends DurableComputerObject {
       if (this.#preparationTask === task) this.#preparationTask = undefined;
       await this.#scheduleNextAlarm();
     }));
+  }
+
+  /** Opportunistic rebuilds pause after a construction died with its isolate. */
+  #speculativeConstructionAllowed(reason: string): boolean {
+    const strikes = this.#guardStrikes(RUNTIME_CONSTRUCTION_GUARD_KEY);
+    if (strikes <= SPECULATIVE_CONSTRUCTION_MAX_STRIKES) return true;
+    this.#observe("managed.speculative_construction_paused", { interrupted: strikes, retry_source: reason }, "warn");
+    return false;
   }
 
   #prepareModelTransport(agent: CloudflareAgent.Agent | undefined = this.#agent): void {
@@ -10271,6 +10696,8 @@ export class DurableAgentSession extends DurableComputerObject {
     this.#agentConstructions.add(construction);
     // Register ownership before starting credential/catalog I/O. Retirement
     // aborts preparation and joins this exact construction before replacement.
+    const strikes = this.#beginGuarded(RUNTIME_CONSTRUCTION_GUARD_KEY);
+    if (strikes > 0) this.#observe("managed.runtime_construction_after_reset", { interrupted: strikes }, "warn");
     construction.promise = Promise.resolve().then(() => this.#createAgent(construction.abort.signal));
     const publication = this.#publishAgentConstruction(construction);
     construction.publication = publication;
@@ -10278,6 +10705,7 @@ export class DurableAgentSession extends DurableComputerObject {
     try {
       return await publication;
     } finally {
+      this.#finishGuarded(RUNTIME_CONSTRUCTION_GUARD_KEY);
       if (this.#agentPromise === publication) this.#agentPromise = undefined;
       if (this.#agentConstruction === construction) this.#agentConstruction = undefined;
     }
@@ -10843,7 +11271,9 @@ export class DurableAgentSession extends DurableComputerObject {
               assertRoutingAuthority(this.#activeTurnAuthorization());
           }
         } else {
-          const binding = readChildRoute(sessionId);
+          const binding = readChildRoute(sessionId) ?? (!this.#threadRoute()
+            && ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna"].includes(this.#settings().model)
+            ? adoptImportedSubagentRoute(this.ctx.storage, bindings, rootSessionId, sessionId) : undefined);
           if (!binding) throw new Error("Child route is missing; refusing parent transport");
           const authorization = managedAuthorizationForRouting(
             this.ctx.storage, bindings, rootSessionId, sessionId, binding.hostContextRef,
@@ -11655,11 +12085,33 @@ export class DurableAgentSession extends DurableComputerObject {
         inferenceForSession,
         preserveRootTransport: !this.#threadRoute(),
         subagentLifecycle: (event: unknown) => {
-          const completed = applyManagedSubagentLifecycle(this.ctx.storage, bindings, event);
+          const completed = applyManagedSubagentLifecycle(
+            this.ctx.storage, bindings, event, rootSessionId => this.#importedSubagentAuthority(rootSessionId),
+          );
+          const lifecycle = event as { type?: unknown; sessionId?: unknown };
+          if (lifecycle.type === "release" && typeof lifecycle.sessionId === "string") {
+            // An explicit close (runtime teardown detaches without a release):
+            // the parent itself ended this child, so nothing is left to decide.
+            const released = settleReleasedSubagentCompletions(this.ctx.storage, lifecycle.sessionId);
+            if (released > 0) console.info({ type: "managed.subagent_completion", action: "settled_released", rows: released, agent: this.#sessionId() });
+            return;
+          }
           if (completed?.parentAgentId === null) {
-            this.ctx.waitUntil(this.#track(this.#continueAfterSubagent(completed, bindings, runtimeGeneration)).catch(error => {
-              if (error instanceof ManagedRequestError && error.code === "subagent_continuation_superseded") return;
-              console.warn({ type: "managed.subagent_continuation_failed", error_kind: errorKind(error) });
+            const revision = subagentCompletionRevision(event);
+            if (revision === undefined) {
+              // Every root-child completion carries its turn revision.
+              console.warn({ type: "managed.subagent_completion", action: "unrevisioned", agent_id: completed.agentId });
+              return;
+            }
+            // Recorded before this callback returns: the registry treats a
+            // returned delivery as acknowledged and stops re-announcing it.
+            if (!recordSubagentCompletion(this.ctx.storage, completed.sessionId, revision)) {
+              console.info({ type: "managed.subagent_completion", action: "ignored_decided", agent_id: completed.agentId, revision, agent: this.#sessionId() });
+              return;
+            }
+            console.info({ type: "managed.subagent_completion", action: "received", agent_id: completed.agentId, revision, agent: this.#sessionId() });
+            this.ctx.waitUntil(this.#track(this.#decideSubagentCompletion(completed.sessionId, revision)).catch(error => {
+              this.#deferSubagentCompletion(completed.sessionId, revision, "decision_failed", error);
             }));
           }
         },
@@ -12135,41 +12587,132 @@ export class DurableAgentSession extends DurableComputerObject {
     return id;
   }
 
-  async #continueAfterSubagent(
-    child: ManagedSubagentAuthorizationRow,
-    bindings: ManagedSubagentBindings,
-    runtimeGeneration: number,
-  ): Promise<void> {
+  /** A root wait_agent/list_agents receipt is committing (same transaction). */
+  #observeSubagentReceipt(context: CodeEffectContext, receipt: CodeEffectReceipt): void {
+    try {
+      const reported = reportedSubagentCompletions(context.name, receipt);
+      if (reported.length === 0) return;
+      for (const { agentId, revision } of reported) {
+        // Only the root conversation's own direct children: a child session's
+        // receipts and nested agents never decide a root wake.
+        const child = [...this.#subagentBindings.authorizations.values()].find(row =>
+          row.root_session_id === context.sessionId && row.agentId === agentId && row.parentAgentId === null);
+        if (!child) continue;
+        markSubagentCompletionReceipt(this.ctx.storage, child.sessionId, revision);
+        console.info({ type: "managed.subagent_completion", action: "receipt_committed", agent_id: agentId, revision, tool: context.name, agent: this.#sessionId() });
+      }
+    } catch (error) {
+      // Never fail the receipt itself: without the mark the parent is woken,
+      // a duplicate notice rather than a lost one.
+      console.warn({ type: "managed.subagent_receipt_observation_failed", error_kind: errorKind(error) });
+    }
+  }
+
+  /**
+   * Decides one recorded root-child completion. A runtime transition keeps it
+   * for a later drain; a parent with any turn in flight, recovering or queued
+   * defers it until that turn is terminal (each terminal turn reschedules
+   * recovery, which drains). For an idle parent it settles after the parent
+   * durably observed it (committed receipt) or after admitting exactly one
+   * deterministic wake turn.
+   */
+  async #decideSubagentCompletion(sessionId: string, revision: number): Promise<void> {
     const session = this.#session();
     if (!session) return;
-    // Match the CLI: a completion wakes only an idle parent. Active turns can
-    // inspect their children themselves, including through wait_agent.
-    const canContinue = () => this.#runtimeOwnershipGeneration === runtimeGeneration && this.#agent !== undefined
-      && !this.#deleting && !this.#deleted && !this.#streamError
-      && !this.#durabilityExported && this.#durabilityImportState !== "pending"
-      && this.#subagentBindings === bindings && bindings.authorizations.get(child.sessionId) === child
-      && this.#session()?.authorization_epoch === session.authorization_epoch
-      && this.#session()?.accepted_turns === session.accepted_turns
-      && this.#recoverableTurnCount() === 0 && this.#turns.size === 0;
-    if (!canContinue()) return;
+    const bindings = this.#subagentBindings;
+    const runtimeGeneration = this.#runtimeOwnershipGeneration;
+    const child = bindings.authorizations.get(sessionId);
+    const decide = (action: string) => console.info({ type: "managed.subagent_completion", action, agent_id: child?.agentId ?? null,
+      revision, turns: this.#turns.size, recoverable: this.#recoverableTurnCount(), agent: this.#sessionId() });
+    const settle = (reason: string) => { if (settleSubagentCompletion(this.ctx.storage, sessionId, revision, reason)) decide("settled_" + reason); };
+    // An idle parent's undecided row: retried by the alarm with backoff.
+    const retry = (action: string) => this.#deferSubagentCompletion(sessionId, revision, action);
+    const row = () => subagentCompletion(this.ctx.storage, sessionId, revision);
+    if (row()?.settled !== null) return;
+    const transient = () => this.#runtimeOwnershipGeneration !== runtimeGeneration || this.#agent === undefined
+      || this.#deleting || this.#deleted || this.#streamError || this.#durabilityExported
+      || this.#durabilityImportState === "pending" || this.#subagentBindings !== bindings;
+    // Including a turn replayed by restart recovery: its outcome decides, and
+    // its terminal transition re-drains (no alarm needed while busy).
+    const busy = () => this.#turns.size > 0 || this.#recoverableTurnCount() > 0;
+    const hold = (): boolean => {
+      if (transient()) { retry("kept_transient"); return true; }
+      if (busy()) { decide("deferred_busy"); return true; }
+      return false;
+    };
+    if (hold()) return;
+    // One logical completion admits at most one wake turn, across restarts.
+    // Durable consumption is checked before the binding: a closed child's
+    // binding is gone, but its committed receipt or wake still decides.
+    const id = "subagent:" + (await hashManagedInput(sessionId + ":" + revision)).slice(0, 48);
+    if (await this.#findManagedTurn(id)) { settle("woken"); return; }
+    if (row()?.settled !== null) return;
+    const consumed = () => consumedSubagentCompletion(this.ctx.storage, sessionId, revision);
+    const durablyConsumed = consumed();
+    if (durablyConsumed) { settle(durablyConsumed); return; }
+    // Bindings are persisted and only an explicit release deletes them (which
+    // settles the rows itself): an unbound row has no child left to report.
+    if (!child) { settle("unbound"); return; }
+    if (child.parentAgentId !== null) { settle("nested"); return; }
     const source = await this.#findManagedTurn(child.host_context_ref);
-    if (!source || source.state !== "completed" || !canContinue()) return;
+    if (hold()) return;
+    const consumedLater = consumed();
+    if (consumedLater) { settle(consumedLater); return; }
+    if (!source || source.state !== "completed") { settle("source_not_completed"); return; }
     // A later cancellation/failure must not be undone by an older child's result.
     const latest = this.ctx.storage.sql.exec<{ state: string }>(
       "SELECT state FROM managed_turns ORDER BY rowid DESC LIMIT 1",
     ).toArray()[0];
-    if (latest && latest.state !== "completed") return;
+    if (latest && latest.state !== "completed") { settle("latest_not_completed"); return; }
+    const canContinue = () => !transient() && !busy()
+      && bindings.authorizations.get(child.sessionId)?.host_context_ref === child.host_context_ref
+      && this.#session()?.authorization_epoch === session.authorization_epoch
+      && this.#session()?.accepted_turns === session.accepted_turns
+      && row()?.settled === null && consumed() === undefined;
     const input: PromptInput = `[Subagent ${child.agentId} completed]
 
 A direct subagent completed after the previous turn ended. Continue the current task by inspecting its structured result. Call list_agents with include_completed=true, find agent ${child.agentId}, integrate and verify the relevant findings, finish any remaining work, and then respond to the user. Do not merely repeat the raw subagent result.
 
 <subagent_completion agent_id="${child.agentId}" />`;
-    const id = `subagent:${crypto.randomUUID()}`;
-    await this.#submitManagedTurn(id, input, await hashManagedInput(input), null, true,
-      parseTurnAuthorization(child.authorization_json), () => {
-        if (!canContinue()) throw new ManagedRequestError(409, "subagent_continuation_superseded",
-          "the parent changed before subagent continuation admission");
-      }, undefined, "unknown", {}, false);
+    try {
+      await this.#submitManagedTurn(id, input, await hashManagedInput(input), null, true,
+        parseTurnAuthorization(child.authorization_json), () => {
+          if (!canContinue()) throw new ManagedRequestError(409, "subagent_continuation_superseded",
+            "the parent changed before subagent continuation admission");
+        }, undefined, "unknown", {}, false);
+    } catch (error) {
+      if (error instanceof ManagedRequestError && error.code === "subagent_continuation_superseded") {
+        // Re-decided by the next drain: after the turn that superseded it, or
+        // by the backed-off alarm if the parent stays idle.
+        retry("kept_superseded");
+        return;
+      }
+      // The caller's catch backs the row off (decision_failed).
+      throw error;
+    }
+    settle("woken");
+  }
+
+  /** Backs an undecided row off (2 s doubling to 1 h) and logs its new schedule. */
+  #deferSubagentCompletion(sessionId: string, revision: number, action: string, error?: unknown): void {
+    try {
+      const next = deferSubagentCompletion(this.ctx.storage, sessionId, revision);
+      console[error === undefined ? "info" : "warn"]({ type: "managed.subagent_completion", action, revision,
+        attempts: next?.attempts ?? null, next_at: next?.next_at ?? null, agent: this.#sessionId(),
+        ...(error === undefined ? {} : { error_kind: errorKind(error) }) });
+    } catch (deferError) {
+      console.warn({ type: "managed.subagent_completion_defer_failed", error_kind: errorKind(deferError) });
+    }
+  }
+
+  /** Re-evaluates recorded root-child completions whose wake was not decided. */
+  async #drainSubagentCompletions(): Promise<void> {
+    if (!this.#agent) return;
+    for (const row of pendingSubagentCompletions(this.ctx.storage)) {
+      await this.#decideSubagentCompletion(row.session_id, row.revision).catch(error => {
+        this.#deferSubagentCompletion(row.session_id, row.revision, "decision_failed", error);
+      });
+    }
   }
 
   async #continueGoal(): Promise<void> {
@@ -12220,6 +12763,11 @@ A direct subagent completed after the previous turn ended. Continue the current 
     });
     if (!response.ok) throw await userDataResponseError(response);
     return response.json<unknown>();
+  }
+
+  /** Live root-turn authority for children restored by managed import; see applyManagedSubagentLifecycle. */
+  #importedSubagentAuthority(rootSessionId: string): TurnAuthorization | undefined {
+    return managedImportedSubagentAuthority(this.ctx.storage, rootSessionId, this.#activeTurnAuthorization());
   }
 
   #activeTurnAuthorization(): TurnAuthorization | undefined {
@@ -14561,6 +15109,17 @@ A direct subagent completed after the previous turn ended. Continue the current 
     if (this.#deleting || !this.#sessionId()) return;
     const now = Date.now();
     const targets: number[] = [];
+    // Only an idle parent's undecided completions need the alarm (backed off
+    // per row); a busy parent's are re-decided when its turn ends. An exported
+    // or importing agent no longer owns its outbox.
+    if (this.#turns.size === 0 && this.#recoverableTurnCount() === 0
+      && !this.#durabilityExported && this.#durabilityImportState !== "pending") {
+      const nextCompletion = subagentCompletionAlarmAt(this.ctx.storage, now);
+      if (nextCompletion !== undefined) {
+        targets.push(nextCompletion);
+        console.info({ type: "managed.subagent_completion_alarm", at: nextCompletion, agent: this.#sessionId() });
+      }
+    }
     const presentationAlarm = presentationRetryAt(this.ctx.storage);
     if (presentationAlarm !== undefined) targets.push(Math.max(now + 1, presentationAlarm));
     const webhookAlarm = this.#operations.nextAlarm();
@@ -15135,12 +15694,16 @@ function validateManagedDurabilityArchive(value: unknown): ManagedDurabilityArch
     || archive.format !== "nanocodex-managed-durability-state-v2"
     || typeof archive.source_agent_id !== "string" || !SESSION_ID.test(archive.source_agent_id)
     || !durability || Array.isArray(durability)
-    || Object.keys(durability).some((key) => !["format", "stateId", "revision", "payload", "records"].includes(key))
+    || Object.keys(durability).some((key) => !["format", "stateId", "revision", "payload", "records", "subagents"].includes(key))
     || durability.format !== "nanocodex-durability-state-v2"
     || typeof durability.stateId !== "string" || durability.stateId.length === 0
     || typeof durability.revision !== "string" || !/^[1-9][0-9]*$/.test(durability.revision)
     || typeof durability.payload !== "string"
     || !Array.isArray(durability.records) || durability.records.length !== 0
+    || !validPortableSubagentsArchive(durability.stateId, durability.subagents)
+    // Journal records travel through the bounded R2 archive, like the root's.
+    || (durability.subagents !== undefined
+      && (durability.subagents as { records: unknown[] }).records.length !== 0)
     || !validManagedPortableArchiveIdentity(archive.managed_durability_records)
     || !identity || Array.isArray(identity)
     || Object.keys(identity).some((key) => ![
@@ -15311,14 +15874,27 @@ function portableDurabilityStateId(value: unknown): string {
     throw new Error("portable durability archive is invalid");
   }
   const archive = value as Record<string, unknown>;
-  if (Object.keys(archive).some((key) => !["format", "stateId", "revision", "payload", "records"].includes(key))
+  if (Object.keys(archive).some((key) => !["format", "stateId", "revision", "payload", "records", "subagents"].includes(key))
     || archive.format !== "nanocodex-durability-state-v2"
     || typeof archive.stateId !== "string" || archive.stateId.length === 0
     || typeof archive.revision !== "string" || !/^[1-9][0-9]*$/.test(archive.revision)
-    || typeof archive.payload !== "string") {
+    || typeof archive.payload !== "string"
+    || !validPortableSubagentsArchive(archive.stateId, archive.subagents)) {
     throw new Error("portable durability archive is invalid");
   }
   return archive.stateId;
+}
+
+/** The optional nested task-tree journal must be exactly its root's companion state. */
+function validPortableSubagentsArchive(rootStateId: string, value: unknown): boolean {
+  if (value === undefined) return true;
+  return isRecord(value)
+    && !Object.keys(value).some((key) => !["format", "stateId", "revision", "payload", "records"].includes(key))
+    && value.format === "nanocodex-durability-state-v2"
+    && value.stateId === `${rootStateId}:subagents`
+    && typeof value.revision === "string" && /^[1-9][0-9]*$/.test(value.revision)
+    && typeof value.payload === "string"
+    && Array.isArray(value.records);
 }
 
 function validDurabilityImportPreparation(value: unknown): boolean {
@@ -15994,6 +16570,20 @@ function uuidV7(): string {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
+
+/** UTF-8 length of a string without allocating its encoding. */
+function utf8ByteLength(value: string): number {
+  let bytes = 0;
+  for (let index = 0; index < value.length; index++) {
+    const unit = value.charCodeAt(index);
+    if (unit < 0x80) bytes += 1;
+    else if (unit < 0x800) bytes += 2;
+    else if (unit >= 0xd800 && unit <= 0xdbff && index + 1 < value.length
+      && (value.charCodeAt(index + 1) & 0xfc00) === 0xdc00) { bytes += 4; index++; }
+    else bytes += 3;
+  }
+  return bytes;
+}
 
 function closeSocket(socket: WebSocket, code: number, reason: string): void {
   if (socket.readyState !== WebSocket.CONNECTING && socket.readyState !== WebSocket.OPEN) return;

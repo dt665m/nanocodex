@@ -19,8 +19,7 @@ use axum::{
 use eyre::{Result, WrapErr, bail};
 use futures_util::{Stream, stream};
 use nanocodex::{
-    AgentEvents, Nanocodex, OpenAi,
-    agent::{events::AgentEvent, session::SessionSnapshot},
+    Agent, AgentEvents, OpenAi, SessionCheckpoint, agent::events::AgentEvent,
     oai::transport::ResponsesTransport,
 };
 use serde::{Deserialize, Serialize};
@@ -43,7 +42,7 @@ pub struct Config {
     pub listen: SocketAddr,
     /// Project root affected by model-callable workspace tools.
     pub workspace: PathBuf,
-    /// Durable completed-turn snapshot.
+    /// Durable completed-turn session checkpoint.
     pub state_file: PathBuf,
     /// Stable model instructions used for both fresh and resumed sessions.
     pub instructions: String,
@@ -126,7 +125,7 @@ fn validate_endpoint_policy(
 }
 
 /// Builds one retained native session, resuming its last completed boundary when present.
-pub fn build_agent(config: &Config) -> Result<(Nanocodex, AgentEvents)> {
+pub fn build_agent(config: &Config) -> Result<(Agent, AgentEvents)> {
     let mut openai = OpenAi::builder(config.api_key.clone()).transport(config.transport);
     if let Some(api_base) = &config.api_base {
         openai = openai.api_base_url(api_base);
@@ -136,18 +135,21 @@ pub fn build_agent(config: &Config) -> Result<(Nanocodex, AgentEvents)> {
     }
     let openai = openai.build().wrap_err("failed to configure OpenAI")?;
 
-    let mut builder = Nanocodex::builder(openai)
+    let mut builder = Agent::builder(openai)
         .instructions(config.instructions.clone())
         .workspace(&config.workspace);
-    if let Some(snapshot) = load_snapshot(&config.state_file)? {
-        builder = builder.resume(snapshot);
+    if let Some(checkpoint) = load_session(&config.state_file)? {
+        builder = builder
+            .resume(checkpoint)
+            .wrap_err("failed to resume the saved session checkpoint")?;
     }
     builder
         .build()
         .wrap_err("failed to build Nanocodex session")
 }
 
-fn load_snapshot(path: &Path) -> Result<Option<SessionSnapshot>> {
+/// Reads the portable checkpoint written after every completed turn.
+fn load_session(path: &Path) -> Result<Option<SessionCheckpoint>> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -155,14 +157,16 @@ fn load_snapshot(path: &Path) -> Result<Option<SessionSnapshot>> {
             return Err(error).wrap_err_with(|| format!("failed to read {}", path.display()));
         }
     };
-    serde_json::from_slice(&bytes)
-        .wrap_err_with(|| format!("failed to decode {}", path.display()))
+    let encoded = std::str::from_utf8(&bytes)
+        .wrap_err_with(|| format!("failed to decode {}", path.display()))?;
+    SessionCheckpoint::from_json(encoded)
         .map(Some)
+        .wrap_err_with(|| format!("failed to decode {}", path.display()))
 }
 
 /// Running application tasks and the Nanocodex shutdown capability.
 pub struct Runtime {
-    agent: Nanocodex,
+    agent: Agent,
     prompt_task: JoinHandle<()>,
     event_task: JoinHandle<()>,
 }
@@ -211,7 +215,7 @@ struct PromptRequest {
 }
 
 /// Starts the application-owned prompt queue and event projection.
-pub fn application(agent: Nanocodex, events: AgentEvents, config: &Config) -> (Router, Runtime) {
+pub fn application(agent: Agent, events: AgentEvents, config: &Config) -> (Router, Runtime) {
     let (prompt_tx, prompt_rx) = mpsc::channel(PROMPT_QUEUE_CAPACITY);
     let (event_tx, _) = broadcast::channel(EVENT_CAPACITY);
     let state = AppState {
@@ -313,7 +317,7 @@ async fn event_stream(
 }
 
 async fn prompt_loop(
-    agent: Nanocodex,
+    agent: Agent,
     state_file: PathBuf,
     mut commands: mpsc::Receiver<PromptCommand>,
 ) {
@@ -324,11 +328,7 @@ async fn prompt_loop(
     }
 }
 
-async fn run_prompt(
-    agent: &Nanocodex,
-    state_file: &Path,
-    prompt: String,
-) -> Result<PromptResponse> {
+async fn run_prompt(agent: &Agent, state_file: &Path, prompt: String) -> Result<PromptResponse> {
     let result = agent
         .prompt(prompt)
         .await
@@ -336,23 +336,26 @@ async fn run_prompt(
         .result()
         .await
         .wrap_err("agent turn failed")?;
-    let snapshot = result
-        .snapshot()
-        .ok_or_else(|| eyre::eyre!("the local agent did not retain a snapshot"))?;
-    persist_snapshot(state_file, &snapshot).await?;
+    let checkpoint = result
+        .checkpoint()
+        .ok_or_else(|| eyre::eyre!("the local agent did not retain a checkpoint"))?;
+    persist_checkpoint(state_file, &checkpoint).await?;
     Ok(PromptResponse {
         final_message: result.into_final_message(),
     })
 }
 
-async fn persist_snapshot(path: &Path, snapshot: &SessionSnapshot) -> Result<()> {
+async fn persist_checkpoint(path: &Path, checkpoint: &SessionCheckpoint) -> Result<()> {
     let parent = path
         .parent()
-        .ok_or_else(|| eyre::eyre!("snapshot path has no parent: {}", path.display()))?;
+        .ok_or_else(|| eyre::eyre!("checkpoint path has no parent: {}", path.display()))?;
     tokio::fs::create_dir_all(parent)
         .await
         .wrap_err_with(|| format!("failed to create {}", parent.display()))?;
-    let bytes = serde_json::to_vec(snapshot).wrap_err("failed to encode session snapshot")?;
+    let bytes = checkpoint
+        .to_json()
+        .wrap_err("failed to encode session checkpoint")?
+        .into_bytes();
     let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
     let mut options = tokio::fs::OpenOptions::new();
     options.create(true).write(true).truncate(true);

@@ -2,17 +2,28 @@
 #![deny(missing_docs, rustdoc::broken_intra_doc_links)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+/// One owned agent lifecycle: prompts, turns, steering, settings, forks and
+/// checkpoints, the same for every harness family.
+///
+/// Build one directly with `Agent::builder(OpenAi)` or
+/// `Agent::builder(Claude)`, or construct many from a reusable
+/// [`Nanocodex`] runtime.
+pub use nanocodex_agent::Nanocodex as Agent;
+/// The single-backend Codex builder returned by `Agent::builder(openai)`.
 #[cfg(feature = "openai")]
 #[cfg_attr(docsrs, doc(cfg(feature = "openai")))]
-pub use nanocodex_agent::NanocodexBuilder;
+pub use nanocodex_agent::NanocodexBuilder as CodexBuilder;
 pub use nanocodex_agent::{
-    AgentEvents, AgentSessionContext, ClaudeModel, CostStatus, EstimatedUsdCost,
-    ExecutionPolicyDisposition, HarnessFamily, HarnessModel, Nanocodex, NanocodexError,
-    PromptRequest, PromptRoute, ReportedTurnUsage, ServiceTier, Turn, TurnControl, TurnResult,
-    TurnUsage, UsdAmount,
+    AgentEvents, AgentSessionContext, Capabilities, ClaudeModel, CostStatus, EstimatedUsdCost,
+    ExecutionPolicyDisposition, ForkPoint, ForkRequest, HarnessFamily, HarnessModel, Lineage,
+    ModelCapabilities, ModelTransport, Mutability, NanocodexError, Origin, Persistence,
+    PromptRequest, PromptRoute, ReportedTurnUsage, ServiceTier, SessionCheckpoint, SessionInfo,
+    Turn, TurnControl, TurnResult, TurnUsage, UsdAmount, WeakAgent,
 };
 mod harness;
 pub use harness::{Harness, HarnessBuilder, HarnessRequest};
+#[cfg(not(target_family = "wasm"))]
+mod runtime;
 #[cfg(feature = "claude")]
 #[cfg_attr(docsrs, doc(cfg(feature = "claude")))]
 pub use nanocodex_claude::Claude;
@@ -50,8 +61,17 @@ pub use nanocodex_oai_tools::Tools;
     doc(cfg(all(feature = "openai", feature = "oai-tools", not(target_family = "wasm"))))
 )]
 pub use nanocodex_oai_tools::tool;
+#[cfg(all(not(target_family = "wasm"), feature = "claude"))]
+#[cfg_attr(docsrs, doc(cfg(all(not(target_family = "wasm"), feature = "claude"))))]
+pub use runtime::ClaudeHarness;
+#[cfg(all(not(target_family = "wasm"), feature = "openai"))]
+#[cfg_attr(docsrs, doc(cfg(all(not(target_family = "wasm"), feature = "openai"))))]
+pub use runtime::CodexHarness;
+#[cfg(not(target_family = "wasm"))]
+#[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
+pub use runtime::{Nanocodex, NanocodexBuilder, SpawnBuilder};
 
-/// Owned agent lifecycle, builders, turns, branching, and snapshots.
+/// Owned agent lifecycle, builders, turns, branching, and checkpoints.
 ///
 /// Provider and tool-runtime APIs keep their canonical detailed paths under
 /// [`crate::oai`] and [`crate::tools`].
@@ -59,19 +79,23 @@ pub mod agent {
     #[cfg(feature = "durability")]
     #[cfg_attr(docsrs, doc(cfg(feature = "durability")))]
     pub use crate::durability;
+    pub use nanocodex_agent::Nanocodex as Agent;
     #[cfg(all(feature = "openai", not(target_family = "wasm")))]
     #[cfg_attr(docsrs, doc(cfg(all(feature = "openai", not(target_family = "wasm")))))]
     pub use nanocodex_agent::rollout;
     pub use nanocodex_agent::{
         AgentEvents, AgentSessionContext, BuilderBackend, CostStatus, EstimatedUsdCost,
-        ExecutionPolicyDisposition, Nanocodex, NanocodexError, PromptRequest, PromptRoute,
-        ReportedTurnUsage, Result, ServiceTier, SpawnOptions, Turn, TurnControl, TurnResult,
-        TurnUsage, UsdAmount, events, input, session, usage,
+        ExecutionPolicyDisposition, NanocodexError, PromptRequest, PromptRoute, ReportedTurnUsage,
+        Result, ServiceTier, SpawnOptions, Turn, TurnControl, TurnResult, TurnUsage, UsdAmount,
+        WeakAgent, events, input, session, usage,
     };
-    pub use nanocodex_agent::{AgentHandle, ChildSnapshot};
+    pub use nanocodex_agent::{
+        AgentHandle, Capabilities, ForkPoint, ForkRequest, Lineage, Mutability, Origin,
+        Persistence, SessionCheckpoint, SessionInfo,
+    };
     #[cfg(feature = "openai")]
     #[cfg_attr(docsrs, doc(cfg(feature = "openai")))]
-    pub use nanocodex_agent::{ExecutionEnvironment, NanocodexBuilder, execution};
+    pub use nanocodex_agent::{ExecutionEnvironment, NanocodexBuilder as CodexBuilder, execution};
 }
 
 /// Anthropic Messages client, provider-native builder, protocol, and authentication.
@@ -134,9 +158,18 @@ pub mod prelude {
     #[cfg(feature = "claude")]
     #[cfg_attr(docsrs, doc(cfg(feature = "claude")))]
     pub use crate::Claude;
+    #[cfg(all(not(target_family = "wasm"), feature = "claude"))]
+    #[cfg_attr(docsrs, doc(cfg(all(not(target_family = "wasm"), feature = "claude"))))]
+    pub use crate::ClaudeHarness;
+    #[cfg(all(not(target_family = "wasm"), feature = "openai"))]
+    #[cfg_attr(docsrs, doc(cfg(all(not(target_family = "wasm"), feature = "openai"))))]
+    pub use crate::CodexHarness;
     #[cfg(feature = "durability")]
     #[cfg_attr(docsrs, doc(cfg(feature = "durability")))]
     pub use crate::DurableAgentExt;
+    #[cfg(not(target_family = "wasm"))]
+    #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
+    pub use crate::Nanocodex;
     #[cfg(feature = "oai-tools")]
     #[cfg_attr(docsrs, doc(cfg(feature = "oai-tools")))]
     pub use crate::Tool;
@@ -158,10 +191,10 @@ pub mod prelude {
         doc(cfg(all(feature = "openai", feature = "oai-tools", not(target_family = "wasm"))))
     )]
     pub use crate::tool;
-    pub use crate::{Model, Nanocodex};
+    pub use crate::{Agent, ClaudeModel, HarnessFamily, HarnessModel, Model, Thinking};
     #[cfg(feature = "openai")]
     #[cfg_attr(docsrs, doc(cfg(feature = "openai")))]
-    pub use crate::{NanocodexBuilder, OpenAi};
+    pub use crate::{CodexBuilder, OpenAi};
 }
 
 #[cfg(all(feature = "openai", feature = "oai-tools", not(target_family = "wasm")))]

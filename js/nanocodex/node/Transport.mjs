@@ -44,3 +44,6 @@ function endpoints(options = {}) {
     websocketWarmup: options.websocketWarmup,
   };
 }
+
+/** Explicit Claude Messages authentication for Nanocodex.create backends. */
+export { anthropic } from "../runtime/claude-transport.mjs";

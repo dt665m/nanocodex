@@ -4,6 +4,9 @@ import { toClaudeConfig } from './claude.mjs';
 import { createBrowserHost } from '../browser/host.mjs';
 import { resolveResponsesTransport } from './responses-transport.mjs';
 import { resolveTools } from './tool-configuration.mjs';
+import { rawSubscription } from './chatgpt-subscription.mjs';
+
+const MPP_RESPONSES_URL = 'wss://openai.mpp.tempo.xyz/v1/responses';
 
 /** Explicit alternate-family capabilities; the Rust registry owns every child. */
 export async function prepareHarnesses(harnesses, emit, {
@@ -26,7 +29,7 @@ export async function prepareHarnesses(harnesses, emit, {
   try {
     if (harnesses.claude) {
       const options = { ...harnesses.claude, codeEvaluator: harnesses.claude.codeEvaluator ?? codeEvaluator };
-      if (options.durability !== undefined || options.durabilityId !== undefined || options.sessionId !== undefined || options.harnesses !== undefined) throw new TypeError('child harness capabilities must be ephemeral and cannot contain nested harnesses');
+      if (options.durability !== undefined || options.durabilityId !== undefined || options.sessionId !== undefined || options.harnesses !== undefined || options.resume !== undefined) throw new TypeError('child harness capabilities must be ephemeral and cannot contain nested harnesses');
       const config = toClaudeConfig(options);
       const host = createClaudeHost({ ...options, onEvent: emit, subagentSessions, subagentRouting, codeEffectJournal, traceTool });
       const id = registerDefinitionHost(host, cloudflareReservation);
@@ -39,15 +42,22 @@ export async function prepareHarnesses(harnesses, emit, {
       const options = { ...harnesses.codex, codeEvaluator: harnesses.codex.codeEvaluator ?? codeEvaluator };
       if (options.durability !== undefined || options.durabilityId !== undefined || options.sessionId !== undefined || options.harnesses !== undefined || options.resume !== undefined) throw new TypeError('child harness capabilities must be ephemeral and cannot contain nested harnesses');
       const transport = resolveResponsesTransport(options.transport);
-      if (transport.subscription || transport.mpp) throw new TypeError('alternate Codex harness requires an explicit API or host-managed transport');
+      // A ChatGPT subscription stays Rust-owned: the Claude root passes its raw
+      // handle to createClaudeWithChatGpt, so Codex children refresh through
+      // the same credential lifecycle. MPP frames flow through this host's mpp.ws.
+      if (transport.subscription) result.codexSubscription = rawSubscription(transport.subscription);
       if (options.codeEvaluator !== undefined && typeof options.codeEvaluator !== 'function') throw new TypeError('Codex harness codeEvaluator must be a function');
-      if (createCodexHost === createBrowserHost && typeof globalThis.Worker !== 'function' && options.codeEvaluator === undefined) throw new TypeError('Codex harness Code Mode requires an explicit codeEvaluator outside a browser Worker host');
+      // Each recipe honors its own toolMode; only Code Mode needs an evaluator.
+      if ((options.toolMode ?? 'code-only') === 'code-only' && createCodexHost === createBrowserHost && typeof globalThis.Worker !== 'function' && options.codeEvaluator === undefined) throw new TypeError('Codex harness Code Mode requires an explicit codeEvaluator outside a browser Worker host');
       const { tools } = resolveTools(options.tools, { defaultSubagents: false });
       const host = createCodexHost({ ...transport, hostAuth: transport.hostAuth === true, tools, workspace: options.workspace, toolMode: options.toolMode ?? 'code-only', codeEvaluator: options.codeEvaluator, onEvent: emit, subagentSessions, subagentRouting, toolProviders, codeEffectJournal, traceTool });
       const id = registerDefinitionHost(host, cloudflareReservation);
       hosts.push([id, host]);
       await host.ready();
-      result.codex = toWasmConfig({ ...options, ...transport, apiKey: transport.apiKey ?? 'host-managed', hostDefinitionId: id });
+      result.codex = toWasmConfig({ ...options, ...transport,
+        apiKey: transport.apiKey ?? (transport.subscription ? 'subscription-managed' : transport.mpp ? 'mpp-managed' : 'host-managed'),
+        websocketUrl: transport.websocketUrl ?? (transport.mpp ? MPP_RESPONSES_URL : undefined),
+        hostDefinitionId: id });
     }
     return result;
   } catch (error) { await close(); throw error; }

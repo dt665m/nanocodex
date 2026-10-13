@@ -21,13 +21,12 @@ type WorkerMcpServer = Readonly<{
   timeoutMs?: number | undefined;
 }>;
 type WorkerMcpServers = Readonly<Record<string, string | URL | WorkerMcpServer>>;
-type WorkerToolExposureOptions = {
-  mcp?: WorkerMcpServers | false | undefined;
-  toolMode?: "code-only" | undefined;
-};
+/** Code Mode (exec/wait) by default; `direct` exposes host tools to the provider without code evaluation. Remote MCP requires Code Mode. */
+type WorkerToolExposureOptions =
+  | { mcp?: false | undefined; toolMode?: "code-only" | "direct" | undefined }
+  | { mcp: WorkerMcpServers; toolMode?: "code-only" | undefined };
 
 /** Creates a Rust/WASM Agent in a package-owned browser module Worker. */
-export function create(options: import('../runtime/claude.mjs').Options & { harness: 'claude' }): Promise<import('../runtime/claude.mjs').Agent>;
 export function create(options: create.ManagedOptions): Promise<AgentLifecycle>;
 export function create(options?: create.Options): Promise<create.ReturnType>;
 export declare namespace create {
@@ -35,7 +34,8 @@ export declare namespace create {
     transport: ManagedTransport;
     tools?: Tools | undefined;
   }>;
-  type Options = Omit<AgentOptions, "beforeCompaction" | "harness"> & WorkerToolExposureOptions & {
+  /** Codex (OpenAI Responses) harness options. */
+  type CodexOptions = Omit<AgentOptions, "beforeCompaction" | "harness"> & WorkerToolExposureOptions & {
     /** Precompiled browser module; WebAssembly modules are structured-clone-safe. */
     module?: WebAssembly.Module | undefined;
     /** Fixed browser workspace facts, including its AGENTS.md snapshot. */
@@ -51,5 +51,9 @@ export declare namespace create {
     /** Set false to omit the default OPFS, shell, web, image, plan, and artifact tools. */
     harness?: false | 'codex' | undefined;
   };
+  /** Claude (Messages) harness options; see docs/CLAUDE_JAVASCRIPT.md. */
+  type ClaudeOptions = import('../runtime/claude.mjs').Options & { harness: 'claude' };
+  /** Options of either harness family, discriminated by `harness`; both return the same Agent. */
+  type Options = CodexOptions | ClaudeOptions;
   type ReturnType = Agent;
 }

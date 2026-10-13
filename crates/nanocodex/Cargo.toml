@@ -19,7 +19,11 @@ rustdoc-args = ["-D", "warnings"]
 
 [features]
 default = ["durability", "mcp", "openai", "tools"]
-claude = ["dep:nanocodex-claude", "nanocodex-durability?/claude"]
+claude = [
+    "dep:nanocodex-claude",
+    "nanocodex-durability?/claude",
+    "nanocodex-oai-tools?/code-mode",
+]
 claude-tools = ["claude", "dep:nanocodex-claude-tools", "nanocodex-claude/tools"]
 durability = ["dep:nanocodex-durability", "openai"]
 managed = ["dep:nanocodex-managed"]
@@ -45,6 +49,8 @@ nanocodex-claude-tools = { workspace = true, optional = true }
 nanocodex-durability = { workspace = true, optional = true }
 nanocodex-oai-api = { path = "../nanocodex-oai-api", version = "0.6.7", default-features = false, features = ["events"] }
 nanocodex-oai-tools = { path = "../nanocodex-oai-tools", version = "0.6.7", default-features = false, optional = true }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt", "sync"] }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 nanocodex-managed = { workspace = true, optional = true }

@@ -9,7 +9,7 @@
 use std::{path::PathBuf, sync::Arc};
 
 use eyre::Result;
-use nanocodex::{HarnessModel, Nanocodex, OpenAi, tools::mcp::McpHandle};
+use nanocodex::{Agent, HarnessModel, OpenAi, tools::mcp::McpHandle};
 
 use crate::config::{AgentArgs, ConfiguredAgent, InteractionReceiver, SessionScheduler};
 use crate::nanocodex2::tui::backend::Capabilities;
@@ -48,13 +48,13 @@ pub(crate) struct LocalLaunch {
 /// A running local agent and the resources it must release on exit.
 pub(crate) struct LocalBackend {
     pub(crate) launch: LocalLaunch,
-    pub(crate) handle: Nanocodex,
+    pub(crate) handle: Agent,
     pub(crate) model: HarnessModel,
     pub(crate) workspace: PathBuf,
     pub(crate) parts: LocalParts,
     capabilities: Capabilities,
     /// Visible history of a resumed session, replayed once on connect.
-    pub(crate) transcript: Vec<nanocodex::agent::rollout::RolloutTranscriptItem>,
+    pub(crate) transcript: Vec<nanocodex::agent::session::TranscriptItem>,
     mpp_adapter: Option<crate::mpp::MppAdapter>,
     vm: Option<crate::vm::ConfiguredVm>,
     child_agents: Option<Arc<ChildAgents>>,
@@ -68,8 +68,11 @@ impl LocalBackend {
         agent: ConfiguredAgent,
     ) -> (Self, nanocodex::AgentEvents) {
         let ConfiguredAgent {
-            claude_scheduler,
-            claude_interactions,
+            host:
+                crate::config::HostChannels {
+                    interactions: claude_interactions,
+                    scheduler: claude_scheduler,
+                },
             handle,
             events,
             realtime,

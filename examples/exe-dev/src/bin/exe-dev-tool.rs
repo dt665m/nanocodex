@@ -5,7 +5,7 @@ use std::{env, path::PathBuf};
 use chrono::Utc;
 use eyre::{Result, WrapErr, bail};
 use nanocodex::{
-    Nanocodex, OpenAi, Thinking,
+    Agent, OpenAi, Thinking,
     agent::ExecutionEnvironment,
     oai::auth::{OpenAiAuth, load_chatgpt_auth},
 };
@@ -86,7 +86,7 @@ async fn run_agent(sandbox: &ExeDevSandbox, prompt: String) -> Result<String> {
     let auth = model_auth()?;
     let openai = OpenAi::new(auth).wrap_err("failed to configure OpenAI")?;
     let tools = sandbox.tools()?;
-    let (agent, events) = Nanocodex::builder(openai)
+    let (agent, events) = Agent::builder(openai)
         .instructions(
             "You operate exactly one caller-owned remote exe.dev sandbox. Call sandbox_create before sandbox_exec. Execute all shell work through sandbox_exec; host workspace tools are unavailable. The sandbox name and deletion policy are fixed by the caller. Never claim a command succeeded unless its structured result reports exit_code 0.",
         )

@@ -7,7 +7,7 @@
 
 use std::sync::{Arc, Mutex, PoisonError};
 
-use nanocodex::Nanocodex;
+use nanocodex::Agent;
 use nanocodex_agent::{PromptRequest, TurnControl, TurnResult};
 use nanocodex_managed::AgentSettings;
 use tokio::{sync::mpsc, task::JoinSet};
@@ -36,7 +36,7 @@ const MAX_INLINE_COLLAPSE_BYTES: usize = 48 * 1024;
 #[derive(Clone)]
 pub(crate) struct Side {
     pub(crate) pane: PaneId,
-    pub(crate) agent: Nanocodex,
+    pub(crate) agent: Agent,
     /// A side turn is running.
     pub(crate) busy: bool,
     /// At least one side turn completed.
@@ -88,13 +88,16 @@ impl Drop for Registration {
 /// Runs one local side conversation until its pane closes.
 pub(in crate::nanocodex2::tui) async fn run(
     pane: PaneId,
-    main: Nanocodex,
+    main: Agent,
     settings: AgentSettings,
     start_sequence: u64,
     mut requests: mpsc::UnboundedReceiver<Request>,
     events: mpsc::UnboundedSender<Event>,
 ) {
-    let (agent, mut agent_events) = match main.fork_side_conversation().await {
+    let (agent, mut agent_events) = match main
+        .fork(nanocodex::ForkRequest::latest().side_conversation())
+        .await
+    {
         Ok(fork) => fork,
         Err(error) => {
             let _ = events.send(Event::Failed {
@@ -273,7 +276,11 @@ fn collapse_prompt() -> Result<(Side, (String, String)), &'static str> {
     if !side.completed {
         return Err("BTW needs one completed turn before /collapse");
     }
-    let prompt = match side.agent.rollout() {
+    let prompt = match side
+        .agent
+        .persistence()
+        .and_then(|persistence| persistence.rollout)
+    {
         Some(rollout) => collapse_btw_prompt(rollout.thread_id()),
         // Claude forks (and Codex without rollouts) have no session another turn
         // can read, so carry the side exchanges inline.

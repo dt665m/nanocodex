@@ -9,7 +9,7 @@ use std::{
 
 use futures_util::StreamExt;
 use nanocodex::{
-    Nanocodex, NanocodexError, OpenAi, PromptRoute, TurnControl,
+    Agent, NanocodexError, OpenAi, PromptRoute, TurnControl,
     agent::events::{AgentEvent, AgentEventData, AssistantEvent, RunEvent},
     oai::{
         auth::OpenAiAuthMode,
@@ -434,7 +434,7 @@ impl Drop for VoiceSession {
 /// Builder for one reusable desktop voice-to-agent lifecycle.
 pub struct VoiceSessionBuilder {
     openai: OpenAi,
-    agent: Nanocodex,
+    agent: Agent,
     instructions: Arc<str>,
     session_id: Option<Arc<str>>,
     attestation_header: Option<Arc<str>>,
@@ -463,7 +463,7 @@ pub struct VoiceSessionBuilder {
 impl VoiceSessionBuilder {
     /// Creates a voice lifecycle over an existing OpenAI recipe and agent.
     #[must_use]
-    pub fn new(openai: OpenAi, agent: Nanocodex) -> Self {
+    pub fn new(openai: OpenAi, agent: Agent) -> Self {
         Self {
             openai,
             agent,
@@ -921,7 +921,8 @@ async fn run_voice(
         .await?;
     if builder.include_startup_context {
         let rollout = lifecycle_agent
-            .rollout()
+            .persistence()
+            .and_then(|persistence| persistence.rollout)
             .map(|rollout| rollout.path().to_path_buf());
         if let Some(startup) = startup_context::build(&context, rollout.as_deref()) {
             builder.instructions = Arc::from(format!("{}\n\n{startup}", builder.instructions));
@@ -1222,7 +1223,7 @@ struct ActiveAgentRequest {
 }
 
 struct AgentBridge {
-    agent: Nanocodex,
+    agent: Agent,
     updates: mpsc::UnboundedSender<AgentBridgeUpdate>,
     active: Option<ActiveAgentRequest>,
     next_generation: u64,
@@ -1624,7 +1625,7 @@ async fn handle_observed_agent_event(
 }
 
 async fn retain_transcript_tail(
-    agent: &Nanocodex,
+    agent: &Agent,
     tail: &[RealtimeTranscriptEntry],
 ) -> Result<(), VoiceFailure> {
     let transcript = tail
@@ -1638,7 +1639,7 @@ async fn retain_transcript_tail(
 }
 
 async fn route_transcript_tail(
-    agent: &Nanocodex,
+    agent: &Agent,
     tail: &[RealtimeTranscriptEntry],
 ) -> Result<(), VoiceFailure> {
     let Some(prompt) = codex_realtime_tail_delegation(tail) else {

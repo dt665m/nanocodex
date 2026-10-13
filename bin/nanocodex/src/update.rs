@@ -336,9 +336,13 @@ impl Update {
                         "Background updates paused for explicit selection {key}; run nanocodex update --auto enable to resume"
                     );
                 }
+                if let Err(error) = require_no_interrupted_update(&store) {
+                    println!("{error}");
+                }
             }
             return Ok(());
         }
+        // activate_coordinated refuses an interrupted transaction itself.
         if self.apply {
             let key = store
                 .pending()?
@@ -362,6 +366,11 @@ impl Update {
                 }
             }
         }
+        // An interrupted activation owns the CLI selection until recovery.
+        // Refuse before preparing, downloading, staging, clearing pending state
+        // or reporting an apparently active version that recovery would roll
+        // back. Computer Use refreshes above never touch the selection.
+        require_no_interrupted_update(&store)?;
         let manager_key = manager_key(&manager_version);
         store.prepare(&manager_key)?;
         automatic::ensure_default(store.root(), self.nightly || version::is_nightly())?;
@@ -825,11 +834,29 @@ pub(crate) async fn recover_hand_update() -> Result<()> {
             println!("No interrupted coordinated update is recorded");
         }
     } else {
-        crate::hand_service::recover().await?;
+        // A recorded service handover whose backup is already gone (a failed
+        // switch that rolled back cleanly, or a crash before the backup was
+        // saved) leaves the running service as it is; never call it CLI-only.
+        let recorded_service = previous.is_some()
+            && serde_json::from_slice::<serde_json::Value>(&fs::read(&journal)?)?["service"]
+                == true;
+        let restored_service = crate::hand_service::recover().await?;
         if let Some(previous) = previous {
             store.activate(&previous)?;
             fs::remove_file(&journal)?;
-            println!("Restored Nanocodex {previous} and its Hand service");
+            if restored_service {
+                println!("Restored Nanocodex {previous} and its Hand service");
+            } else if recorded_service {
+                println!(
+                    "Restored Nanocodex {previous}; no Hand service backup remained, so the Hand service was left unchanged"
+                );
+            } else {
+                println!("Restored Nanocodex {previous}; this was a CLI-only transaction");
+            }
+        } else if restored_service {
+            println!("Restored the interrupted Hand service update without changing CLI selection");
+        } else {
+            println!("No interrupted coordinated update is recorded");
         }
     }
     #[cfg(not(target_os = "linux"))]
@@ -907,9 +934,7 @@ pub(crate) async fn restart_hand_with_executable(path: &Path) -> Result<()> {
         bail!("hand restart --executable requires macOS");
     }
     let store = VersionStore::discover()?;
-    if store.root().join("update-transaction.json").exists() {
-        bail!("An interrupted update needs recovery; run nanocodex hand recover first");
-    }
+    require_no_interrupted_update(&store)?;
     if store.pending()?.is_some() {
         bail!(
             "A version update is pending; apply it with nanocodex hand restart before selecting a development executable"
@@ -950,6 +975,20 @@ pub(crate) async fn restart_hand() -> Result<()> {
     platform_hand_action(true).await
 }
 
+/// An uncommitted or unfinalized transaction must be resolved by
+/// `nanocodex hand recover` before any selection changes.
+fn require_no_interrupted_update(store: &VersionStore) -> Result<()> {
+    if store.root().join("update-transaction.json").exists() {
+        bail!("An interrupted update needs recovery; run nanocodex hand recover first");
+    }
+    if cfg!(target_os = "windows") && crate::windows_hand::pending_recovery_record()?.is_some() {
+        bail!(
+            "An interrupted Windows Hand update needs recovery; run nanocodex hand recover first"
+        );
+    }
+    Ok(())
+}
+
 /// Background updates defer any installed Hand until an explicit start/restart.
 /// An explicit activation changes the service first and commits the CLI only
 /// after the exact new publisher has registered with the account.
@@ -959,14 +998,19 @@ async fn activate_coordinated(
     background: bool,
     restart_hand: bool,
 ) -> Result<bool> {
-    store.validate_activation(key)?;
+    // Staging, clearing pending state and no-op reports below must not run
+    // while a previous activation awaits recovery.
+    require_no_interrupted_update(store)?;
+    // Early refusal only: the checks before the journal and in activation hash
+    // every file afresh, so this preflight may reuse the selection checks.
+    store.preflight_activation(key)?;
     // On macOS this is the version's signed Nanocodex.app when it has one.
     let companion = store.hand_executable(key);
     // A bundle without a Hand, or whose Hand bytes equal the Hand already in
     // use, changes only the CLI: the Hand service is neither switched nor
     // restarted. Corrupt Hand bytes still fail closed.
     let hand_present = companion.exists();
-    if hand_present && !store.is_cached_bundle(key, false)? {
+    if hand_present && !store.preflight_bundle(key)? {
         bail!("update Hand binary failed checksum verification");
     }
     let installed = if cfg!(target_os = "macos") {
@@ -1011,19 +1055,15 @@ async fn activate_coordinated(
         store.clear_pending()?;
         return Ok(false);
     }
+    // Fresh checks before any journal or service handover; the CLI was just
+    // verified, so only the Hand half of the bundle remains.
     store.validate_activation(key)?;
-    if companion.exists() && !store.is_cached_bundle(key, false)? {
+    if companion.exists() && !store.is_cached_hand(key)? {
         bail!("update Hand binary failed checksum verification");
     }
+    // Repeated under the held lock after the fresh checks above.
+    require_no_interrupted_update(store)?;
     let journal = store.root().join("update-transaction.json");
-    if journal.exists() {
-        bail!("An interrupted update needs recovery; run nanocodex hand recover first");
-    }
-    if cfg!(target_os = "windows") && crate::windows_hand::pending_recovery_record()?.is_some() {
-        bail!(
-            "An interrupted Windows Hand update needs recovery; run nanocodex hand recover first"
-        );
-    }
     let previous = store.active()?;
     if previous.is_none() {
         bail!("An active CLI version is required before coordinated activation");

@@ -18,4 +18,12 @@ mod claude;
 ))]
 mod harness;
 
+#[cfg(all(
+    feature = "claude",
+    feature = "openai",
+    feature = "tools",
+    not(target_family = "wasm")
+))]
+mod runtime;
+
 const fn main() {}

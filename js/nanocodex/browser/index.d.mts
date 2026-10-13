@@ -24,7 +24,17 @@ export type {
   LifecycleTurn,
   LifecycleTurnResult,
   ReasoningMode,
-  SessionSnapshot,
+  ClaudeModel,
+  HarnessFamily,
+  HarnessModel,
+  Mutability,
+  SessionCapabilities,
+  SessionCheckpoint,
+  SessionInfo,
+  SessionLineage,
+  SessionOrigin,
+  SessionPersistence,
+  ServiceTier,
   Thinking,
   Tool,
   NamedTool,
@@ -72,3 +82,5 @@ export type {
 } from "./host.mjs";
 
 export * as Claude from "./Claude.mjs";
+
+export * as Nanocodex from "./Nanocodex.mjs";

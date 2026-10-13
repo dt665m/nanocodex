@@ -56,6 +56,7 @@ Transport.chatGpt({ subscription });
 Transport.mpp({ session: paymentSession });
 Transport.managed({ agent: { create: true } });
 Transport.managed({ agent: { id: retainedAgentId } });
+Transport.anthropic({ apiKey }); // Claude backend of Nanocodex.create
 ```
 
 Managed identity is always explicit. `{ create: true }` provisions one new
@@ -80,15 +81,127 @@ Worker, Durable Object, or application proxy that owns rotating credentials.
 Authentication modes are constructors rather than a union of mutually
 exclusive fields on `Agent.create`.
 
-### Explicit Claude runtime
+### Claude harness
 
-`Claude.create` is an additive Messages backend with explicit host-owned auth
-and an explicit host tool array, using the existing durability store contract.
+`Agent.create({ harness: "claude", model, auth, tools })` runs the native Rust
+Messages backend and returns the same Agent as a Codex session: identical
+`session`, `turn`, and `events` actions, the same `SessionCheckpoint`/fork/resume
+contract, and the same durability store. `Claude.create` is the equivalent
+constructor for the Claude-only `worker` entry point. Claude sessions take
+explicit host-owned auth and a Claude tool array.
 Host tools can share the `exec_command` and `write_stdin` contracts with Codex.
 It does not silently switch managed providers, install Codex tools, or supply
 a subscription sign-in screen. Managed account connection is documented in the
 [managed Claude guide](../../docs/CLAUDE_MANAGED.md). See the [Claude JavaScript guide](../../docs/CLAUDE_JAVASCRIPT.md)
 for durable reopen, replay, and placement boundaries.
+
+### Reusable runtime: Nanocodex.create
+
+Configure credentials, tools and defaults once, then create any number of
+independent root Agents. Each root is created through the same per-agent path as
+`Agent.create`, so it has its own host, tool execution state, evaluator binding,
+session and lifecycle; the runtime shares only immutable configuration and the
+credential capabilities you pass it.
+
+```js
+import { Nanocodex, Transport, Workspace } from "nanocodex/node";
+
+// subscription: an open ChatGptSubscription; codexTools/claudeTools: your named tool arrays.
+
+const nano = await Nanocodex.create({
+  backends: {
+    codex: {
+      transport: Transport.chatGpt({ subscription }), // or Transport.openAi({ apiKey })
+      tools: codexTools,                                // copied per Agent host
+      codeMode: true,
+      filesystem: await Workspace.open({ path: "./codex-work", root: "/workspace" }),
+    },
+    claude: {
+      transport: Transport.anthropic({ apiKey: process.env.ANTHROPIC_API_KEY }),
+      tools: claudeTools,
+      workspace: "/workspace",
+      maxTokens: 8192,
+    },
+  },
+  harness: "codex",
+  model: "gpt-6.1-sol",
+  thinking: "low",
+  instructions: "Default root instructions.",
+});
+
+const coder = await nano.spawn({ instructions: "Implement the change." });
+const reviewer = await nano.spawn({ harness: "claude", instructions: "Review the diff." });
+const turn = reviewer.turn.prompt({ input: "Review src/ for regressions." });
+console.log((await turn.result()).finalMessage);
+
+const checkpoint = await coder.session.checkpoint();
+await coder.session.shutdown();
+const resumed = await nano.resume(checkpoint); // current credentials and tools
+await nano.shutdown();
+```
+
+Backends. `backends.codex` takes a Responses transport (`openAi`, `chatGpt`, `mpp`, `hostManaged`)
+or `{ transport, tools, codeMode, workspace, filesystem, ...codexOptions }`.
+`backends.claude` takes `Transport.anthropic({ apiKey } | { headers } | { subscription })`
+or `{ transport, tools, codeMode, workspace, filesystem, ...claudeOptions }`. A
+`subscription` is an open `ClaudeSubscription` from `nanocodex/worker`; each request reads
+its current private headers with the subscription compatibility profile.
+Nothing is read from the environment, and a family without a backend is never
+served by another family's credential. Keep caller-owned ChatGPT and Claude
+subscriptions open until `nano.shutdown()` resolves. `Transport.managed` opens one
+server-owned durable Agent and stays an `Agent.create` transport.
+
+Selection. `harness` defaults to the family of an explicit `model`, else `codex`
+when configured, else the only backend; `model` defaults to that family's catalog
+default and `thinking` to the model's default. Every choice is validated against the
+bundled WASM model catalog before any request. `nano.spawn()` with no overrides uses
+these defaults. A different `harness` without a model uses that family's default
+model; the same harness keeps the default model. An explicit `model` selects its own
+family, and thinking then defaults to that model's default unless it is the
+runtime default model. Unsupported thinking, a model of another family, an
+unknown model and a family without a backend reject before dispatch. When both
+backends are configured, each root can spawn canonical subagents of either
+family; children use their own backend's credentials, tools and workspace. A
+Claude root's Codex children may use the ChatGPT subscription or MPP.
+
+Tools and workspaces belong to each backend. Declarative tool arrays and maps
+are copied per Agent. A factory `({ harness, role }) => tools` runs once per root
+(`role: "root"`) and once per alternate-family child capability (`role: "child"`,
+created with the root even if no child is spawned); it may return or resolve a
+fresh `createTools()` instance (Codex only), which the claiming host closes. A
+`createTools()` instance itself belongs to one host and is rejected, and a
+factory-made `createTools()` cannot be combined with `backends.codex.filesystem`
+for a Claude root's Codex children: configure the workspace inside `createTools`
+or use a declarative tool array there. `workspace` is only the model's
+working directory label; `filesystem` is a `Workspace` adapter that grants rooted file
+tools (Codex installs them natively, Claude receives the same tools as named
+Claude tools) and fixes the working directory to its root. One adapter shared
+by both backends shares files, never execution state. Shells are separate
+tools. `workspace` resolves spawn, then backend, then runtime; `instructions`
+resolve spawn, then runtime. `codeMode: true` (default) exposes only `exec`/`wait`; `codeMode: false`
+exposes the host tools directly to the provider (no evaluator needed; remote MCP
+requires Code Mode).
+
+Ownership. The runtime owns every root, `nano.resume` result, fork and
+`session.spawn` sibling, including ones made through `Actions`. `agent.session.shutdown()`
+releases one now. `agent.dispose()` detaches a runtime-owned handle and stops its
+event watchers, but the session stays owned until `nano.shutdown()` joins it; call
+`session.shutdown()` to release resources early in long-lived servers.
+`nano.shutdown()` waits for in-flight admissions, cancels and joins every owned
+Agent, rejects later spawns and is idempotent; failures surface as an
+`AggregateError`. Runtime-level `sessionId`, `durability`, `resume` and `harnesses`
+are rejected: use `Agent.create` for named or durable sessions.
+
+Placement. `nanocodex/node` runs every root in the current process with the Node
+evaluator. `nanocodex/host` runs roots inline in the current Web API isolate and
+requires `module`; Code Mode backends also need `codeEvaluator` (for example
+`createQuickJsEvaluator()`) where no `Worker` exists. `nanocodex/browser` places a Codex-only root in its own package
+module Worker, so its options must be structured-clone-safe (`openAi` or
+`hostManaged` transports, no function tool handlers or subscriptions); Claude
+and mixed-family roots run inline in the page, so their credentials are
+visible to that page. Use `nanocodex/host` inside a caller-owned Worker for
+function-bearing tools. Every placement loads the bundled WASM
+model catalog once at `Nanocodex.create`.
 
 ### Personal memories and caller context
 
@@ -990,29 +1103,48 @@ Cloudflare requires the QuickJS `.wasm` file to be statically imported and
 passed with `newVariant(..., { wasmModule })`; the complete deployment is in
 `examples/cloudflare-fetch-mcp`.
 
-Completed results can be persisted and resumed by a fresh Node or browser
-agent:
+Every session, Codex or Claude, exposes the same harness-neutral contract.
+A `SessionCheckpoint` is the one portable, family-tagged boundary used to
+resume, fork, and restore. It is JSON-safe; its contents are opaque and only
+the harness that produced it decodes them:
 
 ```js
-const snapshot = await result.snapshot();
+const checkpoint = await result.checkpoint(); // or agent.session.checkpoint()
+await store.put("session", JSON.stringify(checkpoint));
 result.dispose();
 await agent.session.shutdown();
 
 const resumed = await Agent.create({
   transport: Transport.openAi({ apiKey: process.env.OPENAI_API_KEY }),
-  resume: snapshot,
+  resume: JSON.parse(await store.get("session")),
   tools,
 });
 await resumed.session.shutdown();
 ```
 
-The snapshot contains authoritative typed history but no provider response ID,
-so the first resumed request safely replays the committed conversation. Resume
-with the same instructions and tool definitions, and release the original
-agent before handing its snapshot to another writer.
+The checkpoint contains the complete unredacted model-visible conversation but
+no provider response ID, so the first resumed request safely replays the
+committed conversation. Resume with the same instructions and tool definitions,
+and release the original agent before handing its checkpoint to another writer.
+`Agent.create({ harness: "claude", ..., resume })` resumes a Claude checkpoint
+the same way; a checkpoint of another family rejects with
+`code: "checkpoint_family_mismatch"`.
+
+`agent.session.info()` returns `{ sessionId, harness, lineage: { rootSessionId,
+parentSessionId, origin, depth } }`. `agent.session.capabilities()` states which
+lifecycle operations the backend supports and when model, thinking, and service
+tier may change (`setModel`, `setThinking`, `setServiceTier`/`setFastMode`); an
+unsupported operation rejects with
+`code: "unsupported_capability"` and a `capability` name.
+`agent.session.persistence()` reports the durable state backing the session, or
+`null`. `agent.session.fork({ at, origin })` forks the latest boundary, a
+completed `TurnResult`, or a `SessionCheckpoint` of the same conversation;
+`origin: "side_conversation"` records a side exploration in the child's
+lineage. A fork of a durable session, side conversation or not, is durable in
+its own right and reports its own `session.persistence()`.
 
 For crash recovery inside a turn, provide the generic durability host instead
-of manually persisting snapshots. The host stores one opaque Rust state value;
+of manually persisting checkpoints. The host stores one opaque Rust state value;
 model replay, tool ambiguity, operation deduplication, and checkpoint recovery
 remain in Rust/WASM:
 
@@ -1102,23 +1234,31 @@ import { importDurabilityStatePages } from "nanocodex/durability";
 import { createPostgresDurabilityStore } from "nanocodex/durability/postgres";
 
 await cloudflareAgent.session.shutdown();
-const pages = [];
-let cursor;
-let to;
-do {
-  const page = await CloudflareAgent.exportDurabilityState(durableObjectOwner, {
-    from: "0", // exclusive destination revision
-    to,        // omit once, then repeat the selected inclusive source revision
-    cursor,
-  });
-  pages.push(page);
-  to = page.to;
-  cursor = page.nextCursor ?? undefined;
-} while (cursor !== undefined);
+// The root state, then its task-tree journal (`<stateId>:subagents`).
+async function exportPages(selection) {
+  const pages = [];
+  let cursor;
+  let to;
+  do {
+    const page = await CloudflareAgent.exportDurabilityState(durableObjectOwner, {
+      ...selection,
+      from: "0", // exclusive destination revision
+      to,        // omit once, then repeat the selected inclusive source revision
+      cursor,
+    });
+    pages.push(page);
+    to = page.to;
+    cursor = page.nextCursor ?? undefined;
+  } while (cursor !== undefined);
+  return pages;
+}
+const pages = await exportPages({});
+const subagentPages = await exportPages({ subagents: true });
 
 // Send the pages through an authenticated, encrypted operator path.
 const destination = createPostgresDurabilityStore(vercelPostgresPool);
 await importDurabilityStatePages(destination, JSON.parse(JSON.stringify(pages)));
+await importDurabilityStatePages(destination, JSON.parse(JSON.stringify(subagentPages)));
 
 const vercelAgent = await Agent.create({
   module: wasmModule,
@@ -1165,24 +1305,25 @@ const module = await WebAssembly.compile(await readFile(wasmAssetPath));
 const agent = await Agent.create({ transport: Transport.openAi({ apiKey }), module });
 ```
 
-A Codex-compatible rollout can also be resumed by materializing its committed
-`response_item` history into a snapshot with no `request_prefix`. Nanocodex
-rebuilds the current prefix from the supplied instructions and JavaScript tools
-while preserving the rollout's workspace, lineage, cache key, canonical user
-context, and typed history.
-
 `Agent` and `Actions` are module namespaces, not classes. `Agent.create` returns
 an owned client decorated with matching domain actions:
 
 - `agent.turn.prompt(...)` / `Actions.turn.prompt(agent, ...)`
 - `turn.accepted()` / `Actions.turn.accepted(turn)`
 - `turn.result()` / `Actions.turn.getResult(turn)`
-- `result.snapshot()` / `Actions.turn.getSnapshot(result)`
+- `result.checkpoint()` / `Actions.turn.getCheckpoint(result)`
 - `result.usage()` / `Actions.turn.getUsage(result)`
+- `agent.session.info()` / `Actions.session.info(agent)`
+- `agent.session.capabilities()` / `Actions.session.capabilities(agent)`
+- `agent.session.persistence()` / `Actions.session.persistence(agent)`
+- `agent.session.checkpoint()` / `Actions.session.checkpoint(agent)`
 - `agent.session.fork(...)` / `Actions.session.fork(agent, ...)`
+- `agent.session.setModel(...)` / `Actions.session.setModel(agent, ...)`
+- `agent.session.cancel()` / `Actions.session.cancel(agent)`
 - `agent.session.compact()` / `Actions.session.compact(agent)`
 - `agent.session.setThinking(...)` / `Actions.session.setThinking(agent, ...)`
 - `agent.session.setFastMode(...)` / `Actions.session.setFastMode(agent, ...)`
+- `agent.session.setServiceTier(...)` / `Actions.session.setServiceTier(agent, ...)`
 - `agent.session.shutdown()` / `Actions.session.shutdown(agent)`
 - `agent.session.spawn()` / `Actions.session.spawn(agent)`
 - `agent.events.watch(...)` / `Actions.events.watch(agent, ...)`
@@ -1194,17 +1335,17 @@ acknowledging a request without waiting for model execution or materializing a
 result.
 
 `turn.result()` resolves to a frozen, opaque completed `TurnResult` handle. Its
-`finalMessage` is eager. The async `usage()` and `snapshot()` actions materialize
+`finalMessage` is eager. The async `usage()` and `checkpoint()` actions materialize
 immutable values once and cache their promises. A package Worker completes a
-turn with only the message and hidden result identity; Rust-produced snapshot
+turn with only the message and hidden result identity; Rust-produced checkpoint
 JSON crosses the Worker boundary only on first demand and is parsed once in the
-calling isolate. Historical `fork({ at })` consumes the hidden identity directly,
-never an unfinished turn, clone, snapshot, or provider response ID.
+calling isolate. `fork({ at: result })` consumes the hidden identity directly,
+never an unfinished turn, clone, or provider response ID.
 
 The completed result owns its identity independently from the `Turn`, so
 `turn.dispose()` does not invalidate a successful result. Call `result.dispose()`
 after its last fork/materialization; this releases the retained Worker/native
-checkpoint and invalidates future `snapshot()`, `usage()`, and historical forks.
+checkpoint and invalidates future `checkpoint()`, `usage()`, and turn forks.
 An undisposed result intentionally keeps its package Worker alive after the last
 Agent shuts down so its lazy values remain available. Garbage collection is only
 a fallback for forgotten handles, not deterministic cleanup.

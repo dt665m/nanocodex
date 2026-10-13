@@ -1022,11 +1022,13 @@ impl ServiceUpdate {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) async fn recover() -> Result<()> {
+/// Restore an interrupted service handover. Returns whether a Hand service
+/// backup existed and was restored.
+pub(crate) async fn recover() -> Result<bool> {
     refuse_system_service().await?;
     let backup = plist_path()?.with_extension("plist.update-backup");
     match fs::symlink_metadata(&backup) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error.into()),
         Ok(_) => {}
     }
@@ -1046,7 +1048,8 @@ pub(crate) async fn recover() -> Result<()> {
         backup,
         _legacy_guards: guards,
     };
-    transaction.rollback().await
+    transaction.rollback().await?;
+    Ok(true)
 }
 
 const fn competing_owner(plist_exists: bool, system_loaded: bool) -> bool {

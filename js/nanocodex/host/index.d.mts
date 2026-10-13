@@ -40,7 +40,17 @@ export type {
   LifecycleTurnResult,
   RealtimeTranscriptEntry,
   ReasoningMode,
-  SessionSnapshot,
+  ClaudeModel,
+  HarnessFamily,
+  HarnessModel,
+  Mutability,
+  SessionCapabilities,
+  SessionCheckpoint,
+  SessionInfo,
+  SessionLineage,
+  SessionOrigin,
+  SessionPersistence,
+  ServiceTier,
   SubscriptionCommitRequest,
   SubscriptionCommitResult,
   SubscriptionRevision,
@@ -65,3 +75,5 @@ export type {
 } from "../browser/host.mjs";
 
 export * as Claude from "./Claude.mjs";
+
+export * as Nanocodex from "./Nanocodex.mjs";

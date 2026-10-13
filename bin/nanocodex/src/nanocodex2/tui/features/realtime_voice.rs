@@ -13,7 +13,7 @@ use std::sync::{
 };
 
 use crossterm::event::{KeyCode, KeyEvent};
-use nanocodex::{Nanocodex, OpenAi};
+use nanocodex::{Agent, OpenAi};
 use nanocodex_voice::{
     CHATGPT_REALTIME_VOICES, PLATFORM_REALTIME_VOICES, RealtimeVoice as Voice, VoiceAgentControl,
     VoiceEvent, VoiceEvents, VoiceSession, VoiceSessionBuilder, VoiceSpeaker,
@@ -57,7 +57,7 @@ type Slot = Arc<Mutex<Option<VoiceSession>>>;
 #[derive(Default)]
 pub(crate) struct RealtimeVoice {
     realtime: Option<OpenAi>,
-    agent: Option<Nanocodex>,
+    agent: Option<Agent>,
     mute_key: Option<MuteKey>,
     slot: Slot,
     control: VoiceAgentControl,
@@ -174,7 +174,7 @@ impl RealtimeVoice {
 struct Job {
     slot: Slot,
     realtime: Option<OpenAi>,
-    agent: Option<Nanocodex>,
+    agent: Option<Agent>,
     control: VoiceAgentControl,
     generation: Arc<AtomicU64>,
     forward: Arc<StdMutex<Option<JoinHandle<()>>>>,

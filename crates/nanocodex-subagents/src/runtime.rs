@@ -20,7 +20,7 @@ use super::{
 use futures_util::future::join_all;
 use jsonschema::Validator;
 use nanocodex_agent::{
-    AgentEvents, AgentHandle, ChildSnapshot, Nanocodex, NanocodexError, Result as AgentResult,
+    AgentEvents, AgentHandle, Nanocodex, NanocodexError, Result as AgentResult, SessionCheckpoint,
     TurnResult, events::AgentEventKind,
 };
 use serde::Serialize;
@@ -48,7 +48,7 @@ pub(super) struct ChildSession {
     pub(super) active: bool,
     pub(super) output_validator: Validator,
     pub(super) output_schema: Value,
-    pub(super) stored_runtime: Option<ChildSnapshot>,
+    pub(super) stored_runtime: Option<SessionCheckpoint>,
     /// The latest boundary is a durable journal record, loaded on rehydration
     /// instead of being held in memory while the child is idle.
     pub(super) journaled_runtime: bool,
@@ -65,6 +65,16 @@ pub(super) struct ChildSession {
     pub(super) in_flight_calls: Vec<durable::InFlightCall>,
     /// Observed calls dropped by the retention bound this turn.
     pub(super) in_flight_omitted: u32,
+    /// Revision of a root child's completion announced but not yet
+    /// acknowledged by the host (journaled with the terminal status).
+    pub(super) pending_completion: Option<u64>,
+    /// Instruction revision of the turn that produced the current terminal
+    /// status. Wait marks and reported completion revisions both use it, so a
+    /// later delegation (which bumps next_instruction_revision) never makes an
+    /// old result look new.
+    pub(super) settled_revision: Option<u64>,
+    /// Commit state of omitted live calls, so checkpoints also retire them.
+    pub(super) in_flight_progress: durable::OmittedProgress,
     /// Journal-restored children need a fresh host binding before execution.
     announce: bool,
 }
@@ -123,6 +133,10 @@ pub struct Registry {
     journals: std::sync::RwLock<HashMap<String, Arc<dyn SubagentStore>>>,
     /// Per-root restoration outcome. Pending and failed roots must never be saved.
     restored: std::sync::Mutex<HashMap<String, RestorationOutcome>>,
+    /// Per-root FIFO spawn admission for adopted journals. The restoration
+    /// gate is a watch, which wakes concurrent waiters in no defined order;
+    /// spawns queue here instead, so agent IDs follow call order.
+    spawn_admission: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     journal_writer: std::sync::atomic::AtomicBool,
     /// Orders background snapshots and the final pre-teardown journal flush.
     journal_write_lock: tokio::sync::Mutex<()>,
@@ -139,6 +153,20 @@ pub struct Registry {
     wait_reported: std::sync::Mutex<HashMap<(String, AgentId), u64>>,
     /// Consecutive waits per caller with nothing new and nothing left active.
     idle_waits: std::sync::Mutex<HashMap<String, (Vec<AgentId>, u32)>>,
+    /// This registry, for per-agent ordered status workers.
+    this: std::sync::OnceLock<Weak<Self>>,
+    /// Per-agent ordered status delivery: a settled turn's final checkpoint,
+    /// journal write and announcement run off the harness loop, in order with
+    /// that agent's other status updates.
+    status_queues: std::sync::Mutex<HashMap<(String, AgentId), mpsc::UnboundedSender<OrderedJob>>>,
+    /// Completions a live host failed to take: (attempts, retry scheduled).
+    completion_retries: std::sync::Mutex<HashMap<(String, AgentId), (u32, bool)>>,
+}
+
+/// Bounded backoff for re-announcing an undelivered completion in a live
+/// runtime: 2 s doubling to a 5 minute ceiling, never a hot loop.
+fn completion_retry_delay(attempt: u32) -> Duration {
+    Duration::from_millis(1000_u64 << attempt.clamp(1, 9)).min(Duration::from_secs(300))
 }
 
 #[derive(Default)]
@@ -157,6 +185,35 @@ struct AgentScope {
     /// Shutdown saved the durable pre-teardown tree; later Closing/Closed
     /// transitions are live-only and must never reach the journal.
     journal_frozen: bool,
+}
+
+/// Evidence a checkpoint commits, bound to the turn it was taken from.
+struct CommittedCalls {
+    revision: u64,
+    call_ids: Vec<String>,
+    omitted: u32,
+}
+
+/// Work on one agent's ordered status queue.
+enum OrderedJob {
+    Update(AgentUpdate),
+    /// A settled turn: final checkpoint, then journal, then announcement.
+    Settle {
+        status: AgentStatus,
+        completion: Option<u64>,
+        harness: Option<HarnessHandle>,
+    },
+}
+
+const fn settled_update(id: AgentId, status: AgentStatus, completion: Option<u64>) -> AgentUpdate {
+    match completion {
+        Some(revision) => AgentUpdate::Completion {
+            id,
+            status,
+            revision,
+        },
+        None => AgentUpdate::Status { id, status },
+    }
 }
 
 /// One root journal value and the checkpoint records (key, JSON) it newly references.
@@ -259,6 +316,11 @@ pub struct AgentSummary {
     pub status: AgentStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_output: Option<Value>,
+    /// For a completed agent: the instruction revision of the turn whose
+    /// result this is. Hosts match a committed wait/list receipt to exactly
+    /// one logical completion with (agent_id, completion_revision).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_revision: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -270,6 +332,9 @@ pub struct AgentDirectoryEntry {
     pub status: AgentStatus,
     pub can_message: bool,
     pub can_manage: bool,
+    /// See AgentSummary::completion_revision.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_revision: Option<u64>,
     /// A restored child whose automatic resume is not yet delivered: it is
     /// interrupted now but about to run, so hosts must keep the runtime live.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -654,6 +719,7 @@ impl RegistryState {
                     status: session.status.clone(),
                     can_message,
                     can_manage,
+                    completion_revision: session.completion_revision(),
                     resuming: false,
                 })
             })
@@ -818,9 +884,11 @@ impl RegistryState {
         Ok(summaries
             .into_iter()
             .map(|summary| {
-                let revision = sessions
-                    .get(&summary.agent_id)
-                    .map_or(0, |session| session.next_instruction_revision);
+                let revision = sessions.get(&summary.agent_id).map_or(0, |session| {
+                    session
+                        .settled_revision
+                        .unwrap_or(session.next_instruction_revision)
+                });
                 (summary, revision)
             })
             .collect())
@@ -1099,6 +1167,7 @@ impl Registry {
             store: std::sync::RwLock::new(None),
             journals: std::sync::RwLock::new(HashMap::new()),
             restored: std::sync::Mutex::new(HashMap::new()),
+            spawn_admission: std::sync::Mutex::new(HashMap::new()),
             journal_writer: std::sync::atomic::AtomicBool::new(false),
             journal_write_lock: tokio::sync::Mutex::new(()),
             checkpoints: std::sync::Mutex::new(HashMap::new()),
@@ -1108,6 +1177,9 @@ impl Registry {
             pending_resume: std::sync::Mutex::new(HashMap::new()),
             wait_reported: std::sync::Mutex::new(HashMap::new()),
             idle_waits: std::sync::Mutex::new(HashMap::new()),
+            this: std::sync::OnceLock::new(),
+            status_queues: std::sync::Mutex::new(HashMap::new()),
+            completion_retries: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -1144,6 +1216,10 @@ impl Registry {
             }
             restored.insert(root.clone(), gate);
         }
+        self.spawn_admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(root.clone(), Arc::new(tokio::sync::Mutex::new(())));
         self.journals
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1154,14 +1230,19 @@ impl Registry {
         self.ensure_journal_writer();
         let registry = Arc::clone(self);
         drop(platform::spawn(async move {
+            let mut completed = Vec::new();
             match registry.restore(&root).await {
-                Ok(report) if report.restored > 0 => tracing::info!(
-                    restored = report.restored,
-                    interrupted = report.interrupted.len(),
-                    unrecoverable = report.unrecoverable.len(),
-                    %root,
-                    "restored durable subagent task tree"
-                ),
+                Ok(report) if report.restored > 0 => {
+                    tracing::info!(
+                        restored = report.restored,
+                        interrupted = report.interrupted.len(),
+                        completed = report.completed.len(),
+                        unrecoverable = report.unrecoverable.len(),
+                        %root,
+                        "restored durable subagent task tree"
+                    );
+                    completed = report.completed;
+                }
                 Ok(_) => {}
                 Err(error) => {
                     tracing::warn!(%error, %root, "could not restore durable subagent task tree");
@@ -1171,6 +1252,11 @@ impl Registry {
                     return;
                 }
             }
+            // Queue restored completions before releasing waiters: a parent's
+            // wait that observes one must follow its announcement in order.
+            registry
+                .announce_restored_completions(&root, &completed)
+                .await;
             let _ = ready.send(Some(Ok(())));
             registry.changed();
             for (id, result) in registry.resume_interrupted(&root).await {
@@ -1179,6 +1265,37 @@ impl Registry {
                 }
             }
         }));
+    }
+
+    /// Admits a spawn under `session_id`'s root: waits for its restoration in
+    /// call order. Hold the guard until the spawn's agent IDs are reserved.
+    ///
+    /// Concurrent spawns waiting on [`Self::await_restored`] alone would resume
+    /// (and reserve IDs) in the restoration watch's wake order, not their own.
+    /// Each queues on its root's FIFO admission lock first, in the same poll
+    /// that obtained the root under the FIFO state lock, so arrival order holds.
+    pub(crate) async fn admit_spawn(
+        &self,
+        session_id: &str,
+    ) -> std::io::Result<Option<tokio::sync::OwnedMutexGuard<()>>> {
+        let root = self
+            .state
+            .lock()
+            .await
+            .root_session_id(session_id)
+            .to_owned();
+        let admission = self
+            .spawn_admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&root)
+            .cloned();
+        let guard = match admission {
+            Some(admission) => Some(admission.lock_owned().await),
+            None => None,
+        };
+        self.await_restored(session_id).await?;
+        Ok(guard)
     }
 
     /// Waits until an adopted root's journaled tree is restored.
@@ -1240,6 +1357,8 @@ impl Registry {
         let mut revision = self.revision.subscribe();
         drop(platform::spawn(async move {
             let mut saved = HashMap::<String, String>::new();
+            // Child session ID -> checkpoint record key last recorded as its own session.
+            let mut recorded = HashMap::<String, Arc<str>>::new();
             loop {
                 let Some(live) = registry.upgrade() else {
                     return;
@@ -1267,6 +1386,25 @@ impl Registry {
                     {
                         Ok(()) => {
                             live.acknowledge(&root_session_id, &records);
+                            // Only boundaries already in a saved journal become
+                            // sessions, so a recorded child is always restorable.
+                            for (key, checkpoint) in live.child_checkpoints(&root_session_id).await
+                            {
+                                let session_id = checkpoint.session_id().to_owned();
+                                if recorded.get(&session_id) == Some(&key) {
+                                    continue;
+                                }
+                                match store.record_session(&root_session_id, checkpoint).await {
+                                    Ok(()) => {
+                                        live.release_recorded(&root_session_id, &key);
+                                        recorded.insert(session_id, key);
+                                    }
+                                    Err(error) => tracing::warn!(
+                                        %error, %root_session_id, %session_id,
+                                        "could not record subagent session"
+                                    ),
+                                }
+                            }
                             saved.insert(root_session_id, payload);
                         }
                         Err(error) => {
@@ -1281,6 +1419,34 @@ impl Registry {
                 }
             }
         }));
+    }
+
+    /// Latest committed checkpoint (record key, boundary) of every child
+    /// journaled under a root.
+    async fn child_checkpoints(&self, root_session_id: &str) -> Vec<(Arc<str>, SessionCheckpoint)> {
+        let state = self.state.lock().await;
+        let checkpoints = self
+            .checkpoints
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(scope) = state.scopes.get(root_session_id) else {
+            return Vec::new();
+        };
+        let mut ids = scope.sessions.keys().copied().collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids.into_iter()
+            .filter_map(|id| {
+                // Boundaries already recorded were released from memory.
+                let checkpoint = match checkpoints.get(&(root_session_id.to_owned(), id)) {
+                    Some(checkpoint) => checkpoint.clone(),
+                    None => durable::JournalCheckpoint::encode(
+                        scope.sessions.get(&id)?.stored_runtime.as_ref()?,
+                    )
+                    .ok()?,
+                };
+                Some((checkpoint.key, checkpoint.checkpoint?))
+            })
+            .collect()
     }
 
     async fn journal_payloads(&self) -> Vec<(String, JournalWrite)> {
@@ -1308,7 +1474,7 @@ impl Registry {
         &self,
         root_session_id: &str,
         id: AgentId,
-        snapshot: ChildSnapshot,
+        snapshot: SessionCheckpoint,
     ) -> bool {
         // Encode once, outside the lock; journal writes only reference it.
         match durable::JournalCheckpoint::encode(&snapshot) {
@@ -1328,7 +1494,7 @@ impl Registry {
         &self,
         root_session_id: &str,
         id: AgentId,
-    ) -> std::io::Result<ChildSnapshot> {
+    ) -> std::io::Result<SessionCheckpoint> {
         let (key, pending) = self
             .checkpoints
             .lock()
@@ -1362,6 +1528,20 @@ impl Registry {
             .insert((root_session_id.to_owned(), id), checkpoint);
     }
 
+    /// Drops in-memory boundaries once they are recorded as child sessions; the
+    /// journal record still holds them for rehydration.
+    fn release_recorded(&self, root_session_id: &str, key: &Arc<str>) {
+        let mut checkpoints = self
+            .checkpoints
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for ((root, _), checkpoint) in checkpoints.iter_mut() {
+            if root == root_session_id && checkpoint.key == *key && checkpoint.pending.is_none() {
+                checkpoint.checkpoint = None;
+            }
+        }
+    }
+
     /// Releases encoded checkpoints once a saved journal references their records.
     fn acknowledge(&self, root_session_id: &str, records: &[(Arc<str>, Arc<str>)]) {
         if records.is_empty() {
@@ -1381,41 +1561,34 @@ impl Registry {
         }
     }
 
-    /// Captures a child's latest committed boundary for the durable journal.
-    fn capture_checkpoint(
-        self: &Arc<Self>,
-        root_session_id: String,
-        id: AgentId,
-        harness: HarnessHandle,
-    ) {
-        if self.store_for(&root_session_id).is_none() {
-            return;
+    /// Registers a final checkpoint as pending (shutdown waits for it).
+    fn begin_pending_checkpoint(&self, root_session_id: &str) -> bool {
+        if self.store_for(root_session_id).is_none() {
+            return false;
         }
         *self
             .pending_checkpoints
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(root_session_id.clone())
+            .entry(root_session_id.to_owned())
             .or_default() += 1;
-        let registry = Arc::clone(self);
-        drop(platform::spawn(async move {
-            if let Ok(snapshot) = harness.snapshot().await {
-                registry.record_checkpoint(&root_session_id, id, snapshot);
-            }
-            {
-                let mut pending = registry
-                    .pending_checkpoints
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if let Some(count) = pending.get_mut(&root_session_id) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        pending.remove(&root_session_id);
-                    }
+        true
+    }
+
+    fn finish_pending_checkpoint(&self, root_session_id: &str) {
+        {
+            let mut pending = self
+                .pending_checkpoints
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(count) = pending.get_mut(root_session_id) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    pending.remove(root_session_id);
                 }
             }
-            registry.changed();
-        }));
+        }
+        self.changed();
     }
 
     /// Journals a running child's latest committed step.
@@ -1449,11 +1622,17 @@ impl Registry {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .remove(&key);
                 let harness = registry.running_harness(&key.0, key.1).await;
+                // Also taken before the snapshot, which therefore commits them.
+                let commits = registry.committable_calls(&key.0, key.1).await;
                 if let Some(harness) = harness
                     && let Ok(snapshot) = harness.snapshot().await
                     && registry.running_harness(&key.0, key.1).await.is_some()
                 {
-                    registry.record_checkpoint(&key.0, key.1, snapshot);
+                    if registry.record_checkpoint(&key.0, key.1, snapshot)
+                        && let Some(commits) = commits
+                    {
+                        registry.retire_committed(&key.0, key.1, commits).await;
+                    }
                     if progressed {
                         registry.reset_resume_attempts(&key.0, key.1).await;
                     }
@@ -1478,6 +1657,81 @@ impl Registry {
                 }
             }
         }));
+    }
+
+    /// A provider call began from a committed step holding every result the
+    /// live runtime has settled so far; the next checkpoint captures them.
+    async fn commit_boundary(&self, root_session_id: &str, id: AgentId) {
+        let mut state = self.state.lock().await;
+        let Some(session) = state
+            .scopes
+            .get_mut(root_session_id)
+            .and_then(|scope| scope.sessions.get_mut(&id))
+        else {
+            return;
+        };
+        for call in &mut session.in_flight_calls {
+            if call.live && call.settled {
+                call.committable = true;
+            }
+        }
+        let progress = &mut session.in_flight_progress;
+        progress.committable = progress.committable.saturating_add(progress.settled);
+        progress.settled = 0;
+    }
+
+    /// Calls a checkpoint captured from now on commits, for its active turn.
+    async fn committable_calls(
+        &self,
+        root_session_id: &str,
+        id: AgentId,
+    ) -> Option<CommittedCalls> {
+        let state = self.state.lock().await;
+        let session = state
+            .scopes
+            .get(root_session_id)
+            .and_then(|scope| scope.sessions.get(&id))?;
+        let revision = session.active_instruction_revision?;
+        let call_ids = session
+            .in_flight_calls
+            .iter()
+            .filter(|call| call.live && call.committable)
+            .map(|call| call.call_id.clone())
+            .collect::<Vec<_>>();
+        let omitted = session.in_flight_progress.committable;
+        (!call_ids.is_empty() || omitted > 0).then_some(CommittedCalls {
+            revision,
+            call_ids,
+            omitted,
+        })
+    }
+
+    /// Drops calls whose results a recorded checkpoint now holds. Ordered
+    /// after the checkpoint, so a journal never has the pruned evidence
+    /// without the checkpoint that replaces it.
+    async fn retire_committed(&self, root_session_id: &str, id: AgentId, commits: CommittedCalls) {
+        {
+            let mut state = self.state.lock().await;
+            let Some(session) = state
+                .scopes
+                .get_mut(root_session_id)
+                .and_then(|scope| scope.sessions.get_mut(&id))
+            else {
+                return;
+            };
+            // A newer turn has its own evidence.
+            if session.active_instruction_revision != Some(commits.revision) {
+                return;
+            }
+            session
+                .in_flight_calls
+                .retain(|call| !(call.live && commits.call_ids.contains(&call.call_id)));
+            let progress = &mut session.in_flight_progress;
+            let omitted = commits.omitted.min(progress.committable);
+            progress.committable -= omitted;
+            session.in_flight_omitted = session.in_flight_omitted.saturating_sub(omitted);
+        }
+        self.changed();
     }
 
     /// A resumed child journaled a checkpoint after finishing a tool call in
@@ -1511,6 +1765,35 @@ impl Registry {
             tool: String,
             #[serde(default)]
             arguments: Option<Value>,
+            #[serde(default)]
+            parent_call_id: Option<String>,
+            /// Codex Code Mode cell lifetime.
+            #[serde(default)]
+            cell: Option<Cell>,
+            /// Claude reports the cell under metadata._nanocodex_code.
+            #[serde(default)]
+            metadata: Option<Value>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Cell {
+            origin_call_id: String,
+            running: bool,
+        }
+        impl Call {
+            /// The Code Mode cell this result observed: its original exec
+            /// call and whether it is still running. Claude omits running for
+            /// a cell that may produce more updates.
+            fn cell(&self) -> Option<(&str, bool)> {
+                if let Some(cell) = &self.cell {
+                    return Some((cell.origin_call_id.as_str(), cell.running));
+                }
+                let code = self.metadata.as_ref()?.get("_nanocodex_code")?;
+                let origin = code.get("origin_call_id")?.as_str()?;
+                Some((
+                    origin,
+                    code.get("running").and_then(Value::as_bool) != Some(false),
+                ))
+            }
         }
         let Some(call) = payload
             .as_ref()
@@ -1535,21 +1818,62 @@ impl Registry {
                             &call.call_id,
                             &call.tool,
                             call.arguments.as_ref(),
+                            parent_call(&call.call_id, call.parent_call_id.as_deref()),
                         ),
                     );
-                    session.in_flight_omitted = session.in_flight_omitted.saturating_add(evicted);
+                    for call in &evicted {
+                        session.in_flight_progress.evicted(call);
+                    }
+                    session.in_flight_omitted = session
+                        .in_flight_omitted
+                        .saturating_add(u32::try_from(evicted.len()).unwrap_or(u32::MAX));
                 }
                 // Kept, not removed: a result reaches the restored history only
-                // once a later checkpoint commits it.
+                // once a later checkpoint commits it (see commit_boundary).
                 AgentEventKind::ToolResult => {
-                    let Some(existing) = session
+                    let cell = call.cell();
+                    let top_level =
+                        parent_call(&call.call_id, call.parent_call_id.as_deref()).is_none();
+                    if let Some(existing) = session
                         .in_flight_calls
                         .iter_mut()
                         .find(|existing| existing.call_id == call.call_id)
-                    else {
-                        return;
-                    };
-                    existing.result_recorded = true;
+                    {
+                        existing.result_recorded = true;
+                        if existing.live && existing.parent_call_id.is_none() {
+                            // A yielded exec keeps running: its output is in
+                            // the conversation, but the cell is not finished.
+                            if matches!(cell, Some((origin, true)) if origin == call.call_id) {
+                                existing.yielded = true;
+                            } else {
+                                existing.settled = true;
+                            }
+                        }
+                    }
+                    // Only a terminal cell result (from its exec or a later
+                    // wait) reports the cell's nested work as finished. Nested
+                    // results never enter the conversation themselves, and a
+                    // yielded cell is lost with its runtime.
+                    if top_level && let Some((origin, false)) = cell {
+                        for listed in &mut session.in_flight_calls {
+                            if !listed.live {
+                                continue;
+                            }
+                            if listed.parent_call_id.as_deref() == Some(origin)
+                                && listed.result_recorded
+                            {
+                                listed.settled = true;
+                            } else if listed.call_id == origin && listed.yielded {
+                                // Settled by this terminal result once it commits.
+                                listed.yielded = false;
+                                listed.settled = true;
+                            }
+                        }
+                        if let Some(count) = session.in_flight_progress.nested.remove(origin) {
+                            session.in_flight_progress.settled =
+                                session.in_flight_progress.settled.saturating_add(count);
+                        }
+                    }
                 }
                 _ => return,
             }
@@ -1587,9 +1911,7 @@ impl Registry {
             .map_err(|error| std::io::Error::other(format!("invalid subagent journal: {error}")))?;
         // Embedded (version 1) journals carry whole child conversations.
         drop(payload);
-        if journal.version != durable::JOURNAL_VERSION
-            && journal.version != durable::EMBEDDED_JOURNAL_VERSION
-        {
+        if !(durable::MIN_JOURNAL_VERSION..=durable::JOURNAL_VERSION).contains(&journal.version) {
             return Err(std::io::Error::other(format!(
                 "unsupported subagent journal version {}",
                 journal.version
@@ -1597,14 +1919,21 @@ impl Registry {
         }
         let mut agents = journal.agents;
         agents.sort_by_key(|agent| agent.descriptor.id);
-        // Referenced conversations stay in the store until a child runs.
+        // Current records stay in the store until a child runs. Older
+        // journals are loaded now so their per-family checkpoints can be
+        // upgraded with the child's lineage and re-recorded.
+        let lazy = journal.version == durable::JOURNAL_VERSION;
         let mut stored = HashMap::new();
-        for agent in &agents {
-            if let Some(key) = &agent.checkpoint_ref {
-                stored.insert(
-                    agent.descriptor.id,
-                    durable::JournalCheckpoint::stored(key.clone()),
-                );
+        for agent in &mut agents {
+            if lazy {
+                if let Some(key) = &agent.checkpoint_ref {
+                    stored.insert(
+                        agent.descriptor.id,
+                        durable::JournalCheckpoint::stored(key.clone(), None),
+                    );
+                }
+            } else if let Some(checkpoint) = agent.hydrate(store.as_ref(), root_session_id).await? {
+                stored.insert(agent.descriptor.id, checkpoint);
             }
         }
         let mut report = RestoreReport::default();
@@ -1618,12 +1947,22 @@ impl Registry {
                 "subagent scope already has live children and cannot be restored",
             ));
         }
-        for agent in agents {
+        let lineages = agents
+            .iter()
+            .map(|agent| durable::journaled_lineage(root_session_id, &agents, agent.descriptor.id))
+            .collect::<Vec<_>>();
+        for (agent, lineage) in agents.into_iter().zip(lineages) {
             let id = agent.descriptor.id;
-            let (session, resume, lost) = durable::restored_session(agent)?;
+            let checkpoint = agent.snapshot(&lineage)?;
+            let (session, resume, lost) = durable::restored_session(agent, checkpoint)?;
+            if session.pending_completion.is_some()
+                && matches!(session.status, AgentStatus::Completed { .. })
+            {
+                report.completed.push(id);
+            }
             match (stored.remove(&id), &session.stored_runtime) {
                 (Some(checkpoint), _) => self.insert_checkpoint(root_session_id, id, checkpoint),
-                // An embedded checkpoint becomes a record on the next save.
+                // Embedded and per-family checkpoints become records on the next save.
                 (None, Some(snapshot)) => {
                     self.insert_checkpoint(
                         root_session_id,
@@ -1645,7 +1984,7 @@ impl Registry {
         drop(state);
         // Persist each resume attempt before admitting it: a runtime lost during
         // every resume must still exhaust its bounded recovery budget.
-        if !report.interrupted.is_empty() {
+        if !report.interrupted.is_empty() || !report.completed.is_empty() {
             self.save_scope(root_session_id, store.as_ref())
                 .await
                 .map_err(|error| {
@@ -1729,8 +2068,9 @@ impl Registry {
             }
         };
         for id in ids {
-            // Restate the binding task: a resumed child must finish it, not
-            // summarize partial progress as its result.
+            // Restate the current delegated task (the latest delegation, not
+            // the immutable authorization binding): a resumed child must
+            // finish it, not summarize partial progress as its result.
             let (task, evidence) = self
                 .state
                 .lock()
@@ -1740,7 +2080,7 @@ impl Registry {
                 .and_then(|scope| scope.sessions.get(&id))
                 .map(|session| {
                     (
-                        Some(session.binding_task.clone()),
+                        Some(session.descriptor.task.clone()),
                         durable::in_flight_evidence(
                             &session.in_flight_calls,
                             session.in_flight_omitted,
@@ -1874,17 +2214,291 @@ impl Registry {
         (0..count).map(|_| state.reserve_for(session_id)).collect()
     }
 
+    #[cfg(test)]
     pub(super) async fn submit_result(
-        &self,
+        self: &Arc<Self>,
         session_id: &str,
         instruction_revision: Option<u64>,
         output: Value,
     ) -> std::io::Result<SubmissionOutcome> {
-        self.await_restored(session_id).await?;
-        self.state
-            .lock()
+        self.submit_result_durably(session_id, instruction_revision, output)
             .await
-            .submit_result(session_id, instruction_revision, output)
+            .map(|(outcome, _)| outcome)
+    }
+
+    /// Accepts a result and reports whether the acceptance is journaled. An
+    /// unsaved acceptance stays accepted in this runtime and the writer
+    /// retries; only a restart before it lands resumes the turn.
+    pub(super) async fn submit_result_durably(
+        self: &Arc<Self>,
+        session_id: &str,
+        instruction_revision: Option<u64>,
+        output: Value,
+    ) -> std::io::Result<(SubmissionOutcome, bool)> {
+        self.await_restored(session_id).await?;
+        let (outcome, root) = {
+            let mut state = self.state.lock().await;
+            let outcome = state.submit_result(session_id, instruction_revision, output)?;
+            (outcome, state.root_session_id(session_id).to_owned())
+        };
+        let durable = match outcome {
+            SubmissionOutcome::Accepted { .. } => match self.persist_durably(&root).await {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::warn!(%error, %root, "accepted subagent result is not journaled yet");
+                    self.changed();
+                    false
+                }
+            },
+            SubmissionOutcome::Superseded => false,
+        };
+        Ok((outcome, durable))
+    }
+
+    /// Ok means saved; every skip, failure or interrupted write is an error.
+    async fn persist_durably(self: &Arc<Self>, root_session_id: &str) -> std::io::Result<()> {
+        let (done, saved) = oneshot::channel();
+        let registry = Arc::clone(self);
+        let root_session_id = root_session_id.to_owned();
+        drop(platform::spawn(async move {
+            let _ = done.send(registry.persist_now(&root_session_id).await);
+        }));
+        saved
+            .await
+            .map_err(|_| std::io::Error::other("subagent journal write was interrupted"))?
+    }
+
+    /// Runs (or queues) one agent's status work in order.
+    fn send_status(&self, root_session_id: &str, update: AgentUpdate) {
+        let id = match &update {
+            AgentUpdate::Status { id, .. } | AgentUpdate::Completion { id, .. } => *id,
+            _ => return self.send(root_session_id, update),
+        };
+        self.enqueue_status(root_session_id, id, OrderedJob::Update(update));
+    }
+
+    fn enqueue_status(&self, root_session_id: &str, id: AgentId, job: OrderedJob) {
+        let Some(registry) = self.this.get().cloned() else {
+            // Registries outside an Arc (unit fixtures) deliver inline.
+            match job {
+                OrderedJob::Update(update) => self.send(root_session_id, update),
+                OrderedJob::Settle {
+                    status, completion, ..
+                } => self.send(root_session_id, settled_update(id, status, completion)),
+            }
+            return;
+        };
+        let key = (root_session_id.to_owned(), id);
+        let mut queues = self
+            .status_queues
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let job = match queues.get(&key) {
+            Some(sender) => match sender.send(job) {
+                Ok(()) => return,
+                Err(mpsc::error::SendError(job)) => job,
+            },
+            None => job,
+        };
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let _ = sender.send(job);
+        queues.insert(key.clone(), sender);
+        drop(queues);
+        drop(platform::spawn(async move {
+            while let Some(job) = receiver.recv().await {
+                let Some(registry) = registry.upgrade() else {
+                    return;
+                };
+                registry.run_ordered(&key.0, key.1, job).await;
+            }
+        }));
+    }
+
+    async fn run_ordered(self: &Arc<Self>, root_session_id: &str, id: AgentId, job: OrderedJob) {
+        match job {
+            OrderedJob::Update(update) => self.send(root_session_id, update),
+            OrderedJob::Settle {
+                status,
+                completion,
+                harness,
+            } => {
+                if let Some(harness) = harness {
+                    if let Ok(snapshot) = harness.snapshot().await {
+                        self.record_checkpoint(root_session_id, id, snapshot);
+                    }
+                    self.finish_pending_checkpoint(root_session_id);
+                }
+                // The pending completion is journaled before it is announced.
+                // A failed write still announces (the writer retries), and the
+                // completion stays pending until the host acknowledges it.
+                if let Err(error) = self.persist_durably(root_session_id).await {
+                    tracing::warn!(%error, %root_session_id, "settled subagent turn not journaled yet; the writer retries");
+                }
+                self.send(root_session_id, settled_update(id, status, completion));
+                self.changed();
+            }
+        }
+    }
+
+    /// The host received a completion: stop re-announcing it.
+    pub async fn acknowledge_completion(&self, root_session_id: &str, id: AgentId, revision: u64) {
+        let acknowledged = {
+            let mut state = self.state.lock().await;
+            match state
+                .scopes
+                .get_mut(root_session_id)
+                .and_then(|scope| scope.sessions.get_mut(&id))
+            {
+                Some(session) if session.pending_completion == Some(revision) => {
+                    session.pending_completion = None;
+                    true
+                }
+                _ => false,
+            }
+        };
+        if acknowledged {
+            lock_unpoisoned(&self.completion_retries).remove(&(root_session_id.to_owned(), id));
+            self.changed();
+        }
+    }
+
+    /// The live host could not take a completion (its callback failed or the
+    /// child was not yet bound). The completion stays pending in the journal,
+    /// so a restore announces it again; until then this re-announces it after
+    /// a bounded backoff while it is still the pending completion.
+    pub fn retry_completion(self: &Arc<Self>, root_session_id: &str, id: AgentId, revision: u64) {
+        let key = (root_session_id.to_owned(), id);
+        let delay = {
+            let mut retries = lock_unpoisoned(&self.completion_retries);
+            let entry = retries.entry(key.clone()).or_insert((0, false));
+            if entry.1 {
+                return;
+            }
+            entry.1 = true;
+            entry.0 = entry.0.saturating_add(1);
+            completion_retry_delay(entry.0)
+        };
+        tracing::warn!(%id, revision, ?delay, "subagent completion was not delivered; retrying");
+        // A pending retry never keeps a shut-down runtime's registry alive.
+        let registry = Arc::downgrade(self);
+        drop(platform::spawn(async move {
+            platform::sleep(delay).await;
+            let Some(registry) = registry.upgrade() else {
+                return;
+            };
+            if let Some(entry) = lock_unpoisoned(&registry.completion_retries).get_mut(&key) {
+                entry.1 = false;
+            }
+            let status = {
+                let state = registry.state.lock().await;
+                state
+                    .scopes
+                    .get(&key.0)
+                    .and_then(|scope| scope.sessions.get(&key.1))
+                    .filter(|session| {
+                        session.pending_completion == Some(revision)
+                            && matches!(session.status, AgentStatus::Completed { .. })
+                    })
+                    .map(|session| session.status.clone())
+            };
+            if let Some(status) = status {
+                registry.send_status(
+                    &key.0,
+                    AgentUpdate::Completion {
+                        id: key.1,
+                        status,
+                        revision,
+                    },
+                );
+            }
+        }));
+    }
+
+    /// Synchronously journals one root, ordered with the background writer.
+    async fn persist_now(&self, root_session_id: &str) -> std::io::Result<()> {
+        let Some(store) = self.store_for(root_session_id) else {
+            return Err(std::io::Error::other("no subagent store is installed"));
+        };
+        let restoring = self
+            .restored
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(root_session_id)
+            .is_some_and(|gate| !matches!(&*gate.borrow(), Some(Ok(()))));
+        if restoring {
+            return Err(std::io::Error::other(
+                "subagent task tree is still restoring",
+            ));
+        }
+        // Ordered with the writer and shutdown: a frozen scope already wrote
+        // its final journal, which this must never overwrite.
+        let _write_guard = self.journal_write_lock.lock().await;
+        let payload = {
+            let state = self.state.lock().await;
+            let checkpoints = self
+                .checkpoints
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match state.scopes.get(root_session_id) {
+                Some(scope) if !scope.journal_frozen => {
+                    Some(scope.journal_payload(root_session_id, &checkpoints))
+                }
+                _ => None,
+            }
+        };
+        match payload {
+            Some(Ok(write)) => {
+                self.save_write(root_session_id, store.as_ref(), write)
+                    .await
+            }
+            Some(Err(error)) => Err(error),
+            None => Err(std::io::Error::other(
+                "subagent journal is frozen for shutdown",
+            )),
+        }
+    }
+
+    /// Announces children completed during restore by an accepted result.
+    /// Completion notices are sent only after the journal records them, so
+    /// a turn still in flight with an accepted result was never announced.
+    async fn announce_restored_completions(&self, root_session_id: &str, ids: &[AgentId]) {
+        for &id in ids {
+            let announced = {
+                let mut state = self.state.lock().await;
+                let Some(session) = state
+                    .scopes
+                    .get_mut(root_session_id)
+                    .and_then(|scope| scope.sessions.get_mut(&id))
+                else {
+                    continue;
+                };
+                let Some(revision) = session.pending_completion else {
+                    continue;
+                };
+                if !matches!(session.status, AgentStatus::Completed { .. }) {
+                    continue;
+                }
+                let descriptor = std::mem::take(&mut session.announce).then(|| {
+                    let mut descriptor = session.descriptor.clone();
+                    descriptor.task = session.binding_task.clone();
+                    descriptor
+                });
+                (descriptor, session.status.clone(), revision)
+            };
+            let (descriptor, status, revision) = announced;
+            if let Some(descriptor) = descriptor {
+                self.send(root_session_id, AgentUpdate::Added(descriptor));
+            }
+            self.send_status(
+                root_session_id,
+                AgentUpdate::Completion {
+                    id,
+                    status,
+                    revision,
+                },
+            );
+        }
+        self.changed();
     }
 
     pub(super) async fn begin_turn_steer(
@@ -1924,7 +2538,7 @@ impl Registry {
         // snapshots may wait for an active turn's conversation lock; spawning a
         // background capture here can journal a child with no recovery state.
         let checkpoint = if self.store_for(&root_session_id).is_some() {
-            match agent.runtime_snapshot().await {
+            match agent.checkpoint().await {
                 Ok(snapshot) => Some(snapshot),
                 Err(error) => {
                     event_task.abort();
@@ -1976,6 +2590,9 @@ impl Registry {
                 resume_attempts: 0,
                 in_flight_calls: Vec::new(),
                 in_flight_omitted: 0,
+                pending_completion: None,
+                settled_revision: None,
+                in_flight_progress: durable::OmittedProgress::default(),
                 announce: false,
             },
         )?;
@@ -2020,6 +2637,7 @@ impl Registry {
                 if !matches!(session.status, AgentStatus::Interrupted) {
                     session.in_flight_calls.clear();
                     session.in_flight_omitted = 0;
+                    session.in_flight_progress = durable::OmittedProgress::default();
                 }
                 session.next_instruction_revision = revision;
                 session.active_instruction_revision = Some(revision);
@@ -2032,7 +2650,7 @@ impl Registry {
             }
         };
         if revision.is_some() {
-            self.send(
+            self.send_status(
                 root_session_id,
                 AgentUpdate::Status {
                     id,
@@ -2068,7 +2686,7 @@ impl Registry {
             }
             session.status.clone()
         };
-        self.send(root_session_id, AgentUpdate::Status { id, status });
+        self.send_status(root_session_id, AgentUpdate::Status { id, status });
         self.changed();
     }
 
@@ -2091,12 +2709,13 @@ impl Registry {
                 return;
             }
             session.active = false;
-            session.active_instruction_revision = None;
+            let revision = session.active_instruction_revision.take();
             session.steering = false;
             // The turn settled in this runtime, so restart recovery made progress.
             session.resume_attempts = 0;
             session.in_flight_calls.clear();
             session.in_flight_omitted = 0;
+            session.in_flight_progress = durable::OmittedProgress::default();
             let submitted_output = session.submitted_output.take();
             // Acceptance belongs to this turn even if cancellation/close wins settlement.
             // Keep its evidence, without claiming the interrupted execution completed.
@@ -2117,12 +2736,38 @@ impl Registry {
             .clone_into(&mut session.status);
             // Register capture while state is still locked: shutdown must not
             // observe Completed before its final checkpoint is pending.
-            if let Some(harness) = session.harness.clone() {
-                self.capture_checkpoint(root_session_id.to_owned(), id, harness);
+            // The final checkpoint is pending from here; the ordered settle job
+            // captures it off this harness loop, which must stay free to answer.
+            let harness = session
+                .harness
+                .clone()
+                .filter(|_| self.begin_pending_checkpoint(root_session_id));
+            let settled = revision.unwrap_or(session.next_instruction_revision);
+            session.settled_revision = Some(settled);
+            // Only a root child's completion needs the host outbox (an idle
+            // root conversation may need a wake). A nested parent reads its
+            // children from this registry, whose journal records the Completed
+            // status before any announcement, so there is nothing to ack.
+            let completion = (matches!(session.status, AgentStatus::Completed { .. })
+                && session.descriptor.parent.is_none())
+            .then_some(settled);
+            if completion.is_some() {
+                session.pending_completion = completion;
             }
-            session.status.clone()
+            (session.status.clone(), completion, harness)
         };
-        self.send(root_session_id, AgentUpdate::Status { id, status });
+        // Never await the journal here: capture -> journal -> announce runs in
+        // order on this agent's status queue.
+        let (status, completion, harness) = status;
+        self.enqueue_status(
+            root_session_id,
+            id,
+            OrderedJob::Settle {
+                status,
+                completion,
+                harness,
+            },
+        );
         self.changed();
         let registry = Arc::clone(self);
         let root_session_id = root_session_id.to_owned();
@@ -2728,7 +3373,7 @@ impl Registry {
             state.request_close(session_id, id)?
         };
         for (id, status) in status_updates {
-            self.send(&root_session_id, AgentUpdate::Status { id, status });
+            self.send_status(&root_session_id, AgentUpdate::Status { id, status });
         }
         self.changed();
         self.stop_and_close(root_session_id, ids, harnesses, false)
@@ -2814,7 +3459,7 @@ impl Registry {
         // Even if persistence failed, join the live subtree; report the error
         // after cleanup rather than leaving children running during shutdown.
         for (id, status) in status_updates {
-            self.send(&root_session_id, AgentUpdate::Status { id, status });
+            self.send_status(&root_session_id, AgentUpdate::Status { id, status });
         }
         self.changed();
         let root = root_session_id.clone();
@@ -3111,7 +3756,7 @@ impl ChildSession {
         status: AgentStatus,
         contract: OutputContract,
         output_schema: Value,
-        stored_runtime: Option<ChildSnapshot>,
+        stored_runtime: Option<SessionCheckpoint>,
         next_instruction_revision: u64,
         last_output: Option<Value>,
     ) -> Self {
@@ -3138,6 +3783,9 @@ impl ChildSession {
             resume_attempts: 0,
             in_flight_calls: Vec::new(),
             in_flight_omitted: 0,
+            pending_completion: None,
+            settled_revision: None,
+            in_flight_progress: durable::OmittedProgress::default(),
             announce: true,
         }
     }
@@ -3155,7 +3803,14 @@ impl ChildSession {
             parent_agent_id: self.descriptor.parent,
             status: self.status.clone(),
             last_output,
+            completion_revision: self.completion_revision(),
         }
+    }
+
+    pub(super) fn completion_revision(&self) -> Option<u64> {
+        matches!(self.status, AgentStatus::Completed { .. })
+            .then_some(self.settled_revision)
+            .flatten()
     }
 }
 
@@ -3202,11 +3857,14 @@ pub(super) fn forward_events(
         }
         while let Some(event) = events.recv().await {
             // Each provider call starts from a committed step (prompt plus all
-            // finished tool results), and each tool batch begins at one.
-            let progress = matches!(
+            // finished tool results), and each tool batch begins at one. Claude
+            // reports only a provider call's completion, still before any tool
+            // of the round it returned runs.
+            let boundary = matches!(
                 event.kind,
-                AgentEventKind::ModelCallStarted | AgentEventKind::ToolCall
+                AgentEventKind::ModelCallStarted | AgentEventKind::ModelCallCompleted
             );
+            let progress = boundary || event.kind == AgentEventKind::ToolCall;
             let completed_tool = event.kind == AgentEventKind::ToolResult;
             let kind = event.kind;
             let payload = matches!(kind, AgentEventKind::ToolCall | AgentEventKind::ToolResult)
@@ -3223,6 +3881,9 @@ pub(super) fn forward_events(
                 registry
                     .track_in_flight(&root_session_id, id, &kind, &payload)
                     .await;
+                if boundary {
+                    registry.commit_boundary(&root_session_id, id).await;
+                }
                 if completed_tool {
                     registry
                         .completed_tools
@@ -3239,6 +3900,14 @@ pub(super) fn forward_events(
             registry.runtime_closed(&root_session_id, id).await;
         }
     })
+}
+
+/// Enclosing Code Mode cell of a nested call. Claude events name it; Codex
+/// nested call IDs embed it as "PARENT/code-N".
+fn parent_call<'a>(call_id: &'a str, parent_call_id: Option<&'a str>) -> Option<&'a str> {
+    parent_call_id
+        .filter(|parent| !parent.is_empty())
+        .or_else(|| call_id.split_once("/code-").map(|(parent, _)| parent))
 }
 
 fn send_update(
@@ -3265,6 +3934,7 @@ pub fn channel(
 ) {
     let (updates, receiver) = mpsc::unbounded_channel();
     let registry = Arc::new(Registry::new(updates, max_concurrency));
+    let _ = registry.this.set(Arc::downgrade(&registry));
     let control = SubagentControl {
         registry: Arc::clone(&registry),
     };
@@ -3274,8 +3944,8 @@ pub fn channel(
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentDescriptor, AgentId, AgentStatus, ChildSession, ChildSnapshot, OutputContract,
-        Registry, RegistryState, complete_session, forward_events,
+        AgentDescriptor, AgentId, AgentStatus, ChildSession, JournalWrite, OutputContract,
+        Registry, RegistryState, SessionCheckpoint, complete_session, forward_events,
     };
     use crate::platform;
     use crate::{
@@ -3840,8 +4510,188 @@ mod tests {
             resume_attempts: 0,
             in_flight_calls: Vec::new(),
             in_flight_omitted: 0,
+            pending_completion: None,
+            settled_revision: None,
+            in_flight_progress: crate::durable::OmittedProgress::default(),
             announce: false,
         }
+    }
+
+    /// A store whose saves fail while armed, sharing another store's state.
+    struct FlakyStore {
+        inner: crate::MemorySubagentStore,
+        failing: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl crate::SubagentStore for FlakyStore {
+        fn load<'a>(
+            &'a self,
+            root_session_id: &'a str,
+        ) -> crate::SubagentStoreFuture<'a, std::io::Result<Option<String>>> {
+            self.inner.load(root_session_id)
+        }
+        fn save<'a>(
+            &'a self,
+            root_session_id: &'a str,
+            payload: String,
+            records: Vec<Arc<str>>,
+        ) -> crate::SubagentStoreFuture<'a, std::io::Result<()>> {
+            if self.failing.load(std::sync::atomic::Ordering::SeqCst) {
+                return Box::pin(async { Err(std::io::Error::other("synthetic store outage")) });
+            }
+            self.inner.save(root_session_id, payload, records)
+        }
+        fn load_record<'a>(
+            &'a self,
+            root_session_id: &'a str,
+            key: &'a str,
+        ) -> crate::SubagentStoreFuture<'a, std::io::Result<String>> {
+            self.inner.load_record(root_session_id, key)
+        }
+    }
+
+    async fn insert_active_child(registry: &Arc<Registry>) -> AgentId {
+        let mut state = registry.state.lock().await;
+        let reservation = state.reserve("main", None).unwrap();
+        let mut session = test_session(reservation.id, "child-session", None);
+        session.active = true;
+        session.next_instruction_revision = 1;
+        session.active_instruction_revision = Some(1);
+        session.status = AgentStatus::Running;
+        state
+            .insert(
+                reservation.root_session_id,
+                reservation.id,
+                "child-session".to_owned(),
+                session,
+            )
+            .unwrap();
+        reservation.id
+    }
+
+    #[tokio::test]
+    async fn unsaved_acceptance_stays_accepted_and_reports_it_is_not_durable() {
+        let store = crate::MemorySubagentStore::new();
+        let failing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (registry, _control, _updates) = super::channel(4);
+        registry.set_store(Arc::new(FlakyStore {
+            inner: store.clone(),
+            failing: Arc::clone(&failing),
+        }));
+        let id = insert_active_child(&registry).await;
+        let (outcome, durable) = registry
+            .submit_result_durably("child-session", Some(1), json!({"report": "done"}))
+            .await
+            .unwrap();
+        assert!(matches!(outcome, super::SubmissionOutcome::Accepted { .. }));
+        assert!(
+            !durable,
+            "a failed journal write must never be reported as durable"
+        );
+        assert_eq!(
+            registry.state.lock().await.scopes["main"].sessions[&id].submitted_output,
+            Some(json!({"report": "done"})),
+            "the acceptance is kept for this runtime; the writer retries"
+        );
+        // Once the store recovers, a journal write carries the accepted result.
+        failing.store(false, std::sync::atomic::Ordering::SeqCst);
+        registry.persist_durably("main").await.unwrap();
+        let journal = crate::SubagentStore::load(&store, "main")
+            .await
+            .unwrap()
+            .unwrap();
+        let journal: serde_json::Value = serde_json::from_str(&journal).unwrap();
+        assert_eq!(
+            journal["agents"][0]["accepted_output"],
+            json!({"report": "done"})
+        );
+        assert_eq!(journal["agents"][0]["accepted_revision"], json!(1));
+        let (outcome, durable) = registry
+            .submit_result_durably("child-session", Some(1), json!({"report": "again"}))
+            .await
+            .map(|(outcome, durable)| (Some(outcome), durable))
+            .unwrap_or((None, false));
+        assert!(
+            outcome.is_none() && !durable,
+            "one result per turn, however it was saved"
+        );
+    }
+
+    #[tokio::test]
+    async fn unacknowledged_completion_is_announced_after_each_restore_until_acknowledged() {
+        let store = crate::MemorySubagentStore::new();
+        let (registry, _control, _updates) = super::channel(4);
+        registry.set_store(Arc::new(store.clone()));
+        let id = {
+            let mut state = registry.state.lock().await;
+            let reservation = state.reserve("main", None).unwrap();
+            let mut session = test_session(reservation.id, "child-session", None);
+            session.next_instruction_revision = 3;
+            session.status = AgentStatus::Completed {
+                output: json!({"report": "done"}),
+            };
+            // Journaled with the terminal status, before any announcement.
+            session.pending_completion = Some(3);
+            state
+                .insert(
+                    reservation.root_session_id,
+                    reservation.id,
+                    "child-session".to_owned(),
+                    session,
+                )
+                .unwrap();
+            reservation.id
+        };
+        registry.persist_durably("main").await.unwrap();
+
+        // The runtime is lost before the host confirmed delivery.
+        let next_completion =
+            |updates: &mut tokio::sync::mpsc::UnboundedReceiver<super::ScopedAgentUpdate>| {
+                let mut found = None;
+                while let Ok(update) = updates.try_recv() {
+                    if let AgentUpdate::Completion { id, revision, .. } = update.update {
+                        found = Some((id, revision));
+                    }
+                }
+                found
+            };
+        let (restored, _control, mut updates) = super::channel(4);
+        restored.set_store(Arc::new(store.clone()));
+        let report = restored.restore("main").await.unwrap();
+        assert_eq!(report.completed, vec![id]);
+        restored
+            .announce_restored_completions("main", &report.completed)
+            .await;
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(found) = next_completion(&mut updates) {
+                    assert_eq!(
+                        found,
+                        (id, 3),
+                        "the same logical completion is announced again"
+                    );
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        // A second loss before acknowledgement announces it once more.
+        restored.persist_durably("main").await.unwrap();
+        let (again, _control, _updates) = super::channel(4);
+        again.set_store(Arc::new(store.clone()));
+        assert_eq!(again.restore("main").await.unwrap().completed, vec![id]);
+        // The host acknowledged delivery: later restores stay quiet.
+        again.acknowledge_completion("main", id, 3).await;
+        again.persist_durably("main").await.unwrap();
+        let (quiet, _control, _updates) = super::channel(4);
+        quiet.set_store(Arc::new(store.clone()));
+        assert!(quiet.restore("main").await.unwrap().completed.is_empty());
+        assert!(matches!(
+            quiet.state.lock().await.scopes["main"].sessions[&id].status,
+            AgentStatus::Completed { .. }
+        ));
     }
 
     #[tokio::test]
@@ -3991,8 +4841,195 @@ mod tests {
         assert!(!has_checkpoint());
     }
 
+    /// Embeds each referenced checkpoint record, as version-1 journals did.
+    fn inline_records(write: &JournalWrite) -> String {
+        let mut journal: serde_json::Value = serde_json::from_str(&write.payload).unwrap();
+        for agent in journal["agents"].as_array_mut().unwrap() {
+            let Some(key) = agent.as_object_mut().unwrap().remove("checkpoint_ref") else {
+                continue;
+            };
+            let (_, json) = write
+                .records
+                .iter()
+                .find(|(record, _)| **record == *key.as_str().unwrap())
+                .unwrap();
+            agent["checkpoint"] = serde_json::from_str(json).unwrap();
+        }
+        journal.to_string()
+    }
+
+    /// Rewrites a current journal as the version-1 layout, which stored a
+    /// Codex child's boundary as an untagged `ChildRuntimeSnapshot`.
+    fn legacy_codex_journal(payload: &str) -> String {
+        let mut journal: serde_json::Value = serde_json::from_str(payload).unwrap();
+        journal["version"] = json!(1);
+        for agent in journal["agents"].as_array_mut().unwrap() {
+            let checkpoint: SessionCheckpoint =
+                serde_json::from_value(agent["checkpoint"].take()).unwrap();
+            let nanocodex_agent::HarnessModel::Codex(model) = checkpoint.model() else {
+                panic!("expected a Codex checkpoint");
+            };
+            let mut legacy = checkpoint.payload().as_object().unwrap().clone();
+            legacy.insert("session_id".into(), json!(checkpoint.session_id()));
+            legacy.insert("model".into(), serde_json::to_value(model).unwrap());
+            legacy.insert(
+                "thinking".into(),
+                serde_json::to_value(checkpoint.thinking()).unwrap(),
+            );
+            agent["checkpoint"] = serde_json::Value::Object(legacy);
+        }
+        journal.to_string()
+    }
+
+    fn restore_journaled(agent: crate::durable::PersistedAgent) -> (ChildSession, bool, bool) {
+        let lineage = nanocodex_agent::Lineage::root("root");
+        let checkpoint = agent.snapshot(&lineage).unwrap();
+        crate::durable::restored_session(agent, checkpoint).unwrap()
+    }
+
+    /// Root journal whose load stays pending until released, holding the
+    /// adopted root's restoration gate open.
+    struct GatedJournal {
+        opened: Arc<tokio::sync::Semaphore>,
+    }
+
+    impl nanocodex_agent::backend::ChildJournalStore for GatedJournal {
+        fn load(&self) -> nanocodex_agent::backend::BackendFuture<std::io::Result<Option<String>>> {
+            let opened = Arc::clone(&self.opened);
+            Box::pin(async move {
+                let _permit = opened.acquire().await;
+                Ok(None)
+            })
+        }
+
+        fn save(
+            &self,
+            _payload: String,
+            _records: Vec<Arc<str>>,
+        ) -> nanocodex_agent::backend::BackendFuture<std::io::Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn load_record(
+            &self,
+            key: String,
+        ) -> nanocodex_agent::backend::BackendFuture<std::io::Result<String>> {
+            Box::pin(async move { Err(std::io::Error::other(format!("no record {key}"))) })
+        }
+    }
+
+    /// Spawns admitted while a durable root's journal is still being restored
+    /// queue behind its restoration gate, whose watch wakes waiters by shard
+    /// rather than arrival. Agent IDs must still follow call order.
+    #[tokio::test]
+    async fn spawns_behind_journal_restoration_reserve_ids_in_call_order() {
+        const SPAWNS: u64 = 8;
+        let (registry, _, _updates) = super::channel(usize::try_from(SPAWNS).unwrap());
+        let opened = Arc::new(tokio::sync::Semaphore::new(0));
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let capture = Arc::clone(&captured);
+        let factory_registry = registry.clone();
+        let openai = OpenAi::builder("test-key")
+            .service(|| PendingService {
+                called: Arc::new(Notify::new()),
+            })
+            .build()
+            .unwrap();
+        let (root, _events) = Nanocodex::builder(openai)
+            .child_journal(nanocodex_agent::backend::ChildJournal::new(Arc::new(
+                GatedJournal {
+                    opened: Arc::clone(&opened),
+                },
+            )))
+            .tools_factory(move |handle| {
+                capture
+                    .lock()
+                    .unwrap()
+                    .get_or_insert_with(|| handle.clone());
+                // Adopting the journal starts its (gated) restoration.
+                factory_registry.register_handle(handle);
+                nanocodex_oai_tools::Tools::builder()
+                    .without_defaults()
+                    .build()
+            })
+            .build()
+            .unwrap();
+        let root_id = root.session_id().to_owned();
+        let parent = captured.lock().unwrap().clone().unwrap();
+        // Each spawn is its own task, as separate host calls are: tasks resume
+        // in wake order, unlike one future polling its children by index.
+        let spawns = (0..SPAWNS)
+            .map(|index| {
+                let (parent, registry, root_id) =
+                    (parent.clone(), Arc::clone(&registry), root_id.clone());
+                tokio::spawn(async move {
+                    crate::start_agent(
+                        &parent,
+                        &registry,
+                        &root_id,
+                        crate::AgentTask {
+                            role: format!("child-{index}"),
+                            task: format!("ordered task {index}"),
+                            output_schema: json!({"type": "object"}),
+                        },
+                    )
+                    .await
+                })
+            })
+            .collect::<Vec<_>>();
+        let spawns = futures_util::future::join_all(spawns);
+        let release = async {
+            // Every spawn is admitted and waiting before restoration completes.
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                registry
+                    .restored
+                    .lock()
+                    .unwrap()
+                    .get(&root_id)
+                    .is_some_and(|gate| gate.borrow().is_none()),
+                "restoration must still be pending while the spawns wait"
+            );
+            opened.add_permits(1);
+        };
+        let (reports, ()) = timeout(Duration::from_secs(10), async {
+            tokio::join!(spawns, release)
+        })
+        .await
+        .expect("spawns must finish once restoration completes");
+        let assigned = reports
+            .into_iter()
+            .map(|report| {
+                let report = report.unwrap().unwrap();
+                (report.role, report.agent_id)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            assigned,
+            (0..SPAWNS)
+                .map(|index| (format!("child-{index}"), AgentId::new(index + 1)))
+                .collect::<Vec<_>>()
+        );
+        for (_, id) in assigned {
+            registry.close(&root_id, id).await.unwrap();
+        }
+        root.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn reconstructed_child_announces_host_binding_once_before_execution() {
+        reconstructed_child_announces_host_binding_once(false).await;
+    }
+
+    /// Version-1 Codex journal entries upgrade to restorable checkpoints.
+    #[tokio::test]
+    async fn legacy_codex_journal_child_reconstructs_and_binds_once() {
+        reconstructed_child_announces_host_binding_once(true).await;
+    }
+
+    async fn reconstructed_child_announces_host_binding_once(legacy: bool) {
         let (registry, _, mut updates) = super::channel(4);
         let factory_registry = registry.clone();
         let constructions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -4035,6 +5072,16 @@ mod tests {
                 .status = AgentStatus::Running;
         }
         let write = source.journal_payloads().await.pop().unwrap().1;
+        let write = if legacy {
+            let payload = legacy_codex_journal(&inline_records(&write));
+            assert!(payload.contains("\"version\":1") && !payload.contains("\"format\""));
+            JournalWrite {
+                payload,
+                records: Vec::new(),
+            }
+        } else {
+            write
+        };
         let store = crate::MemorySubagentStore::new();
         let records = write
             .records
@@ -4163,13 +5210,12 @@ mod tests {
         )
         .unwrap();
         let decoded = serde_json::from_str(&encoded).unwrap();
-        let (restored, _, _) = crate::durable::restored_session(decoded).unwrap();
+        let (restored, _, _) = restore_journaled(decoded);
         assert_eq!(restored.descriptor.task, "delegated replacement");
         assert_eq!(restored.binding_task, original);
         let mut legacy: serde_json::Value = serde_json::from_str(&encoded).unwrap();
         legacy.as_object_mut().unwrap().remove("binding_task");
-        let (legacy, _, _) =
-            crate::durable::restored_session(serde_json::from_value(legacy).unwrap()).unwrap();
+        let (legacy, _, _) = restore_journaled(serde_json::from_value(legacy).unwrap());
         assert_eq!(legacy.binding_task, legacy.descriptor.task);
     }
 
@@ -4211,13 +5257,12 @@ mod tests {
                 )
                 .unwrap()
             };
-            let (restored, _, _) =
-                crate::durable::restored_session(serde_json::from_str(&encoded).unwrap()).unwrap();
+            let (restored, _, _) = restore_journaled(serde_json::from_str(&encoded).unwrap());
             assert_eq!(restored.descriptor.task, task);
             assert_eq!(restored.binding_task, original);
             // A second checkpoint after restoration must retain both identities.
             let next = crate::durable::persist_agent(&restored, None, &mut Vec::new()).unwrap();
-            let (again, _, _) = crate::durable::restored_session(next).unwrap();
+            let (again, _, _) = restore_journaled(next);
             assert_eq!(again.descriptor.task, task);
             assert_eq!(again.binding_task, original);
             registry.interrupt("main", child).await.unwrap();
@@ -5695,7 +6740,12 @@ mod tests {
         let reservation = registry.reserve(root_id).await.unwrap();
         let (parent, events) = root.spawn().await.unwrap();
         let (child, child_events) = parent.spawn().await.unwrap();
-        child.set_model(nanocodex_agent::Model::Sol).await.unwrap();
+        child
+            .set_harness_model(nanocodex_agent::HarnessModel::Codex(
+                nanocodex_agent::Model::Sol,
+            ))
+            .await
+            .unwrap();
         child
             .set_thinking(nanocodex_agent::Thinking::High)
             .await
@@ -5790,11 +6840,13 @@ mod tests {
             .harness
             .clone()
             .unwrap();
-        let ChildSnapshot::Codex(snapshot) = harness.snapshot().await.unwrap() else {
-            panic!("expected native Codex checkpoint");
-        };
-        assert_eq!(snapshot.model, nanocodex_agent::Model::Sol);
-        assert_eq!(snapshot.thinking, nanocodex_agent::Thinking::High);
+        let snapshot = harness.snapshot().await.unwrap();
+        assert_eq!(snapshot.family(), nanocodex_agent::HarnessFamily::Codex);
+        assert_eq!(
+            snapshot.model(),
+            nanocodex_agent::HarnessModel::Codex(nanocodex_agent::Model::Sol)
+        );
+        assert_eq!(snapshot.thinking(), nanocodex_agent::Thinking::High);
         assert_eq!(
             registry
                 .host_context(root_id, child_reservation.id)
@@ -5831,11 +6883,7 @@ mod tests {
                 decoded_json_text: false
             }
         );
-        assert!(
-            serde_json::to_string(&snapshot.conversation)
-                .unwrap()
-                .contains("retain amber history")
-        );
+        assert!(snapshot.to_json().unwrap().contains("retain amber history"));
         assert!(
             registry.state.lock().await.scopes[root_id].sessions[&child_reservation.id].active,
             "reading in-memory history must not interrupt running children or discard their mailbox"
@@ -5848,5 +6896,158 @@ mod tests {
         assert_eq!(registrations.lock().unwrap()[&child_session], 2);
         registry.close_all(root_id).await.unwrap();
         root.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn completion_revision_is_the_settled_turn_and_survives_a_later_delegation() {
+        let (registry, _control, _updates) = super::channel(4);
+        let (done, running) = {
+            let mut state = registry.state.lock().await;
+            let first = state.reserve("main", None).unwrap();
+            let mut completed = test_session(first.id, "done-session", None);
+            completed.status = AgentStatus::Completed {
+                output: json!("OK"),
+            };
+            completed.settled_revision = Some(2);
+            completed.next_instruction_revision = 2;
+            state
+                .insert(
+                    first.root_session_id,
+                    first.id,
+                    "done-session".to_owned(),
+                    completed,
+                )
+                .unwrap();
+            let second = state.reserve("main", None).unwrap();
+            let mut active = test_session(second.id, "busy-session", None);
+            active.status = AgentStatus::Running;
+            state
+                .insert(
+                    second.root_session_id,
+                    second.id,
+                    "busy-session".to_owned(),
+                    active,
+                )
+                .unwrap();
+            (first.id, second.id)
+        };
+        let (summaries, timed_out) = registry
+            .wait("main", &[done, running], Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(!timed_out, "the completed result is new to this caller");
+        assert_eq!(summaries[0].completion_revision, Some(2));
+        assert_eq!(summaries[1].completion_revision, None);
+        // A queued delegation bumps the next revision; the result is unchanged.
+        registry
+            .state
+            .lock()
+            .await
+            .scopes
+            .get_mut("main")
+            .unwrap()
+            .sessions
+            .get_mut(&done)
+            .unwrap()
+            .next_instruction_revision = 3;
+        let (summaries, timed_out) = registry
+            .wait("main", &[done, running], Duration::from_millis(50))
+            .await
+            .unwrap();
+        assert!(
+            timed_out,
+            "an already reported result must not look new after a delegation bump"
+        );
+        assert_eq!(summaries[0].completion_revision, Some(2));
+        let directory = registry.directory("main", true, false).await.unwrap();
+        let entry = directory
+            .iter()
+            .find(|entry| entry.agent_id == done)
+            .unwrap();
+        assert_eq!(entry.completion_revision, Some(2));
+    }
+
+    #[tokio::test]
+    async fn restored_acceptance_keys_its_completion_by_its_own_turn_and_only_for_root_children() {
+        for parent in [None, Some(AgentId::new(7))] {
+            let mut session = test_session(AgentId::new(3), "accepting-session", parent);
+            session.active = true;
+            session.status = AgentStatus::Running;
+            session.active_instruction_revision = Some(2);
+            // A delegation queued behind the accepted turn already bumped this.
+            session.next_instruction_revision = 5;
+            session.submitted_output = Some(json!("ACCEPTED"));
+            let persisted = crate::durable::persist_agent(&session, None, &mut Vec::new()).unwrap();
+            let (restored, _, _) = restore_journaled(persisted);
+            assert_eq!(
+                restored.status,
+                AgentStatus::Completed {
+                    output: json!("ACCEPTED")
+                }
+            );
+            assert_eq!(restored.settled_revision, Some(2));
+            assert_eq!(restored.completion_revision(), Some(2));
+            // Nested parents read the registry; only root children use the host outbox.
+            assert_eq!(
+                restored.pending_completion,
+                parent.is_none().then_some(2),
+                "parent {parent:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn undelivered_completion_is_retried_with_backoff_while_pending() {
+        let (registry, _control, mut updates) = super::channel(4);
+        let id = {
+            let mut state = registry.state.lock().await;
+            let reservation = state.reserve("main", None).unwrap();
+            let mut session = test_session(reservation.id, "child-session", None);
+            session.status = AgentStatus::Completed {
+                output: json!("DONE"),
+            };
+            session.settled_revision = Some(3);
+            session.pending_completion = Some(3);
+            state
+                .insert(
+                    reservation.root_session_id,
+                    reservation.id,
+                    "child-session".to_owned(),
+                    session,
+                )
+                .unwrap();
+            reservation.id
+        };
+        let completions =
+            |updates: &mut tokio::sync::mpsc::UnboundedReceiver<super::ScopedAgentUpdate>| {
+                let mut found = Vec::new();
+                while let Ok(update) = updates.try_recv() {
+                    if let AgentUpdate::Completion { id, revision, .. } = update.update {
+                        found.push((id, revision));
+                    }
+                }
+                found
+            };
+        // The host failed to take it: one retry is scheduled, never a burst.
+        registry.retry_completion("main", id, 3);
+        registry.retry_completion("main", id, 3);
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        assert!(
+            completions(&mut updates).is_empty(),
+            "no hot loop before the backoff"
+        );
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        assert_eq!(completions(&mut updates), vec![(id, 3)]);
+        // A second failure backs off further (4 s).
+        registry.retry_completion("main", id, 3);
+        tokio::time::sleep(Duration::from_millis(3_000)).await;
+        assert!(completions(&mut updates).is_empty());
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        assert_eq!(completions(&mut updates), vec![(id, 3)]);
+        // Once acknowledged, a stale retry announces nothing.
+        registry.acknowledge_completion("main", id, 3).await;
+        registry.retry_completion("main", id, 3);
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        assert!(completions(&mut updates).is_empty());
     }
 }

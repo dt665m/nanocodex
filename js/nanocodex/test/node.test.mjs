@@ -85,7 +85,7 @@ test("Node host owns one Tools lifecycle and validates Tools-owned MCP policy", 
   const tools = await createTools({ mcp });
   assert.throws(
     () => createNodeHost({ tools, toolMode: "direct" }),
-    /toolMode must be code-only/,
+    /remote MCP requires Code Mode/,
   );
   assert.throws(
     () => createNodeHost({ tools, mcpServers: mcp }),
@@ -410,7 +410,8 @@ test("a durable Node-hosted root runs the canonical in-memory Rust subagent task
     assert.match(JSON.stringify(childExecuted.input[0].output), /root/);
     sendCompleted(childSocket, "child-submit", [codeCall("call-submit", "submit_result", JSON.stringify({ output: { report: "portable" } }))]);
     const childSubmitted = await childReader.next();
-    assert.deepEqual(codeResult(childSubmitted.input[0].output), { accepted: true, status: "accepted" });
+    // The root is durable, so the child's acceptance is journaled before its receipt.
+    assert.deepEqual(codeResult(childSubmitted.input[0].output), { accepted: true, status: "accepted", durable: true });
     sendFinal(childSocket, "child-final", "submitted");
 
     const rootWaited = await rootReader.next();
@@ -425,7 +426,12 @@ test("a durable Node-hosted root runs the canonical in-memory Rust subagent task
   })();
 
   try {
-    const result = await agent.turn.prompt({ input: "Delegate this check." }).result();
+    // A failed provider step must fail this test and reach cleanup; otherwise
+    // the prompt waits forever and its open sockets keep the file alive.
+    const result = await Promise.race([
+      agent.turn.prompt({ input: "Delegate this check." }).result(),
+      scenario.then(() => new Promise(() => {})),
+    ]);
     assert.equal(result.finalMessage, "portable");
     await scenario;
     assert.equal(rootToolContexts.length, 1);
@@ -489,6 +495,15 @@ test("a durable Node-hosted root runs the canonical in-memory Rust subagent task
   }
 });
 
+// No durability store: an accepted result lives only in this runtime, and the
+// receipt says so instead of inviting a resubmission.
+const IN_MEMORY_ACCEPTANCE = {
+  accepted: true,
+  status: "accepted",
+  durable: false,
+  note: "Accepted in memory; not yet durable across a restart. Do not submit again.",
+};
+
 test("Node host invokes canonical subagent handlers without a root model turn", async () => {
   const server = await startServer();
   const agent = await createWarmAgent({
@@ -540,7 +555,7 @@ test("Node host invokes canonical subagent handlers without a root model turn", 
         output: { answer: "thread-memory" },
       }))]);
     const submitted = await bounded(childReader.next(), "submit_result output");
-    assert.deepEqual(codeResult(submitted.input[0].output), { accepted: true, status: "accepted" });
+    assert.deepEqual(codeResult(submitted.input[0].output), IN_MEMORY_ACCEPTANCE);
     sendFinal(childSocket, "direct-final", "submitted");
 
     const waited = await bounded(Subagents.wait(agent, {
@@ -561,6 +576,8 @@ test("Node host invokes canonical subagent handlers without a root model turn", 
       status: { state: "completed", output: { answer: "thread-memory" } },
       can_message: true,
       can_manage: true,
+      // The listed result is the logical completion of the first delegation.
+      completion_revision: 1,
     }]);
 
     const sendPromise = Subagents.send(agent, {
@@ -581,7 +598,7 @@ test("Node host invokes canonical subagent handlers without a root model turn", 
         output: { answer: "thread-memory-confirmed" },
       }))]);
     const messageSubmitted = await bounded(childReader.next(), "message submit_result output");
-    assert.deepEqual(codeResult(messageSubmitted.input[0].output), { accepted: true, status: "accepted" });
+    assert.deepEqual(codeResult(messageSubmitted.input[0].output), IN_MEMORY_ACCEPTANCE);
     sendFinal(childSocket, "direct-message-final", "submitted");
     const messageWait = await bounded(Subagents.wait(agent, {
       agentIds: [started.agent_id],
@@ -654,7 +671,7 @@ test("Node host invokes canonical subagent handlers without a root model turn", 
   }
 });
 
-test("WASM snapshots rebind deployed policy while retaining authoritative history", async () => {
+test("WASM checkpoints rebind deployed policy while retaining authoritative history", async () => {
   const originalServer = await startServer();
   const original = await createWarmAgent({
     apiKey: "test-key",
@@ -671,21 +688,31 @@ test("WASM snapshots rebind deployed policy while retaining authoritative histor
       },
     },
   });
+  let originalCacheKey;
   const originalScenario = (async () => {
     const socket = await originalServer.connection;
     const reader = messageReader(socket);
-    await reader.next();
+    originalCacheKey = (await reader.next()).prompt_cache_key;
     sendWarmup(socket, "resp-warmup");
     await reader.next();
     sendFinal(socket, "resp-first", "stored");
   })();
+  assert.deepEqual(original.session.info(), {
+    sessionId: SESSION_IDS.original,
+    harness: "codex",
+    lineage: { rootSessionId: SESSION_IDS.original, parentSessionId: null, origin: "root", depth: 0 },
+  });
+  assert.equal(original.session.capabilities().checkpoint, true);
+  assert.equal(original.session.capabilities().model, "before_first_prompt");
   const first = await original.turn.prompt({ input: "remember cobalt" }).result();
   assert.equal(first.finalMessage, "stored");
-  const snapshot = await first.snapshot();
-  assert.equal(snapshot.version, 1);
-  assert.equal(snapshot.workspace, "/virtual/original-workspace");
-  assert.strictEqual(await Actions.turn.getSnapshot(first), snapshot);
+  const checkpoint = await first.checkpoint();
+  assert.equal(Object.isFrozen(checkpoint), true);
+  assert.strictEqual(await Actions.turn.getCheckpoint(first), checkpoint);
+  // Checkpoints are JSON-safe: hosts persist the text and pass it back parsed.
+  const stored = JSON.parse(JSON.stringify(checkpoint));
   await originalScenario;
+  await assert.rejects(original.session.setModel("gpt-6-luna"), (error) => error.code !== undefined);
   original.dispose();
   await originalServer.close();
 
@@ -696,7 +723,7 @@ test("WASM snapshots rebind deployed policy while retaining authoritative histor
     thinking: "low",
     instructions: "instructions from the new WASM deployment",
     sessionId: SESSION_IDS.resumed,
-    resume: snapshot,
+    resume: stored,
     tools: {
       newDeploymentTool: {
         description: "Only the new deployment exposes this tool.",
@@ -711,7 +738,7 @@ test("WASM snapshots rebind deployed policy while retaining authoritative histor
     assert.equal(socket.request.headers["thread-id"], SESSION_IDS.resumed);
     const request = await messageReader(socket).next();
     assert.equal(request.previous_response_id, undefined);
-    assert.equal(request.prompt_cache_key, snapshot.prompt_cache_key);
+    assert.equal(request.prompt_cache_key, originalCacheKey);
     const input = JSON.stringify(request.input);
     assert.match(input, /instructions from the new WASM deployment/);
     assert.match(input, /newDeploymentTool/);
@@ -738,7 +765,7 @@ test("WASM snapshots rebind deployed policy while retaining authoritative histor
     const socket = await spawnedConnection;
     const reader = messageReader(socket);
     const warmup = await reader.next();
-    assert.equal(warmup.prompt_cache_key, snapshot.prompt_cache_key);
+    assert.equal(warmup.prompt_cache_key, originalCacheKey);
     sendWarmup(socket, "resp-spawn-warmup");
     await reader.next();
     sendFinal(socket, "resp-spawned", "fresh");
@@ -753,44 +780,44 @@ test("WASM snapshots rebind deployed policy while retaining authoritative histor
   await resumedServer.close();
 });
 
-test("Node can load an application-owned web module and resume Codex rollout history", async () => {
-  const server = await startServer();
+test("Node can load an application-owned web module and resume a stored checkpoint", async () => {
   const wasm = await readFile(new URL("../pkg-web/nanocodex_bg.wasm", import.meta.url));
-  const canonicalContext = {
-    type: "message",
-    role: "user",
-    content: [{ type: "input_text", text: "remember amber" }],
-  };
-  const snapshot = {
-    version: 1,
-    model: "gpt-6.1-sol",
-    lineage_id: "codex-rollout-lineage",
-    prompt_cache_key: "codex-rollout-lineage",
-    workspace: process.cwd(),
-    canonical_context: canonicalContext,
-    history: [
-      canonicalContext,
-      {
-        type: "message",
-        role: "assistant",
-        content: [{ type: "output_text", text: "stored" }],
-        status: "completed",
-      },
-    ],
-  };
+  const sourceServer = await startServer();
+  const source = await createWarmAgent({
+    apiKey: "test-key",
+    module: wasm,
+    websocketUrl: sourceServer.url,
+    thinking: "low",
+  });
+  let sourceCacheKey;
+  const sourceScenario = (async () => {
+    const socket = await sourceServer.connection;
+    const reader = messageReader(socket);
+    sourceCacheKey = (await reader.next()).prompt_cache_key;
+    sendWarmup(socket, "resp-source-warmup");
+    await reader.next();
+    sendFinal(socket, "resp-source", "stored");
+  })();
+  const sourceResult = await source.turn.prompt({ input: "remember amber" }).result();
+  await sourceScenario;
+  const storedText = JSON.stringify(await sourceResult.checkpoint());
+  source.dispose();
+  await sourceServer.close();
+
+  const server = await startServer();
   const agent = await createWarmAgent({
     apiKey: "test-key",
     module: wasm,
     websocketUrl: server.url,
     thinking: "low",
     sessionId: SESSION_IDS.embedded,
-    resume: snapshot,
+    resume: JSON.parse(storedText),
   });
   const scenario = (async () => {
     const socket = await server.connection;
     const request = await messageReader(socket).next();
     assert.equal(request.previous_response_id, undefined);
-    assert.equal(request.prompt_cache_key, snapshot.prompt_cache_key);
+    assert.equal(request.prompt_cache_key, sourceCacheKey);
     assert.match(JSON.stringify(request.input), /remember amber/);
     assert.match(JSON.stringify(request.input), /what color/);
     sendFinal(socket, "resp-rollout-resumed", "amber");

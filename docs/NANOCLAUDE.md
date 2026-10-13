@@ -16,13 +16,13 @@ independent; Claude content is never translated into Responses items.
 ## Construction and durability
 
 ```rust,ignore
-use nanocodex::{Claude, DurableAgentExt, Nanocodex};
+use nanocodex::{Claude, DurableAgentExt, Agent};
 use nanocodex::claude::{ClaudeClient, Effort};
 use nanocodex::durability::DurableSession;
 
 let client = ClaudeClient::official(reqwest::Client::new(), console_api_key);
 let session = DurableSession::open(agent_store, "session-id").await?;
-let (agent, events) = Nanocodex::builder(Claude::latest(client))
+let (agent, events) = Agent::builder(Claude::latest(client))
     .cache_one_hour()
     .max_tokens(8192)
     .effort(Effort::Medium)
