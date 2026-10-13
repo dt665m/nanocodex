@@ -146,7 +146,7 @@ impl Harness {
     /// model, thinking level, conversation tree and committed history; it uses
     /// the recipe's current credentials, tools and instructions. A checkpoint
     /// taken before the first completed turn reopens the session with its
-    /// settings and no history. Use [`Nanocodex::fork`] instead to continue a
+    /// settings and no history. Use [`Agent::fork`] instead to continue a
     /// conversation under a new identity.
     ///
     /// ```
