@@ -903,14 +903,14 @@ pub(super) fn estimate_cost(
     service_tier: ServiceTier,
 ) -> (Option<crate::EstimatedUsdCost>, crate::CostStatus) {
     match usage {
-        Some(usage) => (
-            Some(crate::pricing::estimate_for_model(
-                usage,
-                model,
-                service_tier,
-            )),
-            crate::CostStatus::EstimatedFromUsage,
-        ),
+        Some(usage) => {
+            let estimate = crate::pricing::estimate_for_model(usage, model, service_tier);
+            if estimate.is_available() {
+                (Some(estimate), crate::CostStatus::EstimatedFromUsage)
+            } else {
+                (None, crate::CostStatus::PricingUnavailable)
+            }
+        }
         None => (None, crate::CostStatus::UsageNotReported),
     }
 }

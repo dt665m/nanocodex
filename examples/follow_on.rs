@@ -1,5 +1,5 @@
 use eyre::{Result, WrapErr};
-use nanocodex::{Nanocodex, OpenAi, Thinking, Tools};
+use nanocodex::{Agent, OpenAi, Thinking, Tools};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -9,7 +9,7 @@ async fn main() -> Result<()> {
         .image_generation(false)
         .build()?;
     let openai = OpenAi::new(api_key)?;
-    let (agent, events) = Nanocodex::builder(openai)
+    let (agent, events) = Agent::builder(openai)
         .instructions("Follow the requested output format exactly.")
         .thinking(Thinking::Low)
         .tools(tools)

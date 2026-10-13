@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use eyre::{Result, eyre};
 use futures_util::{SinkExt, StreamExt};
-use nanocodex::{Nanocodex, OpenAi, Thinking, Tools};
+use nanocodex::{Agent, OpenAi, Thinking, Tools};
 use nanocodex_browser::{BrowserAction, BrowserTool};
 use serde_json::{Value, json};
 use tokio::{net::TcpListener, time::timeout};
@@ -107,7 +107,7 @@ async fn run_agent(browser: BrowserTool) -> Result<Value> {
     let openai = OpenAi::builder("test-key")
         .websocket_url(endpoint)
         .build()?;
-    let (agent, events) = Nanocodex::builder(openai)
+    let (agent, events) = Agent::builder(openai)
         .thinking(Thinking::Low)
         .tools(tools)
         .build()?;

@@ -1,7 +1,7 @@
 use std::{env, path::PathBuf, time::Instant};
 
 use eyre::{Result, WrapErr, eyre};
-use nanocodex::{Nanocodex, OpenAi, agent::rollout::RolloutConfig};
+use nanocodex::{Agent, OpenAi, agent::rollout::RolloutConfig};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -39,7 +39,7 @@ async fn main() -> Result<()> {
             loaded = Some(session);
         }
         let session = loaded.ok_or_else(|| eyre!("iteration count must be positive"))?;
-        let (agent, events) = Nanocodex::builder(openai.clone())
+        let (agent, events) = Agent::builder(openai.clone())
             .resume(session.checkpoint()?)?
             .build()
             .wrap_err_with(|| format!("failed to construct resumed driver for {thread_id}"))?;

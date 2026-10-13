@@ -85,7 +85,7 @@ test("Node host owns one Tools lifecycle and validates Tools-owned MCP policy", 
   const tools = await createTools({ mcp });
   assert.throws(
     () => createNodeHost({ tools, toolMode: "direct" }),
-    /toolMode must be code-only/,
+    /remote MCP requires Code Mode/,
   );
   assert.throws(
     () => createNodeHost({ tools, mcpServers: mcp }),

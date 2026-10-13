@@ -98,7 +98,7 @@ After login, construction uses the ordinary agent and durability APIs:
 
 ```rust,ignore
 use std::sync::Arc;
-use nanocodex::{Claude, DurableAgentExt, Nanocodex};
+use nanocodex::{Claude, DurableAgentExt, Agent};
 use nanocodex::claude::{ClaudeClient, subscription::*};
 use nanocodex::durability::DurableSession;
 
@@ -108,7 +108,7 @@ let subscription = Arc::new(ClaudeSubscription::new(
 )?);
 let client = ClaudeClient::subscription(reqwest::Client::new(), subscription);
 let state = DurableSession::open(agent_store, "agent-session").await?;
-let (agent, events) = Nanocodex::builder(Claude::latest(client))
+let (agent, events) = Agent::builder(Claude::latest(client))
     .cache_one_hour()
     .keep_thinking()
     .durability(state).await?

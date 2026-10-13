@@ -3117,17 +3117,27 @@ impl RootNode {
 
     fn apply_model(&mut self, model: Model) -> ComponentUpdate<RootEffect> {
         if !self.model_catalog.iter().any(|entry| entry.id == model) {
-            // Local Claude models are listed only once Claude is signed in.
-            let local_claude = self.capabilities.local
-                && model
-                    .as_str()
-                    .parse::<nanocodex::HarnessModel>()
-                    .is_ok_and(|native| native.family() == nanocodex::HarnessFamily::Claude);
+            // Subscription models are listed only when their local credentials are available.
+            let local_family = self
+                .capabilities
+                .local
+                .then(|| {
+                    model
+                        .as_str()
+                        .parse::<nanocodex::HarnessModel>()
+                        .ok()
+                        .map(|native| native.family())
+                })
+                .flatten();
             self.notification = Some(Notification::plain(
-                if local_claude {
-                    "Claude is not signed in; run `nanocodex --claude auth login`".into()
-                } else {
-                    "Model is not available in the account catalog".into()
+                match local_family {
+                    Some(nanocodex::HarnessFamily::Claude) => {
+                        "Claude is not signed in; run `ncl --claude auth login`".into()
+                    }
+                    Some(nanocodex::HarnessFamily::Muse) => {
+                        "Muse is not signed in; run `ncl --muse auth login`".into()
+                    }
+                    _ => "Model is not available in the account catalog".into(),
                 },
                 Color::Red,
             ));

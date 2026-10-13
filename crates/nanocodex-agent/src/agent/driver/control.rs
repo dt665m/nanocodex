@@ -385,31 +385,34 @@ pub(super) fn handle_idle_command<S>(
             host_context,
             result,
         } => {
-            let model = options.model.unwrap_or(defaults.model);
-            let thinking = options.thinking.unwrap_or_else(|| {
-                if model == defaults.model {
-                    defaults.thinking
-                } else {
-                    model.default_thinking()
-                }
-            });
             let outcome = options
                 .validate_harness()
                 .and_then(|()| {
                     if options
-                        .selected_harness()
+                        .selected_family()
                         .is_some_and(|family| family != crate::HarnessFamily::Codex)
-                        || options
-                            .selected_harness_model()
-                            .is_some_and(|model| model.family() != crate::HarnessFamily::Codex)
                     {
                         return Err(NanocodexError::InvalidRequest(
                             "selected harness requires a configured child factory".into(),
                         ));
                     }
-                    validate_model_thinking(model, thinking)
+                    // Shared selection semantics: omitted settings inherit,
+                    // an explicit model or family takes its own defaults.
+                    let resolved = options.resolve(
+                        crate::HarnessModel::Codex(defaults.model),
+                        defaults.thinking,
+                    )?;
+                    let Some(crate::HarnessModel::Codex(model)) = resolved.selected_harness_model()
+                    else {
+                        return Err(NanocodexError::InvalidRequest(
+                            "selected harness requires a configured child factory".into(),
+                        ));
+                    };
+                    let thinking = resolved.thinking.unwrap_or(defaults.thinking);
+                    validate_model_thinking(model, thinking)?;
+                    Ok((model, thinking))
                 })
-                .and_then(|()| {
+                .and_then(|(model, thinking)| {
                     if let Some(snapshot) = restore {
                         return spawner.restore_child(
                             snapshot,

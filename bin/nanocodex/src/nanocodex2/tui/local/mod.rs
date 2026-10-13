@@ -15,7 +15,7 @@ use std::{
     sync::{Arc, Mutex, PoisonError},
 };
 
-use nanocodex::{HarnessModel, Nanocodex};
+use nanocodex::{Agent, HarnessModel};
 use nanocodex_managed::{AgentSettings, ManagedEvent, ManagedModel};
 use tokio::{sync::mpsc, task::JoinHandle};
 
@@ -42,7 +42,7 @@ pub(crate) struct LocalState {
 
 /// What a successful local connection hands to the driver.
 pub(crate) struct LocalConnection {
-    pub(crate) agent: Nanocodex,
+    pub(crate) agent: Agent,
     pub(crate) events: mpsc::UnboundedReceiver<ManagedEvent>,
     pub(crate) session_id: String,
     pub(crate) workspace: PathBuf,
@@ -325,6 +325,10 @@ pub(crate) fn model_catalog(launch: &LocalLaunch) -> Vec<nanocodex_managed::Avai
             HarnessModel::for_family(HarnessFamily::Claude)
                 .filter(|_| launch.args.local_claude_available()),
         )
+        .chain(
+            HarnessModel::for_family(HarnessFamily::Muse)
+                .filter(|_| launch.args.local_muse_available()),
+        )
         .filter_map(|model| {
             let id: ManagedModel = model.as_str().parse().ok()?;
             let capabilities = model.capabilities(ModelTransport::Native);
@@ -350,7 +354,7 @@ pub(crate) fn model_catalog(launch: &LocalLaunch) -> Vec<nanocodex_managed::Avai
 }
 
 pub(super) async fn apply_settings(
-    agent: Option<Nanocodex>,
+    agent: Option<Agent>,
     current: AgentSettings,
     mutation: super::SettingsMutation,
 ) -> Result<AgentSettings, nanocodex_managed::ManagedError> {

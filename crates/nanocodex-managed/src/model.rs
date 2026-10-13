@@ -52,7 +52,7 @@ impl ManagedModel {
     #[must_use]
     pub const fn family(self) -> nanocodex_agent::HarnessFamily {
         match self {
-            Self::Oai(_) => nanocodex_agent::HarnessFamily::Codex,
+            Self::Oai(model) => HarnessModel::from_responses(model).family(),
             Self::ClaudeSonnet46
             | Self::ClaudeOpus46
             | Self::ClaudeSonnet55
@@ -69,6 +69,7 @@ impl ManagedModel {
         match model {
             nanocodex_agent::HarnessModel::Codex(model) => Some(Self::Oai(model)),
             nanocodex_agent::HarnessModel::Claude(model) => model.as_str().parse().ok(),
+            nanocodex_agent::HarnessModel::Muse(model) => Some(Self::Oai(model.into())),
         }
     }
 
@@ -110,6 +111,7 @@ impl ManagedModel {
         match self.harness() {
             HarnessModel::Codex(model) => Some(model),
             HarnessModel::Claude(_) => None,
+            HarnessModel::Muse(model) => Some(model.model()),
         }
     }
 
@@ -117,7 +119,7 @@ impl ManagedModel {
     #[must_use]
     pub const fn claude(self) -> Option<ClaudeModel> {
         match self.harness() {
-            HarnessModel::Codex(_) => None,
+            HarnessModel::Codex(_) | HarnessModel::Muse(_) => None,
             HarnessModel::Claude(model) => Some(model),
         }
     }
@@ -126,7 +128,7 @@ impl ManagedModel {
     #[must_use]
     pub const fn harness(self) -> HarnessModel {
         match self {
-            Self::Oai(model) => HarnessModel::Codex(model),
+            Self::Oai(model) => HarnessModel::from_responses(model),
             Self::ClaudeSonnet46 => HarnessModel::Claude(ClaudeModel::Sonnet46),
             Self::ClaudeOpus46 => HarnessModel::Claude(ClaudeModel::Opus46),
             Self::ClaudeSonnet55 => HarnessModel::Claude(ClaudeModel::Sonnet55),
@@ -169,6 +171,7 @@ impl From<HarnessModel> for ManagedModel {
         match model {
             HarnessModel::Codex(model) => Self::Oai(model),
             HarnessModel::Claude(model) => model.into(),
+            HarnessModel::Muse(model) => Self::Oai(model.into()),
         }
     }
 }
@@ -215,7 +218,10 @@ impl FromStr for ManagedModel {
             "@cf/zai-org/glm-5.3" => Ok(Model::Glm53.into()),
             "kimi-k3" => Ok(Model::Kimi.into()),
             "mimo-v2.6-pro" => Ok(Model::Mimo.into()),
-            _ => Err("unsupported managed model identity"),
+            _ => value
+                .parse::<nanocodex_agent::MuseModel>()
+                .map(|model| Self::Oai(model.into()))
+                .map_err(|_| "unsupported managed model identity"),
         }
     }
 }

@@ -1,5 +1,5 @@
 use eyre::{Result, WrapErr};
-use nanocodex::{AgentEvents, Nanocodex, OpenAi, Thinking, Tools};
+use nanocodex::{Agent, AgentEvents, OpenAi, Thinking, Tools};
 use nanocodex_browser::{Browser, BrowserTool};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::time::{Duration, timeout};
@@ -14,7 +14,7 @@ async fn main() -> Result<()> {
         .provider(BrowserTool::from_browser(browser.clone()))
         .build()?;
     let openai = OpenAi::new(api_key)?;
-    let (agent, mut events) = Nanocodex::builder(openai)
+    let (agent, mut events) = Agent::builder(openai)
         .instructions(
             "Use `tools.browser` from Code Mode for browser work. Inspect the page after every navigation before interacting with it.",
         )

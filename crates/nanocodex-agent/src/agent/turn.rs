@@ -398,7 +398,7 @@ impl SpawnOptions {
     #[must_use]
     pub const fn model(mut self, model: Model) -> Self {
         self.model = Some(model);
-        self.harness_model = Some(crate::HarnessModel::Codex(model));
+        self.harness_model = Some(crate::HarnessModel::from_responses(model));
         self
     }
 
@@ -432,6 +432,17 @@ impl SpawnOptions {
         self.harness_model
     }
 
+    /// Returns the family this selection names: the explicit family, else the
+    /// family inferred from an explicit model, else `None` (inherit).
+    #[must_use]
+    pub const fn selected_family(&self) -> Option<crate::HarnessFamily> {
+        match (self.harness, self.harness_model) {
+            (Some(family), _) => Some(family),
+            (None, Some(model)) => Some(model.family()),
+            (None, None) => None,
+        }
+    }
+
     /// Rejects a model that belongs to a different explicitly selected family.
     pub fn validate_harness(&self) -> Result<()> {
         if let (Some(family), Some(model)) = (self.harness, self.harness_model)
@@ -449,10 +460,17 @@ impl SpawnOptions {
         Ok(())
     }
 
-    /// Resolves defaults within one family without inheriting another family's model.
+    /// Resolves a complete selection against the inherited `parent` settings.
+    ///
+    /// Within the parent's family omitted settings inherit: no model keeps the
+    /// parent's model, and no thinking on the parent's model keeps its
+    /// thinking. An explicit model selects its own family. A family switch
+    /// takes the destination family's default model, and any model other
+    /// than the parent's takes its own default thinking. Explicit thinking
+    /// the selected model does not support is rejected, never clamped.
     pub fn resolve(self, parent: crate::HarnessModel, parent_thinking: Thinking) -> Result<Self> {
         self.validate_harness()?;
-        let family = self.harness.unwrap_or(parent.family());
+        let family = self.selected_family().unwrap_or(parent.family());
         let model = self.harness_model.unwrap_or_else(|| {
             if family == parent.family() {
                 parent
@@ -466,7 +484,7 @@ impl SpawnOptions {
             ));
         }
         let thinking = self.thinking.unwrap_or_else(|| {
-            if family == parent.family() && model == parent {
+            if model == parent {
                 parent_thinking
             } else {
                 model.default_thinking()

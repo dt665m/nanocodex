@@ -1,16 +1,13 @@
 //! Native, private host capabilities for Rust-owned Claude subscription OAuth.
 use std::{
-    fs::{self, File, OpenOptions},
-    io::{IsTerminal, Read, Write},
+    fs::File,
+    io::{IsTerminal, Read},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
 
-use aes_gcm::{
-    Aes256Gcm, KeyInit, Nonce,
-    aead::{Aead, Payload},
-};
+use super::store::{NativeStore, PrivateStore};
 use clap::Args;
 use eyre::{Result, eyre};
 use futures_util::StreamExt;
@@ -22,7 +19,6 @@ use nanocodex::claude::{
         ClaudeSubscriptionHttpResponse, ClaudeSubscriptionStatus, ClaudeSubscriptionStoreValue,
     },
 };
-use serde::{Deserialize, Serialize};
 
 const STORE_KEY: &str = "claude-subscription";
 const MAGIC: &[u8] = b"nanocodex-claude-auth-v1\0";
@@ -235,22 +231,6 @@ struct NativeHost {
     http: reqwest::Client,
 }
 
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct PrivateStore {
-    revision: u64,
-    install_id: String,
-    payload: Option<String>,
-}
-
-struct StoreLock(File);
-
-impl Drop for StoreLock {
-    fn drop(&mut self) {
-        let _ = fs2::FileExt::unlock(&self.0);
-    }
-}
-
 impl NativeHost {
     async fn install_id(&self) -> Result<String> {
         let host = self.clone();
@@ -264,84 +244,9 @@ impl NativeHost {
         &self,
         action: impl FnOnce(&mut PrivateStore) -> HostResult<T>,
     ) -> HostResult<T> {
-        let directory = self
-            .path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        private_directory(directory)?;
-        let key_path = self.path.with_added_extension("key");
-        let lock_path = self.path.with_added_extension("lock");
-        let lock = private_open(&lock_path, true)?;
-        fs2::FileExt::lock_exclusive(&lock).map_err(|_| ClaudeSubscriptionHostError)?;
-        let _lock = StoreLock(lock);
-        // RAII releases this lock on every return; the OS releases it on process
-        // exit. First key publication uses the same lock as all loads and commits.
-        let key = match private_read(&key_path, 32)? {
-            Some(bytes) if bytes.len() == 32 => bytes,
-            Some(_) => return Err(ClaudeSubscriptionHostError),
-            None => {
-                if fs::symlink_metadata(&self.path).is_ok() {
-                    return Err(ClaudeSubscriptionHostError);
-                }
-                let key: [u8; 32] = rand::random();
-                atomic_private_write(&key_path, &key)?;
-                key.to_vec()
-            }
-        };
-        let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| ClaudeSubscriptionHostError)?;
-        let stored = private_read(&self.path, MAX_STORE_BYTES)?;
-        let is_new = stored.is_none();
-        let mut store = match stored {
-            Some(bytes) => {
-                if !bytes.starts_with(MAGIC) || bytes.len() < MAGIC.len() + 12 + 16 {
-                    return Err(ClaudeSubscriptionHostError);
-                }
-                let plaintext = cipher
-                    .decrypt(
-                        Nonce::from_slice(&bytes[MAGIC.len()..MAGIC.len() + 12]),
-                        Payload {
-                            msg: &bytes[MAGIC.len() + 12..],
-                            aad: MAGIC,
-                        },
-                    )
-                    .map_err(|_| ClaudeSubscriptionHostError)?;
-                let store: PrivateStore =
-                    serde_json::from_slice(&plaintext).map_err(|_| ClaudeSubscriptionHostError)?;
-                if store.install_id.is_empty() || store.install_id.len() > 128 {
-                    return Err(ClaudeSubscriptionHostError);
-                }
-                store
-            }
-            None => PrivateStore {
-                revision: 0,
-                install_id: uuid::Uuid::new_v4().to_string(),
-                payload: None,
-            },
-        };
-        let prior_revision = store.revision;
-        let result = action(&mut store)?;
-        if is_new || store.revision != prior_revision {
-            let plaintext = serde_json::to_vec(&store).map_err(|_| ClaudeSubscriptionHostError)?;
-            let nonce: [u8; 12] = rand::random();
-            let encrypted = cipher
-                .encrypt(
-                    Nonce::from_slice(&nonce),
-                    Payload {
-                        msg: &plaintext,
-                        aad: MAGIC,
-                    },
-                )
-                .map_err(|_| ClaudeSubscriptionHostError)?;
-            let mut bytes = MAGIC.to_vec();
-            bytes.extend_from_slice(&nonce);
-            bytes.extend_from_slice(&encrypted);
-            if bytes.len() as u64 > MAX_STORE_BYTES {
-                return Err(ClaudeSubscriptionHostError);
-            }
-            atomic_private_write(&self.path, &bytes)?;
-        }
-        Ok(result)
+        NativeStore::new(self.path.clone(), MAGIC)
+            .with_store(|store| action(store).map_err(|_| super::store::StoreError))
+            .map_err(|_| ClaudeSubscriptionHostError)
     }
 }
 
@@ -441,124 +346,4 @@ impl ClaudeSubscriptionHost for NativeHost {
             .map_err(|_| ClaudeSubscriptionHostError)?
         })
     }
-}
-
-fn private_directory(path: &Path) -> HostResult<()> {
-    let mut builder = fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    builder
-        .create(path)
-        .map_err(|_| ClaudeSubscriptionHostError)?;
-    let metadata = fs::symlink_metadata(path).map_err(|_| ClaudeSubscriptionHostError)?;
-    if !metadata.is_dir() {
-        return Err(ClaudeSubscriptionHostError);
-    }
-    check_private(&metadata)
-}
-
-fn check_private(_metadata: &fs::Metadata) -> HostResult<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        if _metadata.permissions().mode() & 0o077 != 0
-            || _metadata.uid() != nix::unistd::geteuid().as_raw()
-        {
-            return Err(ClaudeSubscriptionHostError);
-        }
-    }
-    Ok(())
-}
-
-fn private_open(path: &Path, create: bool) -> HostResult<File> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            if !metadata.is_file() {
-                return Err(ClaudeSubscriptionHostError);
-            }
-            check_private(&metadata)?;
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {}
-        Err(_) => return Err(ClaudeSubscriptionHostError),
-    }
-    let mut options = OpenOptions::new();
-    options
-        .read(true)
-        .write(create)
-        .create(create)
-        .truncate(false);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options
-            .mode(0o600)
-            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
-    }
-    let file = options
-        .open(path)
-        .map_err(|_| ClaudeSubscriptionHostError)?;
-    let metadata = file.metadata().map_err(|_| ClaudeSubscriptionHostError)?;
-    if !metadata.is_file() {
-        return Err(ClaudeSubscriptionHostError);
-    }
-    check_private(&metadata)?;
-    Ok(file)
-}
-
-fn private_read(path: &Path, max_bytes: u64) -> HostResult<Option<Vec<u8>>> {
-    match fs::symlink_metadata(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Err(ClaudeSubscriptionHostError),
-        Ok(metadata) if !metadata.is_file() => return Err(ClaudeSubscriptionHostError),
-        Ok(_) => {}
-    }
-    let mut bytes = Vec::new();
-    private_open(path, false)?
-        .take(max_bytes + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| ClaudeSubscriptionHostError)?;
-    if bytes.len() as u64 > max_bytes {
-        return Err(ClaudeSubscriptionHostError);
-    }
-    Ok(Some(bytes))
-}
-
-fn atomic_private_write(path: &Path, bytes: &[u8]) -> HostResult<()> {
-    let directory = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    // Refuse existing symlinks/public files, including when replacing a store.
-    if fs::symlink_metadata(path).is_ok() {
-        let _ = private_open(path, false)?;
-    }
-    let mut temporary =
-        tempfile::NamedTempFile::new_in(directory).map_err(|_| ClaudeSubscriptionHostError)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        temporary
-            .as_file()
-            .set_permissions(fs::Permissions::from_mode(0o600))
-            .map_err(|_| ClaudeSubscriptionHostError)?;
-    }
-    temporary
-        .write_all(bytes)
-        .map_err(|_| ClaudeSubscriptionHostError)?;
-    temporary
-        .as_file()
-        .sync_all()
-        .map_err(|_| ClaudeSubscriptionHostError)?;
-    temporary
-        .persist(path)
-        .map_err(|_| ClaudeSubscriptionHostError)?;
-    #[cfg(unix)]
-    File::open(directory)
-        .and_then(|file| file.sync_all())
-        .map_err(|_| ClaudeSubscriptionHostError)?;
-    Ok(())
 }

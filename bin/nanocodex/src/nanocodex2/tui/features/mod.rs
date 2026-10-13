@@ -21,7 +21,7 @@
 use std::{path::PathBuf, sync::Arc};
 
 use crossterm::event::KeyEvent;
-use nanocodex::Nanocodex;
+use nanocodex::Agent;
 use ratatui::{Frame, layout::Rect};
 use tokio::sync::{mpsc, oneshot};
 
@@ -192,7 +192,7 @@ pub(crate) struct FeatureContext<'a> {
     pub(crate) capabilities: Capabilities,
     pub(crate) workspace: &'a std::path::Path,
     /// The current local agent; None in managed mode or while connecting.
-    pub(crate) agent: Option<&'a Nanocodex>,
+    pub(crate) agent: Option<&'a Agent>,
     pub(crate) launch: Option<&'a LocalLaunch>,
     /// Whether the main agent is running a turn.
     pub(crate) busy: bool,
@@ -373,4 +373,4 @@ pub(crate) fn feature_state_dir(workspace: &std::path::Path) -> PathBuf {
 }
 
 #[allow(dead_code, reason = "shared by feature modules")]
-pub(crate) type SharedAgent = Arc<Nanocodex>;
+pub(crate) type SharedAgent = Arc<Agent>;

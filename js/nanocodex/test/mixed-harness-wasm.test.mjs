@@ -112,12 +112,12 @@ test('public SDK shares canonical children across both native harness families',
   }] };
   const roots = [];
   try {
-    for (const toolMode of ['direct', 'code']) {
-      for (const SDK of [Agent, NodeAgent]) {
-        await assert.rejects(async () => SDK.create({ ...codex, toolMode }), /code-only/);
-        await assert.rejects(async () => SDK.create({ ...claude, harness: 'claude', toolMode }), /code-only/);
-        await assert.rejects(async () => SDK.create({ ...claude, harness: 'claude', harnesses: { codex: { ...codex, toolMode } } }), /code-only/);
-      }
+    // The legacy mixed exposure stays rejected; explicit direct mode is
+    // covered by direct-tools-wasm.test.mjs.
+    for (const SDK of [Agent, NodeAgent]) {
+      await assert.rejects(async () => SDK.create({ ...codex, toolMode: 'code' }), /code-only or direct/);
+      await assert.rejects(async () => SDK.create({ ...claude, harness: 'claude', toolMode: 'code' }), /code-only or direct/);
+      await assert.rejects(async () => SDK.create({ ...claude, harness: 'claude', harnesses: { codex: { ...codex, toolMode: 'code' } } }), /code-only or direct/);
     }
     assert.equal(trace.length, 0, 'unsupported modes reject before inference');
     roots.push(await Agent.create({ ...codex, harnesses: { claude } }));

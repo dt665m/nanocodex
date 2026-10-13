@@ -158,6 +158,7 @@ pub mod execution;
 #[cfg(feature = "openai")]
 mod executor;
 mod handle;
+mod owned;
 mod session_context;
 #[cfg(feature = "openai")]
 mod spawn;
@@ -169,7 +170,9 @@ pub use builder::NanocodexBuilder;
 #[cfg(feature = "openai")]
 pub use context_source::ExecutionEnvironment;
 pub use handle::AgentHandle;
-pub use handle::Nanocodex;
+pub use handle::{Nanocodex, WeakAgent};
+#[doc(hidden)]
+pub use owned::{AgentOwner, adopt};
 pub use session_context::AgentSessionContext;
 pub use turn::{PromptRequest, PromptRoute, SpawnOptions, Turn, TurnControl, TurnResult};
 

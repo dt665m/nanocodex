@@ -126,6 +126,34 @@ const MIMO_STANDARD: TokenRates = TokenRates {
     cache_write_input: 435,
     output: 870,
 };
+// https://dev.meta.ai/docs/pricing-rate-limits
+// Meta publishes no separate cache-write fee or long-context premium.
+const MUSE_WONDER10_STANDARD: TokenRates = TokenRates {
+    input: 4_000,
+    cached_input: 200,
+    cache_write_input: 4_000,
+    output: 20_000,
+};
+const MUSE_SPARK_STANDARD: TokenRates = TokenRates {
+    input: 1_250,
+    cached_input: 150,
+    cache_write_input: 1_250,
+    output: 4_250,
+};
+const MUSE_SPARK_CONTRIBUTOR: TokenRates = TokenRates {
+    input: 100,
+    cached_input: 2,
+    cache_write_input: 100,
+    output: 200,
+};
+// Placeholder components for models whose rates have not been published.
+// EstimatedUsdCost::is_available distinguishes these from a free model.
+const UNAVAILABLE_RATES: TokenRates = TokenRates {
+    input: 0,
+    cached_input: 0,
+    cache_write_input: 0,
+    output: 0,
+};
 const LONG_CONTEXT_THRESHOLD: u64 = 272_000;
 
 #[derive(Clone, Copy)]
@@ -144,6 +172,14 @@ impl TokenRates {
 
         let long = input_tokens > LONG_CONTEXT_THRESHOLD;
         match (model, service_tier, long) {
+            (Model::MuseSpark11 | Model::MuseSpark12 | Model::MuseSpark13, _, _) => {
+                MUSE_SPARK_STANDARD
+            }
+            (Model::MuseSpark12Contributor | Model::MuseSpark13Contributor, _, _) => {
+                MUSE_SPARK_CONTRIBUTOR
+            }
+            (Model::MuseWonder10, _, _) => MUSE_WONDER10_STANDARD,
+            (Model::MuseWonderFull10, _, _) => UNAVAILABLE_RATES,
             (Model::Glm53, _, _) => GLM53_STANDARD,
             (Model::Kimi, _, _) => KIMI_STANDARD,
             (Model::Mimo, _, _) => MIMO_STANDARD,
@@ -205,6 +241,16 @@ impl ServiceTier {
     pub const fn effective_for_model(self, model: Model) -> Self {
         match (model, self) {
             (Model::Glm53 | Model::Kimi | Model::Mimo, _) => Self::Standard,
+            (
+                Model::MuseSpark11
+                | Model::MuseSpark12
+                | Model::MuseSpark12Contributor
+                | Model::MuseSpark13
+                | Model::MuseSpark13Contributor
+                | Model::MuseWonder10
+                | Model::MuseWonderFull10,
+                _,
+            ) => Self::Standard,
             (Model::Luna, Self::Ultrafast) => Self::Fast,
             _ => self,
         }
@@ -252,10 +298,23 @@ pub struct EstimatedUsdCost {
     output: UsdAmount,
     #[serde(default)]
     service_tier: ServiceTier,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pricing_unavailable: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 impl EstimatedUsdCost {
-    /// Returns the exact aggregate estimate.
+    /// Whether published rates are available for every operation in this estimate.
+    /// Unavailable estimates have placeholder components, not a zero-dollar charge.
+    #[must_use]
+    pub const fn is_available(&self) -> bool {
+        !self.pricing_unavailable
+    }
+
+    /// Returns the aggregate estimate; check [`Self::is_available`] before using it.
     #[must_use]
     pub const fn amount(&self) -> UsdAmount {
         self.amount
@@ -305,6 +364,7 @@ impl EstimatedUsdCost {
                 .saturating_add(other.cache_write_input),
             output: self.output.saturating_add(other.output),
             service_tier: self.service_tier,
+            pricing_unavailable: self.pricing_unavailable || other.pricing_unavailable,
         }
     }
 }
@@ -343,7 +403,8 @@ pub fn estimate(usage: &Usage, service_tier: ServiceTier) -> EstimatedUsdCost {
 /// Estimates one provider operation using the selected model's built-in rates.
 ///
 /// This is the model-aware form of [`estimate`]. Managed sessions use it so
-/// every supported model receives an estimate from reported usage.
+/// every supported model receives an estimate from reported usage. Check
+/// [`EstimatedUsdCost::is_available`] before using models with unpublished rates.
 #[must_use]
 pub fn estimate_for_model(
     usage: &Usage,
@@ -400,6 +461,7 @@ pub(crate) fn estimate_tokens(
         cache_write_input,
         output,
         service_tier,
+        pricing_unavailable: matches!(model, Model::MuseWonderFull10),
     }
 }
 

@@ -15,14 +15,14 @@ The primary consumer is a Nanocodex agent. `BrowserTool` is caller-owned and is
 not installed by default:
 
 ```rust,ignore
-use nanocodex::{Nanocodex, OpenAi, Tools};
+use nanocodex::{Agent, OpenAi, Tools};
 use nanocodex_browser::BrowserTool;
 
 # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 let browser = BrowserTool::new()?;
 let tools = Tools::builder().provider(browser).build()?;
 let openai = OpenAi::new(std::env::var("OPENAI_API_KEY")?)?;
-let (agent, _events) = Nanocodex::builder(openai).tools(tools).build()?;
+let (agent, _events) = Agent::builder(openai).tools(tools).build()?;
 
 let result = agent
     .prompt("Open https://example.com, inspect it, and report the main heading.")

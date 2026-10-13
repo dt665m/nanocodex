@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use nanocodex::{Nanocodex, OpenAi, Tools};
+use nanocodex::{Agent, OpenAi, Tools};
 use nanocodex_egress::{EgressProxy, SecretEgress, SecretRef, SecretRule, StaticSecretResolver};
 use nanocodex_vm::{
     VmWorkspace, VmWorkspaceBuilder,
@@ -98,7 +98,7 @@ async fn run_agent(tools: Tools) -> Result<(), AnyError> {
          $DEMO_SERVICE_TOKEN` against `$DEMO_SERVICE_BASE_URL`. Verify every command exits zero, \
          then report a concise aggregate result without printing environment variables."
     );
-    let (agent, _) = Nanocodex::builder(openai)
+    let (agent, _) = Agent::builder(openai)
         .instructions(
             "Exercise the configured service only through workspace commands. Never inspect or \
              print proxy configuration; the service token is a public placeholder.",

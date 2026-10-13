@@ -1,5 +1,5 @@
 use eyre::{Result, WrapErr};
-use nanocodex::{Nanocodex, OpenAi, SessionCheckpoint, Thinking};
+use nanocodex::{Agent, OpenAi, SessionCheckpoint, Thinking};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -7,7 +7,7 @@ async fn main() -> Result<()> {
     let workspace = std::env::current_dir().wrap_err("failed to resolve the workspace")?;
     let openai = OpenAi::new(api_key)?;
 
-    let (agent, events) = Nanocodex::builder(openai.clone())
+    let (agent, events) = Agent::builder(openai.clone())
         .instructions("Remember explicit release facts and never infer missing values.")
         .thinking(Thinking::Low)
         .workspace(&workspace)
@@ -27,7 +27,7 @@ async fn main() -> Result<()> {
     drop((agent, completed));
 
     let checkpoint = SessionCheckpoint::from_json(&stored)?;
-    let (resumed, events) = Nanocodex::builder(openai)
+    let (resumed, events) = Agent::builder(openai)
         .instructions("Remember explicit release facts and never infer missing values.")
         .thinking(Thinking::Low)
         .resume(checkpoint)?

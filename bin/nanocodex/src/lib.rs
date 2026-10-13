@@ -526,7 +526,9 @@ async fn run(cli: Cli) -> Result<()> {
             } else {
                 nanocodex::HarnessFamily::Codex
             };
-            command.run(family, cli.agent.claude_auth).await
+            command
+                .run(family, cli.agent.claude_auth, cli.agent.muse_auth)
+                .await
         }
         Some(Command::Login(command)) => command.run().await,
         Some(Command::Connect(command)) => command.run().await,
@@ -627,7 +629,7 @@ async fn run(cli: Cli) -> Result<()> {
 /// `resume --from ROLLOUT` / `resume ID --at TURN`: starts a new session from a
 /// saved point and returns its ID; the source is never changed.
 ///
-/// A durable session of either harness branches through the session catalog in
+/// A durable session of any native harness branches through the session catalog in
 /// its own family. A rollout file, or a rollout-only Codex thread, is copied as
 /// a new Codex thread.
 async fn resume_point(
@@ -675,10 +677,10 @@ async fn resume_point(
         return Ok(branched.id().to_owned());
     }
     // Rollout files and rollout-only threads are Codex history.
-    if explicit == Some(nanocodex::HarnessFamily::Claude) {
+    if explicit.is_some_and(|family| family != nanocodex::HarnessFamily::Codex) {
         return Err(eyre!(
-            "--from copies a Codex rollout into a new Codex thread and cannot start a Claude \
-             session; branch a stored Claude session with nanocodex resume ID --at TURN"
+            "--from copies a Codex rollout into a new Codex thread; branch a stored non-Codex \
+             session with ncl resume ID --at TURN"
         ));
     }
     let source = match (from, session) {

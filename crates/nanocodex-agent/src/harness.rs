@@ -15,6 +15,8 @@ pub enum HarnessFamily {
     Codex,
     /// The native Claude Messages agent loop.
     Claude,
+    /// The Muse HTTP Responses agent loop.
+    Muse,
 }
 
 impl HarnessFamily {
@@ -23,6 +25,7 @@ impl HarnessFamily {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::Muse => "muse",
         }
     }
 
@@ -31,6 +34,7 @@ impl HarnessFamily {
         match self {
             Self::Codex => HarnessModel::Codex(Model::Sol),
             Self::Claude => HarnessModel::Claude(ClaudeModel::Opus55),
+            Self::Muse => HarnessModel::Muse(MuseModel::Spark13),
         }
     }
 }
@@ -48,7 +52,8 @@ impl FromStr for HarnessFamily {
         match value {
             "codex" => Ok(Self::Codex),
             "claude" => Ok(Self::Claude),
-            _ => Err("expected harness family codex or claude"),
+            "muse" => Ok(Self::Muse),
+            _ => Err("expected harness family codex, claude or muse"),
         }
     }
 }
@@ -140,6 +145,100 @@ impl FromStr for ClaudeModel {
     }
 }
 
+/// Muse model selector.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(into = "Model", try_from = "Model")]
+pub enum MuseModel {
+    /// Standard Spark 1.3.
+    #[default]
+    Spark13,
+    /// Subsidized Spark 1.3: Meta may train on prompts and completions.
+    Spark13Contributor,
+    /// Standard Spark 1.2.
+    Spark12,
+    /// Subsidized Spark 1.2: Meta may train on prompts and completions.
+    Spark12Contributor,
+    /// Standard Spark 1.1.
+    Spark11,
+    /// Wonder 1.0.
+    Wonder10,
+    /// Wonder Full 1.0.
+    WonderFull10,
+}
+impl MuseModel {
+    /// Validated Muse models exposed by the shared harness router.
+    pub const ALL: [Self; 7] = [
+        Self::Spark13,
+        Self::Spark13Contributor,
+        Self::Spark12,
+        Self::Spark12Contributor,
+        Self::Spark11,
+        Self::Wonder10,
+        Self::WonderFull10,
+    ];
+    /// Native Responses selector for this Muse model.
+    #[must_use]
+    pub const fn model(self) -> Model {
+        match self {
+            Self::Spark13 => Model::MuseSpark13,
+            Self::Spark13Contributor => Model::MuseSpark13Contributor,
+            Self::Spark12 => Model::MuseSpark12,
+            Self::Spark12Contributor => Model::MuseSpark12Contributor,
+            Self::Spark11 => Model::MuseSpark11,
+            Self::Wonder10 => Model::MuseWonder10,
+            Self::WonderFull10 => Model::MuseWonderFull10,
+        }
+    }
+
+    /// Provider-native model ID.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        self.model().as_str()
+    }
+}
+
+impl From<MuseModel> for Model {
+    fn from(model: MuseModel) -> Self {
+        model.model()
+    }
+}
+impl TryFrom<Model> for MuseModel {
+    type Error = String;
+    fn try_from(model: Model) -> Result<Self, Self::Error> {
+        match model {
+            Model::MuseSpark13 => Ok(Self::Spark13),
+            Model::MuseSpark13Contributor => Ok(Self::Spark13Contributor),
+            Model::MuseSpark12 => Ok(Self::Spark12),
+            Model::MuseSpark12Contributor => Ok(Self::Spark12Contributor),
+            Model::MuseSpark11 => Ok(Self::Spark11),
+            Model::MuseWonder10 => Ok(Self::Wonder10),
+            Model::MuseWonderFull10 => Ok(Self::WonderFull10),
+            other => Err(invalid_muse_model(other.as_str())),
+        }
+    }
+}
+
+fn invalid_muse_model(value: &str) -> String {
+    format!(
+        "invalid Muse model {value:?}; expected muse-spark-1.1, muse-spark-1.2, muse-spark-1.2-contributor, muse-spark-1.3, muse-spark-1.3-contributor, muse-wonder-1.0, or muse-wonder-full-1.0"
+    )
+}
+
+impl std::fmt::Display for MuseModel {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+impl std::str::FromStr for MuseModel {
+    type Err = String;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        value
+            .parse::<Model>()
+            .map_err(|_| invalid_muse_model(value))
+            .and_then(Self::try_from)
+    }
+}
+
 /// A model belongs to exactly one native harness family.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HarnessModel {
@@ -147,14 +246,32 @@ pub enum HarnessModel {
     Codex(Model),
     /// A model implemented by the native Messages harness.
     Claude(ClaudeModel),
+    /// A model implemented by the Muse HTTP Responses harness.
+    Muse(MuseModel),
 }
 
 impl HarnessModel {
+    /// Infers the native family for a shared Responses model selector.
+    #[doc(hidden)]
+    pub const fn from_responses(model: Model) -> Self {
+        match model {
+            Model::MuseSpark13 => Self::Muse(MuseModel::Spark13),
+            Model::MuseSpark13Contributor => Self::Muse(MuseModel::Spark13Contributor),
+            Model::MuseSpark12 => Self::Muse(MuseModel::Spark12),
+            Model::MuseSpark12Contributor => Self::Muse(MuseModel::Spark12Contributor),
+            Model::MuseSpark11 => Self::Muse(MuseModel::Spark11),
+            Model::MuseWonder10 => Self::Muse(MuseModel::Wonder10),
+            Model::MuseWonderFull10 => Self::Muse(MuseModel::WonderFull10),
+            _ => Self::Codex(model),
+        }
+    }
+
     /// The harness capable of running this model.
     pub const fn family(self) -> HarnessFamily {
         match self {
             Self::Codex(_) => HarnessFamily::Codex,
             Self::Claude(_) => HarnessFamily::Claude,
+            Self::Muse(_) => HarnessFamily::Muse,
         }
     }
 
@@ -163,6 +280,7 @@ impl HarnessModel {
         match self {
             Self::Codex(model) => model.as_str(),
             Self::Claude(model) => model.as_str(),
+            Self::Muse(model) => model.as_str(),
         }
     }
 
@@ -238,6 +356,18 @@ impl HarnessModel {
                     model.supports_reasoning_mode(ReasoningMode::Pro),
                 )
             }
+            (Self::Muse(model), _) => {
+                let model = model.model();
+                let mut bits = 0;
+                let mut index = 0;
+                while index < Thinking::ALL.len() {
+                    if model.supports_thinking(Thinking::ALL[index]) {
+                        bits |= thinking_bit(Thinking::ALL[index]);
+                    }
+                    index += 1;
+                }
+                (bits, model.default_thinking(), false, false, false)
+            }
             (Self::Claude(ClaudeModel::Haiku45), _) => (set(&[None]), None, false, false, false),
             // The native Messages adapter sends each level as output_config.effort.
             (Self::Claude(model), ModelTransport::Native) => (
@@ -276,6 +406,7 @@ impl HarnessModel {
             .into_iter()
             .map(Self::Codex)
             .chain(ClaudeModel::ALL.into_iter().map(Self::Claude))
+            .chain(MuseModel::ALL.into_iter().map(Self::Muse))
             .filter(move |model| model.family() == family)
     }
 }
@@ -515,7 +646,7 @@ const fn display_name(model: HarnessModel) -> &'static str {
         HarnessModel::Claude(ClaudeModel::Opus46) => "Claude Opus 4.6",
         HarnessModel::Claude(ClaudeModel::Sonnet46) => "Claude Sonnet 4.6",
         HarnessModel::Claude(ClaudeModel::Haiku45) => "Claude Haiku 4.5",
-        HarnessModel::Codex(_) => "The selected model",
+        HarnessModel::Codex(_) | HarnessModel::Muse(_) => "The selected model",
     }
 }
 
@@ -525,7 +656,12 @@ fn join<'a>(values: impl Iterator<Item = &'a str>) -> String {
 
 impl From<Model> for HarnessModel {
     fn from(model: Model) -> Self {
-        Self::Codex(model)
+        Self::from_responses(model)
+    }
+}
+impl From<MuseModel> for HarnessModel {
+    fn from(model: MuseModel) -> Self {
+        Self::Muse(model)
     }
 }
 impl Default for HarnessModel {
@@ -540,7 +676,7 @@ impl From<ClaudeModel> for HarnessModel {
 }
 impl PartialEq<Model> for HarnessModel {
     fn eq(&self, model: &Model) -> bool {
-        *self == Self::Codex(*model)
+        *self == Self::from_responses(*model)
     }
 }
 impl PartialEq<HarnessModel> for Model {
@@ -558,7 +694,7 @@ impl FromStr for HarnessModel {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         value
             .parse::<Model>()
-            .map(Self::Codex)
+            .map(Self::from_responses)
             .or_else(|_| value.parse::<ClaudeModel>().map(Self::Claude))
     }
 }
