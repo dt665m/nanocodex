@@ -30,7 +30,7 @@ COPY scripts/tests/linux-screen-helpers-bundle.py ./scripts/tests/
 RUN scripts/build-linux-screen-helpers.sh --auto /out/linux-screen-helpers.tar.gz /tmp/screen-build
 
 # The standalone server image uses the same publisher as desktop and VM Hands.
-FROM rust:1.97-slim-trixie AS remote-chef
+FROM rust:1.100.0-slim-trixie AS remote-chef
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential cmake pkg-config libssl-dev clang libpulse-dev libxkbcommon-dev \
     libasound2-dev libudev-dev libwayland-dev libpipewire-0.3-dev libspa-0.2-dev uuid-dev \
@@ -72,7 +72,7 @@ RUN NANOCODEX_LINUX_SCREEN_BUNDLE=/opt/linux-screen-helpers.tar.gz \
     && python3 scripts/tests/linux-screen-helpers-bundle.py \
        --binary /out/nanocodex-remote /opt/linux-screen-helpers.tar.gz
 
-FROM rust:1.97-slim-trixie AS rust-toolchain
+FROM rust:1.100.0-slim-trixie AS rust-toolchain
 RUN rustup component add clippy rustfmt && rustup target add wasm32-unknown-unknown
 FROM node:24.19.0-trixie-slim AS node-toolchain
 RUN npm install --global pnpm@11.25.0
