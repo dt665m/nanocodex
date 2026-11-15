@@ -2,7 +2,7 @@
 
 FROM node:24-bookworm AS node
 
-FROM rust:1.97-bookworm AS wasm-builder
+FROM rust:1.100.0-bookworm AS wasm-builder
 COPY --from=node /usr/local/ /usr/local/
 WORKDIR /src
 COPY Cargo.lock ./

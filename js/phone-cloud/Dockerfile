@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM rust:1.97.0-bookworm AS voice-chef
+FROM rust:1.100.0-bookworm AS voice-chef
 # Explicit upstream refresh without disabling normal source-layer reuse.
 ARG NANOCODEX_IMAGE_CACHE_EPOCH=1
 RUN test -n "$NANOCODEX_IMAGE_CACHE_EPOCH"

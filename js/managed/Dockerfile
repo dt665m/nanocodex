@@ -95,7 +95,7 @@ RUN curl --fail --location --proto '=https' --tlsv1.2 \
 
 RUN ln -s /usr/bin/fdfind /usr/local/bin/fd \
     && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --profile minimal --default-toolchain 1.97.0 \
+        | sh -s -- -y --profile minimal --default-toolchain 1.100.0 \
     && rustup component add clippy rustfmt \
     && rustup target add wasm32-unknown-unknown x86_64-unknown-linux-musl \
     && cargo install --locked wasm-bindgen-cli --version 0.2.126 \
