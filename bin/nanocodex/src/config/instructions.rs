@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 /// Resolves from the durable workspace binding at the actual user submission
 /// boundary, without locking an active model conversation.
 pub(crate) fn expand_session_user_skill(
-    agent: &nanocodex::Nanocodex,
+    agent: &nanocodex::Agent,
     prompt: &str,
 ) -> Result<Option<String>, String> {
     if !prompt.trim().starts_with('/') {
@@ -74,7 +74,9 @@ pub(super) fn native_with_context(
     let mut sections = vec![
         match family {
             HarnessFamily::Claude => include_str!("prompts/claude.md"),
-            HarnessFamily::Codex => unreachable!("Codex owns its standard instructions"),
+            HarnessFamily::Codex | HarnessFamily::Muse => {
+                unreachable!("the native harness owns its standard instructions")
+            }
         }
         .trim()
         .to_owned(),

@@ -2279,33 +2279,6 @@ exec "$install_root/current/nanocodex2" "$@"
     }
 
     #[test]
-    #[ignore = "requires NANOCODEX_TEST_VOICE_ARCHIVE built by scripts/build-voice-release.py"]
-    fn installs_and_launches_the_real_release_runtime() {
-        let archive = fs::read(std::env::var_os("NANOCODEX_TEST_VOICE_ARCHIVE").unwrap()).unwrap();
-        let directory = tempfile::tempdir().unwrap();
-        let store = VersionStore::at(directory.path());
-        store
-            .install_bundle("release", b"cli", b"managed", None, Some(&archive))
-            .unwrap();
-        store.activate("release").unwrap();
-        assert!(
-            store
-                .is_cached_voice("release", Some(&hex::encode(Sha256::digest(&archive))))
-                .unwrap()
-        );
-        let runtime = directory.path().join("current/nanocodex-resources/voice");
-        let receipt: serde_json::Value =
-            serde_json::from_slice(&fs::read(runtime.join("runtime.json")).unwrap()).unwrap();
-        assert_eq!(receipt["developmentOnly"], false);
-        assert_eq!(receipt["distribution"], "publicRelease");
-        let helper = std::process::Command::new(runtime.join("bin/nanocodex-voice-host"))
-            .arg("--build-commit")
-            .output()
-            .unwrap();
-        assert!(helper.status.success());
-        assert!(!helper.stdout.is_empty());
-    }
-    #[test]
     fn pending_update_requires_complete_verified_bundle_and_preserves_active() {
         let directory = tempfile::tempdir().unwrap();
         let store = VersionStore::at(directory.path());

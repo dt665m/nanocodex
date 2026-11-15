@@ -125,6 +125,7 @@ pub mod __private {
             },
         },
         tower::attempt::ResponsesAttemptFactory,
+        transport::http::ResponsesHttp,
     };
 
     /// Agent-owned context accounting and compaction policy primitives.
@@ -176,6 +177,27 @@ pub enum Model {
     /// Xiaomi MiMo V2.6 Pro through a host-managed gateway.
     #[serde(rename = "mimo-v2.6-pro", alias = "mimo")]
     Mimo,
+    /// Meta Muse Spark 1.1.
+    #[serde(rename = "muse-spark-1.1")]
+    MuseSpark11,
+    /// Meta Muse Spark 1.2.
+    #[serde(rename = "muse-spark-1.2")]
+    MuseSpark12,
+    /// Subsidized Muse Spark 1.2; Meta may train on prompts and completions.
+    #[serde(rename = "muse-spark-1.2-contributor")]
+    MuseSpark12Contributor,
+    /// Meta Muse Spark 1.3.
+    #[serde(rename = "muse-spark-1.3")]
+    MuseSpark13,
+    /// Subsidized Muse Spark 1.3; Meta may train on prompts and completions.
+    #[serde(rename = "muse-spark-1.3-contributor")]
+    MuseSpark13Contributor,
+    /// Meta Muse Wonder 1.0.
+    #[serde(rename = "muse-wonder-1.0")]
+    MuseWonder10,
+    /// Meta Muse Wonder Full 1.0.
+    #[serde(rename = "muse-wonder-full-1.0")]
+    MuseWonderFull10,
 }
 
 impl Model {
@@ -188,6 +210,13 @@ impl Model {
         match self {
             Self::Astra | Self::Sol | Self::Glm53 | Self::Kimi | Self::Mimo => Thinking::Low,
             Self::Luna => Thinking::Medium,
+            Self::MuseSpark11
+            | Self::MuseSpark12
+            | Self::MuseSpark12Contributor
+            | Self::MuseSpark13
+            | Self::MuseSpark13Contributor
+            | Self::MuseWonder10
+            | Self::MuseWonderFull10 => Thinking::Low,
         }
     }
     /// Returns the Responses API model identifier.
@@ -200,6 +229,13 @@ impl Model {
             Self::Glm53 => "@cf/zai-org/glm-5.3",
             Self::Kimi => "kimi-k3",
             Self::Mimo => "mimo-v2.6-pro",
+            Self::MuseSpark11 => "muse-spark-1.1",
+            Self::MuseSpark12 => "muse-spark-1.2",
+            Self::MuseSpark12Contributor => "muse-spark-1.2-contributor",
+            Self::MuseSpark13 => "muse-spark-1.3",
+            Self::MuseSpark13Contributor => "muse-spark-1.3-contributor",
+            Self::MuseWonder10 => "muse-wonder-1.0",
+            Self::MuseWonderFull10 => "muse-wonder-full-1.0",
         }
     }
 
@@ -213,6 +249,13 @@ impl Model {
             }
             Self::Luna => true,
             Self::Astra | Self::Sol => !matches!(thinking, Thinking::None),
+            Self::MuseSpark13 | Self::MuseWonder10 | Self::MuseWonderFull10 => {
+                !matches!(thinking, Thinking::None)
+            }
+            Self::MuseSpark11
+            | Self::MuseSpark12
+            | Self::MuseSpark12Contributor
+            | Self::MuseSpark13Contributor => !matches!(thinking, Thinking::None | Thinking::Max),
         }
     }
 
@@ -228,6 +271,16 @@ impl Model {
         !matches!(
             (self, mode),
             (Self::Glm53 | Self::Kimi | Self::Mimo, ReasoningMode::Pro)
+                | (
+                    Self::MuseSpark11
+                        | Self::MuseSpark12
+                        | Self::MuseSpark12Contributor
+                        | Self::MuseSpark13
+                        | Self::MuseSpark13Contributor
+                        | Self::MuseWonder10
+                        | Self::MuseWonderFull10,
+                    ReasoningMode::Pro
+                )
         )
     }
 
@@ -238,6 +291,13 @@ impl Model {
             Self::Glm53 => 1_310_720,
             Self::Kimi => 1_000_000,
             Self::Mimo => 1_048_576,
+            Self::MuseSpark11
+            | Self::MuseSpark12
+            | Self::MuseSpark12Contributor
+            | Self::MuseSpark13
+            | Self::MuseSpark13Contributor
+            | Self::MuseWonder10
+            | Self::MuseWonderFull10 => 1_048_576,
             _ => MAX_CONTEXT_WINDOW_TOKENS,
         }
     }
@@ -260,8 +320,15 @@ impl FromStr for Model {
             "@cf/zai-org/glm-5.3" | "glm-5.3" | "glm53" => Ok(Self::Glm53),
             "kimi-k3" | "kimi" => Ok(Self::Kimi),
             "mimo-v2.6-pro" | "mimo" => Ok(Self::Mimo),
+            "muse-spark-1.1" => Ok(Self::MuseSpark11),
+            "muse-spark-1.2" => Ok(Self::MuseSpark12),
+            "muse-spark-1.2-contributor" => Ok(Self::MuseSpark12Contributor),
+            "muse-spark-1.3" | "muse" => Ok(Self::MuseSpark13),
+            "muse-spark-1.3-contributor" => Ok(Self::MuseSpark13Contributor),
+            "muse-wonder-1.0" | "wonder" => Ok(Self::MuseWonder10),
+            "muse-wonder-full-1.0" | "wonder-full" => Ok(Self::MuseWonderFull10),
             _ => Err(format!(
-                "invalid model {value:?}; expected gpt-6-astra, gpt-6.1-sol, gpt-6-luna, @cf/zai-org/glm-5.3, kimi-k3, or mimo-v2.6-pro"
+                "invalid model {value:?}; expected gpt-6-astra, gpt-6.1-sol, gpt-6-luna, @cf/zai-org/glm-5.3, kimi-k3, mimo-v2.6-pro, muse-spark-1.1, muse-spark-1.2, muse-spark-1.2-contributor, muse-spark-1.3, muse-spark-1.3-contributor, muse-wonder-1.0, or muse-wonder-full-1.0"
             )),
         }
     }

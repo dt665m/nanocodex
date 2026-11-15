@@ -150,7 +150,7 @@ This is **not** full upstream `instant_interrupt` parity.
 
 Steering-triggered observation preemption is opt-in and disabled by default:
 
-- Rust: `Nanocodex::builder(openai).instant_tool_steering(true)`.
+- Rust: `Agent::builder(openai).instant_tool_steering(true)`.
 - Node/browser SDK: `Agent.create({ ..., instantToolSteering: true })`.
 - Durable Cloudflare SDK: `CloudflareAgent.create(owner, { instantToolSteering: true })`.
 - Managed SDK/HTTP: create the agent with

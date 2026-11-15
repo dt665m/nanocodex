@@ -49,6 +49,8 @@ export type ModelCapabilityEntry = Readonly<{
   /** Accepted thinking levels, ascending. */
   thinking: readonly Thinking[];
   defaultThinking: Thinking;
+  /** Whether this is its family's default model, used when a selection switches family without naming a model. */
+  familyDefault: boolean;
   fastMode: boolean;
   /** Accepted processing tiers, slowest first; "priority" is the compatibility name of "fast". */
   serviceTiers: readonly Exclude<ServiceTier, "priority">[];

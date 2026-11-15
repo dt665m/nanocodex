@@ -1,7 +1,7 @@
 mod auth;
 
 use eyre::{Result, WrapErr};
-use nanocodex::{Nanocodex, OpenAi};
+use nanocodex::{Agent, OpenAi};
 use nanocodex_voice::{VoiceEvent, VoiceSessionBuilder};
 
 use self::auth::load_codex_auth;
@@ -10,7 +10,7 @@ use self::auth::load_codex_auth;
 async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
     let openai = OpenAi::new(load_codex_auth()?)?;
-    let (agent, mut agent_events) = Nanocodex::builder(openai.clone())
+    let (agent, mut agent_events) = Agent::builder(openai.clone())
         .instructions("Inspect the repository carefully and report only verified facts.")
         .workspace(std::env::current_dir()?)
         .build()?;

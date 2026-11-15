@@ -41,7 +41,7 @@ constructed:
 ```rust,ignore
 use std::time::Duration;
 
-use nanocodex::{Nanocodex, OpenAi};
+use nanocodex::{Agent, OpenAi};
 use tower::{limit::ConcurrencyLimitLayer, timeout::TimeoutLayer};
 
 let openai = OpenAi::builder(std::env::var("OPENAI_API_KEY")?)
@@ -49,7 +49,7 @@ let openai = OpenAi::builder(std::env::var("OPENAI_API_KEY")?)
     .layer(ConcurrencyLimitLayer::new(1))
     .build()?;
 
-let (agent, events) = Nanocodex::builder(openai)
+let (agent, events) = Agent::builder(openai)
     .instructions(
         "You are a Rust coding agent. Preserve unrelated work and run relevant tests.",
     )

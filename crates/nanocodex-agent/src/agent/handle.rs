@@ -29,6 +29,41 @@ impl Clone for Nanocodex {
     }
 }
 
+/// Weak lifecycle reference that never keeps its agent alive.
+///
+/// Owners that must stop agents they did not retain, such as a reusable
+/// runtime, hold this instead of a [`Nanocodex`] clone so dropping the final
+/// handle still performs the backend's implicit cleanup.
+#[derive(Clone)]
+pub struct WeakAgent {
+    backend: std::sync::Weak<dyn LifecycleBackend>,
+}
+
+impl WeakAgent {
+    /// Whether any handle or backend owner still keeps the agent alive.
+    #[must_use]
+    pub fn is_live(&self) -> bool {
+        self.backend.strong_count() > 0
+    }
+
+    /// Shuts the agent down when it is still alive, returning `None` after
+    /// its final handle was dropped. Shutdown is the same idempotent shared
+    /// operation as [`Nanocodex::shutdown`].
+    pub async fn shutdown(&self) -> Option<Result<()>> {
+        let backend = self.backend.upgrade()?;
+        Some(backend.shutdown().await)
+    }
+}
+
+impl fmt::Debug for WeakAgent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WeakAgent")
+            .field("live", &self.is_live())
+            .finish()
+    }
+}
+
 /// Cheap weak capability for constructing children from one owning runtime.
 /// Holding this handle never keeps its parent driver alive.
 #[derive(Clone)]
@@ -351,11 +386,8 @@ impl super::backend::AgentFactory for OpenAiAgentFactory {
         Box::pin(async move {
             options.validate_harness()?;
             if options
-                .selected_harness()
+                .selected_family()
                 .is_some_and(|family| family != crate::HarnessFamily::Codex)
-                || options
-                    .selected_harness_model()
-                    .is_some_and(|model| model.family() != crate::HarnessFamily::Codex)
             {
                 return Err(NanocodexError::InvalidRequest(
                     "Claude harness requires a configured child factory".into(),
@@ -458,6 +490,15 @@ impl Nanocodex {
     #[must_use]
     pub fn harness_family(&self) -> crate::HarnessFamily {
         self.session.family
+    }
+
+    /// Returns a weak reference that can shut this agent down without
+    /// keeping it alive.
+    #[must_use]
+    pub fn downgrade(&self) -> WeakAgent {
+        WeakAgent {
+            backend: Arc::downgrade(&self.backend),
+        }
     }
 
     /// Returns this session's identity, family, and lineage.

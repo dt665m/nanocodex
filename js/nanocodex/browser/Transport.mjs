@@ -63,3 +63,6 @@ function connection(options = {}) {
 }
 
 export { multiplex } from "../runtime/response-lanes.mjs";
+
+/** Explicit Claude Messages authentication for Nanocodex.create backends. */
+export { anthropic } from "../runtime/claude-transport.mjs";

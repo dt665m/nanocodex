@@ -19,7 +19,7 @@ use axum::{
     routing::post,
 };
 use nanocodex::claude::{Claude, ClaudeClient, ClaudeTools};
-use nanocodex::{Nanocodex, OpenAi, Tools, agent::AgentEvents, oai::transport::ResponsesTransport};
+use nanocodex::{Agent, OpenAi, Tools, agent::AgentEvents, oai::transport::ResponsesTransport};
 use nanocodex_decisions::{DecisionTool, openai::OpenAiDecisions};
 use serde_json::{Value, json};
 
@@ -95,7 +95,7 @@ impl Fixture {
     }
 
     /// Builds a Responses agent with only the decision tool installed.
-    fn codex_agent(&self) -> (Nanocodex, AgentEvents) {
+    fn codex_agent(&self) -> (Agent, AgentEvents) {
         let openai = OpenAi::builder("synthetic-responses-key")
             .transport(ResponsesTransport::Https)
             .store(false)
@@ -107,18 +107,18 @@ impl Fixture {
             .tool(DecisionTool::new(self.decisions()))
             .build()
             .unwrap();
-        Nanocodex::builder(openai).tools(tools).build().unwrap()
+        Agent::builder(openai).tools(tools).build().unwrap()
     }
 
     /// Builds a Claude agent with only the decision tool installed.
-    fn claude_agent(&self) -> (Nanocodex, AgentEvents) {
+    fn claude_agent(&self) -> (Agent, AgentEvents) {
         let client = ClaudeClient::new(
             reqwest::Client::new(),
             format!("http://{}/v1/messages", self.address),
             "synthetic-claude-key",
         );
         let decisions = self.decisions();
-        Nanocodex::builder(Claude::new(client, "claude-opus-5-5"))
+        Agent::builder(Claude::new(client, "claude-opus-5-5"))
             .tools_factory(move |_handle| {
                 ClaudeTools::new().shared_tool(DecisionTool::new(decisions.clone()))
             })
@@ -134,7 +134,7 @@ impl Fixture {
 
     /// Runs one prompt, which the scripted model turns into a single tool
     /// call, and returns the tool's output.
-    async fn run(&self, agent: &Nanocodex, prompt: &str) -> String {
+    async fn run(&self, agent: &Agent, prompt: &str) -> String {
         let turn = agent.prompt(prompt).await.unwrap();
         let result = turn.result().await;
         self.save();

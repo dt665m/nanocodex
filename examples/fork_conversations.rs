@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use eyre::{Result, WrapErr};
 use nanocodex::{
-    AgentEvents, ForkRequest, Nanocodex, OpenAi, Thinking, Tools, TurnResult,
+    Agent, AgentEvents, ForkRequest, OpenAi, Thinking, Tools, TurnResult,
     agent::{events::AgentEventKind, session::SessionId},
     oai::{OpenAiBuilder, tower::StandardServiceFactory, transport::ResponsesTransport},
 };
@@ -51,7 +51,7 @@ async fn main() -> Result<()> {
     let tools = Tools::builder().without_defaults().build()?;
     let lineage = SessionId::new();
     let workspace = std::env::current_dir().wrap_err("failed to resolve the current directory")?;
-    let (agent, root_events) = Nanocodex::builder(openai)
+    let (agent, root_events) = Agent::builder(openai)
         .session_id(lineage)
         .instructions(LEDGER_PROMPT)
         .thinking(Thinking::Low)

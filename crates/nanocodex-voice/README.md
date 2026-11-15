@@ -60,10 +60,10 @@ preferences. Non-default update preferences select
 the appropriate handoff routing and take precedence over `handoff_mode`.
 
 ```rust,no_run
-use nanocodex::{Nanocodex, OpenAi};
+use nanocodex::{Agent, OpenAi};
 use nanocodex_voice::{VoiceAgentControl, VoiceEvent, VoiceSessionBuilder};
 
-# async fn example(openai: OpenAi, agent: Nanocodex) -> Result<(), Box<dyn std::error::Error>> {
+# async fn example(openai: OpenAi, agent: Agent) -> Result<(), Box<dyn std::error::Error>> {
 let agent_control = VoiceAgentControl::default();
 let (mut voice, mut events) = VoiceSessionBuilder::new(openai, agent)
     .agent_control(agent_control.clone())

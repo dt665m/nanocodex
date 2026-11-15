@@ -1,7 +1,7 @@
 mod auth;
 
 use nanocodex::{
-    Nanocodex, OpenAi, PromptRoute,
+    Agent, OpenAi, PromptRoute,
     oai::realtime::{RealtimeAgentSteer, RealtimeAudio, RealtimeEvent},
 };
 use nanocodex_voice::{codex_realtime_delegation_with_transcript, codex_voice_instructions};
@@ -26,7 +26,7 @@ struct ActiveRequest {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let openai = OpenAi::new(load_codex_auth()?)?;
-    let (agent, mut agent_events) = Nanocodex::builder(openai.clone())
+    let (agent, mut agent_events) = Agent::builder(openai.clone())
         .instructions("Act as a coding agent. Inspect before claiming and preserve unrelated work.")
         .workspace(std::env::current_dir()?)
         .build()?;

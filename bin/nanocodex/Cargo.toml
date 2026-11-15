@@ -72,7 +72,7 @@ image.workspace = true
 indicatif.workspace = true
 percent-encoding.workspace = true
 jsonschema.workspace = true
-nanocodex = { workspace = true, features = ["claude-tools", "workspace-tools"] }
+nanocodex = { workspace = true, features = ["claude-tools", "muse", "workspace-tools"] }
 nanocodex-bin-shared.workspace = true
 nanocodex-cli-auth.workspace = true
 nanocodex-durability = { workspace = true, features = ["sqlite"] }
@@ -331,3 +331,7 @@ path = "tests/nanocodex2_hand_share.rs"
 [[test]]
 name = "model_capabilities"
 path = "tests/model_capabilities.rs"
+
+[[test]]
+name = "muse_cli"
+path = "tests/muse_cli.rs"

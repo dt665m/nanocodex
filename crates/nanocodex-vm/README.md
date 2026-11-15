@@ -62,7 +62,7 @@ let workspace = image.private_workspace(
 .await?;
 
 let tools = workspace.tools_builder().await?.build()?;
-// Pass `tools` to `Nanocodex::builder(...).tools(tools)`.
+// Pass `tools` to `Agent::builder(...).tools(tools)`.
 
 drop(tools);
 workspace.shutdown().await?;

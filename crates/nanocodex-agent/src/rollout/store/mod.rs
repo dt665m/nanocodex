@@ -28,6 +28,22 @@ impl PartialEq for RolloutInfo {
 impl Eq for RolloutInfo {}
 
 impl RolloutInfo {
+    /// Constructs rollout metadata supplied by an external lifecycle backend.
+    /// The writer updates `committed_bytes` after complete records are flushed.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn from_backend(
+        thread_id: impl Into<String>,
+        path: impl Into<PathBuf>,
+        committed_bytes: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            thread_id: thread_id.into(),
+            path: path.into(),
+            committed_bytes,
+        }
+    }
+
     /// Exclusive byte boundary of successfully flushed, complete rollout records.
     #[must_use]
     pub fn committed_bytes(&self) -> u64 {

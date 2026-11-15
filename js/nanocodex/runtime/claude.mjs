@@ -18,9 +18,9 @@ const OPTION_KEYS = new Set([
 export function toClaudeConfig(options = {}) {
   if (!options || typeof options !== 'object' || Array.isArray(options)) throw new TypeError('Claude options must be an object');
   for (const key of Object.keys(options)) if (!OPTION_KEYS.has(key)) throw new TypeError('unsupported Claude option');
-  if (options.toolMode !== undefined && options.toolMode !== 'code-only') throw new TypeError('Claude toolMode must be code-only');
+  if (options.toolMode !== undefined && options.toolMode !== 'code-only' && options.toolMode !== 'direct') throw new TypeError('Claude toolMode must be code-only or direct');
   if (options.codeEvaluator !== undefined && typeof options.codeEvaluator !== 'function') throw new TypeError('Claude codeEvaluator must be a function');
-  if (options.serverTools?.length || options.clientToolSearch) throw new TypeError('Claude Code Mode does not expose provider or client search tools directly');
+  if (options.serverTools?.length || options.clientToolSearch) throw new TypeError('Claude does not expose provider or client search tools directly');
   if (options.harness !== undefined && options.harness !== 'claude') throw new TypeError('Claude requires harness claude');
   if (options.subagents !== undefined && (!options.subagents || typeof options.subagents !== 'object' || Array.isArray(options.subagents) || Object.keys(options.subagents).some(key => key !== 'maxConcurrency') || (options.subagents.maxConcurrency !== undefined && (!Number.isSafeInteger(options.subagents.maxConcurrency) || options.subagents.maxConcurrency < 1)))) throw new TypeError('subagents maxConcurrency must be positive');
   if (typeof options.model !== 'string' || !options.model.trim()) throw new TypeError('Claude model must be non-empty');
@@ -53,7 +53,8 @@ export function toClaudeConfig(options = {}) {
       if (!['installId','accountUuid','userId','platform','arch','version'].includes(key) || typeof value !== 'string' || !value || value.length > 8192 || /[\u0000-\u001f\u007f]/.test(value)) throw new TypeError('invalid subscriptionIdentity');
     }
   }
-  const config = { toolMode: 'code-only' };
+  // Code Mode stays the default; direct mode is an explicit opt-in.
+  const config = { toolMode: options.toolMode ?? 'code-only' };
   for (const key of OPTION_KEYS) if (!['codeEvaluator', 'auth', 'fetch', 'tools', 'module', 'durability', 'compatibilityProfile', 'harness', 'harnesses', 'subagents'].includes(key) && options[key] !== undefined) config[key] = options[key];
   if (options.compatibilityProfile !== undefined) {
     config.subscriptionCompatibility = true;
@@ -153,7 +154,13 @@ export async function createClaude(options, load, type, harnessDefaults) {
         if (typeof Nanocodex?.createClaude !== 'function') throw new Error('this WASM build does not expose the Claude harness');
         // Construction acquires the durable fence before adoption replaces
         // the live host route, matching the Codex lifecycle.
-        const raw = await Nanocodex.createClaude(JSON.stringify(config));
+        let raw;
+        if (harnesses.codexSubscription === undefined) raw = await Nanocodex.createClaude(JSON.stringify(config));
+        else {
+          // Codex children share the Rust-owned ChatGPT credential lifecycle.
+          if (typeof Nanocodex.createClaudeWithChatGpt !== 'function') throw new Error('this WASM build cannot route Codex children through a ChatGPT subscription');
+          raw = await Nanocodex.createClaudeWithChatGpt(JSON.stringify(config), harnesses.codexSubscription);
+        }
         if (!raw || typeof raw.prompt !== 'function') {
           raw?.free?.();
           throw new TypeError('the runtime returned an invalid Nanocodex handle');

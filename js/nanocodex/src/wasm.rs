@@ -9,7 +9,7 @@ use std::{
 
 use js_sys::Promise;
 use nanocodex::{
-    AgentEvents, AgentSessionContext, DurableAgentExt, Model, Nanocodex as RustNanocodex,
+    Agent as RustNanocodex, AgentEvents, AgentSessionContext, DurableAgentExt, Model,
     NanocodexError, OpenAi, PromptRoute, ReasoningMode, Thinking, Tools, Turn, TurnControl,
     TurnResult,
     agent::{
@@ -102,6 +102,7 @@ pub fn model_capabilities() -> Result<JsValue, JsValue> {
                 serde_json::json!({
                     "model": model.as_str(),
                     "family": model.family().as_str(),
+                    "familyDefault": model == model.family().default_model(),
                     "transport": transport.as_str(),
                     "thinking": capabilities.thinking().map(|level| level.as_str()).collect::<Vec<_>>(),
                     "defaultThinking": capabilities.default_thinking().as_str(),
@@ -213,6 +214,9 @@ extern "C" {
 
     #[wasm_bindgen(js_namespace = ["globalThis", "nanocodexHost"], js_name = cancelCode)]
     fn host_cancel_code(session_id: &str);
+
+    #[wasm_bindgen(catch, js_namespace = ["globalThis", "nanocodexHost"], js_name = toolMode)]
+    fn host_tool_mode(definition_host_id: u32, session_id: &str) -> Result<String, JsValue>;
 
     #[wasm_bindgen(catch, js_namespace = ["globalThis", "nanocodexHost"], js_name = toolDefinitions)]
     fn host_tool_definitions(definition_host_id: u32, session_id: &str) -> Result<String, JsValue>;
@@ -798,7 +802,13 @@ impl JavaScriptCodeModeHost {
     fn new(definition_host_id: u32) -> Self {
         Self {
             definition_host_id,
-            mode: EmbeddedToolMode::CodeOnly,
+            // Code Mode is the default; direct is an explicit host opt-in.
+            // The legacy mixed `Code` exposure is never selectable.
+            // JS hosts validate the mode; an unavailable host keeps Code Mode.
+            mode: match host_tool_mode(definition_host_id, "").as_deref() {
+                Ok("direct") => EmbeddedToolMode::Direct,
+                _ => EmbeddedToolMode::CodeOnly,
+            },
         }
     }
 }
@@ -1649,6 +1659,7 @@ impl WasmHarnessFactory {
                 (recipe, Some(auth))
             }
             HarnessFamily::Claude => (factory.claude.clone().ok_or_else(unavailable)?, None),
+            HarnessFamily::Muse => return Err(unavailable()),
         };
         let object = recipe.as_object_mut().ok_or_else(unavailable)?;
         for key in [
@@ -1698,6 +1709,7 @@ impl WasmHarnessFactory {
                 )
                 .await
             }
+            HarnessFamily::Muse => return Err(unavailable()),
         }
         .map_err(|_| NanocodexError::InvalidRequest("target harness construction failed".into()))?;
         factory
@@ -1719,9 +1731,7 @@ impl AgentFactory for WasmHarnessFactory {
         Box::pin(async move {
             parent.ensure_available().await?;
             options.validate_harness()?;
-            if options
-                .selected_harness()
-                .unwrap_or(parent.harness_family())
+            if options.selected_family().unwrap_or(parent.harness_family())
                 == parent.harness_family()
             {
                 return parent

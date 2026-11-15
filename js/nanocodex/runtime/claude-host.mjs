@@ -85,9 +85,11 @@ export function createClaudeHost({ auth, tools = [], onEvent = () => {}, fetch, 
     || (auth.apiKey !== undefined && (typeof auth.apiKey !== 'string' || !auth.apiKey.trim()))) {
     throw new TypeError('Claude auth requires exactly one apiKey or headers callback');
   }
-  if (toolMode !== 'code-only') throw new TypeError('Claude toolMode must be code-only');
-  if (codeEvaluator === undefined && typeof globalThis.Worker === 'function') codeEvaluator = createWorkerEvaluator();
-  if (typeof codeEvaluator !== 'function') throw new TypeError('Claude Code Mode requires a Worker or explicit codeEvaluator');
+  if (toolMode !== 'code-only' && toolMode !== 'direct') throw new TypeError('Claude toolMode must be code-only or direct');
+  // Direct mode exposes host tools as native Messages tools: no evaluator.
+  const codeOnly = toolMode === 'code-only';
+  if (codeOnly && codeEvaluator === undefined && typeof globalThis.Worker === 'function') codeEvaluator = createWorkerEvaluator();
+  if (codeOnly && typeof codeEvaluator !== 'function') throw new TypeError('Claude Code Mode requires a Worker or explicit codeEvaluator');
   let apiKey = auth.apiKey;
   let headerProvider = auth.headers;
   const { handlers, definitions, parallelSafe } = resolveClaudeTools(tools);
@@ -97,7 +99,7 @@ export function createClaudeHost({ auth, tools = [], onEvent = () => {}, fetch, 
   const codeTurns = new Map();
   const codeTurnOrdinals = new Map();
   const effectIdentity = createCodeEffectIdentity(codeEffectJournal);
-  const code = createCodeRuntime(Object.fromEntries(definitions.map(definition => [definition.name, {
+  const code = codeOnly ? createCodeRuntime(Object.fromEntries(definitions.map(definition => [definition.name, {
     description: definition.description, parameters: definition.input_schema,
     async handler(input, context) {
       if (disposed) throw new Error('Claude tool host is disposed');
@@ -127,8 +129,8 @@ export function createClaudeHost({ auth, tools = [], onEvent = () => {}, fetch, 
       }
     },
   }])), { evaluate: codeEvaluator, effectJournal: codeEffectJournal,
-    effectIdentity: codeEffectJournal ? effectIdentity.resolve : undefined, traceTool });
-  const modelDefinitions = codeDefinitions(definitions);
+    effectIdentity: codeEffectJournal ? effectIdentity.resolve : undefined, traceTool }) : undefined;
+  const modelDefinitions = code ? codeDefinitions(definitions) : definitions;
   function beginCodeTurn(sessionId, turnId) {
     let turns = codeTurns.get(sessionId);
     if (!turns) codeTurns.set(sessionId, turns = new Map());
@@ -171,7 +173,8 @@ export function createClaudeHost({ auth, tools = [], onEvent = () => {}, fetch, 
       } catch { throw new Error('Claude authentication unavailable'); }
     },
     toolDefinitions() { return JSON.stringify(modelDefinitions); },
-    // Code Mode exposes only exec/wait, which keep the serial default.
+    // Code Mode exposes only exec/wait, which keep the serial default; direct
+    // mode overlaps host tools declaring supportsParallelToolCalls.
     parallelSafeTools() { return code ? [] : [...parallelSafe]; },
     toolMode() { return toolMode; },
     emitEvent(event, ...args) {
@@ -223,17 +226,20 @@ export function createClaudeHost({ auth, tools = [], onEvent = () => {}, fetch, 
         let value;
         if (disposed) throw new Error('Claude tool host is disposed');
         if (!sessionId || !turnId || !callId) throw new Error('Claude tools require session, turn and call identities');
-        beginCodeTurn(sessionId, turnId);
-        // Live consumers drain updates while the cell runs. The final receipt
-        // covers any tail still queued when execution settles; discard that
-        // tail so delivered payloads cannot stay retained for the session.
-        try {
-          if (name === 'exec') {
-            const input = JSON.parse(encodedInput);
-            value = JSON.parse(await code.executeCodeObserved(input.code, sessionId, callId, model, turnId, localDefinitions, executeLocalTool));
-          } else if (name === 'wait') value = JSON.parse(await code.waitCodeObserved(encodedInput, sessionId, callId));
-          else value = failed('Claude tool is unavailable in Code Mode');
-        } finally { if (name === 'exec' || name === 'wait') code.discardCodeUpdates(sessionId, callId); }
+        if (!code) value = await host.invokeTool(name, encodedInput, sessionId, callId, model, turnId);
+        else {
+          beginCodeTurn(sessionId, turnId);
+          // Live consumers drain updates while the cell runs. The final receipt
+          // covers any tail still queued when execution settles; discard that
+          // tail so delivered payloads cannot stay retained for the session.
+          try {
+            if (name === 'exec') {
+              const input = JSON.parse(encodedInput);
+              value = JSON.parse(await code.executeCodeObserved(input.code, sessionId, callId, model, turnId, localDefinitions, executeLocalTool));
+            } else if (name === 'wait') value = JSON.parse(await code.waitCodeObserved(encodedInput, sessionId, callId));
+            else value = failed('Claude tool is unavailable in Code Mode');
+          } finally { if (name === 'exec' || name === 'wait') code.discardCodeUpdates(sessionId, callId); }
+        }
         if (value && typeof value === 'object' && Object.hasOwn(value, 'content')) {
           if (typeof value.content !== 'string' && !Array.isArray(value.content)) throw new TypeError('invalid Claude native tool content');
           if (value.isError !== undefined && typeof value.isError !== 'boolean') throw new TypeError('invalid Claude tool error flag');
@@ -266,6 +272,7 @@ export function createClaudeHost({ auth, tools = [], onEvent = () => {}, fetch, 
     // executeClaudeTool for this call. Resolves null once that observation
     // closes; the final _nanocodex_code receipt stays authoritative.
     async nextClaudeCodeUpdate(sessionId, callId) {
+      if (!code) return null;
       const encoded = await code.nextCodeUpdate(sessionId, callId);
       if (typeof encoded !== 'string') return null;
       const update = JSON.parse(encoded);
@@ -286,6 +293,8 @@ export function createClaudeHost({ auth, tools = [], onEvent = () => {}, fetch, 
         }));
         return value;
       } catch (error) {
+        // Host interruption cancels the invocation; it is never a tool result.
+        if (error?.code === 'host_interrupted') throw error;
         return failed(errorText(error));
       }
     },

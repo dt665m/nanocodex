@@ -75,6 +75,10 @@ let result = agent.prompt(
 ).await?.result().await?;
 ```
 
+Enable the `muse` feature to attach the same Responses execution policy to
+Muse builders. Muse retains its native HTTP/SSE history and checkpoint decoder;
+the facade forwards this feature when both `muse` and `durability` are enabled.
+
 Choose `SqliteStore`, `PostgresStore`, or a persistent host store to retain work
 across process restarts. Reopen the same state ID and replay the same request ID
 and input to recover pending work or return its committed receipt. Unfinished

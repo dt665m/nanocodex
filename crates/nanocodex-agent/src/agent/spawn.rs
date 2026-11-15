@@ -162,9 +162,11 @@ where
         .tools
         .materialize(child_handle.clone())?
         .for_session(&child_handle.session_environment());
-    if tools.exposure() != nanocodex_oai_tools::ToolExposure::CodeModeOnly {
+    // Code Mode (the default) exposes tools through `exec`; direct exposure
+    // declares them as ordinary provider tools dispatched by the driver.
+    if tools.exposure() == nanocodex_oai_tools::ToolExposure::Hidden {
         return Err(NanocodexError::InvalidRequest(
-            "Nanocodex agents require CodeModeOnly tool exposure; direct exposure is only available to standalone tool runtimes".to_owned(),
+            "Nanocodex agents require Code Mode or direct tool exposure".to_owned(),
         ));
     }
     let prompt_cache_key = spawner

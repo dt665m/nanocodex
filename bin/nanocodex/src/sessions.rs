@@ -210,10 +210,13 @@ pub(crate) async fn list(home: &Path) -> Result<Vec<SessionSummary>> {
             continue;
         }
         // Only Codex threads resume from a rollout alone; see the module docs.
-        if info.harness_family() == Some(HarnessFamily::Claude) {
+        if info
+            .harness_family()
+            .is_some_and(|family| family != HarnessFamily::Codex)
+        {
             tracing::debug!(
                 session = info.thread_id(),
-                "skipping a Claude rollout mirror without durable state"
+                "skipping a non-Codex rollout mirror without durable state"
             );
             continue;
         }
@@ -269,10 +272,12 @@ pub(crate) async fn load(home: &Path, id: &str) -> Result<ResumedSession> {
         .list_sessions()
         .ok()
         .and_then(|listed| listed.into_iter().find(|info| info.thread_id() == id))
-        && info.harness_family() == Some(HarnessFamily::Claude)
+        && info
+            .harness_family()
+            .is_some_and(|family| family != HarnessFamily::Codex)
     {
         return Err(eyre!(
-            "session {id} is a Claude session with no durable state under {}; its JSONL rollout is a read-only mirror, and Claude sessions resume only from the session store",
+            "session {id} is a non-Codex session with no durable state under {}; its JSONL rollout is a read-only mirror, and non-Codex sessions resume only from the session store",
             home.display()
         ));
     }

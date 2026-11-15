@@ -61,7 +61,7 @@ Transport, storage, and history policy are selected when the agent is built and
 are inherited unchanged by every clean child and historical fork:
 
 ```rust
-use nanocodex::{Nanocodex, OpenAi};
+use nanocodex::{Agent, OpenAi};
 use nanocodex::oai::transport::{ResponsesHistory, ResponsesTransport};
 
 let openai = OpenAi::builder(std::env::var("OPENAI_API_KEY")?)
@@ -69,7 +69,7 @@ let openai = OpenAi::builder(std::env::var("OPENAI_API_KEY")?)
     .store(false)
     .history(ResponsesHistory::FullReplay)
     .build()?;
-let (agent, events) = Nanocodex::builder(openai)
+let (agent, events) = Agent::builder(openai)
     .instructions(
         "Remember supplied deployment facts and preserve exact identifiers.",
     )

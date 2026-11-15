@@ -95,12 +95,12 @@ Claude agents install the same tool through `ClaudeTools::shared_tool` and call
 `decide` with those arguments:
 
 ```rust,no_run
-use nanocodex::{Nanocodex, claude::{Claude, ClaudeTools}};
+use nanocodex::{Agent, claude::{Claude, ClaudeTools}};
 use nanocodex_decisions::{DecisionTool, openai::OpenAiDecisions};
 
 # fn build(claude: Claude) -> Result<(), Box<dyn std::error::Error>> {
 let decisions = OpenAiDecisions::from_env()?;
-let (agent, events) = Nanocodex::builder(claude)
+let (agent, events) = Agent::builder(claude)
     .tools_factory(move |_agent| {
         ClaudeTools::new().shared_tool(DecisionTool::new(decisions.clone()))
     })

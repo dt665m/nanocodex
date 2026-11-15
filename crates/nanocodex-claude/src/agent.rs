@@ -2664,9 +2664,11 @@ impl AgentFactory for ClaudeNativeFactory {
             state.durable_child(&mut recipe, &child_id, &lineage, "spawn", journal_backed)?;
             recipe.session_id = Some(child_id);
             recipe.lineage = Some(lineage);
+            // Without a model or family switch the child inherits the exact
+            // native model and policy, including models outside the catalog.
             if options.selected_harness_model().is_none()
                 && options
-                    .selected_harness()
+                    .selected_family()
                     .is_none_or(|family| family == HarnessFamily::Claude)
             {
                 let mut recipe = recipe;
@@ -2680,11 +2682,15 @@ impl AgentFactory for ClaudeNativeFactory {
                 state.initialize_child_workspace(&mut recipe)?;
                 return Nanocodex::persist_created(recipe.host_context(host_context).build()).await;
             }
-            let model: HarnessModel = state.model().parse().map_err(unsupported)?;
-            let thinking = if state.effort().is_none() {
-                model.default_thinking()
-            } else {
-                state.thinking()
+            // An explicit model takes its own defaults, so an uncataloged
+            // parent model never participates in its resolution.
+            let (model, thinking) = match state.model().parse::<HarnessModel>() {
+                Ok(model) if state.effort().is_none() => (model, model.default_thinking()),
+                Ok(model) => (model, state.thinking()),
+                Err(_) => {
+                    let model = HarnessFamily::Claude.default_model();
+                    (model, model.default_thinking())
+                }
             };
             let options = options.resolve(model, thinking)?;
             let selected = options.selected_harness_model().expect("resolved model");

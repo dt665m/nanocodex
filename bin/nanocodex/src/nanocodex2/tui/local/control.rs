@@ -17,6 +17,7 @@ use super::super::{
 fn models() -> Value {
     json!({"models": HarnessModel::for_family(nanocodex::HarnessFamily::Codex)
         .chain(HarnessModel::for_family(nanocodex::HarnessFamily::Claude))
+        .chain(HarnessModel::for_family(nanocodex::HarnessFamily::Muse))
         .map(|model| {
             let capabilities = model.capabilities(ModelTransport::Native);
             json!({

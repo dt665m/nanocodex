@@ -1,5 +1,5 @@
 use eyre::{Result, WrapErr};
-use nanocodex::{Nanocodex, OpenAi, Thinking, Tools, tool};
+use nanocodex::{Agent, OpenAi, Thinking, Tools, tool};
 
 #[tool(description = "Multiplies two signed integers.")]
 async fn multiply(left: i64, right: i64) -> std::result::Result<i64, &'static str> {
@@ -13,7 +13,7 @@ async fn main() -> Result<()> {
     // Registered tools are exposed to code mode as `tools.<definition name>(args)`.
     let tools = Tools::builder().without_defaults().tool(multiply).build()?;
     let openai = OpenAi::new(api_key)?;
-    let (agent, mut events) = Nanocodex::builder(openai)
+    let (agent, mut events) = Agent::builder(openai)
         .instructions("Use the supplied arithmetic tool and preserve exact integer results.")
         .thinking(Thinking::Low)
         .tools(tools)

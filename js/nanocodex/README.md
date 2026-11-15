@@ -56,6 +56,7 @@ Transport.chatGpt({ subscription });
 Transport.mpp({ session: paymentSession });
 Transport.managed({ agent: { create: true } });
 Transport.managed({ agent: { id: retainedAgentId } });
+Transport.anthropic({ apiKey }); // Claude backend of Nanocodex.create
 ```
 
 Managed identity is always explicit. `{ create: true }` provisions one new
@@ -93,6 +94,114 @@ It does not silently switch managed providers, install Codex tools, or supply
 a subscription sign-in screen. Managed account connection is documented in the
 [managed Claude guide](../../docs/CLAUDE_MANAGED.md). See the [Claude JavaScript guide](../../docs/CLAUDE_JAVASCRIPT.md)
 for durable reopen, replay, and placement boundaries.
+
+### Reusable runtime: Nanocodex.create
+
+Configure credentials, tools and defaults once, then create any number of
+independent root Agents. Each root is created through the same per-agent path as
+`Agent.create`, so it has its own host, tool execution state, evaluator binding,
+session and lifecycle; the runtime shares only immutable configuration and the
+credential capabilities you pass it.
+
+```js
+import { Nanocodex, Transport, Workspace } from "nanocodex/node";
+
+// subscription: an open ChatGptSubscription; codexTools/claudeTools: your named tool arrays.
+
+const nano = await Nanocodex.create({
+  backends: {
+    codex: {
+      transport: Transport.chatGpt({ subscription }), // or Transport.openAi({ apiKey })
+      tools: codexTools,                                // copied per Agent host
+      codeMode: true,
+      filesystem: await Workspace.open({ path: "./codex-work", root: "/workspace" }),
+    },
+    claude: {
+      transport: Transport.anthropic({ apiKey: process.env.ANTHROPIC_API_KEY }),
+      tools: claudeTools,
+      workspace: "/workspace",
+      maxTokens: 8192,
+    },
+  },
+  harness: "codex",
+  model: "gpt-6.1-sol",
+  thinking: "low",
+  instructions: "Default root instructions.",
+});
+
+const coder = await nano.spawn({ instructions: "Implement the change." });
+const reviewer = await nano.spawn({ harness: "claude", instructions: "Review the diff." });
+const turn = reviewer.turn.prompt({ input: "Review src/ for regressions." });
+console.log((await turn.result()).finalMessage);
+
+const checkpoint = await coder.session.checkpoint();
+await coder.session.shutdown();
+const resumed = await nano.resume(checkpoint); // current credentials and tools
+await nano.shutdown();
+```
+
+Backends. `backends.codex` takes a Responses transport (`openAi`, `chatGpt`, `mpp`, `hostManaged`)
+or `{ transport, tools, codeMode, workspace, filesystem, ...codexOptions }`.
+`backends.claude` takes `Transport.anthropic({ apiKey } | { headers } | { subscription })`
+or `{ transport, tools, codeMode, workspace, filesystem, ...claudeOptions }`. A
+`subscription` is an open `ClaudeSubscription` from `nanocodex/worker`; each request reads
+its current private headers with the subscription compatibility profile.
+Nothing is read from the environment, and a family without a backend is never
+served by another family's credential. Keep caller-owned ChatGPT and Claude
+subscriptions open until `nano.shutdown()` resolves. `Transport.managed` opens one
+server-owned durable Agent and stays an `Agent.create` transport.
+
+Selection. `harness` defaults to the family of an explicit `model`, else `codex`
+when configured, else the only backend; `model` defaults to that family's catalog
+default and `thinking` to the model's default. Every choice is validated against the
+bundled WASM model catalog before any request. `nano.spawn()` with no overrides uses
+these defaults. A different `harness` without a model uses that family's default
+model; the same harness keeps the default model. An explicit `model` selects its own
+family, and thinking then defaults to that model's default unless it is the
+runtime default model. Unsupported thinking, a model of another family, an
+unknown model and a family without a backend reject before dispatch. When both
+backends are configured, each root can spawn canonical subagents of either
+family; children use their own backend's credentials, tools and workspace. A
+Claude root's Codex children may use the ChatGPT subscription or MPP.
+
+Tools and workspaces belong to each backend. Declarative tool arrays and maps
+are copied per Agent. A factory `({ harness, role }) => tools` runs once per root
+(`role: "root"`) and once per alternate-family child capability (`role: "child"`,
+created with the root even if no child is spawned); it may return or resolve a
+fresh `createTools()` instance (Codex only), which the claiming host closes. A
+`createTools()` instance itself belongs to one host and is rejected, and a
+factory-made `createTools()` cannot be combined with `backends.codex.filesystem`
+for a Claude root's Codex children: configure the workspace inside `createTools`
+or use a declarative tool array there. `workspace` is only the model's
+working directory label; `filesystem` is a `Workspace` adapter that grants rooted file
+tools (Codex installs them natively, Claude receives the same tools as named
+Claude tools) and fixes the working directory to its root. One adapter shared
+by both backends shares files, never execution state. Shells are separate
+tools. `workspace` resolves spawn, then backend, then runtime; `instructions`
+resolve spawn, then runtime. `codeMode: true` (default) exposes only `exec`/`wait`; `codeMode: false`
+exposes the host tools directly to the provider (no evaluator needed; remote MCP
+requires Code Mode).
+
+Ownership. The runtime owns every root, `nano.resume` result, fork and
+`session.spawn` sibling, including ones made through `Actions`. `agent.session.shutdown()`
+releases one now. `agent.dispose()` detaches a runtime-owned handle and stops its
+event watchers, but the session stays owned until `nano.shutdown()` joins it; call
+`session.shutdown()` to release resources early in long-lived servers.
+`nano.shutdown()` waits for in-flight admissions, cancels and joins every owned
+Agent, rejects later spawns and is idempotent; failures surface as an
+`AggregateError`. Runtime-level `sessionId`, `durability`, `resume` and `harnesses`
+are rejected: use `Agent.create` for named or durable sessions.
+
+Placement. `nanocodex/node` runs every root in the current process with the Node
+evaluator. `nanocodex/host` runs roots inline in the current Web API isolate and
+requires `module`; Code Mode backends also need `codeEvaluator` (for example
+`createQuickJsEvaluator()`) where no `Worker` exists. `nanocodex/browser` places a Codex-only root in its own package
+module Worker, so its options must be structured-clone-safe (`openAi` or
+`hostManaged` transports, no function tool handlers or subscriptions); Claude
+and mixed-family roots run inline in the page, so their credentials are
+visible to that page. Use `nanocodex/host` inside a caller-owned Worker for
+function-bearing tools. Every placement loads the bundled WASM
+model catalog once at `Nanocodex.create`.
 
 ### Personal memories and caller context
 

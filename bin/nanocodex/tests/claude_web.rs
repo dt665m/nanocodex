@@ -9,7 +9,7 @@ mod web;
 
 use axum::{Json, Router, routing::post};
 use nanocodex::claude_tools::web::{ApprovedWebFetchSource, WebFetchRequest};
-use nanocodex::{Claude, Nanocodex, claude::ClaudeClient};
+use nanocodex::{Agent, Claude, claude::ClaudeClient};
 use serde_json::{Value, json};
 use std::{
     io::{BufRead, BufReader},
@@ -154,7 +154,7 @@ async fn real_https_pages_redirect_policy_and_auxiliary_messages() {
         endpoint,
         "synthetic",
     );
-    let (agent, _) = Nanocodex::builder(Claude::new(client, "fixture"))
+    let (agent, _) = Agent::builder(Claude::new(client, "fixture"))
         .max_tokens(1024)
         .web_fetch_with_source(source, false)
         .build()

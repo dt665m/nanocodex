@@ -8,7 +8,10 @@ use nanocodex::oai::auth::{ChatGptLogin, logout_chatgpt, resolve_chatgpt_auth_st
 use crate::config::default_auth_file;
 
 mod claude;
+mod muse;
+mod store;
 pub(crate) use claude::ClaudeAuthArgs;
+pub(crate) use muse::MuseAuthArgs;
 
 #[derive(Args)]
 pub(crate) struct Auth {
@@ -43,7 +46,12 @@ struct AuthLogin {
 }
 
 impl Auth {
-    pub(crate) async fn run(self, family: HarnessFamily, claude: ClaudeAuthArgs) -> Result<()> {
+    pub(crate) async fn run(
+        self,
+        family: HarnessFamily,
+        claude: ClaudeAuthArgs,
+        muse: MuseAuthArgs,
+    ) -> Result<()> {
         if family == HarnessFamily::Claude {
             return match self.command {
                 AuthCommand::Login(args) => {
@@ -60,6 +68,22 @@ impl Auth {
                 }
             };
         }
+        if family == HarnessFamily::Muse {
+            return match self.command {
+                AuthCommand::Login(args) => {
+                    args.auth.reject_muse_override()?;
+                    muse.login(!args.no_open).await
+                }
+                AuthCommand::Status(args) => {
+                    args.reject_muse_override()?;
+                    muse.status().await
+                }
+                AuthCommand::Logout(args) => {
+                    args.reject_muse_override()?;
+                    muse.logout().await
+                }
+            };
+        }
         match self.command {
             AuthCommand::Login(args) => login(args.auth.path()?, !args.no_open).await,
             AuthCommand::Status(args) => status(&args.path()?).await,
@@ -73,6 +97,15 @@ impl AuthFile {
         if self.auth_file.is_some() {
             eyre::bail!(
                 "--auth-file selects Codex credentials; use --claude-auth-file or NANOCODEX_CLAUDE_AUTH_FILE with --claude"
+            );
+        }
+        Ok(())
+    }
+
+    fn reject_muse_override(&self) -> Result<()> {
+        if self.auth_file.is_some() {
+            eyre::bail!(
+                "--auth-file selects Codex credentials; use --muse-auth-file or NANOCODEX_MUSE_AUTH_FILE with --muse"
             );
         }
         Ok(())

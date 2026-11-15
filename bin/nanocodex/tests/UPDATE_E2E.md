@@ -227,15 +227,50 @@ Covered public boundaries:
   deliberately executable input fixtures, not a Hand-service implementation.
 - Corrupted cached companion is rejected by real `update --apply`; active CLI
   stays unchanged and pending evidence is preserved.
-- macOS `hand recover`: synthetic interrupted CLI state restores the previous
-  active version; committed CLI-only state finalizes; inconsistent committed
-  state is refused with the journal retained. **These are injected on-disk crash
-  records, not an actual killed update or OS-service rollback.**
+- macOS `hand recover`: while synthetic interrupted CLI state is recorded and
+  the owner names a different Hand (the staging path), `update --apply` and a
+  `--path` re-selection refuse with a `hand recover` instruction and keep
+  `current`, `pending-update`, the cached versions, the explicit selection and
+  the record. Recovery then restores the previous active version and reports a
+  CLI-only transaction; committed CLI-only state finalizes; inconsistent
+  committed state is refused with the journal retained; with no record,
+  recovery says so. **These are injected on-disk crash records, not an actual
+  killed update or OS-service rollback.**
 
 The account fixture and synthetic Mac owner definition must remain byte-identical.
 Windows is explicitly refused: running `--path` there can self-replace the running
 executable and overwrite sibling entrypoints, and task identity is not isolated by
 HOME alone. Use a disposable native interactive Windows user/VM for acceptance.
+
+## Voice runtime install runner
+
+`voice_install_e2e.mjs` installs a real voice archive through the public updater:
+
+```sh
+cargo build --locked -p nanocodex-bin --bin nanocodex -p nanocodex-hand-daemon --bin nanocodex-hand
+node bin/nanocodex/tests/voice_install_e2e.mjs target/debug/nanocodex target/debug/nanocodex-hand \
+  nanocodex-voice-aarch64-apple-darwin.tar.gz output/voice-install-e2e
+```
+
+Use a published `nanocodex-voice-<target>.tar.gz` (checked against its release
+`SHA256SUMS`) or `scripts/build-voice-release.py` output. The runner copies the
+pair into a disposable directory with an isolated HOME/store, a generated invalid
+account file and, on macOS, an unregistered synthetic login-owner plist. It runs
+`update --path CLI --hand-binary HAND --voice-archive ARCHIVE`, then requires every
+`nanocodex-resources/voice/bin/` program to match the archive and be executable.
+The helper must print `--build-commit`; the macOS recorder runs without arguments
+and must exit 2 with its usage before any microphone permission check. The runner
+then makes every program except the helper 0600, as earlier updaters left the
+recorder, reselects the same pair and requires the verified cached runtime to be
+executable again. When the pair is staged, it repeats the 0600 modes and runs
+`update --apply` without `--restart-hand`: activation validation, which rollback
+and `hand recover` share, must restore them without an archive, and the pair stays
+staged. Native status also reads the user's real login Hand (read-only), so the
+pair is staged or activated depending on that Hand (an unstaged run records the
+skipped apply check); no restart is requested and, on macOS, its PID
+(read-only `launchctl print`) must be unchanged. Results are in
+`OUTPUT/transcript.log` and `OUTPUT/summary.json`. Audio devices, microphone
+permission and live voice conversations are not exercised.
 
 ## Source-selector runner
 
@@ -301,7 +336,7 @@ journeys on a shared user's Hand:
    and verify the configured login/boot owner starts the same selected version.
    Passing `--version` or preserving plist text does not cover this lifetime test.
 3. Repeat selectors `update`, `update --nightly`, `update --branch TOPIC`, and
-   `update --pr NUMBER`, `update --version VERSION`, and a local `--path` pair:
+   `update --pr NUMBER`, `update VERSION`, and a local `--path` pair:
    default commands cache a verified coherent pair and stage without disrupting the installed service. Check the old CLI/service remain
    selected and pending state names the new pair after updater exit.
 4. `update --apply` must keep the staged pair deferred while an owner is installed;

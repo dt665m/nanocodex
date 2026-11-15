@@ -199,8 +199,21 @@ nanocodex login --phone '+1 415 555 0123' --label 'Work laptop CLI'
 account credentials. `nanocodex account` (also `auth`) groups those commands.
 `nanocodex connect login|status|logout` manages Connect installation grants
 (`ncl login|status|logout` manage the same grants), and `ncl auth` manages
-ChatGPT provider credentials. Those credentials are independent of the managed
-account key.
+ChatGPT, Claude (`--claude`) or Muse (`--muse`) provider credentials. Those
+credentials are independent of the managed account key.
+
+```bash
+ncl --muse auth login --no-open    # Approve Meta device login using the printed URL
+ncl --muse auth status
+ncl --muse --model muse-wonder-1.0 run "Say hello"
+ncl --muse auth logout
+```
+
+Muse keeps OAuth and inference credentials in an encrypted private store at
+`$CODEX_HOME/muse/private/auth`; `--muse-auth-file` overrides it. Recovered
+inference keys are saved for the next process. `META_MODEL_API_KEY` selects
+key-only inference. Muse uses HTTP/SSE, and image generation requires explicit
+`--image-generation true` plus account access.
 
 Connect accepts `chatgpt`, `github`, `gmail`, `gdrive`, `gcalendar`, `gtasks`,
 `gdocs`, `gsheets`, `gslides`, `gcontacts`, `slack`, `x`, `spotify`, `soundcloud`,

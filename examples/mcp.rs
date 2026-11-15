@@ -1,6 +1,6 @@
 use eyre::{Result, WrapErr};
 use nanocodex::{
-    Nanocodex, OpenAi, Thinking, Tools,
+    Agent, OpenAi, Thinking, Tools,
     tools::mcp::{Mcp, McpServer},
 };
 
@@ -22,7 +22,7 @@ async fn main() -> Result<()> {
     let mcp = Mcp::builder().server("docs", server).build()?;
     let tools = Tools::builder().without_defaults().provider(mcp).build()?;
     let openai = OpenAi::new(api_key)?;
-    let (agent, mut events) = Nanocodex::builder(openai)
+    let (agent, mut events) = Agent::builder(openai)
         .instructions("Search configured MCP servers when documentation evidence is needed.")
         .thinking(Thinking::Low)
         .tools(tools)

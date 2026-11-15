@@ -1,6 +1,6 @@
 use eyre::{OptionExt, Result, WrapErr};
 use nanocodex::{
-    DurableAgentExt, Nanocodex, OpenAi, Tools,
+    Agent, DurableAgentExt, OpenAi, Tools,
     durability::{DurableSession, MemoryStore},
     tool,
 };
@@ -24,7 +24,7 @@ async fn main() -> Result<()> {
     // Postgres through nanocodex-durability's optional features.
     let store = MemoryStore::new()?;
     let journal = DurableSession::open(store, "durable-example").await?;
-    let (agent, _events) = Nanocodex::builder(openai)
+    let (agent, _events) = Agent::builder(openai)
         .instructions("Use the supplied arithmetic tool and preserve exact integer results.")
         .tools(tools)
         .durability(journal)

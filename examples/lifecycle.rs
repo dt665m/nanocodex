@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use eyre::{Result, WrapErr};
 use nanocodex::{
-    AgentEvents, ForkRequest, Nanocodex, NanocodexError, OpenAi, Thinking, Tools,
+    Agent, AgentEvents, ForkRequest, NanocodexError, OpenAi, Thinking, Tools,
     agent::{events::AgentEventKind, session::SessionId},
 };
 use tokio::task::JoinHandle;
@@ -30,7 +30,7 @@ async fn main() -> Result<()> {
     // `tools(tools)` is the normal path for shareable handlers. Agent-relative
     // subagent tools instead use `tools_factory(|handle| ...)`; see subagents.rs.
     let tools = Tools::builder().without_defaults().build()?;
-    let (agent, events) = Nanocodex::builder(openai)
+    let (agent, events) = Agent::builder(openai)
         .session_id(SessionId::new())
         .instructions(INSTRUCTIONS)
         .thinking(Thinking::Low)

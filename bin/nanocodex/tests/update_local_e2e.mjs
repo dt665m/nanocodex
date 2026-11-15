@@ -501,8 +501,39 @@ try {
     const journal = join(store, 'update-transaction.json');
     rmSync(join(store, 'current'));
     symlinkSync(join('versions', key), join(store, 'current'));
-    writeFileSync(journal, JSON.stringify({ previous: oldActive, candidate: key }));
-    run(runner, ['hand', 'recover']);
+    const interrupted = JSON.stringify({ previous: oldActive, candidate: key });
+    writeFileSync(journal, interrupted);
+    // Until recovery, neither applying the staged bundle nor re-selecting the
+    // pair may report it active, clear pending state or consume the record.
+    // The owner temporarily names other Hand bytes, so the candidate is a Hand
+    // switch: the path that stages, or reports a no-op for the active key,
+    // without --restart-hand. The definition is not bootstrapped.
+    assert.equal(pending(), key);
+    const otherOwner = join(fixture, 'other-owner', 'nanocodex2');
+    mkdirSync(dirname(otherOwner), { recursive: true });
+    writeFileSync(otherOwner, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    const xml = x => x.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+    writeFileSync(plist, plistBefore.replace('<string>' + xml(hand) + '</string>', '<string>' + xml(otherOwner) + '</string>'));
+    assert.notEqual(readFileSync(plist, 'utf8'), plistBefore, 'owner fixture names the other Hand');
+    const explicitSelection = join(store, 'explicit-selection');
+    const selection = () => existsSync(explicitSelection) ? readFileSync(explicitSelection, 'utf8') : null;
+    const selectionBefore = selection();
+    const versionsBefore = versions();
+    for (const args of [['--apply'], ['--path', cli]]) {
+      const blocked = update(args, 1);
+      assert.match(blocked.stderr, /interrupted update needs recovery; run nanocodex hand recover first/);
+      assert.doesNotMatch(blocked.stdout, /already active|staged/);
+      assert.equal(active(), key, 'interrupted selection unchanged');
+      assert.equal(pending(), key, 'staged update retained');
+      assert.equal(readFileSync(journal, 'utf8'), interrupted, 'recovery record retained');
+      assert.deepEqual(versions(), versionsBefore, 'nothing cached before refusal');
+      assert.equal(selection(), selectionBefore, 'explicit selection unchanged');
+    }
+    writeFileSync(plist, plistBefore);
+    trace.push('PASS interrupted journal with a Hand switch pending: update --apply and update --path refuse with "hand recover" and keep current, pending-update, versions, explicit selection and the record');
+    const recovered = run(runner, ['hand', 'recover']);
+    assert.ok(recovered.stdout.split('\n').includes('Restored Nanocodex ' + oldActive + '; this was a CLI-only transaction'),
+      'CLI-only recovery must not claim a Hand service restore');
     assert.equal(active(), oldActive);
     assert.equal(existsSync(journal), false);
     assert.equal(readFileSync(plist, 'utf8'), plistBefore);
@@ -523,6 +554,8 @@ try {
     assert.match(refused.stderr, /no longer matches the active CLI/);
     assert.equal(existsSync(journal), true, 'ambiguous recovery evidence retained');
     rmSync(journal);
+    const nothing = run(runner, ['hand', 'recover']);
+    assert.match(nothing.stdout, /^No interrupted coordinated update is recorded$/m);
     assert.equal(readFileSync(plist, 'utf8'), plistBefore);
   }
   if (process.platform === 'linux') {

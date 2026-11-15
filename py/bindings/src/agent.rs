@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use nanocodex::{
-    ForkRequest, HarnessModel, Model, Nanocodex as RustNanocodex, OpenAi, ReasoningMode, Thinking,
+    Agent as RustNanocodex, ForkRequest, HarnessModel, Model, OpenAi, ReasoningMode, Thinking,
     agent::session::SessionId,
     oai::auth::{OpenAiAuth, load_chatgpt_auth},
 };

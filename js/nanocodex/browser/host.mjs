@@ -37,8 +37,10 @@ export function createBrowserHost(options = {}) {
   const socketObservations = createSocketObservations(options.onSocketEvent);
   const preservation = createBeforeCompaction(options.beforeCompaction);
   const toolMode = options.toolMode ?? "code-only";
-  if (toolMode !== "code-only") {
-    throw new TypeError("toolMode must be code-only");
+  // Code Mode is the default; direct mode is an explicit opt-in that exposes
+  // host tools to the provider without dynamic code evaluation.
+  if (toolMode !== "code-only" && toolMode !== "direct") {
+    throw new TypeError("toolMode must be code-only or direct");
   }
   if (options.codeEvaluator !== undefined && typeof options.codeEvaluator !== "function") {
     throw new TypeError("codeEvaluator must be a function");
@@ -52,6 +54,9 @@ export function createBrowserHost(options = {}) {
   }
   if (toolsMcp && options.mcp) {
     throw new TypeError("MCP is already configured in Tools");
+  }
+  if ((toolsMcp || options.mcp) && toolMode === "direct") {
+    throw new TypeError("remote MCP requires Code Mode");
   }
   const toolsLifecycle = options.tools?.[toolRuntimeLifecycle];
   toolsLifecycle?.available();
@@ -82,8 +87,11 @@ export function createBrowserHost(options = {}) {
   const connections = new Map();
   const openingAttempts = new Set();
   const connectingConnections = new Set();
+  // Direct mode never evaluates code, so it neither starts nor requires a Worker.
   const codeEvaluator = options.codeEvaluator
-    ?? (typeof globalThis.Worker === "function"
+    ?? (toolMode === "direct"
+      ? () => Promise.reject(new Error("direct tool mode does not evaluate code"))
+      : typeof globalThis.Worker === "function"
       ? createWorkerEvaluator()
       : () => Promise.reject(new Error(
           "browser Code Mode requires a child Worker or an explicit codeEvaluator",

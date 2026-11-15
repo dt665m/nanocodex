@@ -71,8 +71,8 @@ use self::{
 use crate::nanocodex2::{config::ReasoningEffort, config::ReasoningMode, host::HostConfig};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use futures_util::StreamExt;
-use nanocodex::Model;
-use nanocodex_agent::{Nanocodex, NanocodexError, PromptRequest, Turn, TurnControl, TurnResult};
+use nanocodex::{Agent, Model};
+use nanocodex_agent::{NanocodexError, PromptRequest, Turn, TurnControl, TurnResult};
 use nanocodex_managed::{
     AgentList, AgentSettings, AgentState, EventCursor, EventHistoryPage, ManagedClient,
     ManagedError, ManagedEvent, ManagedEventData, ManagedModel,
@@ -218,7 +218,7 @@ type HistoryReplayCompletion = (
     Result<PreparedHistoryReplay, ManagedError>,
 );
 type ConnectedAgent = (
-    Nanocodex,
+    Agent,
     mpsc::UnboundedReceiver<ManagedEvent>,
     String,
     PathBuf,
@@ -588,7 +588,7 @@ struct DriverRuntime {
     harness_relaunching: bool,
     /// The newest harness launch waiting for the connection slot.
     queued_relaunch: Option<Box<local::agent::LocalLaunch>>,
-    agent: Option<Nanocodex>,
+    agent: Option<Agent>,
     startup_attach: bool,
     pending_resume: Option<(tokio::task::AbortHandle, PaneId)>,
     managed_events: Option<mpsc::UnboundedReceiver<ManagedEvent>>,

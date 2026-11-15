@@ -6,7 +6,7 @@ use std::{
 
 use eyre::{Result, WrapErr, bail, eyre};
 use nanocodex::{
-    AgentEvents, ForkRequest, Nanocodex, OpenAi, Thinking, Tools, Turn, TurnResult,
+    Agent, AgentEvents, ForkRequest, OpenAi, Thinking, Tools, Turn, TurnResult,
     agent::{events::AgentEventKind, session::SessionId},
     oai::{MODEL, auth::load_chatgpt_auth, responses::Usage},
 };
@@ -129,7 +129,7 @@ async fn main() -> Result<()> {
     let lineage = SessionId::new();
     let tools = Tools::builder().without_defaults().build()?;
     let agent_build_started = Instant::now();
-    let (agent, mut root_events) = Nanocodex::builder(openai)
+    let (agent, mut root_events) = Agent::builder(openai)
         .session_id(lineage)
         .instructions(workload.base_instructions.clone())
         .thinking(Thinking::Low)
@@ -228,7 +228,7 @@ fn load_workload(path: &Path) -> Result<(Vec<u8>, Workload)> {
 }
 
 async fn measured_turn(
-    agent: &Nanocodex,
+    agent: &Agent,
     events: &mut AgentEvents,
     prompt: &str,
     expected: &str,
@@ -248,7 +248,7 @@ async fn measurement_after_result(
     finish_measurement(&result, events, latency_ms, expected).await
 }
 
-async fn start_prompt(agent: &Nanocodex, prompt: &str) -> Result<(Turn, Instant)> {
+async fn start_prompt(agent: &Agent, prompt: &str) -> Result<(Turn, Instant)> {
     let started = Instant::now();
     Ok((agent.prompt(prompt).await?, started))
 }

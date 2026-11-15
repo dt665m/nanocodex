@@ -2,13 +2,13 @@
 
 use std::{collections::HashMap, future::Future, sync::Arc};
 
-use crate::{AgentEvents, HarnessFamily, HarnessModel, Nanocodex, NanocodexError, Thinking};
+use crate::{Agent, AgentEvents, HarnessFamily, HarnessModel, NanocodexError, Thinking};
 use nanocodex_agent::{
     AgentHandle, ForkRequest, SessionCheckpoint, SpawnOptions,
     backend::{AgentFactory, BackendFuture},
 };
 
-type AgentResult = nanocodex_agent::Result<(Nanocodex, AgentEvents)>;
+pub(crate) type AgentResult = nanocodex_agent::Result<(Agent, AgentEvents)>;
 type Recipe = Arc<dyn Fn(HarnessRequest) -> BackendFuture<AgentResult> + Send + Sync>;
 
 /// Validated construction input passed to a concrete provider recipe.
@@ -85,6 +85,23 @@ impl HarnessBuilder {
         Harness {
             inner: Arc::new(Router {
                 recipes: self.recipes,
+                #[cfg(not(target_family = "wasm"))]
+                children: None,
+            }),
+        }
+    }
+
+    /// Freezes recipes whose routed children are admitted and tracked by a
+    /// reusable runtime.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn build_tracked(
+        self,
+        children: std::sync::Weak<crate::runtime::Ownership>,
+    ) -> Harness {
+        Harness {
+            inner: Arc::new(Router {
+                recipes: self.recipes,
+                children: Some(children),
             }),
         }
     }
@@ -110,9 +127,8 @@ impl Harness {
     pub async fn start_with(&self, options: SpawnOptions) -> AgentResult {
         options.validate_harness()?;
         let family = options
-            .selected_harness()
-            .or_else(|| options.selected_harness_model().map(HarnessModel::family))
-            .unwrap_or(HarnessFamily::Codex);
+            .selected_family()
+            .unwrap_or_else(|| self.inner.default_family());
         let model = options
             .selected_harness_model()
             .unwrap_or_else(|| family.default_model());
@@ -130,7 +146,7 @@ impl Harness {
     /// model, thinking level, conversation tree and committed history; it uses
     /// the recipe's current credentials, tools and instructions. A checkpoint
     /// taken before the first completed turn reopens the session with its
-    /// settings and no history. Use [`Nanocodex::fork`] instead to continue a
+    /// settings and no history. Use [`Agent::fork`] instead to continue a
     /// conversation under a new identity.
     ///
     /// ```
@@ -258,8 +274,44 @@ impl Reopen {
 
 struct Router {
     recipes: HashMap<HarnessFamily, Recipe>,
+    /// Runtime admission and tracking for children routed through this
+    /// registry; absent for a host-composed [`Harness`].
+    #[cfg(not(target_family = "wasm"))]
+    children: Option<std::sync::Weak<crate::runtime::Ownership>>,
 }
 impl Router {
+    /// Codex when registered, otherwise the sole registered family.
+    fn default_family(&self) -> HarnessFamily {
+        if self.recipes.contains_key(&HarnessFamily::Codex) || self.recipes.len() != 1 {
+            HarnessFamily::Codex
+        } else {
+            *self.recipes.keys().next().expect("one registered family")
+        }
+    }
+
+    /// Runs one routed child construction under the owning runtime's
+    /// admission gate and tracks its result for runtime shutdown.
+    async fn tracked<F>(&self, construct: F) -> nanocodex_agent::Result<Vec<(Agent, AgentEvents)>>
+    where
+        F: Future<Output = nanocodex_agent::Result<Vec<(Agent, AgentEvents)>>>,
+    {
+        #[cfg(not(target_family = "wasm"))]
+        if let Some(owner) = self.children.as_ref().and_then(std::sync::Weak::upgrade) {
+            return owner.track_children(construct).await;
+        }
+        construct.await
+    }
+
+    async fn tracked_one<F>(&self, construct: F) -> AgentResult
+    where
+        F: Future<Output = AgentResult>,
+    {
+        let mut created = self
+            .tracked(async { construct.await.map(|child| vec![child]) })
+            .await?;
+        Ok(created.remove(0))
+    }
+
     async fn construct(
         self: Arc<Self>,
         parent: Option<AgentHandle>,
@@ -327,19 +379,24 @@ impl AgentFactory for RoutedFactory {
     ) -> BackendFuture<AgentResult> {
         let inner = Arc::clone(&self.inner);
         Box::pin(async move {
-            parent.ensure_available().await?;
-            options.validate_harness()?;
-            if resolve_family(&parent, &options) == parent.harness_family() {
-                return parent
-                    .spawn_native_with_host_context(options, host_context)
-                    .await;
-            }
-            // A family switch takes destination defaults. The native parent's
-            // model may be outside the shared catalog and is never inherited.
-            let parent_model = parent.harness_model();
-            let options = options.resolve(parent_model, parent_model.default_thinking())?;
-            inner
-                .construct(Some(parent), options, host_context, Reopen::default())
+            let router = Arc::clone(&inner);
+            router
+                .tracked_one(async move {
+                    parent.ensure_available().await?;
+                    options.validate_harness()?;
+                    if resolve_family(&parent, &options) == parent.harness_family() {
+                        return parent
+                            .spawn_native_with_host_context(options, host_context)
+                            .await;
+                    }
+                    // A family switch takes destination defaults. The native parent's
+                    // model may be outside the shared catalog and is never inherited.
+                    let parent_model = parent.harness_model();
+                    let options = options.resolve(parent_model, parent_model.default_thinking())?;
+                    inner
+                        .construct(Some(parent), options, host_context, Reopen::default())
+                        .await
+                })
                 .await
         })
     }
@@ -353,15 +410,24 @@ impl AgentFactory for RoutedFactory {
         count: usize,
         observer: Arc<dyn Fn(&str) + Send + Sync>,
         host_context: Option<Arc<str>>,
-    ) -> BackendFuture<nanocodex_agent::Result<Vec<(Nanocodex, AgentEvents)>>> {
+    ) -> BackendFuture<nanocodex_agent::Result<Vec<(Agent, AgentEvents)>>> {
+        let inner = Arc::clone(&self.inner);
         Box::pin(async move {
-            parent.ensure_available().await?;
-            debug_assert_eq!(
-                resolve_family(&parent, &SpawnOptions::new()),
-                parent.harness_family()
-            );
-            parent
-                .spawn_many_native_with_host_context(count, move |id| observer(id), host_context)
+            inner
+                .tracked(async move {
+                    parent.ensure_available().await?;
+                    debug_assert_eq!(
+                        resolve_family(&parent, &SpawnOptions::new()),
+                        parent.harness_family()
+                    );
+                    parent
+                        .spawn_many_native_with_host_context(
+                            count,
+                            move |id| observer(id),
+                            host_context,
+                        )
+                        .await
+                })
                 .await
         })
     }
@@ -374,26 +440,31 @@ impl AgentFactory for RoutedFactory {
     ) -> BackendFuture<AgentResult> {
         let inner = Arc::clone(&self.inner);
         Box::pin(async move {
-            parent.ensure_available().await?;
-            checkpoint.validate()?;
-            if checkpoint.family() == parent.harness_family() {
-                return parent
-                    .restore_native_runtime(checkpoint, host_context)
-                    .await;
-            }
-            let model = checkpoint.model();
-            let options = SpawnOptions::new()
-                .harness(model.family())
-                .harness_model(model)
-                .thinking(checkpoint.thinking());
-            options.validate_harness()?;
-            inner
-                .construct(
-                    Some(parent),
-                    options,
-                    host_context,
-                    Reopen::checkpoint(checkpoint),
-                )
+            let router = Arc::clone(&inner);
+            router
+                .tracked_one(async move {
+                    parent.ensure_available().await?;
+                    checkpoint.validate()?;
+                    if checkpoint.family() == parent.harness_family() {
+                        return parent
+                            .restore_native_runtime(checkpoint, host_context)
+                            .await;
+                    }
+                    let model = checkpoint.model();
+                    let options = SpawnOptions::new()
+                        .harness(model.family())
+                        .harness_model(model)
+                        .thinking(checkpoint.thinking());
+                    options.validate_harness()?;
+                    inner
+                        .construct(
+                            Some(parent),
+                            options,
+                            host_context,
+                            Reopen::checkpoint(checkpoint),
+                        )
+                        .await
+                })
                 .await
         })
     }
@@ -415,8 +486,5 @@ fn catalog_error(error: crate::durability::Error) -> NanocodexError {
 /// The family a child of `parent` runs in: an explicit harness or model
 /// selection, otherwise the parent's own family.
 fn resolve_family(parent: &AgentHandle, options: &SpawnOptions) -> HarnessFamily {
-    options
-        .selected_harness()
-        .or_else(|| options.selected_harness_model().map(HarnessModel::family))
-        .unwrap_or(parent.harness_family())
+    options.selected_family().unwrap_or(parent.harness_family())
 }

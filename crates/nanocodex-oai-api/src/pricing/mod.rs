@@ -37,6 +37,8 @@ pub use estimate::{EstimatedUsdCost, ServiceTier, estimate, estimate_for_model};
 pub enum CostStatus {
     /// Provider usage was priced using the built-in rates.
     EstimatedFromUsage,
+    /// Provider usage is present, but the model has no published pricing.
+    PricingUnavailable,
     /// The provider omitted usage from the completed response.
     #[default]
     UsageNotReported,
@@ -51,6 +53,7 @@ impl CostStatus {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::EstimatedFromUsage => "estimated_from_usage",
+            Self::PricingUnavailable => "pricing_unavailable",
             Self::UsageNotReported => "usage_not_reported",
             Self::Other => "other",
         }

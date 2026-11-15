@@ -69,6 +69,7 @@ pub(crate) struct Fork {
 pub(crate) enum Harness {
     Codex,
     Claude,
+    Muse,
 }
 
 impl Harness {
@@ -76,6 +77,7 @@ impl Harness {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::Muse => "muse",
         }
     }
 }
@@ -84,7 +86,8 @@ impl From<HarnessFamily> for Harness {
     fn from(family: HarnessFamily) -> Self {
         match family {
             HarnessFamily::Claude => Self::Claude,
-            _ => Self::Codex,
+            HarnessFamily::Muse => Self::Muse,
+            HarnessFamily::Codex => Self::Codex,
         }
     }
 }
@@ -110,7 +113,7 @@ impl From<&crate::sessions::SessionSummary> for LocalSession {
             // Claude previews are raw first prompts; catalog previews of Codex
             // threads are shown as recorded.
             preview: session.preview().map(|preview| match session.family() {
-                HarnessFamily::Claude => single_line(preview),
+                HarnessFamily::Claude | HarnessFamily::Muse => single_line(preview),
                 _ => preview.to_owned(),
             }),
             model: session.model().map(|model| model.to_string()),
@@ -819,7 +822,7 @@ fn saturating_isize(value: usize) -> isize {
 /// No saved sessions: the error `ncl resume` reports.
 pub(crate) fn none_found(home: &Path) -> eyre::Report {
     eyre!(
-        "no resumable Codex or Claude sessions found under {}",
+        "no resumable Codex, Claude or Muse sessions found under {}",
         home.display()
     )
 }

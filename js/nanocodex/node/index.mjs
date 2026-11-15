@@ -18,3 +18,5 @@ export * as Claude from "./Claude.mjs";
 export function modelCapabilities() {
   return createRequire(import.meta.url)("../pkg-node/nanocodex.js").modelCapabilities();
 }
+
+export * as Nanocodex from "./Nanocodex.mjs";

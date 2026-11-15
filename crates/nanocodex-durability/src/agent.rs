@@ -137,7 +137,7 @@ impl Branches {
     }
 }
 
-struct DurableExecution {
+pub(crate) struct DurableExecution {
     owner: DurableOwner,
     state_id: String,
     branches: Option<Branches>,
@@ -145,7 +145,7 @@ struct DurableExecution {
 }
 
 impl DurableExecution {
-    fn ready(owner: DurableOwner, state_id: String, branches: Option<Branches>) -> Self {
+    pub(crate) fn ready(owner: DurableOwner, state_id: String, branches: Option<Branches>) -> Self {
         Self {
             owner,
             state_id,
@@ -162,7 +162,7 @@ impl DurableExecution {
         crate::context::prepare_snapshot(snapshot, &known).map_err(agent_error)
     }
 
-    fn remember(&self, keys: HashSet<String>) -> AgentResult<()> {
+    pub(crate) fn remember(&self, keys: HashSet<String>) -> AgentResult<()> {
         *self.context_records.lock().map_err(|_| {
             NanocodexError::InvalidExecutionPolicy("context cache poisoned".into())
         })? = keys;
@@ -617,7 +617,7 @@ impl LazyExecution {
                 if let Some(settings) = self.created_with.lock().ok().and_then(|settings| *settings)
                 {
                     // The child's own model and settings, not its parent's.
-                    record.model = nanocodex_agent::HarnessModel::Codex(settings.model);
+                    record.model = nanocodex_agent::HarnessModel::from_responses(settings.model);
                     record.initial = Some(crate::catalog::InitialSettings {
                         thinking: settings.thinking,
                         service_tier: settings.service_tier,
